@@ -26,7 +26,8 @@ Its intents, in `rncfg`'s words:
                 this in RAM only, so it is said again at every boot, not only
                 at setup (`role_volatile`)
     announce    announce now
-    message     send <dest> <text>
+    message     send --no-wait <dest> <text>, which returns once the message
+                is sent or held for a path, not when its proof comes back
 
 and its address is the `lxmf.delivery` line of `rncfg addr`.
 
@@ -150,7 +151,11 @@ class Sergeyculum(Kind):
         if verb == "announce":
             return ["announce now"]
         if verb == "message":
-            return ["send %s %s" % (args["dest"], args["text"])]
+            # Not waited on: `rncfg send` otherwise holds the station's pty
+            # until the proof comes back, on the wall clock, and a timeout in
+            # a virtual-time run is tried again (`run`), which sends the
+            # message again. The station's log says what became of it.
+            return ["send --no-wait %s %s" % (args["dest"], args["text"])]
         return super().lines(verb, **args)
 
     def configured(self, station):

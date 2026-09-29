@@ -43,7 +43,7 @@ runs longer, so the page can say which phase the run is in and when it will
 be done. The result holds the phases (wall and T at each boundary), every
 clock message, the warm-up samples, every send with its route and reply,
 and the gathered output. How much of it was delivered is counted from the
-stations' logs afterwards, which is Reticulous's for now
+stations' logs afterwards, each sender by its own station's
 (simesh.reticulum.delivery, `report`).
 """
 
