@@ -75,7 +75,20 @@ class Run:
         self.read()
 
     def stamp(self, text):
-        return record_module.parse_time(text)
+        """Seconds on the record's clock: T in a virtual-time run, the wall
+        clock read with its date in a real one (referee.to_us), so a run
+        across a midnight, or longer than a day, does not wrap."""
+        return referee.to_us(text) / 1e6
+
+    def zero(self, text):
+        """--starts on the record's clock, `text` being the stamp of the
+        record's first line: T as given in a virtual-time run; in a real one
+        a time of day, at its instant nearest that line."""
+        if ":" not in text:
+            return self.start
+        at = self.stamp(text)
+        zero = at - record_module.parse_time(text) + self.start
+        return zero + 86400 * round((at - zero) / 86400)
 
     def wall_of(self, text):
         """The wall-clock instant of a real run's stamp; None for T."""
@@ -89,6 +102,7 @@ class Run:
     def read(self):
         halves = rframes.Halves()
         arriving = {}                     # ether frame id -> (sender, payload, when)
+        start = None                      # --starts on the record's clock, from its first line
         with open(self.path, encoding="utf-8") as handle:
             for line in handle:
                 if line.startswith("#"):
@@ -103,12 +117,14 @@ class Run:
                 except ValueError:
                     continue
                 at = self.stamp(stamp)
+                if start is None and self.start is not None:
+                    start = self.zero(stamp)
                 kind = msg.get("type")
-                if self.t0 is None and self.start is not None and at >= self.start:
-                    self.t0 = self.start
+                if self.t0 is None and start is not None and at >= start:
+                    self.t0 = start
                     wall = self.wall_of(stamp)
                     if wall is not None:
-                        self.hello_wall = wall - (at - self.start)
+                        self.hello_wall = wall - (at - start)
                 if kind == "hello" and direction == "in":
                     if self.t0 is None:
                         self.t0 = at
@@ -121,8 +137,6 @@ class Run:
                 if self.t0 is None:
                     continue
                 at -= self.t0
-                if at < 0:
-                    at += 86400             # a real run across midnight
                 if getattr(self, "until", None) is not None and at > self.until:
                     break
                 self.end = max(self.end, at)
@@ -359,7 +373,8 @@ def main(argv=None):
                     help="count the LXMF messages each run's senders logged as delivered")
     ap.add_argument("--starts", help="each run's zero, comma separated, in its record's "
                                      "stamps: T in seconds for a virtual run, the time of "
-                                     "day in seconds for a real one (default: the first hello)")
+                                     "day in seconds for a real one, at its instant nearest "
+                                     "the record's first line (default: the first hello)")
     args = ap.parse_args(argv)
     if len(args.runs) > 2:
         ap.error("one or two runs")
