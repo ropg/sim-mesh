@@ -82,6 +82,15 @@ enum {
  * something was found. */
 enum { CAD_ONLY = 0x00, CAD_RX = 0x01 };
 
+/* How many symbols into a frame a receiver that has heard it from the start
+ * finds the preamble and raises PreambleDetected. A real modem finds it within
+ * a few symbols, long before the sync word that `t_pre` marks. Firmware that
+ * senses the channel by asking the demodulator measured a blind window of about
+ * 4 ms at SF7 and 125 kHz: three boards, 150 trials. So 4 symbols is an upper
+ * bound. Raised at the sync word instead, the same firmware is blind for the
+ * whole preamble: 29 ms at SF7 with 24 symbols, 46 ms at SF8 with 18. */
+constexpr double kPreambleFoundSymbols = 4.0;
+
 enum {
     REG_VERSION_STRING  = 0x0320,
     REG_IQ_CONFIG       = 0x0736,
@@ -245,6 +254,21 @@ static int connectorDbm(int chipDbm)
     return fe.ant[fe.n - 1];
 }
 
+/* SNR as the packet status reports it: x/4 dB in a signed byte. Cast straight
+ * into that byte, a level past either end wraps round, so a link 54 dB over the
+ * noise would read -10 dB and the strongest links would pass for the weakest,
+ * to anything that weighs a link by its SNR. A LoRa receiver's estimate stops
+ * well short of the byte's +31.75 dB anyway: it saturates a little above 10 dB
+ * however strong the link (an LR2021 on a desk read 14 dB at -16 dBm). So a
+ * link reads no more than +12 dB, and no less than the byte's -32 dB. */
+static const int kSnrCeilingDb = 12;
+
+static uint8_t snrRegister(int db)
+{
+    const int v = 4 * (db > kSnrCeilingDb ? kSnrCeilingDb : db);
+    return (uint8_t)(int8_t)(v < -128 ? -128 : v);
+}
+
 /* A connector level as the chip reads it, in its -x/2 byte's range. The LNA
  * raises signal and noise alike, so SNR is left as the ether gave it. */
 static int chipLevelDbm(int connectorLevel)
@@ -252,6 +276,19 @@ static int chipLevelDbm(int connectorLevel)
     const int dbm = connectorLevel + frontEnd().rxGainDb;
     return dbm < -127 ? -127 : dbm > 0 ? 0 : dbm;
 }
+
+/* One frame on the air at this antenna, as the ether has told of it: its
+ * number, its level and when it leaves the air. */
+struct AirFrame {
+    int     id = 0;
+    int     levelDbm = 0;
+    int64_t endUs = 0;
+};
+
+/* How many frames at once the instantaneous RSSI keeps track of. More than a
+ * channel carries at once in practice; past it, the frame that leaves the air
+ * first makes room. */
+constexpr int kAirFrames = 16;
 
 /* The chip's state: everything a power cycle puts back. */
 struct ChipState {
@@ -285,9 +322,11 @@ struct ChipState {
 
     /* The air, and the one frame being demodulated out of it. A receiver
      * follows a single frame at a time: the rest is energy, which is what an
-     * instantaneous RSSI reads and what carrier sense acts on. */
-    int      airLevel = 0;           /* the strongest level in flight */
-    int64_t  airEndUs = 0;           /* when the last of it is over */
+     * instantaneous RSSI reads and what carrier sense acts on. The reading
+     * is the power of everything in flight summed, as the ether's own busy
+     * test sums it, not the strongest part of it: two frames at -80 dBm read
+     * -77. Each frame counts once, however often the ether tells of it. */
+    AirFrame air[kAirFrames];
     int      lockId = 0;             /* the frame this receiver is following */
 
     /* When the last frame this antenna has been told of leaves the air. Not
@@ -346,6 +385,7 @@ struct simradio {
      * first use and kept for the chip's life. */
     void* tTxDone = nullptr;
     void* tPre = nullptr;
+    void* tSync = nullptr;
     void* tHdr = nullptr;
     void* tCad = nullptr;
 };
@@ -427,6 +467,7 @@ void dropLock(simradio* c)
     d.lockId = 0;
     d.pendingValid = false;
     stopTimer(c->tPre);
+    stopTimer(c->tSync);
     stopTimer(c->tHdr);
 }
 
@@ -435,13 +476,44 @@ void dropLock(simradio* c)
  * on the air, and it is what a CAD is for. */
 void abandonReception(simradio* c)
 {
-    c->st.airLevel = 0;
-    c->st.airEndUs = 0;
+    for (AirFrame& a : c->st.air) a = AirFrame();
     dropLock(c);
+}
+
+/* A frame's energy arriving at this antenna: kept until it leaves the air,
+ * once per frame number. */
+void feelAir(ChipState& d, int id, int levelDbm, int64_t endUs, int64_t now)
+{
+    int room = -1, soonest = 0;
+    for (int i = 0; i < kAirFrames; i++) {
+        AirFrame& a = d.air[i];
+        if (a.endUs > now && a.id == id) {          /* told again: one frame */
+            a.levelDbm = levelDbm;
+            a.endUs = endUs;
+            return;
+        }
+        if (a.endUs <= now && room < 0) room = i;
+        if (a.endUs < d.air[soonest].endUs) soonest = i;
+    }
+    AirFrame& a = d.air[room >= 0 ? room : soonest];
+    a.id = id;
+    a.levelDbm = levelDbm;
+    a.endUs = endUs;
+}
+
+/* What the instantaneous RSSI reads at the connector: the frames in flight,
+ * their powers summed, or the floor when there are none. */
+int airLevelDbm(const ChipState& d, int64_t now)
+{
+    double mw = 0.0;
+    for (const AirFrame& a : d.air)
+        if (a.endUs > now) mw += std::pow(10.0, a.levelDbm / 10.0);
+    return mw > 0.0 ? (int)std::lround(10.0 * std::log10(mw)) : kNoiseFloorDbm;
 }
 
 void txDoneCb(void* arg);
 void rxPreCb(void* arg);
+void rxSyncCb(void* arg);
 void rxHdrCb(void* arg);
 void rxEndCb(void* arg);
 void cadDoneCb(void* arg);
@@ -473,6 +545,7 @@ extern "C" simradio_t* simradio_open(int slot, void (*on_pin)(void*, int, int), 
          * lives for the process, because a timer may be about to fire on it. */
         stopTimer(c->tTxDone);
         stopTimer(c->tPre);
+        stopTimer(c->tSync);
         stopTimer(c->tHdr);
         stopTimer(c->tCad);
         c->st = ChipState();
@@ -489,6 +562,7 @@ extern "C" void simradio_close(simradio_t* c)
     S()->lock();
     stopTimer(c->tTxDone);
     stopTimer(c->tPre);
+    stopTimer(c->tSync);
     stopTimer(c->tHdr);
     stopTimer(c->tCad);
     c->onPin = nullptr;
@@ -701,7 +775,7 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
     case CMD_GET_RSSI_INST:
         if (len >= 3) {
             /* The chip's -x/2 encoding, and nothing at all outside RX. */
-            int dbm = chipLevelDbm(S()->now_us() < d.airEndUs ? d.airLevel : kNoiseFloorDbm);
+            int dbm = chipLevelDbm(airLevelDbm(d, S()->now_us()));
             in[2] = strcmp(d.mode, "RX") == 0 ? (uint8_t)(-2 * dbm) : 0xFF;
         }
         break;
@@ -819,7 +893,12 @@ void txDoneCb(void* arg)
 
 void rxPreCb(void* arg)
 {
-    raise((simradio*)arg, IRQ_PREAMBLE_DETECTED | IRQ_SYNC_WORD_VALID);
+    raise((simradio*)arg, IRQ_PREAMBLE_DETECTED);
+}
+
+void rxSyncCb(void* arg)
+{
+    raise((simradio*)arg, IRQ_SYNC_WORD_VALID);
 }
 
 void rxHdrCb(void* arg)
@@ -840,7 +919,7 @@ void rxEndCb(void* arg)
         d.rxPtr = d.rxBase;
         d.rssiPkt    = (uint8_t)(-2 * chipLevelDbm(d.pendingEnd.rssiDbm));
         d.sigRssiPkt = d.rssiPkt;
-        d.snrPkt     = (uint8_t)(int8_t)(d.pendingEnd.snrDb * 4);
+        d.snrPkt     = snrRegister(d.pendingEnd.snrDb);
         bits = IRQ_RX_DONE;
         if (!d.pendingEnd.crcOk)    bits |= IRQ_CRC_ERR;
         if (!d.pendingEnd.headerOk) bits |= IRQ_HEADER_ERR;
@@ -885,9 +964,7 @@ void modelRxBegin(simradio* c, const VirtualRxBegin& f)
     /* Energy first: every frame in the air raises the instantaneous reading,
      * whether or not this receiver is following it. */
     int64_t endUs = now + (f.tEnd - f.t0);
-    if (now >= d.airEndUs) d.airLevel = 0;
-    if (f.levelDbm > d.airLevel || d.airLevel == 0) d.airLevel = f.levelDbm;
-    if (endUs > d.airEndUs) d.airEndUs = endUs;
+    feelAir(d, f.id, f.levelDbm, endUs, now);
     if (endUs > d.heardEndUs) d.heardEndUs = endUs;
 
     /* A CAD senses; it demodulates nothing. Nor does an RX slot follow a frame
@@ -903,8 +980,13 @@ void modelRxBegin(simradio* c, const VirtualRxBegin& f)
     d.lockId = f.id;
 
     /* The sender's stamps are its own clock's; only the gaps between them mean
-     * anything here, and they are measured from this instant. */
-    armOnce(c, &c->tPre, rxPreCb, f.tPre - f.t0);
+     * anything here, and they are measured from this instant. The preamble is
+     * found a few symbols in, and the sync word lands where `t_pre` says. */
+    int64_t syncUs = f.tPre - f.t0;
+    double tSym = (double)((uint32_t)1 << d.sf) / (double)d.bwHz;
+    int64_t foundUs = (int64_t)(kPreambleFoundSymbols * tSym * 1e6);
+    armOnce(c, &c->tPre, rxPreCb, foundUs < syncUs ? foundUs : syncUs);
+    armOnce(c, &c->tSync, rxSyncCb, syncUs);
     armOnce(c, &c->tHdr, rxHdrCb, f.tHdr - f.t0);
     S()->unlock();
 }

@@ -380,11 +380,12 @@ class Simd:
             os.makedirs(record_dir, exist_ok=True)
             record = os.path.join(record_dir, "record.tsv")
         bind = ether_module.parse_bind(self.ether_addr)
-        physics = ether_module.Physics(self.args.noise_figure)
+        physics = ether_module.Physics(self.args.noise_figure, self.args.crc_margin_db)
         self.ether_transport, self.ether = await loop.create_datagram_endpoint(
             lambda: ether_module.Ether(record, physics=physics, time_mode=self.args.time,
                                        pairwise=self.args.pairwise, seed=self.args.seed,
-                                       epoch=self.args.epoch),
+                                       epoch=self.args.epoch,
+                                       bench_capture=self.args.bench_capture),
             local_addr=bind)
         self.ether.on_tx = self.ether_tx
         self.ether.on_rx = self.ether_rx
@@ -394,7 +395,8 @@ class Simd:
             log("ether on %s, recording to %s" % (self.ether_addr, record))
             log("time: %s; %s; %s rule" % (
                 ether_module.describe_time(self.ether.mode, self.ether.rate),
-                physics.describe(), "pairwise" if self.args.pairwise else "receiver-centred"))
+                physics.describe(),
+                ether_module.rule_name(self.args.pairwise, self.args.bench_capture)))
         if self.ether.clock.virtual and not os.path.exists(kinds_module.SHIM):
             log("error: no time shim at %s: a virtual-time run needs it "
                 "(see SIMesh/README.md)" % kinds_module.SHIM)
@@ -574,7 +576,18 @@ class Simd:
             clock=self.ether if self.virtual else None)
         station.watchers = len(self.consoles.get(name, ()))
         station.board = boards_module.environment(node.get("max_dbm"))
+        station.clock_profile = self.clock_profile(name)
         return station
+
+    def clock_profile(self, name):
+        """A station's crystal, off by a draw uniform within ±`--clock-ppm`
+        parts per million, from the seed and its name: its node time as a
+        function of T (STATION.md, `SIMESH_CLOCK_PROFILE`), or None for a
+        true clock. A kind's own profile in its `env:` still wins."""
+        if not self.args.clock_ppm or not self.virtual:
+            return None
+        draw = ether_module.seeded_draw(self.ether.seed, name, "clock")
+        return drift_profile(self.args.clock_ppm * (2.0 * draw - 1.0))
 
     def watched(self, name):
         """The console windows open on a station, as the pty thread sees it:
@@ -1498,6 +1511,15 @@ class Simd:
         self.sidecar = sidecar or self.args.sidecar
         self.plan = None                    # a plan is for the run it was sent in
         await self.start_ether(run.dir)
+        # The medium the run is started on, for whatever reads it later: the
+        # analysis tools' levels take their noise figure from it, and a seed
+        # drawn at random is otherwise nowhere to be found again.
+        medium = dict(self.ether.physics.as_dict(), pairwise=self.ether.pairwise)
+        if self.ether.bench_capture:
+            medium["bench_capture"] = True
+        if self.args.clock_ppm:
+            medium["clock_ppm"] = self.args.clock_ppm
+        run.set(physics=medium, seed=self.ether.seed)
         await self.find_grounds([n for n in ns.nodes if n not in self.grounds])
         self.apply_to_ether()
         log("run %s: geodata %s (%s), nodeset %s (%d nodes), script %s, tables %s"
@@ -1721,6 +1743,18 @@ class Simd:
             self.ether.close()
 
 
+
+# How far ahead of T 0 a drifting clock's profile reaches: thirty days, past
+# any run, since past its last point node time runs at T's own rate again.
+CLOCK_HORIZON_US = 30 * 86_400 * 1_000_000
+
+
+def drift_profile(ppm, horizon_us=CLOCK_HORIZON_US):
+    """A `SIMESH_CLOCK_PROFILE` for a crystal `ppm` parts per million fast (or
+    slow, below zero): node time running that much ahead of T from T 0."""
+    return "0:0,%d:%d" % (horizon_us, horizon_us + round(horizon_us * ppm * 1e-6))
+
+
 def parse_args(argv):
     ap = argparse.ArgumentParser(
         description="the simulated testbed: ether, stations, proxy and control page")
@@ -1744,6 +1778,18 @@ def parse_args(argv):
     ap.add_argument("--pairwise", action="store_true",
                     help="rule on collisions pairwise, per interferer by the capture "
                          "margin, instead of on the summed interference")
+    ap.add_argument("--clock-ppm", type=float, default=0.0, metavar="PPM",
+                    help="in a virtual-time run, each station's crystal off by a draw "
+                         "uniform within this many parts per million, from the seed "
+                         "and its name (default 0: every clock true)")
+    ap.add_argument("--bench-capture", action="store_true",
+                    help="rule on two frames of one spreading factor as a bench saw them "
+                         "meet, instead of by the same-SF figure")
+    ap.add_argument("--crc-margin-db", type=float,
+                    default=ether_module.DEFAULT_CRC_MARGIN_DB,
+                    help="the CRC band: how far above its threshold a frame may still "
+                         "fail its CRC, the chance falling linearly to nothing "
+                         "(default %g: none)" % ether_module.DEFAULT_CRC_MARGIN_DB)
     ap.add_argument("--seed", type=int,
                     help="the ether's seed, which its welcome hands every station "
                          "(default: drawn at random)")
@@ -1777,6 +1823,14 @@ def parse_args(argv):
         ether_module.parse_time_mode(args.time)
     except ValueError as err:
         ap.error(str(err))
+    if args.bench_capture and args.pairwise:
+        ap.error("--bench-capture is a variant of the receiver-centred rule, not --pairwise's")
+    if args.crc_margin_db < 0:
+        ap.error("--crc-margin-db is a width in dB")
+    if not 0 <= args.clock_ppm <= 1000:
+        ap.error("--clock-ppm is parts per million, 0 to 1000")
+    if args.clock_ppm and args.time == "real":
+        ap.error("--clock-ppm needs virtual time: in real time a station's clock is the host's")
     args.run = os.path.abspath(args.run)
     args.public_port = args.bind.rpartition(":")[2]
     # The relay binds the same number as the page, on UDP — one number to

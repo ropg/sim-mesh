@@ -11,7 +11,8 @@ and knows a frame only as a carrier, a duration and a payload it never opens.
 ```sh
 python3 ether.py --bind 127.0.0.1:7000 --record record.tsv \
     --geodata <geodata.yaml> --nodeset <nodeset.yaml> --losses <dir> \
-    [--noise-figure 6] [--pairwise] [--time real|max|<k>x]
+    [--noise-figure 6] [--pairwise | --bench-capture] [--crc-margin-db 0] [--seed N]
+    [--time real|max|<k>x]
 ```
 
 Stations reach it through the testbed, which holds it in its own event loop and
@@ -94,6 +95,16 @@ limit of the European Telecommunications Standards Institute's (ETSI) EN 300
 same threshold the same way, which is what its instantaneous RSSI (received
 signal strength indication) reads.
 
+**A station that starts listening mid-frame** — back from its own
+transmission, out of standby, out of a CAD into RX — is judged by the same
+rules at that instant. While at least four symbols of a frame's preamble are
+still to come it can lock on to the frame, as a receiver listening all along
+would; after that it has missed the preamble and is told the frame's energy
+until its end, stamped with the instant it was told. A receiver that leaves
+RX for anything but its own transmission, or is retuned, while following a
+frame is told nothing of how that frame ended, and the record holds no end
+for it.
+
 The ether does not match on preamble length: two radios whose preambles
 differ hear each other here, and may not on a bench.
 
@@ -110,9 +121,28 @@ survives only by leading each audible interferer on its carrier by 6 dB, one
 at a time, whatever their spreading factors, with nothing summed. It is there
 to compare against.
 
-Absent at this depth: fading, the CRC band just above the demodulation
-threshold, and a referee. A pair's loss is the table's and does not change from
-one frame to the next.
+**Bench capture** (`--bench-capture`, or `Ether(bench_capture=True)`) rules
+on two frames of one spreading factor the way a bench saw them meet (289
+collisions of an SX1262 receiver, SF7 at 125 kHz), instead of by the same-SF
+figure. Within 1.2 dB the two are equals: both are lost about one time in
+four, and otherwise one of them survives. From there the stronger survives
+seven times in eight, rising to always at 6.1 dB, and the weaker never does.
+A frame that starts after the receiver has passed the first one's preamble
+never takes it, and spoils the first unless the first is the stronger. Each
+outcome is a draw from the seed, the pair and the receiver, so the lock and
+both verdicts read the same one. Against three or more frames of its class a
+frame's lead is over their sum. Inter-SF rejection and the noise threshold
+are as without it.
+
+Absent at this depth: fading and a referee. A pair's loss is the table's and
+does not change from one frame to the next.
+
+**The CRC band** (`--crc-margin-db`, off unless given) is the few dB just
+above a spreading factor's demodulation threshold where a frame locks but
+fails its cyclic redundancy check at a probability: certain at the threshold,
+never at the band's top, a straight line between. Each frame at each receiver
+draws once, from a hash of the seed (`--seed`), so a verdict does not depend
+on the order receptions end in.
 
 ## Losses
 
