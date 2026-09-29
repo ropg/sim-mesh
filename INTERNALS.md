@@ -1594,9 +1594,10 @@ change.
   100 ms off-time before returning to a frequency, radiated power over a
   channel's cap, a `tx` without the sense window of RX or CAD before it on
   that carrier, a `tx` from a slot that is inside a reception.
-- **The CRC band**: in the `crc_margin_db` (3 dB) above the demodulation
-  threshold, a locked frame ends as `crc` with a probability falling linearly
-  from 1 to 0, drawn from the run's seeded generator.
+- **The CRC band by default**: `--crc-margin-db` gives the band above the
+  demodulation threshold where a locked frame ends as `crc` with a
+  probability falling linearly from 1 to 0 (ether/INTERNALS.md). It is off
+  unless given; whether it should default to the 3 dB planned here is open.
 - **`next_instant()` from a heap**: the pending `until`s kept in a heap keyed
   by instant and station, updated on idle, retraction and leave, stale
   entries dropped when popped, instead of a scan of every station per

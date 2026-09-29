@@ -11,7 +11,8 @@ and knows a frame only as a carrier, a duration and a payload it never opens.
 ```sh
 python3 ether.py --bind 127.0.0.1:7000 --record record.tsv \
     --geodata <geodata.yaml> --nodeset <nodeset.yaml> --losses <dir> \
-    [--noise-figure 6] [--pairwise] [--time real|max|<k>x]
+    [--noise-figure 6] [--pairwise] [--crc-margin-db 0] [--seed N]
+    [--time real|max|<k>x]
 ```
 
 Stations reach it through the testbed, which holds it in its own event loop and
@@ -120,9 +121,15 @@ survives only by leading each audible interferer on its carrier by 6 dB, one
 at a time, whatever their spreading factors, with nothing summed. It is there
 to compare against.
 
-Absent at this depth: fading, the CRC band just above the demodulation
-threshold, and a referee. A pair's loss is the table's and does not change from
-one frame to the next.
+Absent at this depth: fading and a referee. A pair's loss is the table's and
+does not change from one frame to the next.
+
+**The CRC band** (`--crc-margin-db`, off unless given) is the few dB just
+above a spreading factor's demodulation threshold where a frame locks but
+fails its cyclic redundancy check at a probability: certain at the threshold,
+never at the band's top, a straight line between. Each frame at each receiver
+draws once, from a hash of the seed (`--seed`), so a verdict does not depend
+on the order receptions end in.
 
 ## Losses
 

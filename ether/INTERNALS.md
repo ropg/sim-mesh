@@ -209,8 +209,7 @@ the two identical to the medium. A flat cut low enough for SF12 delivers frames
 no SF7 receiver could demodulate, and a nodeset laid out against it draws links
 that do not exist and behaves far worse than it looks. The CRC band just above the
 threshold, where a frame locks but fails its cyclic redundancy check (CRC) at a
-probability, is the next thing this
-could learn; `welcome` already carries a seed for it.
+probability, is there when asked for (`--crc-margin-db`; below).
 
 ## Who is affected, and who can decode
 
@@ -420,11 +419,16 @@ medium: the ether's job is the frames, and everything watching is optional.
 - **Fading and per-frame variation.** A pair's loss is the table's and is
   the same for every frame between them. No shadowing beyond what the table
   was computed with, no multipath, no antenna pattern, no rain.
-- **The CRC band.** The threshold is the spreading factor's own, and above it a
-  frame is delivered. A real receiver also has a few dB above that threshold
-  where a frame locks but fails its CRC at a probability. `welcome` already
-  carries a `seed` so that band, when it arrives, has a reproducible generator
-  to draw from.
+- **The CRC band by default.** The threshold is the spreading factor's own,
+  and above it a frame is delivered. A real receiver also has a few dB above
+  that threshold where a frame locks but fails its CRC at a probability.
+  `Physics.crc_margin_db` (`--crc-margin-db`) gives that band a width: a
+  frame judged clean that stands m dB over its threshold, m under the width,
+  fails with probability 1 − m/width. The straight line stands in for the
+  S-shaped curve a bench measures. The draw is `seeded_draw` of the seed, the
+  frame's number and the receiving slot, not a generator's next number, so a
+  verdict is the same whatever order the receptions end in. It is off unless
+  given, so a run that does not ask is judged as before.
 - **Bandwidth and offset in the rejection figures.** The inter-SF figures
   were measured at one bandwidth on one carrier; a transmission at another
   bandwidth, or partly overlapping the band, is classed by its spreading

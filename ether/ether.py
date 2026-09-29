@@ -60,6 +60,7 @@ a virtual one), direction, station id, JSON.
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import heapq
 import json
 import math
@@ -148,6 +149,16 @@ PAIRWISE_CAPTURE_DB = 6.0
 # on to it if at least this much of the preamble is still to come, and has
 # only its energy otherwise.
 PREAMBLE_FOUND_SYMBOLS = 4.0
+
+# The CRC band: how far above its demodulation threshold a frame that locked
+# may still fail its cyclic redundancy check. A real receiver's packet error
+# rate falls away over a few dB above the threshold, an S-shaped curve; here
+# the chance falls in a straight line, from certain at the threshold to
+# nothing at the band's top. Off (0) unless the medium is given a band
+# (`--crc-margin-db`); INTERNALS.md plans 3 dB. One draw per frame and
+# receiver, hashed from the run's seed (`seeded_draw`), so it is the same
+# whatever order the receptions end in.
+DEFAULT_CRC_MARGIN_DB = 0.0
 
 # What follows the preamble before `t_pre`: two sync-word symbols and 2.25 of
 # the start-of-frame delimiter (AN1200.13), so a frame's preamble proper ends
@@ -320,6 +331,23 @@ def log(msg):
     sys.stderr.flush()
 
 
+def seeded_draw(seed, *parts):
+    """A uniform draw in [0, 1) that is a function of the seed and `parts`
+    alone: the same however often, and in whatever order, it is asked for."""
+    key = ":".join(str(part) for part in (seed,) + parts)
+    return int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big") / 2.0 ** 64
+
+
+def crc_margin_fails(seed, eid, rsid, slot, margin_db, band_db):
+    """Whether a frame `margin_db` over its demodulation threshold fails its
+    CRC anyway, in a band `band_db` wide: certain at the threshold, never at
+    the band's top, a straight line between. One draw per frame and
+    receiving slot."""
+    if band_db <= 0 or margin_db >= band_db:
+        return False
+    return seeded_draw(seed, eid, rsid, slot, "crc") < 1.0 - max(margin_db, 0.0) / band_db
+
+
 def fspl_1m_db(freq_hz):
     """Free-space path loss over the first metre at this carrier, in dB: the
     log-distance model's anchor, for whatever computes synthetic ground's table."""
@@ -327,21 +355,35 @@ def fspl_1m_db(freq_hz):
 
 
 class Physics:
-    """The medium's own setting beyond path loss: the receivers' noise figure."""
+    """The medium's own settings beyond path loss: the receivers' noise
+    figure, and the CRC band above the demodulation threshold (off unless
+    given). A setting at its default is left out of `as_dict`, so what a run
+    records says only what was asked for."""
 
-    def __init__(self, noise_figure_db=DEFAULT_NOISE_FIGURE_DB):
+    def __init__(self, noise_figure_db=DEFAULT_NOISE_FIGURE_DB,
+                 crc_margin_db=DEFAULT_CRC_MARGIN_DB):
         self.noise_figure_db = float(noise_figure_db)
+        self.crc_margin_db = float(crc_margin_db)
+        if self.crc_margin_db < 0:
+            raise ValueError("the CRC band is a width in dB, not %g" % self.crc_margin_db)
 
     def describe(self):
-        return "noise figure %.1f dB" % self.noise_figure_db
+        text = "noise figure %.1f dB" % self.noise_figure_db
+        if self.crc_margin_db:
+            text += ", a %.1f dB CRC band" % self.crc_margin_db
+        return text
 
     @classmethod
     def from_dict(cls, data):
         data = data or {}
-        return cls(data.get("noise_figure_db", DEFAULT_NOISE_FIGURE_DB))
+        return cls(data.get("noise_figure_db", DEFAULT_NOISE_FIGURE_DB),
+                   data.get("crc_margin_db", DEFAULT_CRC_MARGIN_DB))
 
     def as_dict(self):
-        return {"noise_figure_db": self.noise_figure_db}
+        out = {"noise_figure_db": self.noise_figure_db}
+        if self.crc_margin_db != DEFAULT_CRC_MARGIN_DB:
+            out["crc_margin_db"] = self.crc_margin_db
+        return out
 
 
 class Station:
@@ -1606,6 +1648,11 @@ class Ether(asyncio.DatagramProtocol):
             return
         verdict = (self.verdict_pairwise(reception) if self.pairwise
                    else self.verdict_for(reception))
+        if verdict == "clean" and self.physics.crc_margin_db:
+            margin = level - self.noise(frame.bw) - self.sensitivity(frame.sf)
+            if crc_margin_fails(self.seed, frame.eid, rsid, slot, margin,
+                                self.physics.crc_margin_db):
+                verdict = "crc"
         self.send(rsid, {"type": "rx_end", "slot": slot, "id": frame.eid,
                          "t": self.now(), "verdict": verdict,
                          "payload": frame.payload, "rssi": round(level),
@@ -1664,10 +1711,11 @@ def read_losses(directory):
     return tables
 
 
-async def serve(bind, record_path, physics, losses, time_mode="real", pairwise=False):
+async def serve(bind, record_path, physics, losses, time_mode="real", pairwise=False,
+                seed=None):
     loop = asyncio.get_running_loop()
     transport, ether = await loop.create_datagram_endpoint(
-        lambda: Ether(record_path, physics, time_mode=time_mode, pairwise=pairwise),
+        lambda: Ether(record_path, physics, seed=seed, time_mode=time_mode, pairwise=pairwise),
         local_addr=bind)
     tables, sids, gains = losses
     ether.set_losses(tables, sids, gains)
@@ -1706,6 +1754,13 @@ def main(argv=None):
     ap.add_argument("--pairwise", action="store_true",
                     help="rule on collisions pairwise, per interferer by the capture "
                          "margin, instead of on the summed interference")
+    ap.add_argument("--crc-margin-db", type=float, default=DEFAULT_CRC_MARGIN_DB,
+                    help="the CRC band: how far above its threshold a frame may still "
+                         "fail its CRC, the chance falling linearly to nothing "
+                         "(default %g: none)" % DEFAULT_CRC_MARGIN_DB)
+    ap.add_argument("--seed", type=int,
+                    help="the seed of the medium's draws, handed every station in its "
+                         "welcome (default: drawn at random)")
     ap.add_argument("--time", default="real",
                     help="real (default), max, or <k>x: virtual time as fast as the "
                          "stations allow, or paced at k times the wall clock")
@@ -1724,8 +1779,8 @@ def main(argv=None):
             log("geodata: %s" % args.geodata)
     try:
         asyncio.run(serve(parse_bind(args.bind), args.record,
-                          Physics(args.noise_figure), (tables, sids, gains),
-                          args.time, args.pairwise))
+                          Physics(args.noise_figure, args.crc_margin_db), (tables, sids, gains),
+                          args.time, args.pairwise, args.seed))
     except KeyboardInterrupt:
         log("ether stopping")
     return 0
