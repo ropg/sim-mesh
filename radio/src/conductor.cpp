@@ -87,6 +87,12 @@ const std::vector<Point>& profile()
     return points;
 }
 
+/* Forward, from T to node time, rounds down; back, from node time to T,
+ * rounds up, so a wake the host asks for at node time n comes back as the
+ * first T whose node time has reached n. Rounded down both ways, a slope that
+ * is not a whole ratio — a crystal a few ppm off — handed the host its wake a
+ * microsecond early: it found its deadline not reached, asked for the same
+ * instant again, and moved on only by the ether's 10 ms guard. */
 int64_t mapThrough(const std::vector<Point>& p, int64_t x, bool forward)
 {
     auto from = [&](const Point& q) { return forward ? q.t : q.n; };
@@ -98,7 +104,8 @@ int64_t mapThrough(const std::vector<Point>& p, int64_t x, bool forward)
         if (x <= from(p[i])) {
             int64_t dx = from(p[i]) - from(p[i - 1]);
             int64_t dy = to(p[i]) - to(p[i - 1]);
-            return to(p[i - 1]) + (int64_t)((__int128)(x - from(p[i - 1])) * dy / dx);
+            __int128 num = (__int128)(x - from(p[i - 1])) * dy;     /* > 0 here */
+            return to(p[i - 1]) + (int64_t)(forward ? num / dx : (num + dx - 1) / dx);
         }
     }
     return to(p.back()) + (x - from(p.back()));

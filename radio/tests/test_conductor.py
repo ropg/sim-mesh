@@ -327,3 +327,38 @@ def test_a_profile_makes_until_come_back_through_the_inverse(tmp_path):
         assert idle(lib, cond)["until"] == 1_500_000     # past the last point, slope 1
     finally:
         cond.sock.close()
+
+
+def test_a_wake_on_a_drifting_clock_fires_once_its_node_time_has_come(tmp_path):
+    """A crystal 20 ppm fast: node time runs from T by a slope that is no
+    whole ratio. A wake at node time n comes back as the first T whose node
+    time has reached n, and fires there, once; a microsecond of T earlier
+    the node time is still short of it."""
+    lib = load_copy(tmp_path, "libsimradio_drift.so",
+                    {"SIMESH_TIME": "virtual",
+                     "SIMESH_CLOCK_PROFILE": "0:0,1000000000:1000020000"})
+    cond = Conductor()
+    cond.t = 400_000
+    fired = []
+    try:
+        join(lib, cond)
+        idle(lib, cond)
+        on_wake = WAKE_CB(lambda arg: fired.append(lib.simradio_node_us()))
+        wake = lib.simradio_wake_create(on_wake, None)
+        n = 123_456_789
+        t = lib.simradio_node_to_conductor(n)
+        assert (t - 1) * 1_000_020 // 1_000_000 < n <= t * 1_000_020 // 1_000_000
+        lib.simradio_wake_at(wake, n)
+        cond.run(450_000)
+        assert idle(lib, cond)["until"] == t
+        cond.run(t - 1)
+        idle(lib, cond)
+        assert lib.simradio_node_us() < n and not fired
+        cond.run(t)
+        deadline = time.monotonic() + 2.0     # the link's thread takes the run
+        while not fired and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert fired == [n]
+        assert idle(lib, cond)["until"] is NEVER
+    finally:
+        cond.sock.close()
