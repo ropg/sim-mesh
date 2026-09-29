@@ -52,3 +52,9 @@ struct simradio* modelChip(int slot);
 
 void modelRxBegin(struct simradio* chip, const VirtualRxBegin& f);
 void modelRxEnd(struct simradio* chip, const VirtualRxEnd& f);
+
+/** While a datagram from the ether is applied, DIO1's changes are kept, not
+ *  told; release tells them, in the order they came, before the host's waits
+ *  run (conductor::release), so no host thread sees part of an instant. */
+void modelHoldPins();
+void modelReleasePins();

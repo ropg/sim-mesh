@@ -6,6 +6,7 @@ plays the ether on a UDP socket, and stands in for the host by calling
 simradio_idle itself. Nothing moves until the fake conductor says so.
 """
 
+import base64
 import ctypes
 import json
 import os
@@ -17,9 +18,10 @@ import time
 
 import pytest
 
-from test_model import (ALL_IRQ, GET_IRQ, HEADER_VALID, PIN_CB, PREAMBLE,
-                        SET_DIO_IRQ_PARAMS, SET_PACKET_PARAMS, SET_RX, SET_TX,
-                        SYNC, TSYM, TX_DONE, WRITE_BUFFER, load_library, toa_seconds, PRE)
+from test_model import (ALL_IRQ, CLEAR_IRQ, GET_IRQ, GET_RSSI_INST, HEADER_VALID, PIN_CB,
+                        PREAMBLE, RX_DONE, SET_DIO_IRQ_PARAMS, SET_PACKET_PARAMS, SET_RX,
+                        SET_TX, SYNC, TSYM, TX_DONE, WRITE_BUFFER, load_library, toa_seconds,
+                        PRE)
 
 NEVER = None
 T_JOIN = 5_000_000
@@ -272,6 +274,65 @@ def test_a_run_reaching_a_model_timer_fires_it(virtual):
     assert (irq[2] << 8 | irq[3]) & HEADER_VALID
     lib.simradio_close(ctypes.c_void_p(chip))
     pin  # held
+
+
+def test_a_datagram_is_in_whole_before_a_host_wait_due_at_its_instant_runs(virtual):
+    """A frame ends at T, another begins there, the ether says both in one
+    datagram, and a host thread waits until T. Its wake runs once both are on
+    the chip, after DIO1's rise has been told: it finds RX_DONE up and the
+    new frame's energy. Woken as T first moved, it found the chip as far as
+    the reader had got, and two runs of one seed could part at such an
+    instant, on which of two threads the host ran first."""
+    lib, cond = virtual
+    join(lib, cond)
+    idle(lib, cond)
+    seen = []
+    pin = PIN_CB(lambda ctx, p, level: seen.append(("pin", level)))
+    chip = lib.simradio_open(0, pin, None)
+
+    def frame(*out):
+        out = bytes(out)
+        reply = ctypes.create_string_buffer(len(out))
+        lib.simradio_transfer(chip, out, len(out), reply)
+        return reply.raw
+
+    frame(SET_DIO_IRQ_PARAMS, ALL_IRQ >> 8, ALL_IRQ & 0xFF, ALL_IRQ >> 8, ALL_IRQ & 0xFF, 0, 0, 0, 0)
+    frame(SET_PACKET_PARAMS, PRE >> 8, PRE & 0xFF, 0x00, 10, 0x01, 0x00)
+    frame(SET_RX, 0xFF, 0xFF, 0xFF)                    # continuous: it stays in RX
+    idle(lib, cond)
+    t0 = cond.t + 1000
+    t_end = t0 + 250_000
+    cond.t = t0
+    cond.send({"type": "rx_begin", "t": t0, "slot": 0, "id": 5, "t0": t0,
+               "t_pre": t0 + 60_000, "t_hdr": t0 + 100_000, "t_end": t_end, "level": -80})
+    for until in (idle(lib, cond)["until"], t0 + 60_000, t0 + 100_000):
+        cond.run(until)
+        idle(lib, cond)
+    frame(CLEAR_IRQ, ALL_IRQ >> 8, ALL_IRQ & 0xFF)       # DIO1 down
+    del seen[:]
+
+    def woke(arg):
+        irq = frame(GET_IRQ, 0, 0, 0)
+        rssi = -frame(GET_RSSI_INST, 0, 0)[2] / 2
+        seen.append(("wake", bool((irq[2] << 8 | irq[3]) & RX_DONE), rssi))
+    wake_cb = WAKE_CB(woke)
+    wake = lib.simradio_wake_create(wake_cb, None)
+    lib.simradio_wake_at(wake, t_end)
+    assert idle(lib, cond)["until"] == t_end
+    lines = []
+    for msg in ({"type": "rx_end", "slot": 0, "id": 5, "verdict": "clean", "rssi": -80, "snr": 7,
+                 "payload": base64.b64encode(bytes(10)).decode()},
+                {"type": "rx_begin", "slot": 0, "id": 6, "t0": t_end, "t_pre": t_end + 60_000,
+                 "t_hdr": t_end + 100_000, "t_end": t_end + 250_000, "level": -70}):
+        cond.seq += 1
+        lines.append(json.dumps(dict(msg, t=t_end, seq=cond.seq)).encode())
+    cond.t = t_end
+    cond.sock.sendto(b"\n".join(lines), cond.station)
+    assert idle(lib, cond)["seq"] == cond.seq          # both taken, and owed for
+    assert seen[-1] == ("wake", True, -70.0)            # the whole instant, and last
+    assert seen[:-1] and set(seen[:-1]) == {("pin", 1)}    # DIO1 told before it
+    lib.simradio_close(ctypes.c_void_p(chip))
+    pin, wake_cb  # held for the library's sake
 
 
 def transmitting(lib, cond, payload=10):

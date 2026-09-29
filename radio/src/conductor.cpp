@@ -48,6 +48,8 @@ std::atomic<int64_t> s_until{kNever};
 std::atomic<int64_t> s_lastUntil{kNever};
 void               (*s_sendIdle)(uint64_t, int64_t) = nullptr;
 std::atomic<void (*)(void)> s_onAdvance{nullptr};
+std::atomic<bool>    s_holding{false};  /* a datagram is being applied (hold) */
+bool                 s_hookOwed = false; /* T moved during it; under B()->lock() */
 int                  s_tfd = -1;
 
 /* The real wall clock, past the time shim. */
@@ -349,15 +351,10 @@ int64_t epochUs()
     return e;
 }
 
-void advanceTo(int64_t t)
+/* Everything due by T, in time order: the chip's timers, and the host's waits
+ * unless a datagram is being applied (hold), whose waits wait for release. */
+void runDue()
 {
-    if (!isVirtual()) return;
-    B()->lock();
-    bool moved = t > s_T.load();
-    if (moved) s_T.store(t);
-    B()->unlock();
-    void (*hook)(void) = s_onAdvance.load();
-    if (moved && hook) hook();
     B()->lock();
     for (;;) {
         int64_t now = s_T.load();
@@ -366,7 +363,7 @@ void advanceTo(int64_t t)
         int wake = -1;
         for (Timer* tm : timers())
             if (tm->armed && tm->at <= now && tm->at < best) { best = tm->at; timer = tm; }
-        for (size_t i = 0; i < wakes().size(); i++) {
+        for (size_t i = 0; i < wakes().size() && !s_holding.load(); i++) {
             Wake& w = wakes()[i];
             if (w.atNode == kNever) continue;
             int64_t at = conductorOf(w.atNode);
@@ -392,6 +389,37 @@ void advanceTo(int64_t t)
     }
     computeUntil();
     B()->unlock();
+}
+
+void advanceTo(int64_t t)
+{
+    if (!isVirtual()) return;
+    B()->lock();
+    bool moved = t > s_T.load();
+    if (moved) s_T.store(t);
+    bool holding = s_holding.load();
+    if (moved && holding) s_hookOwed = true;
+    B()->unlock();
+    void (*hook)(void) = s_onAdvance.load();
+    if (moved && hook && !holding) hook();
+    runDue();
+}
+
+void hold()
+{
+    s_holding.store(true);
+}
+
+void release()
+{
+    s_holding.store(false);
+    B()->lock();
+    bool owed = s_hookOwed;
+    s_hookOwed = false;
+    B()->unlock();
+    void (*hook)(void) = s_onAdvance.load();
+    if (owed && hook) hook();
+    runDue();
 }
 
 void welcome(bool isVirtualRun, int64_t t, int64_t epoch, uint64_t seq)
