@@ -219,6 +219,14 @@ class Kind:
     # host's ptys; its output must then reach the pipe line by line.
     console_tty = True
 
+    # Whether the testbed acts on what the station prints: framed-RPC replies,
+    # the capability marker. Then what a station printed at an instant is read
+    # before T moves on (simd's drain). False, for a kind whose console carries
+    # log lines alone, and its consoles are read as they come, off the barrier:
+    # nothing waits on them, and holding T for them at every instant is much of
+    # what a large run costs.
+    console_acted_on = True
+
     def describe(self):
         return "%s: %s (%s) %s" % (self.device.get("ref"), self.label, self.type_name,
                                    self.elf or "no binary")

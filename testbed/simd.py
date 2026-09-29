@@ -519,10 +519,13 @@ class Simd:
         since it last did: read everything they printed first (their replies,
         the marker), so what it makes the testbed do happens at this T. False,
         and `done` not called, when none of them printed anything
-        (stations.printed), which is most of the time."""
+        (stations.printed), which is most of the time. A station whose kind
+        is not acted on by what it prints (console_acted_on) is not waited for:
+        its console is read as it comes."""
         wanted = set(sids)
         drains = stations_module.printed([s.drain for s in self.stations.values()
-                                          if s.node_id in wanted and s.drain is not None])
+                                          if s.node_id in wanted and s.drain is not None
+                                          and s.kind.console_acted_on])
         if not drains:
             return False
         stations_module.ptys().call(stations_module.catch_up, drains,
