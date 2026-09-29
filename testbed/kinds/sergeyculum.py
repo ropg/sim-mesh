@@ -55,6 +55,10 @@ RADIO_FLAGS = (("freq_mhz", "--freq-hz", 1e6), ("sf", "--sf", 1), ("bw_khz", "--
                ("cr", "--cr", 1), ("tx_dbm", "--txpower-dbm", 1))
 
 TOOL_TIMEOUT_S = 10.0       # one rncfg invocation, KISS round trips included
+# rncfg's own wait for a reply, in a virtual-time run: long enough that a
+# station working on the line in T (booting, in the middle of a transmission)
+# answers before it, however fast the run is going on the host.
+RNCFG_TIMEOUT_MS = 8000
 TOOL_TRIES = 3              # in a virtual-time run, a line whose reply timed out is tried again
 POLL_S = 0.5                # how often a booting station is asked whether it is up
 
@@ -97,8 +101,10 @@ class Sergeyculum(Kind):
             # runs while the station works on what it read.
             end = (station.clock.tool_session(station.node_id)
                    if station.clock is not None else None)
+            env = {"RNCFG_TIMEOUT_MS": str(RNCFG_TIMEOUT_MS)} if end is not None else None
             try:
-                return await run_tool([self.rncfg, verb, self.kiss(station), *args], timeout)
+                return await run_tool([self.rncfg, verb, self.kiss(station), *args], timeout,
+                                      env=env)
             finally:
                 if end is not None:
                     end()
@@ -106,6 +112,13 @@ class Sergeyculum(Kind):
     async def wait_up(self, station, timeout):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        if station.clock is not None:
+            # Not before it has joined the ether, which T waits for anyway:
+            # the station opens its door before it says hello, so the door is
+            # there then, at the T of the start, and not at whatever T the
+            # first look at it happens to fall on.
+            while station.node_id not in station.clock.stations and loop.time() < deadline:
+                await asyncio.sleep(0.02)
         while loop.time() < deadline:
             if os.path.exists(self.kiss(station)):
                 try:

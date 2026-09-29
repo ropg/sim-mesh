@@ -286,12 +286,14 @@ def make_kinds(builds):
     return kinds
 
 
-async def run_tool(argv, timeout):
-    """Run a helper program to completion: its exit code and all it printed."""
+async def run_tool(argv, timeout, env=None):
+    """Run a helper program to completion: its exit code and all it printed.
+    `env` adds to the testbed's environment."""
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=dict(os.environ, **env) if env else None)
     except OSError as err:
         raise CommandError("%s: %s" % (argv[0], err)) from err
     try:
