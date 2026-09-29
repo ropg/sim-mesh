@@ -1498,6 +1498,11 @@ class Simd:
         self.sidecar = sidecar or self.args.sidecar
         self.plan = None                    # a plan is for the run it was sent in
         await self.start_ether(run.dir)
+        # The medium the run is started on, for whatever reads it later: the
+        # analysis tools' levels take their noise figure from it, and a seed
+        # drawn at random is otherwise nowhere to be found again.
+        run.set(physics=dict(self.ether.physics.as_dict(), pairwise=self.ether.pairwise),
+                seed=self.ether.seed)
         await self.find_grounds([n for n in ns.nodes if n not in self.grounds])
         self.apply_to_ether()
         log("run %s: geodata %s (%s), nodeset %s (%d nodes), script %s, tables %s"

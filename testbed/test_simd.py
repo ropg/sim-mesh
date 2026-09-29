@@ -201,6 +201,23 @@ def test_setup_is_the_name_then_the_first_boot_rules_in_order(stores):
     asyncio.run(go())
 
 
+def test_a_run_records_the_medium_it_was_started_on(stores):
+    """The noise figure, the rule and the seed go into the run, and the
+    analysis tools' medium takes its noise figure from there."""
+    async def go():
+        daemon = make_simd(stores, "--noise-figure", "4.5", "--seed", "77")
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three", **FAR})
+        run = daemon.run
+        assert run.meta["physics"] == {"noise_figure_db": 4.5, "pairwise": False}
+        assert run.meta["seed"] == 77
+        from simesh import view
+        assert view.RunView(run.dir).medium().physics.noise_figure_db == 4.5
+        await daemon.stop_all(flush=False)
+        daemon.ether.close()
+    asyncio.run(go())
+
+
 def test_moves_offsets_ids_and_levels(stores):
     async def go():
         daemon = make_simd(stores)
