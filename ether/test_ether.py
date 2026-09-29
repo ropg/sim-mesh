@@ -1680,6 +1680,35 @@ def test_a_line_typed_at_a_station_waits_for_it_to_have_t_and_holds_t_until_read
     in_process(test)
 
 
+def test_t_stands_at_a_hello_until_what_waited_for_it_has_run():
+    """joined(): done at the expected station's hello, with T held there until
+    what it woke has run; nothing waiting, nothing held."""
+    async def test(bed):
+        ether = bed.ether
+        ether.expect(1)
+        ether.call_at(1_000_000, lambda: None)
+        seen = []
+
+        async def waiter():
+            await ether.joined(1)
+            await asyncio.sleep(0)              # a turn of the loop later
+            seen.append(ether.now())
+            ether.tool_session(1)               # T stays for this from here
+
+        task = asyncio.ensure_future(waiter())
+        await asyncio.sleep(0.01)
+        bed.send({"type": "hello", "slots": [0], "t": 0})
+        welcome = await bed.recv()
+        bed.send({"type": "idle", "seq": welcome["seq"], "until": None})
+        await asyncio.sleep(0.05)
+        await task
+        assert seen == [0]
+        assert ether.now() == 0                 # held: the session has the floor
+        assert ether.joined(1).done()
+
+    in_process(test)
+
+
 def test_a_tool_session_holds_t_while_the_tool_has_the_floor():
     """tool_session(): T stands from the start until the station says it has
     read what the tool wrote (`floor` to the station), runs while the
