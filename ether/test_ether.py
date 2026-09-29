@@ -273,9 +273,17 @@ def pairwise(tmp_path):
         bed.close()
 
 
-@pytest.fixture
-def conductor(tmp_path):
+# The conductors a virtual-time run can have: Ether's own, and ether_core's
+# when it is built (`simesh build ether`); every virtual-time test runs on each.
+CORE_BUILT = os.path.exists(ether_module.CORE_PATH)
+CONDUCTORS = ["python", pytest.param("rust", marks=pytest.mark.skipif(
+    not CORE_BUILT, reason="no ether core built (simesh build ether)"))]
+
+
+@pytest.fixture(params=CONDUCTORS)
+def conductor(tmp_path, request, monkeypatch):
     """The ether in virtual time, as fast as its stations let it go."""
+    monkeypatch.setenv("SIMESH_ETHER_CORE", request.param)
     bed = Bench(tmp_path, "max")
     try:
         yield bed
@@ -1591,9 +1599,7 @@ class InProcess:
         self.sock.setblocking(False)
 
     async def start(self):
-        _, self.ether = await self.loop.create_datagram_endpoint(
-            lambda: ether_module.Ether(None, time_mode="max"),
-            local_addr=("127.0.0.1", 0))
+        _, self.ether = await ether_module.open_ether(("127.0.0.1", 0), None, time_mode="max")
         self.addr = self.ether.transport.get_extra_info("sockname")
 
     def send(self, msg):
@@ -1620,16 +1626,25 @@ class InProcess:
 
 
 def in_process(test):
-    loop = asyncio.new_event_loop()
-    try:
-        bed = InProcess(loop)
-        loop.run_until_complete(bed.start())
+    """Run `test` on an in-process ether, once for each conductor built."""
+    for conductor in ("python", "rust") if CORE_BUILT else ("python",):
+        before = os.environ.get("SIMESH_ETHER_CORE")
+        os.environ["SIMESH_ETHER_CORE"] = conductor
+        loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(test(bed))
+            bed = InProcess(loop)
+            loop.run_until_complete(bed.start())
+            assert isinstance(bed.ether, ether_module.CoreEther) == (conductor == "rust")
+            try:
+                loop.run_until_complete(test(bed))
+            finally:
+                bed.close()
         finally:
-            bed.close()
-    finally:
-        loop.close()
+            loop.close()
+            if before is None:
+                os.environ.pop("SIMESH_ETHER_CORE", None)
+            else:
+                os.environ["SIMESH_ETHER_CORE"] = before
 
 
 def test_t_stays_at_a_sleeps_end_until_what_it_woke_has_run():
