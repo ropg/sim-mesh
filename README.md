@@ -29,7 +29,7 @@ SIMesh keeps, each on its own because each changes on its own:
 | a **device** | one station build: its executable, its `/fixed` tree, its tools | `devices/latest/`, `devices/saved/`, `devices/local/<project>_<catalogue>.yaml` |
 | an **antenna** | a kind of antenna and its radiation pattern | `testbed/antennas/` |
 | **geodata** | the ground: a pack built from public sources, or synthetic ground at 0°, 0° | `testbed/geodata/<name>.yaml`, `packs/<name>/` |
-| a **nodeset** | which nodes stand where with what maximum power and antenna, their tags, and the offsets; its own setup script beside it | `testbed/nodesets/<name>.yaml`, `<name>.py` |
+| a **nodeset** | which nodes stand where with what maximum power and antenna, their tags, the offsets and any stated links; its own setup script beside it | `testbed/nodesets/<name>.yaml`, `<name>.py` |
 | a **loss table** | every ordered pair's path loss, derived from geodata and a nodeset | `testbed/losses/…`, a cache |
 | a **script** | plain Python against the simesh library, top to end: the time, what each node runs and is given at first boot, and what is done | `testbed/scripts/<name>.py` |
 | a **run** | one simulation's output: its record, logs and state | `testbed/runs/<name>/` |
@@ -509,7 +509,7 @@ on the Nodes tab opens it.
 (`firmware()`, [Scripts](#scripts)), so one nodeset is run on any firmware,
 or on a mix of them by tag.
 
-**A node's name is how everything refers to it**: scripts, offsets,
+**A node's name is how everything refers to it**: scripts, offsets, links,
 snapshots, the map, and the proxy's hostnames. **Its id is its network
 identity**: it fixes the station's loopback address in the simulation's
 network (node 1 is `127.16.0.5` in the front's first network) and the MAC
@@ -523,6 +523,21 @@ geodata: where a measurement says the model is wrong, and by how much, with a
 note of where the figure came from. They are a layer over the loss table,
 applied when the medium is given it, so the table stays the model's own and
 an offset never forces a recompute.
+
+**Links** state one pair's loss outright, where a better figure than the
+model's is known:
+
+```yaml
+links:                                # optional
+  - { between: [a, b], loss_db: 131.5, back_db: 133, note: measured }
+```
+
+`loss_db` is from the first node to the second, `back_db` the other way
+(`loss_db` again when absent), the same in every band. A link stands in for
+the model's loss; the antennas and any offset still go on top, so a pair
+with both has the offset added to the stated figure. It is a layer like the
+offsets, and a nodeset without links has no `links:` key and is written
+back without one.
 
 A nodeset is offered on every geodata whose extent holds one of its nodes,
 as a layer of the Nodes tab ([The Nodes tab](#the-nodes-tab)).
@@ -734,9 +749,9 @@ band; the ether adds `20·log10(f/f0)` per frame to move it to the frame's own
 carrier. It is derived, never edited, and cached under
 `testbed/losses/<geodata>/<nodeset geometry>/<band>.bin`, keyed by what it
 depends on: the geodata's content and the nodeset's node set, positions and
-heights. Names, ids, antennas, firmware, radios, tags and offsets leave it
-alone: the antennas and the offsets are layers put on it when the medium is
-given it.
+heights. Names, ids, antennas, firmware, radios, tags, offsets and links
+leave it alone: the links, the antennas and the offsets are layers put on it
+when the medium is given it.
 [LOSSTABLE.md](LOSSTABLE.md) is the file format. A simulation computes a
 table for the band `globals.py`'s carrier falls in.
 
@@ -774,8 +789,9 @@ prints progress as JSON lines and the cached table's path.
 
 ## Who can hear whom
 
-There are no stated links. Where a node stands, on its geodata, is the whole
-of it: the level a frame arrives at is
+Where a node stands, on its geodata, is the whole of it unless the nodeset
+states a pair's loss as a link, which then stands in for the table's: the
+level a frame arrives at is
 
 ```
 L = P_tx + G_tx + G_rx − loss(tx → rx) − offset − 20·log10(f / f0)
@@ -783,11 +799,12 @@ L = P_tx + G_tx + G_rx − loss(tx → rx) − offset − 20·log10(f / f0)
 
 with `P_tx` the power the frame went out at, `G_tx` and `G_rx` each antenna's
 gain toward the other end in three dimensions ([Antennas](#antennas)), the
-loss the table's and the offset the nodeset's. A frame that arrives below
-the signal-to-noise ratio its spreading factor needs — −7.5 dB at SF7, down
-to −20 dB at SF12 — is not delivered at all, and that is what "out of range"
-means here. So a link is in range only if it is one the modem could actually
-hold, and moving to a slower spreading factor really does reach further.
+loss the table's (or the link's) and the offset the nodeset's. A frame that
+arrives below the signal-to-noise ratio its spreading factor needs — −7.5 dB
+at SF7, down to −20 dB at SF12 — is not delivered at all, and that is what
+"out of range" means here. So a link is in range only if it is one the modem
+could actually hold, and moving to a slower spreading factor really does
+reach further.
 
 Every transmission whose channel overlaps a receiver's is interference
 there, whatever its spreading factor, and each receiver rules for itself: a
@@ -899,8 +916,8 @@ changes: save them (a new one is asked a name), discard them, or stay.
   merge: nodes keep their tags and gain their layer's name as a tag; a name
   an earlier layer took gets the layer's name appended; an id taken gets the
   lowest free one; two nodes within 5 m of each other are one node, the
-  earlier layer's; offsets come along where both ends do. The new layer is
-  active and the layers it came from are hidden.
+  earlier layer's; offsets and links come along where both ends do. The new
+  layer is active and the layers it came from are hidden.
 
 **Save** writes the active layer back to its own file (amber while there is
 something to save; it keeps the file's leading comment); nodes placed with no
@@ -939,11 +956,13 @@ ground up:
 - **links**, for the one selected node and no other: every other node it
   reaches, coloured by the level it would be heard at, green to amber where
   it decodes, red where it only interferes, dashed where the first Fresnel
-  zone is not clear; always drawn while one node is selected: from the run's
-  table, or standalone from that node's row and column, which the front
-  computes from the nodes as they stand, saved or not, keeping each pair
-  both ways by where its ends stand, so selecting the next node or moving
-  one asks only for the pairs that are new (`links`);
+  zone is not clear, by the table's own figures without the nodeset's
+  offsets and links (attached, the levels the ether reports for the nodes
+  that decode stand in for those); always drawn while one node is selected:
+  from the run's table, or standalone from that node's row and column, which
+  the front computes from the nodes as they stand, saved or not, keeping each
+  pair both ways by where its ends stand, so selecting the next node or
+  moving one asks only for the pairs that are new (`links`);
 - **the other shown layers**' nodes, hollow rings in each layer's colour,
   named on hover;
 - **the nodes**: a dot each with its name, its antenna's height above the
@@ -1387,7 +1406,7 @@ Every analysis tool reads a run directory, and takes names, positions, radio
 settings and levels from it — the run's nodeset (its tags: a role tag the
 node's role, none a `client`, and `no-radio`), the run's copy of
 `globals.py` (every other node's radio, at its maximum power), its geodata, the firmware each
-node ran and its own loss tables with the antennas and the offsets on them —
+node ran and its own loss tables with the links, antennas and offsets on them —
 never the files as they stand now. What a frame means is a protocol's, under
 `testbed/simesh/<protocol>/`, found by each node's firmware kind; the roles are
 what `airtime.py --roles` and the hop counts through forwarding stations use.
@@ -1734,11 +1753,11 @@ code lives in that component's `src/host/`.
 | `testbed/geodata.py` | geodata: packs and synthetic ground, the projections, the extent, a SIMesh geodata pack's export and import |
 | `testbed/sources.py` | a build's sources: what a rectangle needs of each, the download cache and its fetches |
 | `testbed/packbuild.py` | one pack built from its sources: fetch, `planner-job pack-build`, the pack into place |
-| `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, edits, the geometry hash, the merge of shown layers, the imports |
+| `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, links, edits, the geometry hash, the merge of shown layers, the imports |
 | `planner/` | the Rust workspace: `planner-web` (the sidecar), `planner-job` (a pack's build, a node map's import), `planner-pack` (the compiler, OpenStreetMap from a PBF extract), `planner-buildings`, `planner-import`, and the ground, propagation and coverage crates |
 | `testbed/script.py` | scripts: listing, checking, loading, the `firmware()` rules at a script's top |
 | `testbed/simesh/library.py`, `testbed/simesh/select.py` | the script library, `firmware`, `exec`, `max_tx_pwr`, `send_msg`, and `nodes()` selections |
-| `testbed/losses.py` | a loss table, on synthetic ground or through the sidecar; the cache; antennas and offsets as layers, the ground under each node; one node's row |
+| `testbed/losses.py` | a loss table, on synthetic ground or through the sidecar; the cache; links, antennas and offsets as layers, the ground under each node; one node's row |
 | `testbed/coverage.py` | a node's coverage raster on a pack, through the sidecar, cached |
 | `testbed/runs.py` | a run directory, and snapshots taken from and loaded into one |
 | `testbed/stations.py` | one firmware process, its pty, its log, its supervisor; the thread every station's pty is read on |

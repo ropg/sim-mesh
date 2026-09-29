@@ -357,11 +357,11 @@ to choose from.
 
 ```
 geodata ──┐
-          ├──► loss table (derived, per band, cached) ── + antennas + offsets ──┐
-nodeset ──┘  (positions, heights)                                               │
-nodeset: antenna, role, radio, tags ───────────────────────────────────────────┤
-script: firmware() rules, setup ───────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
-device files (by the rules' device names, fetched when used) ──────────────────┘
+          ├──► loss table (derived, per band, cached) ── + links + antennas + offsets ──┐
+nodeset ──┘  (positions, heights)                                                       │
+nodeset: antenna, role, radio, tags ───────────────────────────────────────────────────┤
+script: firmware() rules, setup ───────────────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
+device files (by the rules' device names, fetched when used) ──────────────────────────┘
 snapshot = geodata + nodeset + script + tables + rules + every station's store
 ```
 
@@ -391,7 +391,7 @@ and each is its own file so that changing one leaves the others alone:
 - the **loss table** follows from the geodata and the nodeset's geometry and
   from nothing else, so it is derived and cached under a hash of exactly
   those, and relabelling a node, changing its antenna, role, radio,
-  firmware or offsets, or changing the script, never recomputes it.
+  firmware, offsets or links, or changing the script, never recomputes it.
 
 **A firmware rule is a condition, kept.** `firmware(which, device)` holds
 its selection as a condition over each node's facts (`simesh.select`), not
@@ -447,6 +447,15 @@ model, and they are added when the tables are handed to the ether
 (`losses.with_offsets`), in simd and in the analysis tools alike. The cached
 table stays the model's own, so an offset is changed without a recompute,
 and the model's error is the offsets themselves, to be driven towards zero.
+
+**Links are a layer too, and the first.** A nodeset's link states one
+pair's loss outright, a figure better than the model's (a measurement, or
+another model's), and it replaces the model's cell before anything else
+goes on (`losses.with_links`), so the antennas and the offsets still add
+to it. The figure is the pair's, not a frequency's, so it goes into every
+band's table as stated; within a band the ether moves it to the frame's
+own carrier as it does every cell, a few hundredths of a dB across the
+EU868 channels.
 
 A node is referred to **by name** everywhere, and its **id** is stored and
 editable. The name is what a person means; the id is the station's network

@@ -83,6 +83,58 @@ def test_offsets_are_a_layer_added_both_ways(stores):
     assert losses.with_offsets({"868": table}, ns)["868"] is table
 
 
+def test_a_link_states_a_pairs_loss_whatever_the_distance(stores):
+    """Ten kilometres apart and heard as the stated 110 dB, not the 150-odd
+    the distance would cost: in every band's table, and in a cell the model
+    never heard."""
+    gd, ns = geodata.load("flat"), nodeset.load("three")
+    ns.add_node("far", 0.09, 0.0)
+    tables = {band: losses.synthetic_table(gd, ns, band) for band in ("433", "868")}
+    assert tables["868"].get("a", "far") > 150
+    for a, b in (("b", "far"), ("far", "b")):
+        tables["433"].put(a, b, slt.NEVER, slt.FLAG_BEYOND_RADIUS)
+    ns.data["links"] = [{"between": ["a", "far"], "loss_db": 110.0},
+                        {"between": ["far", "b"], "loss_db": 120.0}]
+    got = losses.with_links(tables, ns)
+    for band in ("433", "868"):
+        assert got[band] is not tables[band]
+        assert got[band].get("a", "far") == 110 == got[band].get("far", "a")
+        assert got[band].get("b", "far") == 120 == got[band].get("far", "b")
+        assert got[band].get("a", "b") == tables[band].get("a", "b")
+    assert tables["868"].get("a", "far") > 150                  # the model's table left alone
+    del ns.data["links"]
+    assert losses.with_links(tables, ns)["868"] is tables["868"]
+
+
+def test_a_link_is_the_same_both_ways_unless_it_says_otherwise_and_an_offset_still_adds(stores):
+    gd, ns = geodata.load("flat"), nodeset.load("three")      # 25 dB offset between a and c
+    tables = {"868": losses.synthetic_table(gd, ns, "868")}
+    model = tables["868"]
+    gains = losses.with_antennas(tables, gd, ns)["868"]
+
+    def gain(x, y):
+        """Both ends' gains toward each other, as the antenna layer takes them off."""
+        return model.get(x, y) - gains.get(x, y)
+    ns.data["links"] = [{"between": ["a", "c"], "loss_db": 100.0},
+                        {"between": ["a", "b"], "loss_db": 90.0, "back_db": 95.5}]
+    medium = losses.medium_tables(tables, gd, ns)["868"]
+    # The link stands in for the model's loss alone: the gains and the offset go on top.
+    assert medium.get("a", "c") == pytest.approx(100 - gain("a", "c") + 25, abs=1e-3)
+    assert medium.get("c", "a") == pytest.approx(100 - gain("c", "a") + 25, abs=1e-3)
+    assert medium.get("a", "b") == pytest.approx(90 - gain("a", "b"), abs=1e-3)
+    assert medium.get("b", "a") == pytest.approx(95.5 - gain("b", "a"), abs=1e-3)
+    assert medium.get("b", "c") == pytest.approx(model.get("b", "c") - gain("b", "c"), abs=1e-3)
+
+
+def test_without_links_the_medium_is_given_what_it_was_before_them(stores):
+    gd, ns = geodata.load("flat"), nodeset.load("three")
+    tables = {"868": losses.synthetic_table(gd, ns, "868")}
+    got = losses.medium_tables(tables, gd, ns)["868"]
+    was = losses.with_offsets(losses.with_antennas(tables, gd, ns), ns)["868"]
+    assert got.loss.tobytes() == was.loss.tobytes()
+    assert got.flags.tobytes() == was.flags.tobytes()
+
+
 def test_the_band_is_the_one_globals_carrier_falls_in(stores):
     ns = nodeset.load("three")
     assert losses.bands_of(ns) == ["868"]                # the store's globals.py
