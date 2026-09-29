@@ -11,11 +11,14 @@ Such a station logs its LXMF sends under the `lxmf` tag
     nobody answered for <dest8> — the held …      no path came: never sent
 
 where <dest8> is the first eight hex digits of the recipient's delivery
-destination. No message id is logged, so a send of the traffic driver's is
-matched to the first message its sender logged to that recipient from the
-instant the send was due, within MATCH_S, in order. A message is delivered
-when its proof came back, which is the stack's own word that the recipient
-has it. The instant a send was due is the driver's schedule (its phase
+destination. No message id is logged, so the sends of the traffic driver's
+that the station took (its tool refused none of them) are matched in order,
+per sender and recipient, to what the log says became of each: it went out,
+or it was dropped for want of a path. The first such outcome from the instant
+a send was due is that send's, however late: a message held while a path is
+asked for, or behind a tool still waiting on another's proof, goes out
+minutes after it was due. A message is delivered when its proof came back,
+which is the stack's own word that the recipient has it. The instant a send was due is the driver's schedule (its phase
 `traffic_start` and the send's `at`), not when the tool answered, which for a
 tool that waits for the proof is long after the message went out; latency
 runs from it too.
@@ -35,8 +38,8 @@ from simesh import record
 
 # SIMesh's kind for the reticulum project's station.
 KIND_TYPES = ("sergeyculum",)
-MATCH_S = 90.0      # how long after it was due a send may first go out
-EARLY_S = 2.0       # how early: the schedule's instant is the driver's, to a second or so
+EARLY_S = 2.0       # how early a send's outcome may be: the schedule is the driver's, to a second or so
+REFUSED = re.compile(r"(^|\s|!\s*)error:")      # what the tool answers when it took nothing
 
 
 BOOT = re.compile(r"^\s*0\.0+ \[\w+\] simesh .*: station \d+ in ")
@@ -140,24 +143,36 @@ def read_logs(run_dir, sends, drive, sids):
         logged, no_path = {}, {}
         if name in sids and os.path.isfile(path):
             logged, no_path = messages(events(path, starts.get(sids[name], [])))
+        # One outcome per message the station took, in order: it went out,
+        # or it was dropped for want of a path.
+        outcomes = {dest: sorted([(m["sent"], m) for m in logged.get(dest, [])]
+                                 + [(t, None) for t in no_path.get(dest, [])],
+                                 key=lambda o: o[0])
+                    for dest in set(logged) | set(no_path)}
         taken = collections.defaultdict(int)
         for s in sorted(own, key=lambda s: due(drive, s)):
             dest = (dests.get(s["dst"]) or "")[:8]
             at = due(drive, s)
+            said = s.get("reply") or s.get("error") or ""
             rec = out[(name, s["marker"])] = {"delivered": None, "last": None}
             if not dest:
                 rec["last"] = "no destination for the recipient"
                 continue
-            queue = logged.get(dest, [])
+            if REFUSED.search(said):
+                rec["last"] = "not sent: %s" % said
+                continue
+            queue = outcomes.get(dest, [])
             i = taken[dest]
-            while i < len(queue) and queue[i]["sent"] < at - EARLY_S:
+            while i < len(queue) and queue[i][0] < at - EARLY_S:
                 i += 1
-            if i < len(queue) and queue[i]["sent"] <= at + MATCH_S:
-                taken[dest] = i + 1
-                rec["delivered"] = queue[i]["delivered"]
-                rec["last"] = queue[i]["end"] or "sent, no proof by the end"
-            elif any(at - EARLY_S <= t <= at + MATCH_S for t in no_path.get(dest, [])):
+            if i >= len(queue):
+                rec["last"] = "not sent: %s" % (said or "no log line")
+                continue
+            taken[dest] = i + 1
+            message = queue[i][1]
+            if message is None:
                 rec["last"] = "no path: nobody answered"
             else:
-                rec["last"] = "not sent: %s" % (s.get("reply") or s.get("error") or "no log line")
+                rec["delivered"] = message["delivered"]
+                rec["last"] = message["end"] or "sent, no proof by the end"
     return out
