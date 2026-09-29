@@ -264,6 +264,18 @@ An RX slot gets the same energy begins for the frames it is not decoding, so
 the chip's instantaneous RSSI and a CAD it starts straight after RX read the
 same air.
 
+A slot that starts listening after a frame began is judged when it does
+(`tell_late`), so that carrier sense is not blind to every frame that began
+while a station was sending, in standby or in a CAD. It can still lock on to
+a decodable frame while `PREAMBLE_FOUND_SYMBOLS` of its preamble are to come:
+a receiver needs about four symbols to find a preamble, the bench's blind
+window, and the chip model raises PreambleDetected at the same four.
+Otherwise the frame is energy to it, in an `rx_begin` marked `cad` whose `t0`
+is the instant it was told, so the chip measures only what is left of the
+frame. "Starts listening" is a `state` into RX or CAD from another mode, or
+one that retunes it; a chip reports standby at the end of its own
+transmission, so a station back from sending is always one.
+
 ## Reception: two tests, the worst piece deciding
 
 Per receiver, per frame it is locked on to, at that frame's `rx_end`. The
@@ -377,7 +389,10 @@ across the air, and only the medium can issue one.
 `rx_begin` goes out immediately, so the receiver can arm its preamble, sync and
 header interrupts on the offsets. `rx_end` is a timer at the frame's stated
 span. Nothing re-reads the frame in between — a receiver that leaves `RX`
-mid-frame is not told, and discards the reception itself.
+mid-frame, or is retuned, discards the reception itself, and the ether sends
+it no `rx_end` for it either: nothing was received that the record, and every
+tool reading it, could count. Its own transmission is the exception, ruled on
+at the frame's end as talked over, `crc`, because that loss is the medium's.
 
 Both carry the link's level: `rx_begin` as `level`, which is what an
 instantaneous RSSI reads and what carrier sense acts on, and `rx_end` as `rssi`

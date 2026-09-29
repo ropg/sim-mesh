@@ -94,6 +94,16 @@ limit of the European Telecommunications Standards Institute's (ETSI) EN 300
 same threshold the same way, which is what its instantaneous RSSI (received
 signal strength indication) reads.
 
+**A station that starts listening mid-frame** — back from its own
+transmission, out of standby, out of a CAD into RX — is judged by the same
+rules at that instant. While at least four symbols of a frame's preamble are
+still to come it can lock on to the frame, as a receiver listening all along
+would; after that it has missed the preamble and is told the frame's energy
+until its end, stamped with the instant it was told. A receiver that leaves
+RX for anything but its own transmission, or is retuned, while following a
+frame is told nothing of how that frame ended, and the record holds no end
+for it.
+
 The ether does not match on preamble length: two radios whose preambles
 differ hear each other here, and may not on a bench.
 
