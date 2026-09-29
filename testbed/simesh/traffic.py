@@ -55,6 +55,7 @@ import re
 import time
 
 from simesh import library
+from simesh.sim import SimError
 
 OPTIONS = {"warm_rounds": 3, "warm_spread": 300.0, "warm_gap": 120.0,
            "settle_every": 180.0, "settle_max": 3600.0, "warm_snapshot": None,
@@ -258,9 +259,14 @@ async def run_phases(opts, sim, result, phase, dump):
             # The `after` (never less than a millisecond) makes it a task of
             # simd's own: a message without one is handled inside the
             # socket's reader, which holds every later message behind it.
-            results, t = await sim.sequence(
-                [meta("path", to=dst), meta("message", to=dst, text=text)], [src],
-                after=max(0.001, start + at - sim.run_s))
+            try:
+                results, t = await sim.sequence(
+                    [meta("path", to=dst), meta("message", to=dst, text=text)], [src],
+                    after=max(0.001, start + at - sim.run_s))
+            except SimError as err:
+                # This message, not the run: the rest go on at their instants.
+                rec["error"] = str(err)[:300]
+                return
             path_out, out = (r.get(src, "") for r in results)
             rec["t_sent"] = rec["t_path"] = t if t is not None else sim.t
             rec["hops"], parsed = route_hops(path_out)

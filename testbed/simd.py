@@ -1036,11 +1036,22 @@ class Simd:
         try:
             await handler(msg)
         except (store.StoreError, kinds_module.CommandError) as err:
-            self.error(str(err))
+            self.refused(msg, str(err))
         except OSError as err:
-            self.error("%s: %s" % (kind, err))
+            self.refused(msg, "%s: %s" % (kind, err))
         except (KeyError, TypeError, ValueError) as err:
-            self.error("%s: malformed message (%s)" % (kind, err))
+            self.refused(msg, "%s: malformed message (%s)" % (kind, err))
+
+    def refused(self, msg, text):
+        """What `msg` asked for could not be done: the page is told, and a
+        request (one with an `id`, which a script waits on) is answered with
+        the error. Unanswered, a script waited on it for ever, and a
+        virtual-time run went on without its driver as fast as it goes."""
+        self.error(text)
+        if msg.get("id") is not None:
+            self.broadcast({"type": "command_result", "id": msg["id"], "name": msg.get("name"),
+                            "results": {}, "error": text,
+                            "t": self.ether.now() if self.ether is not None else None})
 
     # ---- the driver's turns -------------------------------------------------
 
