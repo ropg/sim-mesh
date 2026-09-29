@@ -299,6 +299,54 @@ def test_compare(run, tmp_path):
     assert rows[0] == ["n01", "7", "7"]            # delivered 7 s after the first hello
 
 
+def told(rec, t, rsid, eid, t0, t_end, cad=False):
+    """An rx_begin, as the ether records one."""
+    msg = {"type": "rx_begin", "slot": 0, "id": eid, "t0": t0, "t_end": t_end}
+    if cad:
+        msg["cad"] = True
+    rec.add(t, "out", rsid, msg)
+
+
+def ended(rec, t, rsid, eid, verdict, payload):
+    rec.add(t, "out", rsid, {"type": "rx_end", "slot": 0, "id": eid, "verdict": verdict,
+                             "payload": base64.b64encode(payload).decode()})
+
+
+def sent(rec, t, sid, payload, span):
+    t0 = int(round(t * 1e6))
+    rec.add(t, "in", sid, {"type": "tx", "sid": sid, "t0": t0, "t_end": t0 + int(span * 1e6),
+                           "freq": CALLING, "sf": 8, "bw": 125000, "power_dbm": 14,
+                           "payload": base64.b64encode(payload).decode()})
+
+
+def test_a_reception_is_tied_to_its_frame_by_the_ethers_number(tmp_path):
+    """At 5 s n04's tx reaches the ether first, but the barrier numbers n01's
+    frame 1 and n04's 2, and tells their receivers in that order. At 7 s n03
+    comes to RX during n02's frame 3, after n04's frame 4 has gone out, and
+    is told of frame 3 then."""
+    run = lay_out(tmp_path)
+    rec = Record()
+    sent(rec, 5.0, 4, b"four", 0.3)
+    sent(rec, 5.0, 1, b"one", 0.2)
+    told(rec, 5.0, 2, 1, 5_000_000, 5_200_000)
+    told(rec, 5.0, 3, 2, 5_000_000, 5_300_000)
+    ended(rec, 5.2, 2, 1, "clean", b"one")
+    ended(rec, 5.3, 3, 2, "crc", b"four")
+    sent(rec, 7.0, 2, b"two", 0.5)
+    told(rec, 7.0, 1, 3, 7_000_000, 7_500_000)
+    sent(rec, 7.1, 4, b"quick", 0.1)
+    rec.add(7.15, "in", 3, {"type": "state", "slot": 0, "mode": "RX", "freq": CALLING, "sf": 8})
+    told(rec, 7.15, 3, 3, 7_150_000, 7_500_000, cad=True)
+    ended(rec, 7.5, 1, 3, "clean", b"two")
+    path = os.path.join(run.dir, "record.tsv")
+    rec.write(path)
+
+    heard = {f.payload: f.heard for f in seq.read_record(path, seq.read_bytes)}
+    assert heard == {b"four": {3: "crc"}, b"one": {2: "clean"},
+                     b"two": {1: "clean", 3: "cad"}, b"quick": {}}
+    assert compare.rx_senders(path) == {1: 1, 2: 4, 3: 2}
+
+
 def test_delivery(run, tmp_path):
     drive = {"sends": [
         {"marker": "G0001", "src": "n01", "dst": "n02", "cls": "short", "hops": 1,
