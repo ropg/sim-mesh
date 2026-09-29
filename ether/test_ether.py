@@ -1627,9 +1627,10 @@ class InProcess:
         self.ether.close()
 
 
-def in_process(test):
-    """Run `test` on an in-process ether, once for each conductor built."""
-    for conductor in ("python", "rust") if CORE_BUILT else ("python",):
+def in_process(test, conductors=None):
+    """Run `test` on an in-process ether, once for each conductor built (or
+    each of `conductors`)."""
+    for conductor in conductors or (("python", "rust") if CORE_BUILT else ("python",)):
         before = os.environ.get("SIMESH_ETHER_CORE")
         os.environ["SIMESH_ETHER_CORE"] = conductor
         loop = asyncio.new_event_loop()
@@ -1858,6 +1859,35 @@ def test_a_watched_console_holds_t_only_once_it_has_printed():
             os.close(w)
 
     in_process(test)
+
+
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (simesh build ether)")
+def test_a_burst_the_kernel_could_not_hold_is_heard_whole_by_the_core():
+    """The core's reader thread takes datagrams off the socket as they come,
+    whatever the loop's thread is doing: a burst far past the kernel's receive
+    buffer, sent while the loop is busy, arrives whole. The kernel dropping
+    one would be a station's `state` or `tx` the medium never heard."""
+    async def test(bed):
+        ether = bed.ether
+        socks = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(4)]
+        try:
+            for s in socks:
+                s.bind(("127.0.0.1", 0))
+            # 1500 hellos, the loop blocked the while: past 200 KB of buffer.
+            for sid in range(2, 1502):
+                hello = {"type": "hello", "sid": sid, "slots": [0], "t": 0}
+                socks[sid % 4].sendto(json.dumps(hello).encode(), bed.addr)
+            time.sleep(0.2)
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if len(ether.stations) == 1500:
+                    break
+            assert len(ether.stations) == 1500
+        finally:
+            for s in socks:
+                s.close()
+
+    in_process(test, conductors=("rust",))
 
 
 def test_what_stations_printed_is_read_before_t_moves():
