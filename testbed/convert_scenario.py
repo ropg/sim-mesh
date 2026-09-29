@@ -534,8 +534,8 @@ def convert(data, devices, name, where="scenario"):
     if links:
         nodeset_text += "links:\n" + "".join(
             "  - { between: [%s, %s], loss_db: %s, note: %s }\n"
-            % (link["between"][0], link["between"][1], store.scalar(link["loss_db"]),
-               store.scalar(link["note"])) for link in links)
+            % (store.name_scalar(link["between"][0]), store.name_scalar(link["between"][1]),
+               store.scalar(link["loss_db"]), store.scalar(link["note"])) for link in links)
     geodata_text = dump_ground(name, ground)
     setup_text = setup_of(name, old, devices, used, left)
 
