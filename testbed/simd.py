@@ -438,8 +438,15 @@ class Simd:
                 "plan": self.plan}
 
     def ether_drops(self):
-        """What the kernel has dropped on the ether's socket, or None."""
-        transport = self.ether.transport if self.ether is not None else None
+        """What the kernel has dropped on the ether's socket, or None: as
+        the core counts it while it reads (SO_RXQ_OVFL), else from its row in
+        /proc/net/udp, a file that grows with every station's sockets."""
+        if self.ether is None:
+            return None
+        core = getattr(self.ether, "core", None)
+        if core is not None:
+            return core.drops
+        transport = self.ether.transport
         if transport is None:
             return None
         return socket_drops(transport.get_extra_info("socket"))

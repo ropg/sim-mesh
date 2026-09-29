@@ -75,6 +75,9 @@ fn empty(fd: RawFd) {
 /// loop (`wake`); the conductor handles them there, in the same order.
 struct Inbox {
     queue: Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
+    /// Datagrams the kernel has dropped on the socket's full buffer, as it
+    /// said with the last one it handed over (SO_RXQ_OVFL).
+    drops: AtomicU64,
     /// A byte is in `wake` for what is queued, or about to be.
     signaled: AtomicBool,
     stop: AtomicBool,
@@ -93,8 +96,18 @@ impl Inbox {
 
     /// The reader thread: the socket's datagrams into the queue, until stopped.
     fn read(self: Arc<Self>, fd: RawFd) {
-        // SAFETY: the socket stays open until `stop` is set and this returns.
-        let sock = ManuallyDrop::new(unsafe { UdpSocket::from_raw_fd(fd) });
+        let on: libc::c_int = 1;
+        // SAFETY: an int option on a socket the caller keeps open. Refused,
+        // the count stays at nought, which the caller reads as none dropped.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RXQ_OVFL,
+                (&on as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
         let mut buf = vec![0u8; DATAGRAM_MAX];
         while !self.stop.load(Ordering::SeqCst) {
             let mut fds = [
@@ -105,7 +118,7 @@ impl Inbox {
             unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
             let mut took = false;
             loop {
-                match sock.recv_from(&mut buf) {
+                match self.recv(fd, &mut buf) {
                     Ok((n, addr)) => {
                         self.queue
                             .lock()
@@ -121,6 +134,59 @@ impl Inbox {
                 self.signal();
             }
         }
+    }
+
+    /// One datagram, and the kernel's count of those it dropped on this
+    /// socket so far, which comes with it as a control message.
+    fn recv(&self, fd: RawFd, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        // SAFETY: zeroed plain C structs, filled in by the kernel below.
+        let mut from: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+        let mut control = [0u64; 8];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_name = (&mut from as *mut libc::sockaddr_storage).cast();
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = std::mem::size_of_val(&control) as _;
+        // SAFETY: every pointer in `msg` is to a live local of the stated size.
+        let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: walking the control messages the kernel wrote into `msg`.
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SO_RXQ_OVFL {
+                    let dropped = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const u32);
+                    self.drops.fetch_max(u64::from(dropped), Ordering::SeqCst);
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+        }
+        let addr = sockaddr_to(&from).ok_or_else(|| std::io::Error::other("not an IP address"))?;
+        Ok((n as usize, addr))
+    }
+}
+
+/// An IPv4 or IPv6 socket address the kernel wrote, as Rust's.
+fn sockaddr_to(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            // SAFETY: the family says this is a sockaddr_in.
+            let sin = unsafe { &*(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in) };
+            let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            Some(SocketAddr::new(IpAddr::V4(ip), u16::from_be(sin.sin_port)))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: the family says this is a sockaddr_in6.
+            let sin6 = unsafe { &*(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in6) };
+            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            Some(SocketAddr::new(IpAddr::V6(ip), u16::from_be(sin6.sin6_port)))
+        }
+        _ => None,
     }
 }
 
@@ -764,6 +830,7 @@ impl Core {
     ) -> PyResult<Self> {
         let inbox = Arc::new(Inbox {
             queue: Mutex::new(VecDeque::new()),
+            drops: AtomicU64::new(0),
             signaled: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             wake: pipe()?,
@@ -815,6 +882,13 @@ impl Core {
     #[getter]
     fn wake_fd(&self) -> i32 {
         self.inbox.wake.0
+    }
+
+    /// Datagrams the kernel has dropped on the ether's socket, as far as the
+    /// reader has heard (SO_RXQ_OVFL, which comes with the next datagram).
+    #[getter]
+    fn drops(&self) -> u64 {
+        self.inbox.drops.load(Ordering::SeqCst)
     }
 
     /// The datagrams queued, handled in the order they came; the event loop
