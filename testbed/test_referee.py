@@ -348,3 +348,21 @@ def test_every_number_the_ether_gives_is_tied_to_its_own_frame(run):
     assert sum(1 for f in record.frames if f.begins and f.start in (1_000_000, 3_000_000)) == 5
     assert {eid: (f.sid, f.start) for eid, f in record.by_eid.items()} == \
         {eid: numbered[eid] for eid in record.by_eid}
+
+
+def test_two_frames_begun_at_one_instant_are_counted_apart(run, capsys):
+    """Neither was on the air when the other began, so neither began over the
+    other: carrier sense had nothing to find. n01 and n02 hear each other and
+    start together, and so do n01 and n03, which do not; only the first pair
+    counts."""
+    rec = Record()
+    rec.tx(1.0, 1, 0.3)
+    rec.tx(1.0, 2, 0.3)
+    rec.tx(3.0, 1, 0.3)
+    rec.tx(3.0, 3, 0.3)
+    rec.write(run)
+    report = judged(run, capsys)
+    assert report["carrier_sense"] == []
+    assert [(e["sid"], e["other"], e["at"]) for e in report["began_together"]] == [(1, 2, 1.0)]
+    assert referee.main(["--run", run.dir]) == 0
+    assert "and 1 time two transmissions began at one instant" in capsys.readouterr().out
