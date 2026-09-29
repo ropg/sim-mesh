@@ -632,6 +632,8 @@ class Ether(asyncio.DatagramProtocol):
         self.pending = []           # (sid, arrival, addr, msg) held for the barrier
         self.holds = 0              # the testbed's own work in hand at the T it has
         self.floors = {}            # sid -> "tool" | "station": a testbed tool's session with it
+        self.joins = {}             # sid -> future, done at its hello (expect)
+        self.join_waited = set()    # sids whose join someone is waiting on (joined)
         self.settling = []          # callbacks for when the loop is next quiet
         self.settle_turns = 0
         self.channels = {}          # key -> Channel with bytes in it, or owed some
@@ -784,9 +786,27 @@ class Ether(asyncio.DatagramProtocol):
     # ---- the conductor --------------------------------------------------
 
     def expect(self, sid):
-        """A station is starting: T waits for it to say hello and then idle."""
+        """A station is starting: T waits for it to say hello and then idle.
+        `joined(sid)` is done at that hello."""
         if self.clock.virtual:
             self.expected.add(sid)
+            old = self.joins.get(sid)
+            if old is None or old.done():
+                self.joins[sid] = self.loop.create_future()
+
+    def joined(self, sid):
+        """A future done once station `sid`, expected, has said hello. At that
+        hello T is held until what the future woke has run, as after a sleep,
+        so what the testbed does next to the station it does at the hello's T
+        however soon it gets there on the host. Done at once in a real-time
+        run, or for a station not expected."""
+        future = self.joins.get(sid)
+        if future is None:
+            future = self.loop.create_future()
+            future.set_result(None)
+        elif not future.done():
+            self.join_waited.add(sid)
+        return future
 
     def leave(self, sid):
         """A station has stopped: T no longer waits for it."""
@@ -1478,6 +1498,13 @@ class Ether(asyncio.DatagramProtocol):
             self.forget(sid)
         station = self.station_for(sid, addr, slots)
         self.expected.discard(sid)
+        join = self.joins.get(sid)
+        if join is not None and not join.done():
+            join.set_result(None)
+            if sid in self.join_waited:
+                self.join_waited.discard(sid)
+                self.holds += 1
+                self.settle(self.release)
         station.until = None
         self.send(sid, {"type": "welcome", "t": self.now(), "mode": self.mode,
                         "rate": self.rate, "epoch": self.epoch, "seed": self.seed})

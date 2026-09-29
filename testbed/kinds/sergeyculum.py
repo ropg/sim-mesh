@@ -113,12 +113,15 @@ class Sergeyculum(Kind):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         if station.clock is not None:
-            # Not before it has joined the ether, which T waits for anyway:
-            # the station opens its door before it says hello, so the door is
-            # there then, at the T of the start, and not at whatever T the
-            # first look at it happens to fall on.
-            while station.node_id not in station.clock.stations and loop.time() < deadline:
-                await asyncio.sleep(0.02)
+            # Not before it has joined the ether: the station opens its door
+            # before it says hello, and the ether holds T at the hello until
+            # this has gone on, so the first question goes in at the hello's
+            # T, and not at whatever T a look at the door happens to fall on.
+            try:
+                await asyncio.wait_for(asyncio.shield(station.clock.joined(station.node_id)),
+                                       max(0.0, deadline - loop.time()))
+            except asyncio.TimeoutError:
+                return False
         while loop.time() < deadline:
             if os.path.exists(self.kiss(station)):
                 try:
