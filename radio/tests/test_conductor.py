@@ -121,10 +121,17 @@ class Conductor:
 
 
 def join(lib, cond, sid=9):
-    assert lib.simradio_station_open(sid, b"127.0.0.1",
-                                     ("127.0.0.1:%d" % cond.port).encode()) == 0
+    """Open the station and welcome it. In virtual time station_open returns
+    only once the welcome has landed, so it runs beside the conductor."""
+    opened = []
+    opener = threading.Thread(target=lambda: opened.append(lib.simradio_station_open(
+        sid, b"127.0.0.1", ("127.0.0.1:%d" % cond.port).encode())), daemon=True)
+    opener.start()
     cond.expect("hello")
-    return cond.welcome()
+    seq = cond.welcome()
+    opener.join(5)
+    assert opened == [0]
+    return seq
 
 
 def idle(lib, cond):
@@ -335,6 +342,23 @@ def test_on_a_drifting_clock_quiet_ends_at_the_first_node_time_that_sees_tx_done
         lib.simradio_close(ctypes.c_void_p(chip))
     finally:
         cond.sock.close()
+
+
+def test_station_open_returns_only_once_the_welcome_has_set_t(virtual):
+    """In virtual time the host goes on at the instant it joined, not at node
+    time 0 before the welcome has landed."""
+    lib, cond = virtual
+    opened = []
+    opener = threading.Thread(target=lambda: opened.append(lib.simradio_station_open(
+        9, b"127.0.0.1", ("127.0.0.1:%d" % cond.port).encode())), daemon=True)
+    opener.start()
+    cond.expect("hello")
+    time.sleep(0.1)
+    assert opened == []                         # still waiting for the welcome
+    cond.welcome()
+    opener.join(5)
+    assert opened == [0]
+    assert lib.simradio_node_us() == T_JOIN
 
 
 def test_the_host_floor_is_said_and_owes_an_idle(virtual):

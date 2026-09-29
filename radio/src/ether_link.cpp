@@ -22,11 +22,17 @@
 #include <cstring>
 #include <string>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
 
 namespace {
 
 constexpr size_t kMaxPayload = 256;
+
+/* How long, in wall time, station_open waits for the ether's welcome. */
+constexpr int kJoinWaitMs = 60 * 1000;
 
 const struct simradio_services* S() { return conductor::modelServices(); }
 
@@ -222,5 +228,19 @@ extern "C" int simradio_station_open(int sid, const char* bind_addr, const char*
         s_sid, (long long)S()->now_us());
     sendRaw(hello, (size_t)n);
     S()->log(SIMRADIO_LOG_INFO, "ether: %s, station %d", ether_addr, s_sid);
+    if (conductor::isVirtual()) {
+        /* Not back to the host before the welcome has set T. What the host
+         * does next reads node time, and until the welcome that is 0, not
+         * the instant the station joins at: a sleep begun before the welcome
+         * landed ended at another millisecond than one begun after it, so a
+         * station's first steps depended on which of two threads the host
+         * ran first. Raw sleeps: the time shim's would wait on T. */
+        struct timespec ms = {0, 1000 * 1000};
+        for (int i = 0; i < kJoinWaitMs && !conductor::joined(); i++)
+            syscall(SYS_nanosleep, &ms, nullptr);
+        if (!conductor::joined())
+            S()->log(SIMRADIO_LOG_WARN, "ether: no welcome in %d ms; going on without it",
+                     kJoinWaitMs);
+    }
     return 0;
 }
