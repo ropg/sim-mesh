@@ -337,6 +337,21 @@ def test_on_a_drifting_clock_quiet_ends_at_the_first_node_time_that_sees_tx_done
         cond.sock.close()
 
 
+def test_the_host_floor_is_said_and_owes_an_idle(virtual):
+    """simradio_host_floor: `floor` to the station once it has read a host's
+    bytes, to the tool once it has answered; either is the station speaking,
+    so an idle is owed after it."""
+    lib, cond = virtual
+    join(lib, cond)
+    idle(lib, cond)
+    lib.simradio_host_floor(1)
+    assert cond.expect("floor") == {"type": "floor", "sid": 9, "to": "station"}
+    assert idle(lib, cond)["seq"] == cond.seq          # owed, with no grant
+    lib.simradio_host_floor(0)
+    assert cond.expect("floor") == {"type": "floor", "sid": 9, "to": "tool"}
+    idle(lib, cond)
+
+
 def test_the_link_survives_a_lost_datagram_either_way(virtual):
     lib, cond = virtual
     seq = join(lib, cond)

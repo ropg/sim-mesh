@@ -44,3 +44,8 @@ struct EtherTxFrame {
 
 void etherPublishState(const EtherState& s);
 void etherPublishTx(const EtherTxFrame& f);
+
+/** Who has the floor on the station's host door: the station, once it has
+ *  read what a host sent (`station`), or the host again once it has been
+ *  answered. The ether keeps T still while a testbed tool has the floor. */
+void etherPublishFloor(bool station);
