@@ -157,6 +157,7 @@ class Runtime:
         self.loop = None
         self.thread = None
         self.lock = threading.Lock()
+        self.blocked = 0            # the script's thread is waiting on this many calls
 
     def configure(self, **world):
         self.world = {k: v for k, v in world.items() if v is not None}
@@ -171,13 +172,25 @@ class Runtime:
                                            daemon=True)
             self.thread.start()
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        return future.result() if wait else future
+        if not wait:
+            return future
+        # While the script's thread waits here, its simulation may yield the
+        # floor; between two calls the script is deciding what to do next, at
+        # the T of the answer it got, and T waits for it.
+        self.blocked += 1
+        if self.sim is not None:
+            self.loop.call_soon_threadsafe(self.sim.poke)
+        try:
+            return future.result()
+        finally:
+            self.blocked -= 1
 
     def held(self):
         """The simulation, started (or attached to) on first need."""
         with self.lock:
             if self.sim is None:
                 self.sim = self.call(self._begin())
+                self.sim.may_yield = lambda: self.blocked > 0
             return self.sim
 
     async def _begin(self):
