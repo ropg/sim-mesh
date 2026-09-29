@@ -365,6 +365,32 @@ by 6 dB, one at a time, with nothing summed and no spreading factor spared.
 CAD is told only of frames it could decode. It is there so a run can be
 compared, frame for frame, with one ruled that way.
 
+## Bench capture
+
+`Ether(bench_capture=True)`, or `--bench-capture`, replaces the same-SF
+figure, and nothing else, with what a bench measured: the reticulum
+project's `tools/rncapture` of 2026-09-17, an SX1262 receiver with an SX1262
+and an LR2021 sending, SF7 at 125 kHz, 121-byte frames, 289 collisions of two
+frames whose starts were within about 8 ms. The figures and what is assumed
+beyond them are in `ether.py`'s table (`BENCH_*`); `bench_outcome` is the
+table as a function of the two frames, the receiver, the first frame's lead
+and whether the receiver was locked on it.
+
+It decides in two places, which must agree. At the lock, a frame arriving
+while the receiver follows another takes it only when the receiver is still
+inside the first one's preamble and the pair's outcome has the new one
+surviving; past the preamble it never does. At the verdict, a frame that is
+not lost must survive its class: its lead is over the summed power of its
+own spreading factor's class in its worst stretch of air, its partner in the
+outcome is the strongest of them, and "locked" is read off the first frame's
+reception at that receiver, whether it was being followed when the second
+started. With two frames that is the bench's pair exactly, and the outcome
+drawn at the lock is the one the verdicts read, because every draw is a hash
+of the seed, the pair and the receiver (`seeded_draw`). With three or more,
+the sum stands in for the second frame, which is an assumption, as are other
+spreading factors, bandwidths and starts further apart than the bench's.
+Inter-SF classes are judged by the matrix as without it.
+
 Matching is on the **last stated** values, not on anything the ether infers.
 This is why a station publishes a `state` on every command that changes its mode
 or carrier, and why a model that forgot to would go deaf silently. The one thing

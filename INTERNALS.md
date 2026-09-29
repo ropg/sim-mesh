@@ -762,6 +762,13 @@ threshold, is there.
 way, one interferer at a time against a 6 dB margin with nothing summed, so a
 run can be compared frame for frame with one ruled that way.
 
+**Bench capture** (`--bench-capture`) replaces the same-SF figure with what
+a bench measured of two frames meeting: equals within 1.2 dB (both lost about
+one time in four, otherwise one survives), the stronger surviving seven times
+in eight from there and always from 6.1 dB, and a frame arriving after the
+receiver has passed the first one's preamble never taking it
+([`ether/INTERNALS.md`](ether/INTERNALS.md#bench-capture)).
+
 ## Why the ether owns the lock
 
 A receiver follows one frame at a time, and which one is decided at the

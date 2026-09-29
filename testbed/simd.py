@@ -384,7 +384,8 @@ class Simd:
         self.ether_transport, self.ether = await loop.create_datagram_endpoint(
             lambda: ether_module.Ether(record, physics=physics, time_mode=self.args.time,
                                        pairwise=self.args.pairwise, seed=self.args.seed,
-                                       epoch=self.args.epoch),
+                                       epoch=self.args.epoch,
+                                       bench_capture=self.args.bench_capture),
             local_addr=bind)
         self.ether.on_tx = self.ether_tx
         self.ether.on_rx = self.ether_rx
@@ -394,7 +395,8 @@ class Simd:
             log("ether on %s, recording to %s" % (self.ether_addr, record))
             log("time: %s; %s; %s rule" % (
                 ether_module.describe_time(self.ether.mode, self.ether.rate),
-                physics.describe(), "pairwise" if self.args.pairwise else "receiver-centred"))
+                physics.describe(),
+                ether_module.rule_name(self.args.pairwise, self.args.bench_capture)))
         if self.ether.clock.virtual and not os.path.exists(kinds_module.SHIM):
             log("error: no time shim at %s: a virtual-time run needs it "
                 "(see SIMesh/README.md)" % kinds_module.SHIM)
@@ -1501,8 +1503,10 @@ class Simd:
         # The medium the run is started on, for whatever reads it later: the
         # analysis tools' levels take their noise figure from it, and a seed
         # drawn at random is otherwise nowhere to be found again.
-        run.set(physics=dict(self.ether.physics.as_dict(), pairwise=self.ether.pairwise),
-                seed=self.ether.seed)
+        medium = dict(self.ether.physics.as_dict(), pairwise=self.ether.pairwise)
+        if self.ether.bench_capture:
+            medium["bench_capture"] = True
+        run.set(physics=medium, seed=self.ether.seed)
         await self.find_grounds([n for n in ns.nodes if n not in self.grounds])
         self.apply_to_ether()
         log("run %s: geodata %s (%s), nodeset %s (%d nodes), script %s, tables %s"
@@ -1749,6 +1753,9 @@ def parse_args(argv):
     ap.add_argument("--pairwise", action="store_true",
                     help="rule on collisions pairwise, per interferer by the capture "
                          "margin, instead of on the summed interference")
+    ap.add_argument("--bench-capture", action="store_true",
+                    help="rule on two frames of one spreading factor as a bench saw them "
+                         "meet, instead of by the same-SF figure")
     ap.add_argument("--crc-margin-db", type=float,
                     default=ether_module.DEFAULT_CRC_MARGIN_DB,
                     help="the CRC band: how far above its threshold a frame may still "
@@ -1787,6 +1794,10 @@ def parse_args(argv):
         ether_module.parse_time_mode(args.time)
     except ValueError as err:
         ap.error(str(err))
+    if args.bench_capture and args.pairwise:
+        ap.error("--bench-capture is a variant of the receiver-centred rule, not --pairwise's")
+    if args.crc_margin_db < 0:
+        ap.error("--crc-margin-db is a width in dB")
     args.run = os.path.abspath(args.run)
     args.public_port = args.bind.rpartition(":")[2]
     # The relay binds the same number as the page, on UDP — one number to

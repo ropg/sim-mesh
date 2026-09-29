@@ -160,6 +160,25 @@ PREAMBLE_FOUND_SYMBOLS = 4.0
 # whatever order the receptions end in.
 DEFAULT_CRC_MARGIN_DB = 0.0
 
+# Capture as a bench measured it (`--bench-capture`, off unless given): the
+# reticulum project's tools/rncapture of 2026-09-17 (its README, the table of
+# 289 collisions): an SX1262 receiver, SX1262 and LR2021 senders, SF7 at 125
+# kHz, 121-byte frames, two frames at a time whose starts were within about
+# 8 ms (listen-before-talk stayed on). Within 1.2 dB the two are equals: both
+# were lost 9 times in 39, and otherwise one of them survived, either one.
+# From there to 2.7 dB the stronger survived 119 times in 136, and from 6.1 dB
+# every time; the straight line between is an assumption. The weaker never
+# survived. A frame that started after the receiver had passed the first
+# one's preamble was never received, and it spoiled the first unless the
+# first was the stronger (six times in six, at about 2 dB); at equal power
+# the first is assumed to survive as often as equals do not both die. Other
+# spreading factors, bandwidths and start offsets are assumed to behave alike.
+BENCH_EQUAL_DB = 1.2
+BENCH_BOTH_LOST = 9 / 39
+BENCH_STRONGER = 119 / 136
+BENCH_STRONGER_DB = 2.7
+BENCH_CERTAIN_DB = 6.1
+
 # What follows the preamble before `t_pre`: two sync-word symbols and 2.25 of
 # the start-of-frame delimiter (AN1200.13), so a frame's preamble proper ends
 # this many symbols before the `t_pre` its transmitter states.
@@ -348,6 +367,55 @@ def crc_margin_fails(seed, eid, rsid, slot, margin_db, band_db):
     return seeded_draw(seed, eid, rsid, slot, "crc") < 1.0 - max(margin_db, 0.0) / band_db
 
 
+def same_class(sf_a, sf_b):
+    """True when two spreading factors meet as one class, by the same-SF
+    figure rather than the inter-SF matrix (`rejection_db`)."""
+    return rejection_db(sf_a, sf_b) == SAME_SF_REJECTION_DB
+
+
+def bench_stronger_odds(lead):
+    """How often the stronger of two frames that met survives, by its lead."""
+    if lead >= BENCH_CERTAIN_DB:
+        return 1.0
+    if lead <= BENCH_STRONGER_DB:
+        return BENCH_STRONGER
+    return BENCH_STRONGER + (1.0 - BENCH_STRONGER) * (
+        (lead - BENCH_STRONGER_DB) / (BENCH_CERTAIN_DB - BENCH_STRONGER_DB))
+
+
+def bench_outcome(seed, first, second, rsid, lead, locked):
+    """Which of two frames that met survive at one receiver, as the bench saw.
+
+    `first` and `second` are the frames' numbers in the order they started,
+    `lead` the first's level over the second's there in dB, and the answer
+    (the first survives, the second survives). A receiver `locked` on the
+    first — following it when the second started after its preamble — never
+    receives the second, however strong, and loses the first too unless the
+    first is the stronger. Frames that started within a preamble of each
+    other are the bench's table. The draws are the pair's and the
+    receiver's, so both frames' verdicts and the lock read one outcome.
+    """
+    lo, hi = min(first, second), max(first, second)
+
+    def draw(what):
+        return seeded_draw(seed, lo, hi, rsid, what)
+
+    if locked:
+        if lead > BENCH_EQUAL_DB:
+            return draw("stronger") < bench_stronger_odds(lead), False
+        if lead < -BENCH_EQUAL_DB:
+            return False, False
+        return draw("equal") >= BENCH_BOTH_LOST, False
+    if abs(lead) <= BENCH_EQUAL_DB:
+        if draw("equal") < BENCH_BOTH_LOST:
+            return False, False
+        first_wins = draw("coin") < 0.5
+        return first_wins, not first_wins
+    if lead > 0:
+        return draw("stronger") < bench_stronger_odds(lead), False
+    return False, draw("stronger") < bench_stronger_odds(-lead)
+
+
 def fspl_1m_db(freq_hz):
     """Free-space path loss over the first metre at this carrier, in dB: the
     log-distance model's anchor, for whatever computes synthetic ground's table."""
@@ -485,6 +553,7 @@ class Frame:
         self.hdr_us = hdr_us
         self.interferers = []   # frames that shared this one's band and air
         self.receivers = []     # (sid, slot, level) for each decoding receiver
+        self.receptions = {}    # (sid, slot) -> its Reception there
         self.levels = {}        # rsid -> dBm there, or None: never heard
 
     def preamble_left(self, now):
@@ -516,13 +585,23 @@ class Reception:
     rx_end goes out and nothing is recorded as received or lost.
     """
 
-    def __init__(self, frame, rsid, slot, level, lost=False):
+    def __init__(self, frame, rsid, slot, level, lost=False, taken_at=None):
         self.frame = frame
         self.rsid = rsid
         self.slot = slot
         self.level = level
         self.lost = lost
         self.abandoned = False
+        # When the receiver took this frame, and when a later one took it off
+        # it: the bench rule asks whether it was following the frame when a
+        # second one started.
+        self.taken_at = None if lost else taken_at
+        self.lost_at = None
+
+    def followed_at(self, t):
+        """True when the receiver was following this frame at instant `t`."""
+        return (self.taken_at is not None and self.taken_at <= t
+                and (self.lost_at is None or self.lost_at > t))
 
 
 class Ether(asyncio.DatagramProtocol):
@@ -536,7 +615,7 @@ class Ether(asyncio.DatagramProtocol):
     """
 
     def __init__(self, record_path, physics=None, seed=None, time_mode="real",
-                 pairwise=False, epoch=None):
+                 pairwise=False, epoch=None, bench_capture=False):
         self.transport = None
         self.loop = asyncio.get_event_loop()
         self.mode, self.rate = parse_time_mode(time_mode)
@@ -569,6 +648,10 @@ class Ether(asyncio.DatagramProtocol):
         self.standing = 0           # steps in a row that left T where it was
         self.physics = physics or Physics()
         self.pairwise = bool(pairwise)
+        if bench_capture and self.pairwise:
+            raise ValueError("bench capture is a variant of the receiver-centred rule, "
+                             "not of the pairwise one")
+        self.bench_capture = bool(bench_capture)
         self.stations = {}          # sid -> Station
         self.tables = {}            # band name -> slt.Table
         self.names = {}             # sid -> node name, the table's index
@@ -1470,10 +1553,12 @@ class Ether(asyncio.DatagramProtocol):
             held = None
         return held
 
-    def open_reception(self, frame, rstation, slot, level, lost=False):
+    def open_reception(self, frame, rstation, slot, level, lost=False, now=None):
         """Schedule the rx_end for one receiver of a decodable frame."""
-        reception = Reception(frame, rstation.sid, slot, level, lost)
+        reception = Reception(frame, rstation.sid, slot, level, lost,
+                              taken_at=frame.start_us if now is None else now)
         frame.receivers.append((rstation.sid, slot, level))
+        frame.receptions[(rstation.sid, slot)] = reception
         self.call_at(frame.end_us, self.deliver_end, reception, key=rstation.sid)
         return reception
 
@@ -1521,18 +1606,32 @@ class Ether(asyncio.DatagramProtocol):
             self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             return
         held = self.current_lock(rstation, slot, now)
-        if held is not None and level - held.level < SAME_SF_REJECTION_DB:
-            # The demodulator is busy with a frame this one does not lead:
-            # it is energy to this receiver, and lost to it.
+        if held is not None and not self.takes(held, frame, rstation.sid, level, now):
+            # The demodulator is busy with a frame this one does not take it
+            # off: it is energy to this receiver, and lost to it.
             self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             self.open_reception(frame, rstation, slot, level, lost=True)
             return
         if held is not None:
             held.lost = True
+            held.lost_at = now
             log("frame %d takes station %d off frame %d" % (
                 frame.eid, rstation.sid, held.frame.eid))
-        rstation.locks[slot] = self.open_reception(frame, rstation, slot, level)
+        rstation.locks[slot] = self.open_reception(frame, rstation, slot, level, now=now)
         self.send(rstation.sid, self.begin_message(frame, slot, level, t0=now))
+
+    def takes(self, held, frame, rsid, level, now):
+        """Whether a frame arriving now takes a receiver off the one it is
+        following: by leading it by the same-SF figure, or with bench capture
+        as the bench saw two frames meet — never once the receiver is past
+        the first one's preamble, and otherwise when the pair's outcome says
+        the new one survives, the same outcome its verdict will read."""
+        if not self.bench_capture:
+            return level - held.level >= SAME_SF_REJECTION_DB
+        if now >= held.frame.pre_us:
+            return False
+        return bench_outcome(self.seed, held.frame.eid, frame.eid, rsid,
+                             held.level - level, locked=False)[1]
 
     def arrive_pairwise(self, frame, msg, rstation, slot, level, now=None):
         """A frame reaches one listening slot: the pairwise rule.
@@ -1559,7 +1658,8 @@ class Ether(asyncio.DatagramProtocol):
             return
         if held is not None:
             held.lost = True
-        rstation.locks[slot] = self.open_reception(frame, rstation, slot, level)
+            held.lost_at = now
+        rstation.locks[slot] = self.open_reception(frame, rstation, slot, level, now=now)
         self.send(rstation.sid, self.begin_message(frame, slot, level, t0=now))
 
     # ---- delivery: the verdict ------------------------------------------
@@ -1605,15 +1705,43 @@ class Ether(asyncio.DatagramProtocol):
         if not others:
             return "clean"
         by_frame = {id(o): a for o, a in others}
+        worst_same_mw = 0.0
         for piece in self.segments(frame, [o for o, _ in others]):
             classes = {}
+            same_mw = 0.0
             for other in piece:
-                key = other.sf
-                classes[key] = classes.get(key, 0.0) + dbm_to_mw(by_frame[id(other)])
+                mw = dbm_to_mw(by_frame[id(other)])
+                if self.bench_capture and same_class(frame.sf, other.sf):
+                    same_mw += mw
+                    continue
+                classes[other.sf] = classes.get(other.sf, 0.0) + mw
+            worst_same_mw = max(worst_same_mw, same_mw)
             for sf, mw in classes.items():
                 if level - mw_to_dbm(mw) < rejection_db(frame.sf, sf):
                     return "crc"
+        if worst_same_mw > 0.0 and not self.bench_survives(
+                reception, others, level - mw_to_dbm(worst_same_mw)):
+            return "crc"
         return "clean"
+
+    def bench_survives(self, reception, others, lead):
+        """Bench capture's word on a frame against its own class: the
+        pair's outcome (`bench_outcome`) with its strongest same-class
+        interferer, at the frame's lead over the summed class in its worst
+        stretch of air. With one interferer that is the bench's pair exactly;
+        with more, the sum stands in for the second frame. Whether the
+        receiver was locked is read off the first frame's reception: past its
+        preamble, and following it, when the second started."""
+        frame, rsid, slot = reception.frame, reception.rsid, reception.slot
+        same = [(o, a) for o, a in others if same_class(frame.sf, o.sf)]
+        partner = max(same, key=lambda oa: (oa[1], -oa[0].eid))[0]
+        first, second = sorted((frame, partner), key=lambda f: (f.start_us, f.eid))
+        was = first.receptions.get((rsid, slot))
+        locked = (second.start_us >= first.pre_us
+                  and was is not None and was.followed_at(second.start_us))
+        outcome = bench_outcome(self.seed, first.eid, second.eid, rsid,
+                                lead if first is frame else -lead, locked)
+        return outcome[0] if first is frame else outcome[1]
 
     def verdict_pairwise(self, reception):
         """How this frame ends at one receiver: the pairwise rule.
@@ -1675,6 +1803,13 @@ class Ether(asyncio.DatagramProtocol):
             self.record.close()
 
 
+def rule_name(pairwise, bench_capture=False):
+    """The collision rule, as the logs name it."""
+    if pairwise:
+        return "pairwise"
+    return "receiver-centred, bench capture" if bench_capture else "receiver-centred"
+
+
 def parse_bind(text):
     """`host:port` into a tuple, with a bare port allowed."""
     if ":" in text:
@@ -1712,10 +1847,11 @@ def read_losses(directory):
 
 
 async def serve(bind, record_path, physics, losses, time_mode="real", pairwise=False,
-                seed=None):
+                seed=None, bench_capture=False):
     loop = asyncio.get_running_loop()
     transport, ether = await loop.create_datagram_endpoint(
-        lambda: Ether(record_path, physics, seed=seed, time_mode=time_mode, pairwise=pairwise),
+        lambda: Ether(record_path, physics, seed=seed, time_mode=time_mode, pairwise=pairwise,
+                      bench_capture=bench_capture),
         local_addr=bind)
     tables, sids, gains = losses
     ether.set_losses(tables, sids, gains)
@@ -1723,8 +1859,7 @@ async def serve(bind, record_path, physics, losses, time_mode="real", pairwise=F
     log("ether listening on %s:%d" % (host, port))
     log("recording to %s" % record_path)
     log("time: %s" % describe_time(ether.mode, ether.rate))
-    log("physics: %s; %s rule" % (physics.describe(),
-                                  "pairwise" if pairwise else "receiver-centred"))
+    log("physics: %s; %s rule" % (physics.describe(), rule_name(pairwise, bench_capture)))
     log("loss tables: %s; nodes: %s" % (
         ", ".join("%s MHz (%d)" % (b, t.n) for b, t in sorted(tables.items())) or "none",
         ", ".join("%s=%d" % (n, s) for n, s in sorted(sids.items(), key=lambda i: i[1]))
@@ -1754,6 +1889,9 @@ def main(argv=None):
     ap.add_argument("--pairwise", action="store_true",
                     help="rule on collisions pairwise, per interferer by the capture "
                          "margin, instead of on the summed interference")
+    ap.add_argument("--bench-capture", action="store_true",
+                    help="rule on two frames of one spreading factor as a bench saw them "
+                         "meet, instead of by the same-SF figure")
     ap.add_argument("--crc-margin-db", type=float, default=DEFAULT_CRC_MARGIN_DB,
                     help="the CRC band: how far above its threshold a frame may still "
                          "fail its CRC, the chance falling linearly to nothing "
@@ -1771,6 +1909,8 @@ def main(argv=None):
         ap.error(str(err))
     if bool(args.nodeset) != bool(args.losses):
         ap.error("--nodeset and --losses go together")
+    if args.bench_capture and args.pairwise:
+        ap.error("--bench-capture is a variant of the receiver-centred rule, not --pairwise's")
     sids, gains, tables = {}, {}, {}
     if args.nodeset:
         sids, gains = read_nodeset(args.nodeset)
@@ -1780,7 +1920,7 @@ def main(argv=None):
     try:
         asyncio.run(serve(parse_bind(args.bind), args.record,
                           Physics(args.noise_figure, args.crc_margin_db), (tables, sids, gains),
-                          args.time, args.pairwise, args.seed))
+                          args.time, args.pairwise, args.seed, args.bench_capture))
     except KeyboardInterrupt:
         log("ether stopping")
     return 0
