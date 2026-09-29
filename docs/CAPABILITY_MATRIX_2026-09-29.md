@@ -51,7 +51,7 @@ bullet, at the commit above. The rows were surveyed read-only. The claims marked
 | 1 | Free-space anchor and exponent | SIMesh | upstream | keep; sweep n through the geodata's exponent |
 | 2 | ITU-R P.1812-8 terrain | SIMesh (its planner copy) | upstream, on packs | add a `loc_pct` pass-through, default 90 |
 | 3 | P.2108 clutter | SIMesh = planner (§3.1 only) | upstream, on packs | keep |
-| 4 | Building entry | SIMesh (P.2109 median at an indoor end) | upstream, on packs | keep; the Berlin measurement is an open question |
+| 4 | Building entry | SIMesh (P.2109 median at an indoor end) | upstream, on packs | keep; the indoor measurement is planner, unpublished |
 | 5 | Near field | SIMesh | upstream | keep |
 | 6 | Antenna height, gain, pattern | SIMesh | upstream | keep |
 | 7 | Shadowing | ours (`feat/shadowing`, rnscale) | branch, on the removed ether | re-implement as a layer on the tables, off by default |
@@ -102,7 +102,7 @@ bullet, at the commit above. The rows were surveyed read-only. The claims marked
   - It carries the same P.1812-8 implementation (`crates/planner-propag/src/p1812/`, module map at `mod.rs:7-14`), with validity checks at `mod.rs:126-151`.
   - It is validated black-box against Py1812: 108 of 108 vectors within 0.1 dB (`README.md:17`).
   - Its `/link.json` runs one direction.
-  - The query is `deny_unknown_fields` with no `erp_dbm`, `loc_pct` or `time_pct` (`crates/planner-web/src/main.rs:2435-2458` ✓).
+  - The query is `deny_unknown_fields` with no `erp_dbm`, `loc_pct` or `time_pct` (`crates/planner-web/src/main.rs:2435-2458` ✓). `loc_pct` is a committed model parameter, default 90 (`crates/planner-core/src/model.rs`), that the query does not expose. `erp_dbm` exists only as an uncommitted change in a local planner tree: planner, unpublished.
 - **mesh, reticulum:** no terrain. mesh adds 3 dB per 50 m of height difference and checks no line of sight (`crates/emulator/src/propagation.rs:335-344`).
 - **Verdict:** SIMesh, whose planner copy is ahead of planner on reciprocity.
   - The tables are 90 %-of-locations values. The shadowing layer (row 7) must start from a median, or location variability is counted twice. P.1812's own term at 90 % is at most about 2.5 dB (1.28·σ_L, with σ_L ≈ 1.96 dB at w_a = 100 m; `planner/crates/planner-propag/src/p1812/location.rs:8-35`).
@@ -126,9 +126,10 @@ bullet, at the commit above. The rows were surveyed read-only. The claims marked
 - **planner:** has P.2109-2, Table 1, with its σ (`crates/planner-core/src/entry_loss.rs:46-54, 188-220`), but only the web census uses it (`crates/planner-web/src/main.rs:3486-3489`).
 - **mesh:** the clutter constants of row 3.
 - **Measurement.** The one Berlin measurement named for this work is 35 indoor links, 28–511 m: P.1812 optimistic by a median 19.6 dB, and a fitted multi-wall law with a leave-one-out RMSE of 7.4 dB.
-  - Neither the data nor the fit is on any planner ref, or in SIMesh or mesh.
+  - The write-up and the model code exist only uncommitted in a local planner tree: planner, unpublished.
+  - The survey logs hold a receiver's home position. Neither they nor anything derived from them comes into this fork.
   - A multi-wall fitter with no data beside it is in reticulum (`tools/bench/multiwall.py` at `2783599`). It compares log-distance, FSPL + wall losses, and both, by leave-one-out error.
-- **Verdict:** SIMesh. Whether the measurement can be used to validate P.1812 plus P.2109 is an open question.
+- **Verdict:** SIMesh. Validating P.1812 plus P.2109 against the measurement waits until the planner owners publish it.
 
 ### 5. Near field
 
@@ -359,7 +360,7 @@ bullet, at the commit above. The rows were surveyed read-only. The claims marked
   - Tables are cached per geometry, and a new nodeset reuses the nearest cached table (`testbed/losses.py:554-640`).
   - Packs are built from public sources by `planner-job pack-build` (`INTERNALS.md:597-660`).
 - **planner:** no pairwise export.
-  - `site_pair_loss` is on no ref and in no working tree, neither in planner nor in SIMesh's copy.
+  - `site_pair_loss` exists only as an uncommitted change in a local planner tree: planner, unpublished. It is on no ref, and not in SIMesh's copy.
   - The nearest code is the private `backbone_graph`, which discards pairs over their budget and gives NaN under 250 m (`crates/planner-coverage/src/gaps.rs:1236-1404`).
 - **branches**
   - `feat/links` is superseded by SLT1.
@@ -468,8 +469,8 @@ These are proposals; planner is read-only here.
    - `loc_pct`, `time_pct` and frequency as inputs;
    - model and near-field flags per cell.
 
-   SIMesh's `testbed/losses.py` is already its consumer. It would replace two requests per pair.
-2. **`/link.json` gets `loc_pct` and `time_pct`.** It has neither, and no `erp_dbm` either at `f3d897a`. The brief expected `erp_dbm` to be committed.
+   SIMesh's `testbed/losses.py` is already its consumer. It would replace two requests per pair. The unpublished `site_pair_loss` may be where this starts; publishing it is the planner owners' call.
+2. **`/link.json` gets `loc_pct` and `time_pct`.** Both are model parameters, and the query exposes neither. `erp_dbm` is unpublished (row 2).
 3. **SIMesh's planner copy has moved on:** both-way means, and P.2109 at an indoor end. The two should be reconciled.
 4. **`sensitivity.db_per_m_*`** compares a loss that includes A_h against a P.1812-only probe (`crates/planner-web/src/main.rs:2954-2963`). It looks inflated.
 5. **Housekeeping:**
@@ -510,6 +511,5 @@ Most consequential first. Each item is one topic, with tests, off by default unl
 
 ## Open questions
 
-- **Fixes and the off-by-default rule.** The chip fixes (`fix/preamble-found`, the SNR clamp, `fix/late-listeners`) change what existing scenarios do. That is their point, and upstream they are unconditional. Under the off-by-default rule they get switches, off by default. Should they be on by default instead?
-- **The indoor measurement.** Where are the 35 indoor links and the multi-wall fit (row 4)?
+- **Fixes and the off-by-default rule.** The chip fixes (`fix/preamble-found`, the SNR clamp, `fix/late-listeners`) change what existing scenarios do. That is their point, and upstream they are unconditional. Here they get switches, off by default, until Sergey decides otherwise.
 - **The late stronger frame (row 10).** No measurement covers a late frame 6 dB or more stronger. That is a bench question for Rop and us.
