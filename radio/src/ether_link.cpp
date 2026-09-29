@@ -165,7 +165,15 @@ void handleMessage(const char* text, size_t len)
 
 void etherPublishFloor(bool station)
 {
-    if (!conductor::isVirtual() || !conductor::joined()) return;
+    if (!conductor::isVirtual()) return;
+    /* A host can write to the door before the welcome has landed (the door
+     * is open before the hello, and the testbed starts talking at the
+     * hello): wait for it, or the floor would be lost, and T held for a tool
+     * that is waiting on a station that cannot move. Raw sleeps, as below. */
+    struct timespec ms = {0, 1000 * 1000};
+    for (int i = 0; i < kJoinWaitMs && !conductor::joined(); i++)
+        syscall(SYS_nanosleep, &ms, nullptr);
+    if (!conductor::joined()) return;
     uint64_t answered = s_floorRuns.load();
     char line[96];
     int n = snprintf(line, sizeof line, "{\"type\":\"floor\",\"sid\":%d,\"to\":\"%s\"}",
