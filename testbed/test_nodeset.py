@@ -99,6 +99,17 @@ def test_a_number_no_file_could_hold_is_refused_where_it_is_read(tmp_path):
             nodeset.read(str(path))
 
 
+def test_offsets_are_a_list_and_an_offsets_ends_a_list_of_nodes(tmp_path):
+    # A string's letters were read as the ends: `ab` joined nodes a and b.
+    head = "nodes:\n  a: { id: 1, lat: 0, lon: 0 }\n  b: { id: 2, lat: 0, lon: 0.01 }\n"
+    for text, match in (("offsets:\n  - { between: ab, db: 3 }\n", "an offset is"),
+                        ("offsets: 5\n", "offsets is a list")):
+        path = tmp_path / "f.yaml"
+        path.write_text(head + text)
+        with pytest.raises(store.StoreError, match=match):
+            nodeset.read(str(path))
+
+
 def test_edits_mark_it_dirty_and_ids_are_the_lowest_free(nodesets_dir):
     ns = nodeset.create("new")
     assert ns.add_node("a", 0.0, 0.0)["id"] == 1
