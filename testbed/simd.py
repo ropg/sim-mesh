@@ -530,12 +530,16 @@ class Simd:
         return True
 
     def ether_tx(self, sid, eid, freq, t_start, t_end):
+        if not self.heard_loud():
+            return
         name = self.name_of(sid)
         if name is not None:
             self.broadcast({"type": "tx", "name": name, "eid": eid, "freq": freq,
                             "t_start": t_start, "t_end": t_end})
 
     def ether_rx(self, sid, from_sid, eid, verdict, level):
+        if not self.heard_loud():
+            return
         name, sender = self.name_of(sid), self.name_of(from_sid)
         if name is not None and sender is not None:
             self.broadcast({"type": "rx", "name": name, "from": sender,
@@ -543,6 +547,8 @@ class Simd:
 
     def ether_station(self, sid, state):
         """A station said what its radio is doing; the map draws only the carrier."""
+        if not self.heard_loud():
+            return
         name = self.name_of(sid)
         if name is None:
             return
@@ -977,11 +983,18 @@ class Simd:
             # yields, so what it does about the answer it does at this T.
             self.driver_ids.discard(message["id"])
             self.take_floor()
-        text = json.dumps(message)
         loud = message.get("type") in LOUD
-        for socket, quiet in list(self.pages.items()):
-            if not (quiet and loud):
-                asyncio.ensure_future(self.send_page(socket, text))
+        pages = [socket for socket, quiet in self.pages.items() if not (quiet and loud)]
+        if not pages:
+            return
+        text = json.dumps(message)
+        for socket in pages:
+            asyncio.ensure_future(self.send_page(socket, text))
+
+    def heard_loud(self):
+        """Whether a page takes what the medium does, frame by frame (LOUD):
+        a run driven by a quiet socket alone need not be told it."""
+        return not all(self.pages.values())
 
     async def send_page(self, socket, text):
         try:
