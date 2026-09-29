@@ -296,6 +296,7 @@ class Simd:
         # until it says `yield`, having nothing left to do but wait on simd.
         self.driver = None
         self.driver_floor = False
+        self.floor_turn = 0                 # moves each time the driver is given the floor
         self.driver_ids = set()             # its requests not yet answered
         self.status_changed = asyncio.Event()   # a station's status moved (`wait` for up)
         self.stopping = False
@@ -1003,9 +1004,22 @@ class Simd:
 
     def take_floor(self):
         """The driver has the floor: T stands until it yields."""
+        self.floor_turn += 1
         if self.driver is not None and not self.driver_floor and self.virtual:
             self.driver_floor = True
             self.ether.holds += 1
+
+    def driver_yields(self):
+        """The driver has nothing left to do but wait on us: it lets go once
+        everything it sent before has been set going (settle), so what it
+        asked for is put at the T it asked at; not if it has been answered
+        again meanwhile, which gives it the floor for that answer."""
+        turn = self.floor_turn
+
+        def let_go():
+            if self.floor_turn == turn:
+                self.give_floor()
+        self.ether.settle(let_go)
 
     def give_floor(self):
         """The driver yields, or has gone: T runs again."""
@@ -1704,10 +1718,16 @@ class Simd:
                         continue
                     if kind == "yield":
                         if socket is self.driver:
-                            self.give_floor()
+                            self.driver_yields()
                         continue
-                    if socket is self.driver and msg.get("id") is not None:
-                        self.driver_ids.add(msg["id"])
+                    if socket is self.driver:
+                        # Each of the driver's requests is set going at
+                        # once, in order, so its `yield` finds them all under
+                        # way (and one waiting on T does not hold up the rest).
+                        if msg.get("id") is not None:
+                            self.driver_ids.add(msg["id"])
+                        asyncio.ensure_future(self.handle(msg))
+                        continue
                     work.put_nowait(msg)
         finally:
             self.pages.pop(socket, None)
