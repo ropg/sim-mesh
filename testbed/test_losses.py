@@ -282,6 +282,22 @@ def test_a_changed_nodeset_computes_only_the_pairs_the_cache_has_not(stores):
     assert losses.nearest_cached(geodata.load("flat"), ns, "868") == (None, None)
 
 
+def test_a_renamed_nodes_row_and_column_are_computed_again(stores):
+    """A table finds a node by its name, so the name is part of the geometry:
+    a rename is a new key, and the renamed node is one the cached table does
+    not have, whatever else it shares with a node there."""
+    gd, ns = geodata.load("flat"), nodeset.load("three")
+    asyncio.run(losses.compute(gd, ns, "868"))
+    ns.rename_node("c", "charlie")
+    said, totals = [], []
+    path, hit = asyncio.run(losses.compute(gd, ns, "868", progress=lambda d, t: totals.append(t),
+                                           notice=said.append))
+    assert not hit and path == losses.cache_path("flat", ns.geometry_hash(), "868")
+    assert said == ["3 of 4 nodes' pairs are from a cached table; computing those of the other 1"]
+    assert set(totals) == {3}                              # the pairs touching charlie
+    assert "charlie" in slt.Table.read(path).names
+
+
 def test_one_nodes_row_and_column_are_recomputed_into_a_copy(stores):
     gd, ns = geodata.load("flat"), nodeset.load("three")
     table = losses.synthetic_table(gd, ns, "868")

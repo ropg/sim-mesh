@@ -783,7 +783,9 @@ band; the ether adds `20·log10(f/f0)` per frame to move it to the frame's own
 carrier. It is derived, never edited, and cached under
 `testbed/losses/<geodata>/<nodeset geometry>/<band>.bin` (`<band>-loc50.bin`
 for a pack at `loc_pct: 50`), keyed by what it depends on: the geodata's
-content and the nodeset's node set, positions and heights. Names, ids,
+content and the nodeset's nodes by name, their positions and heights. A
+table finds a node by its name, so a renamed node's row and column are
+computed again, every other pair coming from the table cached before. Ids,
 antennas, firmware, radios, tags, offsets, links and a geodata's shadowing
 leave it alone: they are layers put on it when the medium is given it.
 [LOSSTABLE.md](LOSSTABLE.md) is the file format. A simulation computes a
