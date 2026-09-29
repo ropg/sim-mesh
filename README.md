@@ -768,9 +768,12 @@ Its messages are the `send_msg` meta command, its identities the `address`
 one and its warm-up the `announce` one, so it runs on any firmware that says
 them. Its first-boot lines give each station what taking part needs, an
 LXMF identity. Its report is the delivery `delivery.py` counts from the
-senders' logs, which is Reticulous's for now: overall, by route and radio
-hops and by size, the latency, and the undelivered by the sender's last
-line; it says so plainly when no station had an LXMF identity to send from.
+senders' logs, each sender by its own station's (Reticulous by the message
+id its send answered; the reticulum project's station, configured with
+rncfg, by the first message its log shows to that recipient once the send
+was due, and the proof that closes it): overall, by route and radio hops and
+by size, the latency, and the undelivered by the sender's last line; it says
+so plainly when no station had an LXMF identity to send from.
 
 ## Loss tables
 

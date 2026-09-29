@@ -1,5 +1,9 @@
 """Delivery of LXMF messages, from the senders' logs.
 
+Each sender is counted by its own station's logs. A station configured with
+rncfg, the reticulum project's, logs no message id and is read by
+`rncfg_delivery`; what follows is Reticulous's.
+
 A message is proven delivered when its sender logs `delivered mid=<mid>`
 (`DIRECT delivered`, `DIRECT resource delivered`, …) for the mid its `lxmf
 send` answered with. `analyse` counts a traffic driver's sends by:
@@ -175,23 +179,36 @@ def analyse(drive, logs, adj, forwarders):
 
 def analyse_run(traffic_path, run_dir):
     """A traffic run's figures: (the driver's result, figures, rows), counted
-    against the run's own record, logs and radio graph. Raises ValueError
-    when the record holds no epoch (a run not in virtual time)."""
+    against the run's own record, logs and radio graph, each sender by its
+    own station's logs: Reticulous's by the mid its send answered, a station
+    configured with rncfg by `rncfg_delivery`, its sends keyed by their
+    marker and timed from when they were due. Raises ValueError when a
+    Reticulous sender's logs cannot be placed in T, the record holding no
+    epoch (a run not in virtual time)."""
     import json
 
     from simesh import record
+    from simesh.reticulum import rncfg_delivery
     from simesh.view import RunView
 
     with open(traffic_path, encoding="utf-8") as handle:
         drive = json.load(handle)
     view = RunView(run_dir)
-    epoch = record.epoch_of(view.record_path)
-    if epoch is None:
-        raise ValueError("%s has no welcome line: not a virtual-time record" % view.record_path)
-    year = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).year
-    logs = read_logs(view.dir, epoch, year)
+    rncfg = {name for name in view.nodes if view.kind_type(name) in rncfg_delivery.KIND_TYPES}
+    sends = [dict(s, mid=s["marker"], t_sent=round(rncfg_delivery.due(drive, s) * 1e6))
+             if s["src"] in rncfg else s for s in drive.get("sends", [])]
+    logs = {}
+    if any(s["src"] not in rncfg for s in sends):
+        epoch = record.epoch_of(view.record_path)
+        if epoch is None:
+            raise ValueError("%s has no welcome line: not a virtual-time record"
+                             % view.record_path)
+        year = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).year
+        logs.update(read_logs(view.dir, epoch, year))
+    logs.update(rncfg_delivery.read_logs(view.dir, [s for s in sends if s["src"] in rncfg],
+                                         drive, view.ids))
     graph = view.radio_graph(view.calling_hz())
     adj = {view.names[a]: {view.names[b] for b in bs} for a, bs in graph.items()}
     forwarders = {view.names[s] for s in view.forwarders()}
-    out, rows = analyse(drive, logs, adj, forwarders)
+    out, rows = analyse(dict(drive, sends=sends), logs, adj, forwarders)
     return drive, out, rows

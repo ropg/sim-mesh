@@ -324,6 +324,63 @@ def test_delivery(run, tmp_path):
     assert [r["radio_hops"] for r in rows] == [1, 1, 2]
 
 
+def test_delivery_counts_each_sender_by_its_own_stations_logs(tmp_path):
+    """A station configured with rncfg logs no message id: a send is the first
+    message its sender logged to that recipient from when it was due, a proof
+    closes it, and a log is placed in T at the station's hello, a restart's
+    section at its own. When a send was due is the driver's schedule, not when
+    its tool answered."""
+    run = lay_out(tmp_path, kind="sergeyculum")
+    with open(os.path.join(run.dir, "record.tsv"), "a", encoding="utf-8") as handle:
+        handle.write("30.000000\tin\t4\t%s\n" % json.dumps(
+            {"type": "hello", "sid": 4, "slots": [0], "t": 0}, separators=(",", ":")))
+    boot = "  0.000000 [INFO] simesh 0.1: station %d in d, bound to a, ether e"
+    logs = {
+        "n01": [boot % 1,
+                "  5.100000 [INFO] [lxmf] sent 42 B to 02020202 iface0 — waiting for its proof",
+                "  7.300000 [INFO] [lxmf] the message to 02020202 was delivered (proof ok)",
+                " 20.500000 [INFO] [lxmf] sent 42 B to 02020202 iface0 — waiting for its proof",
+                " 50.000000 [WARN] [lxmf] no proof for the message to 02020202 after 3 attempt(s)"
+                " — giving up on it"],
+        "n02": [boot % 2,
+                "  5.900000 [INFO] [lxmf] nobody answered for 01010101 — the held message is "
+                "dropped"],
+        "n04": [boot % 4,
+                "  1.000000 [INFO] [lxmf] sent 42 B to 03030303 iface0 — waiting for its proof",
+                boot % 4,
+                "  2.000000 [INFO] [lxmf] sent 42 B to 03030303 iface0 — waiting for its proof",
+                "  4.000000 [INFO] [lxmf] the message to 03030303 was delivered (proof ok)"]}
+    for name, lines in logs.items():
+        os.makedirs(run.node_dir(name), exist_ok=True)
+        with open(os.path.join(run.node_dir(name), "log"), "w") as handle:
+            handle.write("\n".join(lines) + "\n")
+    dests = {"n01": "01" * 16, "n02": "02" * 16, "n03": "03" * 16, "n04": "04" * 16}
+    # Traffic starts at T 3 s, so a send is due at 4 s + its `at`. The first
+    # one's tool answered only when the proof was in, at 7.4 s.
+    drive = {"dests": dests, "phases": [["traffic_start", 0.0, 3_000_000]], "sends": [
+        {"marker": "G0001", "src": "n01", "dst": "n02", "cls": "short", "hops": 1,
+         "at": 1.0, "t_sent": 7_400_000},
+        {"marker": "G0002", "src": "n02", "dst": "n01", "cls": "two", "hops": None,
+         "at": 2.0, "t_sent": 6_000_000},
+        {"marker": "G0003", "src": "n03", "dst": "n04", "cls": "big", "at": 3.0,
+         "t_sent": 7_000_000, "reply": "error: send: this board has heard no announce"},
+        {"marker": "G0004", "src": "n01", "dst": "n02", "cls": "short", "hops": 1,
+         "at": 16.0, "t_sent": 20_000_000},
+        {"marker": "G0005", "src": "n04", "dst": "n03", "cls": "short", "hops": 1,
+         "at": 27.5, "t_sent": 31_500_000}]}
+    path = tmp_path / "traffic.json"
+    path.write_text(json.dumps(drive))
+    code, text = call(delivery.main, [str(path), run.dir])
+    out = json.loads(text)
+    assert code == 0 and out["sent"] == 5 and out["delivered"] == 2
+    assert out["latency_s"]["min"] == pytest.approx(2.3)        # 7.3 after it was due at 5.0
+    assert out["latency_s"]["max"] == pytest.approx(2.5)        # the restart's: 30 + 4 - 31.5
+    words = dict(out["undelivered_last_word"])
+    assert words.get("gave up") == 1
+    assert words.get("no path: nobody answered") == 1
+    assert any(w.startswith("not sent: error: send") for w in words)
+
+
 # ---- the traffic driver, against a stand-in simd ------------------------
 
 class FakeSim:
