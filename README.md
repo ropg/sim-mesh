@@ -68,9 +68,10 @@ mkdir mesh && cd mesh
 git clone https://github.com/reticulous/SIMesh.git
 ```
 
-**2. Build** the page, the chip library and the planner (SIMesh's own, in
-`planner/`; without cargo it is left out, SIMesh says so, and synthetic
-ground works):
+**2. Build** the page, the chip library, the ether's conductor and the
+planner (SIMesh's own, in `planner/`; without cargo the last two are left
+out, SIMesh says so, synthetic ground works and the ether's Python conductor
+runs virtual time):
 
 ```sh
 SIMesh/simesh build
@@ -1726,7 +1727,7 @@ None needs firmware, a planner or a network:
 
 ```sh
 cd SIMesh/testbed && python3 -m pytest -q      # the stores, the devices, the front, simd, the kinds, the library, the tools
-cd SIMesh/ether   && python3 -m pytest -q      # the medium, over real UDP and in-process
+cd SIMesh/ether   && python3 -m pytest -q      # the medium and both conductors, over real UDP and in-process
 cd SIMesh/radio   && python3 -m pytest -q tests  # the chip model, the conductor, the time shim
 cd SIMesh/testbed/ui && npx vue-tsc --noEmit && npx quasar build
 ```

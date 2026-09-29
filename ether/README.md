@@ -311,6 +311,18 @@ sends — a `state`, a `tx`, a second `hello` — means it is not idle.
 - **A station that restarts** says `hello` again, and everything it had
   scheduled or said goes with its old process.
 
+The conductor is the barrier above, and most of what the ether does in a
+virtual-time run: a few microseconds of work at every one of hundreds of
+thousands of instants. [`core/`](core/) does it in Rust (`simesh build
+ether`, into `build/`), in the event loop's thread, on the ether's socket:
+T, the stations' numbering and idles, the resend buffer, the barrier itself,
+and whether the stations that just ran printed anything. Everything else —
+the medium, the ether's timers, hello, the channels, the testbed's holds —
+stays in `ether.py`, called at the same points as before, so the run is the
+same: `Ether`'s own conductor is the reference, and the two give the same
+record. `SIMESH_ETHER_CORE=python` runs `Ether`'s, `rust` the core (an error
+when it is not built); unset, the core runs when it is built.
+
 A station that stays busy cannot stop T for good: its own side reports idle
 after 20 ms of wall time with nothing to show for it (the busy watchdog in
 [`../radio/src/conductor.cpp`](../radio/src/conductor.cpp)), once none of its
