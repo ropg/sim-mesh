@@ -113,9 +113,10 @@ def flow(value):
 
 def write_text(path, text):
     """Write a file whole, through a temporary beside it, so a reader never
-    sees half of one."""
+    sees half of one; this process's own, so a writer in another does not
+    rename it away."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     with open(tmp, "w", encoding="utf-8") as handle:
         handle.write(text)
     os.replace(tmp, path)

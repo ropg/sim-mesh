@@ -632,3 +632,23 @@ def test_a_pack_has_only_the_868_table(stores):
         asyncio.run(losses.pack_table(gd, ns, "433", "http://127.0.0.1:1"))
     with pytest.raises(losses.LossError, match="sidecar"):
         asyncio.run(losses.pack_table(gd, ns, "868", None))
+
+
+def test_two_processes_writing_one_table_do_not_trip_over_each_other(tmp_path):
+    """Two runs of one checkout may write the same cached table at once: each
+    through a temporary of its own."""
+    import subprocess
+    import sys
+    code = ("import sys; sys.path.insert(0, %r)\n"
+            "import losses, slt\n"
+            "class T:\n"
+            "    def write(self, p):\n"
+            "        open(p, 'wb').write(b'x' * 4096)\n"
+            "for _ in range(200):\n"
+            "    losses.write_table(T(), %r)\n") % (os.path.dirname(os.path.abspath(__file__)),
+                                               str(tmp_path / "t.bin"))
+    procs = [subprocess.Popen([sys.executable, "-c", code], stderr=subprocess.PIPE)
+             for _ in range(2)]
+    errors = [p.communicate()[1].decode() for p in procs]
+    assert [p.returncode for p in procs] == [0, 0], errors
+    assert (tmp_path / "t.bin").read_bytes() == b"x" * 4096

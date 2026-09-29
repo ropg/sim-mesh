@@ -89,7 +89,7 @@ class Sweeps:
             data = await self.sweep(sidecar, gd, node, rx_h, radius_km)
             path = cache_path(gd.name, raster_key)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".tmp"
+            tmp = "%s.%d.tmp" % (path, os.getpid())
             with open(tmp, "wb") as handle:
                 handle.write(data)
             os.replace(tmp, path)
