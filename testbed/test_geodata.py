@@ -110,6 +110,19 @@ def test_a_geodata_file_must_say_what_it_is(tmp_path):
         geodata.geodata_path("Not A Name")
 
 
+def test_a_ground_figure_no_file_could_hold_is_refused(tmp_path):
+    # NaN and infinity read as numbers, and store.scalar cannot write them;
+    # a NaN extent also passed the check that it is above 0.
+    path = tmp_path / "g.yaml"
+    for ground, match in (("{ exponent: .nan }", "exponent is a number, not nan"),
+                          ("{ exponent: -.inf }", "exponent is a number, not -inf"),
+                          ("{ extent_m: .nan }", "extent_m is a number, not nan"),
+                          ("{ extent_m: .inf }", "extent_m is a number, not inf")):
+        path.write_text("synthetic: %s\n" % ground)
+        with pytest.raises(store.StoreError, match=match):
+            geodata.read(str(path))
+
+
 def test_a_copied_pack_still_names_its_pack(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
     pack = write_pack(tmp_path)

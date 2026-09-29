@@ -390,9 +390,11 @@ and each is its own file so that changing one leaves the others alone:
   nodeset serves scripts that differ by a few lines;
 - the **loss table** follows from the geodata and the nodeset's geometry and
   from nothing else, so it is derived and cached under a hash of exactly
-  those, and relabelling a node, changing its antenna, role, radio,
-  firmware, offsets or links, the geodata's shadowing, or the script, never
-  recomputes it.
+  those: which nodes, by name, where and how high. Changing a node's
+  antenna, role, radio, firmware, offsets or links, the geodata's
+  shadowing, or the script never recomputes it. A table finds a node by its
+  name, so relabelling one does: its row and column are computed again, and
+  every other pair comes from the table cached before.
 
 **A firmware rule is a condition, kept.** `firmware(which, device)` holds
 its selection as a condition over each node's facts (`simesh.select`), not

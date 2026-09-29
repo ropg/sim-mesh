@@ -179,19 +179,34 @@ def parse(data, where):
         if "board" in node:
             raise store.StoreError("%s: a node has no board: every node is an SX1262, and "
                                    "`max_dbm` is its maximum power" % here)
-        out["nodes"][name] = node_record(
+        record = node_record(
             node_id, lat, lon, node.get("height_m", DEFAULT_HEIGHT_M), height_from,
             antennas_module.check(node.get("antenna"), here), check_tags(node.get("tags")),
             boards_module.check(node.get("max_dbm"), here))
-    for offset in data.get("offsets") or []:
+        for key in ("lat", "lon", "height_m"):
+            if not math.isfinite(record[key]):
+                raise store.StoreError("%s: %s is a finite number, not %r"
+                                       % (here, key, record[key]))
+        out["nodes"][name] = record
+    offsets = data.get("offsets") or []
+    if not isinstance(offsets, list):
+        raise store.StoreError("%s: offsets is a list, each { between: [a, b], db, note? }"
+                               % where)
+    for offset in offsets:
         try:
-            a, b = (str(n) for n in list(offset["between"])[:2])
+            ends = offset["between"]
+            if not isinstance(ends, (list, tuple)):
+                raise TypeError("not a list of nodes")      # a string's letters are no nodes
+            a, b = (str(n) for n in list(ends)[:2])
             db = float(offset.get("db", 0))
         except (KeyError, TypeError, ValueError) as err:
             raise store.StoreError("%s: an offset is { between: [a, b], db, note? }" % where) from err
         for end in (a, b):
             if end not in out["nodes"]:
                 raise store.StoreError("%s: offset names %s, which is not a node" % (where, end))
+        if not math.isfinite(db):
+            raise store.StoreError("%s: the offset between %s and %s states db %s: an offset "
+                                   "is a finite number of dB" % (where, a, b, db))
         entry = {"between": [a, b], "db": db}
         if offset.get("note"):
             entry["note"] = str(offset["note"])
@@ -287,7 +302,7 @@ def dump_node(name, node):
         parts.append("max_dbm: %s" % store.scalar(node["max_dbm"]))
     parts.append("antenna: %s" % dump_antenna(node["antenna"]))
     parts.append("tags: %s" % store.flow(node["tags"]))
-    return "  %s: { %s }" % (name, ", ".join(parts))
+    return "  %s: { %s }" % (store.name_scalar(name), ", ".join(parts))
 
 
 def dump(data, comment=None):
@@ -307,7 +322,8 @@ def dump(data, comment=None):
     for offset in offsets:
         note = ", note: %s" % store.scalar(offset["note"]) if offset.get("note") else ""
         out.append("  - { between: [%s, %s], db: %s%s }"
-                   % (offset["between"][0], offset["between"][1], store.scalar(offset["db"]), note))
+                   % (store.name_scalar(offset["between"][0]),
+                      store.name_scalar(offset["between"][1]), store.scalar(offset["db"]), note))
     links = data.get("links") or []
     if links:
         out.append("links:")

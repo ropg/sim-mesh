@@ -1412,6 +1412,32 @@ def test_one_instant_is_ruled_in_station_order(conductor):
     assert [m["id"] for m in begins] == sorted(m["id"] for m in begins)
 
 
+def test_a_message_the_barrier_cannot_take_drops_only_itself(conductor):
+    conductor.link(1, 3, NEAR_DB)
+    conductor.link(2, 3, NEAR_DB)
+    bad, good, rx = conductor(1), conductor(2), conductor(3)
+    for st in (bad, good, rx):
+        join_virtual(st)
+    rx.state("RX")
+    for st in (rx, bad, good):
+        idle(st, 1, None)
+    # Station 1's frame states a start that is no number. It is taken first,
+    # in station order, and must not take station 2's at the same T with it.
+    for st, t0, payload in ((bad, "soon", b"bad"), (good, 0, b"good")):
+        st.send(dict({"type": "tx", "slot": 0, "id": 1, "t0": t0,
+                      "t_pre": FRAME_US // 10, "t_hdr": FRAME_US // 5,
+                      "t_end": FRAME_US, "power_dbm": POWER_DBM,
+                      "payload": base64.b64encode(payload).decode()}, **radio("TX")))
+    idle(bad, 1, None)
+    idle(good, 1, None)
+    begin = rx.expect("rx_begin")
+    assert "cad" not in begin
+    idle(rx, begin["seq"], None)
+    end = rx.expect("rx_end")
+    assert end["id"] == begin["id"] and base64.b64decode(end["payload"]) == b"good"
+    assert end["verdict"] == "clean"
+
+
 def test_a_station_that_leaves_restarts_with_a_hello(conductor):
     a, b = conductor(1), conductor(2)
     join_virtual(a)
