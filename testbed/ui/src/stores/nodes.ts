@@ -517,11 +517,14 @@ export const useNodes = defineStore('nodes', {
         const own = l.name === this.active || (l.name === 'unnamed' && this.active === '')
         const data = own ? this.nodeset : this.others[l.name]
         const nodes = data ? Object.fromEntries(Object.entries(data.nodes).filter(([, n]) => within(this.bbox, n))) : {}
-        // A link comes along where both its nodes do; the merge refuses one naming a node it has not.
+        // An offset or a link comes along where both its nodes do; the merge
+        // refuses one naming a node it has not, such as one off the geodata.
         const kept = new Set(Object.keys(nodes))
+        const held: Offset[] = data?.offsets ?? []
+        const offsets = held.filter(o => o.between.every(e => kept.has(e)))
         const stated: Link[] = data?.links ?? []
         const links = stated.filter(k => k.between.every(e => kept.has(e)))
-        return { name: l.name, data: data ? { nodes, offsets: data.offsets, ...(links.length ? { links } : {}) } : null }
+        return { name: l.name, data: data ? { nodes, offsets, ...(links.length ? { links } : {}) } : null }
       }).filter(l => l.data)
       if (!layers.length) return 'no layer is shown'
       const r = await request('nodeset_merge', { name, layers })
