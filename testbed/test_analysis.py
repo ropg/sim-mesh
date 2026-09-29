@@ -292,6 +292,20 @@ def test_compliance_over(tmp_path):
     assert "n04 sent 1 frame (0.2 s)" in text and "within PSA" in text
 
 
+def test_compliance_says_when_the_worst_hour_began_on_the_runs_clock(tmp_path):
+    """A real-time run: a station's `tx` states its own clock, here 1000 s
+    ahead of the record's, and the hour's start is told on the record's."""
+    run = lay_out(tmp_path)
+    rec = WallRecord()
+    rec.add(0.0, "in", 1, {"type": "hello", "sid": 1, "slots": [0], "t": 0})
+    sent(rec, 5.0, 1, data_packet(), 0.5, own=1000.0)
+    sent(rec, 65.0, 1, data_packet(), 0.5, own=1000.0)
+    rec.write(os.path.join(run.dir, "record.tsv"))
+    row = compliance.analyse(run.dir)["n01"]["rows"][0]
+    assert row["worst_hour_s"] == pytest.approx(1.0) and row["worst_hour_from"] == 5.0
+    assert "1.0 s (0.03 %) from T 00:00:05" in compliance.section(run.dir)
+
+
 def test_seq(run):
     code, text = call(seq.main, [run.dir])
     assert code == 0
