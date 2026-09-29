@@ -301,11 +301,21 @@ def shared_air(frames):
 
 def carrier_sense(record, air, pairs):
     """Every transmission that began over a frame on its carrier that its
-    sender could decode, one event per such frame."""
-    events = []
+    sender could decode, one event per such frame; and every two that began
+    at the same instant on one carrier where either sender could decode the
+    other, which no carrier sense can prevent (`together`)."""
+    events, together = [], []
     for g, f in pairs:
-        if g.start == f.start or g.sid == f.sid:
-            continue            # neither was on the air when the other began
+        if g.sid == f.sid:
+            continue
+        if g.start == f.start:
+            # Neither was on the air when the other began: both were in each
+            # other's blind window, at its very start.
+            if (ether_module.same_carrier(g.freq, f.freq, max(g.bw or 0, f.bw or 0))
+                    and (air.hears(f.sid, g) or air.hears(g.sid, f))):
+                together.append({"sid": g.sid, "other": f.sid,
+                                 "at": round(record.seconds(g.start), 6)})
+            continue
         if not ether_module.same_carrier(g.freq, f.freq, max(g.bw or 0, f.bw or 0)):
             continue
         if not air.hears(f.sid, g):
@@ -322,7 +332,7 @@ def carrier_sense(record, air, pairs):
             "told": how == "told", "told_late": how == "told late",
             "lock": any(b.lock for b in on_time), "window": window,
             "mode": record.mode_at(f.sid, f.slot, g.line)})
-    return events
+    return events, together
 
 
 def how_told(event):
@@ -375,7 +385,7 @@ def judge(view, record_path=None):
     air = Air(view.medium())
     record = Record(path, air.level)
     pairs = list(shared_air(record.frames))
-    events = carrier_sense(record, air, pairs)
+    events, together = carrier_sense(record, air, pairs)
     counts = {how: {window: 0 for window in WINDOWS} for how in HOW}
     for event in events:
         counts[how_told(event)][event["window"]] += 1
@@ -389,6 +399,7 @@ def judge(view, record_path=None):
         "untied": record.untied,
         "carrier_sense": events,
         "carrier_sense_counts": counts,
+        "began_together": together,
         "unheard": [{"sid": s, "freq": fr, "sf": sf, "bw": bw, "frames": n}
                     for (s, fr, sf, bw), n in sorted(silent.items(), key=lambda kv: tuple(
                         -1 if x is None else x for x in kv[0]))],
@@ -422,6 +433,11 @@ def render(report, view, detail=False):
     out += ["", "carrier sense: " + (
         "no " + what[2:] if not events else
         "%s, %s" % (what, "once" if len(events) == 1 else "%d times" % len(events)))]
+    together = report.get("began_together") or []
+    if together:
+        out.append("  and %d time%s two transmissions began at one instant on one carrier, "
+                   "a sender able to decode the other: no carrier sense can see that" % (
+                       len(together), "" if len(together) == 1 else "s"))
     if events:
         counts = report["carrier_sense_counts"]
         out.append("  %-12s%s" % ("", "".join("%10s" % w for w in WINDOWS)))
