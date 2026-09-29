@@ -202,7 +202,10 @@ class Sim:
                 else:
                     self.stations[m["name"]] = Station(m)
                 if m.get("status") == "up" and self.t_zero is not None:
-                    self.up.setdefault(m["name"], [time.time(), self.t])
+                    # The T the station came up at, as the message says it;
+                    # this socket's own `t` is only its last answer's.
+                    t = m.get("t")
+                    self.up.setdefault(m["name"], [time.time(), self.t if t is None else t])
             elif kind == "node_gone":
                 self.stations.pop(m.get("name"), None)
             elif kind == "command_result":
