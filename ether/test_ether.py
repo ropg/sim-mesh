@@ -1709,6 +1709,30 @@ def test_t_stands_at_a_hello_until_what_waited_for_it_has_run():
     in_process(test)
 
 
+def test_what_stations_say_at_one_instant_is_recorded_in_station_order(conductor):
+    """A virtual run's state and tx are taken at the barrier in station
+    order, and recorded then: the record does not depend on which of two
+    stations the host ran first."""
+    one, two = conductor(1), conductor(2)
+    seqs = {}
+    for station in (one, two):
+        seqs[station.sid] = station.hello()["seq"]
+        station.send({"type": "idle", "seq": seqs[station.sid], "until": None})
+    time.sleep(0.1)
+    two.state("RX")
+    one.state("RX")
+    time.sleep(0.1)
+    for station in (two, one):
+        station.send({"type": "idle", "seq": seqs[station.sid], "until": None})
+    time.sleep(0.2)
+    conductor.close()
+    lines = [line.split("\t") for line in conductor.record.read_text().splitlines()
+             if not line.startswith("#")]
+    states = [int(sid) for _, direction, sid, text in lines
+              if direction == "in" and '"type":"state"' in text]
+    assert states == [1, 2]
+
+
 def test_a_tool_session_holds_t_while_the_tool_has_the_floor():
     """tool_session(): T stands from the start until the station says it has
     read what the tool wrote (`floor` to the station), runs while the
