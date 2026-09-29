@@ -631,6 +631,7 @@ class Ether(asyncio.DatagramProtocol):
         self.busy_count = 0         # stations not idle since they were last told anything
         self.pending = []           # (sid, arrival, addr, msg) held for the barrier
         self.holds = 0              # the testbed's own work in hand at the T it has
+        self.floors = {}            # sid -> "tool" | "station": a testbed tool's session with it
         self.settling = []          # callbacks for when the loop is next quiet
         self.settle_turns = 0
         self.channels = {}          # key -> Channel with bytes in it, or owed some
@@ -715,6 +716,46 @@ class Ether(asyncio.DatagramProtocol):
         """One hold on T is let go."""
         self.holds -= 1
         self.kick()
+
+    # ---- a testbed tool talking to a station ------------------------------
+
+    def tool_session(self, sid):
+        """A tool of the testbed's is about to talk to station `sid` on the
+        wall clock, through the station's host door: T stays where it is while
+        the tool has the floor, and runs while the station has it (from when
+        it has read what the tool wrote until it has answered, `floor`), so
+        each line is read and answered at a T the run decides, however long
+        the tool takes on the host. Returns the function that ends the
+        session, which lets T go once what that set going has run."""
+        if not self.clock.virtual:
+            return lambda: None
+        if sid in self.floors:
+            raise RuntimeError("station %d is already in a tool session" % sid)
+        self.floors[sid] = "tool"
+        self.holds += 1
+
+        def end():
+            floor = self.floors.pop(sid, None)
+            if floor == "tool":
+                self.settle(self.release)
+        return end
+
+    def recv_floor(self, sid, addr, msg):
+        """The station's host door changed hands. It said something, so it is
+        not idle until it says so; a floor outside a tool session is no
+        testbed's and holds nothing."""
+        station = self.stations.get(sid)
+        if station is None:
+            return
+        station.addr = addr
+        self.mark(station, False)
+        floor, to = self.floors.get(sid), msg.get("to")
+        if floor == "tool" and to == "station":
+            self.floors[sid] = "station"
+            self.holds -= 1
+        elif floor == "station" and to == "tool":
+            self.floors[sid] = "tool"
+            self.holds += 1
 
     def settle(self, callback):
         """Run `callback` once the loop has nothing else ready to run.
@@ -1344,7 +1385,7 @@ class Ether(asyncio.DatagramProtocol):
             return
         sid = msg.get("sid")
         kind = msg.get("type")
-        if kind not in ("idle", "wrote", "read"):
+        if kind not in ("idle", "wrote", "read", "floor"):
             self.write_record("in", sid, msg)
         if not isinstance(sid, int):
             return
@@ -1359,6 +1400,8 @@ class Ether(asyncio.DatagramProtocol):
             self.recv_idle(sid, msg)
         elif kind in ("wrote", "read"):
             self.recv_io(sid, addr, msg)
+        elif kind == "floor":
+            self.recv_floor(sid, addr, msg)
         elif kind in ("state", "tx"):
             # Held for the barrier, and taken in station order there, so two
             # stations acting at one instant are ruled on the same way every
