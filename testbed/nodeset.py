@@ -188,9 +188,16 @@ def parse(data, where):
                 raise store.StoreError("%s: %s is a finite number, not %r"
                                        % (here, key, record[key]))
         out["nodes"][name] = record
-    for offset in data.get("offsets") or []:
+    offsets = data.get("offsets") or []
+    if not isinstance(offsets, list):
+        raise store.StoreError("%s: offsets is a list, each { between: [a, b], db, note? }"
+                               % where)
+    for offset in offsets:
         try:
-            a, b = (str(n) for n in list(offset["between"])[:2])
+            ends = offset["between"]
+            if not isinstance(ends, (list, tuple)):
+                raise TypeError("not a list of nodes")      # a string's letters are no nodes
+            a, b = (str(n) for n in list(ends)[:2])
             db = float(offset.get("db", 0))
         except (KeyError, TypeError, ValueError) as err:
             raise store.StoreError("%s: an offset is { between: [a, b], db, note? }" % where) from err
