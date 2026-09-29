@@ -551,6 +551,38 @@ def test_delivery_counts_each_sender_by_its_own_stations_logs(tmp_path):
     assert any(w.startswith("not sent: error: send") for w in words)
 
 
+def test_a_send_is_its_own_outcome_however_late_and_a_refused_one_takes_none(tmp_path):
+    """A message held for a path, or behind a tool waiting on another's proof,
+    goes out long after it was due and is still that send's; a send the tool
+    refused takes nothing, so the next one keeps its own outcome."""
+    run = lay_out(tmp_path, kind="sergeyculum")
+    boot = "  0.000000 [INFO] simesh 0.1: station %d in d, bound to a, ether e"
+    os.makedirs(run.node_dir("n01"), exist_ok=True)
+    with open(os.path.join(run.node_dir("n01"), "log"), "w") as handle:
+        handle.write("\n".join([
+            boot % 1,
+            "300.000000 [INFO] [lxmf] sent 42 B to 02020202 iface0 — waiting for its proof",
+            "303.000000 [INFO] [lxmf] the message to 02020202 was delivered (proof ok)",
+            "400.000000 [INFO] [lxmf] nobody answered for 02020202 — the held message is dropped",
+        ]) + "\n")
+    dests = {"n01": "01" * 16, "n02": "02" * 16, "n03": "03" * 16, "n04": "04" * 16}
+    drive = {"dests": dests, "phases": [["traffic_start", 0.0, 3_000_000]], "sends": [
+        {"marker": "G0001", "src": "n01", "dst": "n02", "cls": "short", "at": 1.0},
+        {"marker": "G0002", "src": "n01", "dst": "n02", "cls": "short", "at": 2.0,
+         "reply": "! error: send: the board is already holding as many messages as it can"},
+        {"marker": "G0003", "src": "n01", "dst": "n02", "cls": "short", "at": 3.0,
+         "reply": "asking  : the board has no path yet and is asking for one"}]}
+    path = tmp_path / "traffic.json"
+    path.write_text(json.dumps(drive))
+    code, text = call(delivery.main, [str(path), run.dir])
+    out = json.loads(text)
+    assert code == 0 and out["sent"] == 3 and out["delivered"] == 1
+    assert out["latency_s"]["min"] == pytest.approx(298.0)     # due at 5, proved at 303
+    words = dict(out["undelivered_last_word"])
+    assert words.get("no path: nobody answered") == 1
+    assert any(w.startswith("not sent: ! error: send: the board is already holding") for w in words)
+
+
 def test_a_real_time_record_is_not_counted_for_rncfg_stations(tmp_path):
     """Their logs are placed in T at the hellos, which a real-time record
     stamps with the wall clock: refused rather than miscounted."""
