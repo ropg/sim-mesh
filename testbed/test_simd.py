@@ -201,6 +201,62 @@ def test_setup_is_the_name_then_the_first_boot_rules_in_order(stores):
     asyncio.run(go())
 
 
+def test_a_run_records_the_medium_it_was_started_on(stores):
+    """The noise figure, the rule and the seed go into the run, and the
+    analysis tools' medium takes its noise figure from there."""
+    async def go():
+        daemon = make_simd(stores, "--noise-figure", "4.5", "--seed", "77")
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three", **FAR})
+        run = daemon.run
+        assert run.meta["physics"] == {"noise_figure_db": 4.5, "pairwise": False}
+        assert run.meta["seed"] == 77
+        from simesh import view
+        assert view.RunView(run.dir).medium().physics.noise_figure_db == 4.5
+        await daemon.stop_all(flush=False)
+        daemon.ether.close()
+    asyncio.run(go())
+
+
+def test_each_station_keeps_its_own_clock_within_the_ppm_given(stores):
+    """--clock-ppm: a station's crystal is off by a draw within the bound,
+    its own, the same for the same seed and name; the kind hands it over in
+    a virtual run, and a device's own profile still wins."""
+    import types
+    daemon = make_simd(stores, "--time", "max", "--clock-ppm", "20")
+    daemon.ether = types.SimpleNamespace(seed=5, clock=types.SimpleNamespace(virtual=True),
+                                         epoch=0)
+    slopes = {}
+    for name in "abc":
+        text = daemon.clock_profile(name)
+        (t0, n0), (t1, n1) = [tuple(map(int, point.split(":"))) for point in text.split(",")]
+        assert (t0, n0) == (0, 0) and t1 == simd.CLOCK_HORIZON_US
+        slopes[name] = (n1 - t1) / t1 * 1e6
+        assert abs(slopes[name]) <= 20
+        assert daemon.clock_profile(name) == text
+    assert len({round(ppm, 3) for ppm in slopes.values()}) == 3
+    assert simd.drift_profile(-20) == "0:0,%d:%d" % (simd.CLOCK_HORIZON_US,
+                                                      simd.CLOCK_HORIZON_US - 51_840_000)
+
+    station = types.SimpleNamespace(node_id=1, dir="d", addr="a", ether_addr="e",
+                                    clock=daemon.ether, board=None,
+                                    clock_profile=daemon.clock_profile("a"))
+    assert Stub({}).env(station)["SIMESH_CLOCK_PROFILE"] == daemon.clock_profile("a")
+    own = Stub({"env": {"SIMESH_CLOCK_PROFILE": "0:0,1:2"}}).env(station)
+    assert own["SIMESH_CLOCK_PROFILE"] == "0:0,1:2"
+    daemon.args.clock_ppm = 0
+    assert daemon.clock_profile("a") is None
+    station.clock_profile = None
+    assert "SIMESH_CLOCK_PROFILE" not in Stub({}).env(station)
+
+
+def test_a_drifting_clock_needs_virtual_time():
+    with pytest.raises(SystemExit):
+        simd.parse_args(["--clock-ppm", "20"])
+    with pytest.raises(SystemExit):
+        simd.parse_args(["--time", "max", "--clock-ppm", "-1"])
+
+
 def test_moves_offsets_ids_and_levels(stores):
     async def go():
         daemon = make_simd(stores)

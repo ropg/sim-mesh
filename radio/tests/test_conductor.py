@@ -19,7 +19,7 @@ import pytest
 
 from test_model import (ALL_IRQ, GET_IRQ, HEADER_VALID, PIN_CB, PREAMBLE,
                         SET_DIO_IRQ_PARAMS, SET_PACKET_PARAMS, SET_RX, SET_TX,
-                        TX_DONE, WRITE_BUFFER, load_library, toa_seconds, PRE)
+                        SYNC, TSYM, TX_DONE, WRITE_BUFFER, load_library, toa_seconds, PRE)
 
 NEVER = None
 T_JOIN = 5_000_000
@@ -238,7 +238,8 @@ def test_a_run_reaching_a_model_timer_fires_it(virtual):
     assert frame(GET_IRQ, 0, 0, 0)[3] & TX_DONE
     assert edges and edges[-1] == 1
 
-    # A reception: the preamble and header land at their instants in T.
+    # A reception: the preamble is found four symbols in, and the sync word
+    # and the header land at their instants in T.
     frame(SET_RX, 0xFF, 0xFF, 0xFF)
     idle(lib, cond)
     t0 = cond.t + 1000
@@ -246,11 +247,17 @@ def test_a_run_reaching_a_model_timer_fires_it(virtual):
     cond.send({"type": "rx_begin", "t": t0, "slot": 0, "id": 5, "t0": t0,
                "t_pre": t0 + 60_000, "t_hdr": t0 + 100_000, "t_end": t0 + 250_000,
                "level": -80})
+    found = idle(lib, cond)["until"]
+    assert abs(found - (t0 + 4 * TSYM * 1e6)) <= 1
+    cond.run(found)
     assert idle(lib, cond)["until"] == t0 + 60_000
+    irq = frame(GET_IRQ, 0, 0, 0)
+    assert (irq[2] << 8 | irq[3]) & PREAMBLE
+    assert not (irq[2] << 8 | irq[3]) & (SYNC | HEADER_VALID)
     cond.run(t0 + 60_000)
     assert idle(lib, cond)["until"] == t0 + 100_000
     irq = frame(GET_IRQ, 0, 0, 0)
-    assert (irq[2] << 8 | irq[3]) & PREAMBLE
+    assert (irq[2] << 8 | irq[3]) & SYNC
     assert not (irq[2] << 8 | irq[3]) & HEADER_VALID
     cond.run(t0 + 100_000)
     idle(lib, cond)

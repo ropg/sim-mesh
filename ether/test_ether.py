@@ -116,11 +116,11 @@ class FakeStation:
     def state(self, mode="RX", **over):
         self.send(dict({"type": "state", "slot": 0}, **radio(mode, **over)))
 
-    def tx(self, fid, payload=b"hello", span_us=FRAME_US, **over):
+    def tx(self, fid, payload=b"hello", span_us=FRAME_US, pre_us=None, hdr_us=None, **over):
         t0 = self.t
         self.send(dict({"type": "tx", "slot": 0, "id": fid, "t0": t0,
-                        "t_pre": t0 + span_us // 10,
-                        "t_hdr": t0 + span_us // 5,
+                        "t_pre": t0 + (span_us // 10 if pre_us is None else pre_us),
+                        "t_hdr": t0 + (span_us // 5 if hdr_us is None else hdr_us),
                         "t_end": t0 + span_us, "power_dbm": POWER_DBM,
                         "payload": base64.b64encode(payload).decode()},
                        **radio("TX", **over)))
@@ -171,10 +171,11 @@ class Bench:
     stated before then — the table is written once, as a run's is.
     """
 
-    def __init__(self, tmp_path, time_mode="real", pairwise=False):
+    def __init__(self, tmp_path, time_mode="real", pairwise=False, *flags):
         self.tmp_path = tmp_path
         self.time_mode = time_mode
         self.pairwise = pairwise
+        self.flags = list(flags)    # more of the ether's own, as its command line takes them
         self.record = tmp_path / "record.tsv"
         self.proc = None
         self.port = None
@@ -215,6 +216,7 @@ class Bench:
             argv += ["--nodeset", str(nodes), "--losses", str(losses)]
         if self.pairwise:
             argv.append("--pairwise")
+        argv += self.flags
         self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE, text=True)
         lines = queue.Queue()
@@ -554,6 +556,351 @@ def test_carrier_sense_hears_energy_over_the_threshold_at_any_sf(ether):
     quiet.tx(2, sf=7)
     sensing.expect_nothing()
     receiving.expect_nothing()
+
+
+# A frame long enough to start listening in the middle of. Its stated sync
+# word is a tenth of the way in, 40 ms, so its preamble proper ends 17 ms
+# before that at SF9 and a slot starting 100 ms in has long missed it.
+LONG_US = 400_000
+
+
+@pytest.mark.parametrize("mode", ["RX", "CAD"])
+def test_a_station_that_starts_listening_mid_frame_is_told_its_energy_only(ether, mode):
+    """A frame reaches the slots listening when it starts. One that starts
+    listening later, here out of standby, has missed the preamble and cannot
+    demodulate the frame; its RSSI still reads it and a CAD still finds it.
+    It is told the energy, from the instant it was told to the frame's end,
+    and nothing else."""
+    ether.link(1, 2, NEAR_DB)
+    sender, late = ether(1), ether(2)
+    sender.hello()
+    late.hello()
+    late.state("STDBY_RC")
+    time.sleep(0.05)
+
+    sender.tx(44, payload=b"already on the air", span_us=LONG_US)
+    time.sleep(0.1)
+    late.state(mode)
+    begin = late.expect("rx_begin")
+    assert begin["cad"] is True
+    assert begin["level"] == round(level_for(NEAR_DB))
+    assert 0 < begin["t_end"] - begin["t0"] < LONG_US - 50_000     # what is left
+    late.expect_nothing(timeout=LONG_US / 1e6)                     # and no rx_end
+
+
+def test_a_station_that_starts_listening_early_in_a_long_preamble_still_locks_on(ether):
+    """With four symbols or more of the preamble still to come, a slot that
+    starts listening finds it as one listening all along would, and receives
+    the frame."""
+    ether.link(1, 2, NEAR_DB)
+    sender, late = ether(1), ether(2)
+    sender.hello()
+    late.hello()
+    late.state("STDBY_RC")
+    time.sleep(0.05)
+
+    sender.tx(45, payload=b"a long preamble", span_us=LONG_US, pre_us=300_000,
+              hdr_us=320_000)
+    time.sleep(0.05)
+    late.state("RX")
+    begin = late.expect("rx_begin")
+    assert "cad" not in begin
+    assert begin["t_pre"] - begin["t0"] < 300_000       # measured from when it was told
+    end = late.expect("rx_end")
+    assert end["verdict"] == "clean"
+    assert base64.b64decode(end["payload"]) == b"a long preamble"
+
+
+def test_a_late_listener_is_told_only_of_frames_it_could_have_been_told_of(ether):
+    """By the rules a frame's start would have applied: not a frame already
+    over, not one at another spreading factor under the sense threshold, but
+    one at another spreading factor over it, as energy."""
+    ether.link(1, 3, 90.0)          # −76 dBm, over the −81 dBm threshold
+    ether.link(2, 3, 110.0)         # −96 dBm, under it
+    loud, quiet, late = ether(1), ether(2), ether(3)
+    for station in (loud, quiet, late):
+        station.hello()
+    late.state("STDBY_RC")
+    time.sleep(0.05)
+
+    quiet.tx(46, span_us=100_000)
+    time.sleep(0.2)
+    late.state("RX")                # it ended before anyone listened
+    late.expect_nothing()
+
+    late.state("STDBY_RC")
+    quiet.tx(47, span_us=LONG_US, sf=7)
+    time.sleep(0.1)
+    late.state("RX")                # another SF, and under the threshold
+    late.expect_nothing(timeout=LONG_US / 1e6)
+
+    late.state("STDBY_RC")
+    loud.tx(48, span_us=LONG_US, sf=7)
+    time.sleep(0.1)
+    late.state("RX")                # another SF, over the threshold
+    begin = late.expect("rx_begin")
+    assert begin["cad"] is True
+    assert begin["level"] == round(level_for(90.0))
+    late.expect_nothing(timeout=LONG_US / 1e6)
+
+
+def test_a_station_back_from_its_own_frame_is_told_of_one_that_began_meanwhile(ether):
+    """Half duplex hides a frame that begins while a station is sending, and
+    it is the frame carrier sense most needs: the station, done sending,
+    wants the channel again. Back in RX, it is told the frame's energy."""
+    ether.link(1, 2, NEAR_DB)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+
+    a.tx(51, payload=b"a first", span_us=100_000)
+    b.expect("rx_begin")
+    time.sleep(0.02)
+    b.tx(52, payload=b"b over it", span_us=LONG_US)
+    a.expect_nothing(timeout=0.15)  # sending, and then not told: not listening
+    a.state("STDBY_RC")
+    a.state("RX")
+    begin = a.expect("rx_begin")
+    assert begin["cad"] is True
+
+
+def test_a_receiver_that_leaves_rx_mid_frame_is_not_told_how_it_ended(ether):
+    """Out of RX into standby, the chip lets go of the frame it was following,
+    and the medium rules on nothing it did not receive: no rx_end, and none in
+    the record."""
+    ether.link(1, 2, NEAR_DB)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+
+    a.tx(53, payload=b"left behind", span_us=LONG_US)
+    assert "cad" not in b.expect("rx_begin")
+    time.sleep(0.05)
+    b.state("STDBY_RC")
+    b.expect_nothing(timeout=LONG_US / 1e6 + 0.2)
+    time.sleep(0.1)
+    ends = [line for line in ether.record.read_text().splitlines()
+            if '"type":"rx_end"' in line]
+    assert ends == []
+
+
+def test_a_receiver_retuned_mid_frame_is_not_told_how_it_ended(ether):
+    """Retuned while in RX, the demodulator cannot follow a frame on the
+    channel it left, so that reception is abandoned as if it had left RX."""
+    ether.link(1, 2, NEAR_DB)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+
+    a.tx(54, payload=b"on the old channel", span_us=LONG_US)
+    assert "cad" not in b.expect("rx_begin")
+    time.sleep(0.05)
+    b.state("RX", freq=FREQ + 600_000)
+    b.expect_nothing(timeout=LONG_US / 1e6 + 0.2)
+
+
+# ---- the CRC band ----------------------------------------------------------
+
+def test_the_crc_band_fails_frames_in_proportion_to_how_near_the_threshold_they_are():
+    """Certain at the threshold, never at the band's top, and in between in
+    proportion: a straight line down, over many frames."""
+    band = 2.0
+    for margin, expected in ((-1.0, 1.0), (0.0, 1.0), (0.5, 0.75), (1.0, 0.5),
+                             (1.5, 0.25), (2.0, 0.0), (5.0, 0.0)):
+        failed = sum(ether_module.crc_margin_fails(7, eid, 2, 0, margin, band)
+                     for eid in range(4000))
+        assert failed / 4000 == pytest.approx(expected, abs=0.03), margin
+    assert not any(ether_module.crc_margin_fails(7, eid, 2, 0, -3.0, 0.0)
+                   for eid in range(100)), "no band, no failures"
+
+
+def test_a_physics_without_a_crc_band_says_nothing_of_one():
+    """A run records what was asked for: no band, no key; a band round-trips."""
+    assert ether_module.Physics().as_dict() == {"noise_figure_db": 6.0}
+    physics = ether_module.Physics(5.0, 2.5)
+    assert physics.as_dict() == {"noise_figure_db": 5.0, "crc_margin_db": 2.5}
+    assert ether_module.Physics.from_dict(physics.as_dict()).crc_margin_db == 2.5
+    with pytest.raises(ValueError):
+        ether_module.Physics(6.0, -1.0)
+
+
+def test_the_crc_band_verdict_is_the_draw_for_that_frame_and_receiver(tmp_path):
+    """A frame 1 dB over SF9's threshold, in a 2 dB band, fails half the
+    time: each one as its own draw from the seed says, whichever that is."""
+    bench = Bench(tmp_path, "real", False, "--crc-margin-db", "2", "--seed", "11")
+    try:
+        loss = POWER_DBM - (NOISE_DBM - 12.5 + 1.0)       # 1 dB over the threshold
+        bench.link(1, 2, loss)
+        a, b = bench(1), bench(2)
+        seed = a.hello()["seed"]
+        assert seed == 11
+        b.hello()
+        b.state("RX")
+        time.sleep(0.1)
+        margin = level_for(loss) - NOISE_DBM + 12.5
+        verdicts = []
+        for n in range(8):
+            a.tx(70 + n, payload=b"near the edge %d" % n, span_us=100_000)
+            begin = b.expect("rx_begin")
+            end = b.expect("rx_end")
+            assert end["id"] == begin["id"]
+            fails = ether_module.crc_margin_fails(seed, end["id"], 2, 0, margin, 2.0)
+            assert end["verdict"] == ("crc" if fails else "clean")
+            verdicts.append(end["verdict"])
+        assert set(verdicts) == {"crc", "clean"}
+    finally:
+        bench.close()
+
+
+def test_without_a_crc_band_a_frame_over_its_threshold_is_clean(ether):
+    """Off by default: a frame half a dB over its threshold is delivered."""
+    loss = POWER_DBM - (NOISE_DBM - 12.5 + 0.5)
+    ether.link(1, 2, loss)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+    for n in range(4):
+        a.tx(80 + n, span_us=100_000)
+        assert b.expect("rx_end")["verdict"] == "clean"
+
+
+# ---- bench capture ---------------------------------------------------------
+#
+# The table's cases are the reticulum project's rnscale medium tests
+# (tools/rnscale/src/medium.rs): the bench at both ends of its table, a late
+# stronger frame costing both, a late weaker one lost alone, and two frames
+# each kept by the listener nearer its sender.
+
+def outcomes(lead, locked=False, pairs=3000):
+    """bench_outcome over many pairs of frames at one receiver."""
+    return [ether_module.bench_outcome(11, 2 * n + 1, 2 * n + 2, 5, lead, locked)
+            for n in range(pairs)]
+
+
+def test_bench_equals_are_both_lost_one_time_in_four_and_never_both_kept():
+    seen = outcomes(0.5)
+    assert (True, True) not in seen
+    both_lost = seen.count((False, False)) / len(seen)
+    assert both_lost == pytest.approx(9 / 39, abs=0.03)
+    first = seen.count((True, False)) / (len(seen) - seen.count((False, False)))
+    assert first == pytest.approx(0.5, abs=0.04)
+
+
+def test_bench_keeps_the_stronger_nine_times_in_ten_at_2_db_and_never_the_weaker():
+    seen = outcomes(2.0)
+    assert all(second is False for _, second in seen)
+    kept = sum(first for first, _ in seen) / len(seen)
+    assert kept == pytest.approx(119 / 136, abs=0.025)
+    assert set(outcomes(-2.0)) <= {(False, True), (False, False)}
+
+
+def test_bench_keeps_the_stronger_every_time_from_6_1_db():
+    assert set(outcomes(6.1, pairs=500)) == {(True, False)}
+    assert set(outcomes(-7.0, pairs=500)) == {(False, True)}
+
+
+def test_bench_a_late_frame_is_never_received_and_a_stronger_one_spoils_both():
+    assert set(outcomes(-2.0, locked=True, pairs=500)) == {(False, False)}
+    assert set(outcomes(7.0, locked=True, pairs=500)) == {(True, False)}
+    assert all(second is False for _, second in outcomes(0.0, locked=True))
+
+
+@pytest.fixture
+def bench(tmp_path):
+    """The ether with bench capture, its seed pinned."""
+    bed = Bench(tmp_path, "real", False, "--bench-capture", "--seed", "3")
+    try:
+        yield bed
+    finally:
+        bed.close()
+
+
+def test_bench_capture_keeps_a_frame_8_db_up_as_the_same_sf_figure_does(bench):
+    """The hidden terminal, judged as the bench saw it: 8 dB is past 6.1."""
+    bench.link(1, 2, 110.0)
+    bench.link(3, 2, 118.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    listen(a, b, c)
+
+    a.tx(151, payload=b"from a")
+    c.tx(152, payload=b"from c")
+    ends = b.ends(2)
+    assert ends[b"from a"]["verdict"] == "clean"
+    assert ends[b"from c"]["verdict"] == "crc"
+
+
+def test_bench_capture_frames_a_decibel_apart_end_as_their_pairs_draw(bench):
+    """1 dB apart, the two are equals, and which survives, if either, is the
+    pair's draw from the seed: the lock and both verdicts read the same one."""
+    bench.link(1, 2, 110.0)
+    bench.link(3, 2, 111.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    seed = a.hello()["seed"]
+    listen(b, c)
+    lead = level_for(110.0) - level_for(111.0)
+    for n in range(5):
+        a.tx(160 + n, payload=b"a %d" % n, pre_us=100_000, hdr_us=120_000)
+        c.tx(170 + n, payload=b"c %d" % n, pre_us=100_000, hdr_us=120_000)
+        first, second = b.expect("rx_begin"), b.expect("rx_begin")
+        ends = b.ends(2)
+        want = ether_module.bench_outcome(seed, first["id"], second["id"], 2, lead, False)
+        assert ends[b"a %d" % n]["verdict"] == ("clean" if want[0] else "crc")
+        assert ends[b"c %d" % n]["verdict"] == ("clean" if want[1] else "crc")
+        assert ("cad" in second) == (not want[1]), "the second takes b only if it survives"
+
+
+def test_bench_capture_a_stronger_frame_after_the_preamble_spoils_both(bench):
+    """b follows a's frame; c's lands after its preamble, 8 dB louder: it
+    never takes b, and a is lost as well."""
+    bench.link(1, 2, 118.0)
+    bench.link(3, 2, 110.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    listen(a, b, c)
+
+    a.tx(181, payload=b"from a")
+    assert "cad" not in b.expect("rx_begin")
+    time.sleep(FRAME_US / 4e6)          # past a's preamble, a tenth of the frame
+    c.tx(182, payload=b"from c")
+    assert b.expect("rx_begin")["cad"] is True
+    ends = b.ends(2)
+    assert ends[b"from a"]["verdict"] == "crc"
+    assert ends[b"from c"]["verdict"] == "crc"
+
+
+def test_bench_capture_a_weaker_frame_after_the_preamble_leaves_the_first(bench):
+    """b follows a's frame; c's lands after its preamble, 8 dB quieter."""
+    bench.link(1, 2, 110.0)
+    bench.link(3, 2, 118.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    listen(a, b, c)
+
+    a.tx(191, payload=b"from a")
+    b.expect("rx_begin")
+    time.sleep(FRAME_US / 4e6)
+    c.tx(192, payload=b"from c")
+    assert b.expect("rx_begin")["cad"] is True
+    ends = b.ends(2)
+    assert ends[b"from a"]["verdict"] == "clean"
+    assert ends[b"from c"]["verdict"] == "crc"
+
+
+def test_bench_capture_keeps_each_frame_at_the_listener_nearer_its_sender(bench):
+    """Two frames that meet are each kept where their sender is 10 dB nearer."""
+    bench.link(1, 2, 105.0)
+    bench.link(3, 2, 115.0)
+    bench.link(1, 4, 115.0)
+    bench.link(3, 4, 105.0)
+    a, near_a, c, near_c = bench(1), bench(2), bench(3), bench(4)
+    listen(a, near_a, c, near_c)
+
+    a.tx(201, payload=b"from a")
+    c.tx(202, payload=b"from c")
+    at_a, at_c = near_a.ends(2), near_c.ends(2)
+    assert at_a[b"from a"]["verdict"] == "clean" and at_a[b"from c"]["verdict"] == "crc"
+    assert at_c[b"from c"]["verdict"] == "clean" and at_c[b"from a"]["verdict"] == "crc"
+
+
+def test_bench_capture_is_not_a_variant_of_the_pairwise_rule(tmp_path):
+    done = subprocess.run([sys.executable, ETHER, "--bench-capture", "--pairwise",
+                           "--record", str(tmp_path / "r.tsv")],
+                          capture_output=True, text=True, timeout=30)
+    assert done.returncode == 2 and "--bench-capture" in done.stderr
 
 
 def test_a_station_is_deaf_while_its_own_frame_is_going_out(ether):

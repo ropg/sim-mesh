@@ -762,6 +762,13 @@ threshold, is there.
 way, one interferer at a time against a 6 dB margin with nothing summed, so a
 run can be compared frame for frame with one ruled that way.
 
+**Bench capture** (`--bench-capture`) replaces the same-SF figure with what
+a bench measured of two frames meeting: equals within 1.2 dB (both lost about
+one time in four, otherwise one survives), the stronger surviving seven times
+in eight from there and always from 6.1 dB, and a frame arriving after the
+receiver has passed the first one's preamble never taking it
+([`ether/INTERNALS.md`](ether/INTERNALS.md#bench-capture)).
+
 ## Why the ether owns the lock
 
 A receiver follows one frame at a time, and which one is decided at the
@@ -1316,8 +1323,9 @@ tick drift a loaded host adds makes it unreproducible for reasons that have
 nothing to do with the protocol.
 
 In real time `esp_timer` is `CLOCK_MONOTONIC` in microseconds from the first
-reading, and every timed event in the model — the instant a preamble ends, a
-header lands, a frame finishes — is a one-shot on the backend's timer. The
+reading, and every timed event in the model — the instant a preamble is found,
+a sync word ends, a header lands, a frame finishes — is a one-shot on the
+backend's timer. The
 FreeRTOS tick is 100 Hz while a task runs and stops while every task is
 blocked, so nothing is accurate below ten milliseconds; the
 frames the driver sends take tens to hundreds of milliseconds, which is why
@@ -1350,7 +1358,11 @@ crystal — drift, an offset — goes. f is the identity unless the station's
 environment has `SIMESH_CLOCK_PROFILE`, a piecewise-linear map given as
 `T:node` pairs in microseconds, both increasing, slope 1 outside them
 ([STATION.md](STATION.md#the-environment)); `nodeOf` / `conductorOf` are the
-only place it is defined.
+only place it is defined. `simd --clock-ppm P` gives every station one: a
+straight line from T 0 whose slope is off by a draw uniform within ±P parts
+per million, hashed from the seed and the node's name, so each station keeps
+its own time and keeps it again in a run with the same seed. A crystal is
+typically within ±20 ppm, 72 ms an hour. The radio's timers stay on T.
 
 **The C library's time is answered by a preloaded shim**,
 `radio/build/libsimclock.so` (built from `radio/shim/simclock.c`), which every
@@ -1593,9 +1605,10 @@ change.
   100 ms off-time before returning to a frequency, radiated power over a
   channel's cap, a `tx` without the sense window of RX or CAD before it on
   that carrier, a `tx` from a slot that is inside a reception.
-- **The CRC band**: in the `crc_margin_db` (3 dB) above the demodulation
-  threshold, a locked frame ends as `crc` with a probability falling linearly
-  from 1 to 0, drawn from the run's seeded generator.
+- **The CRC band by default**: `--crc-margin-db` gives the band above the
+  demodulation threshold where a locked frame ends as `crc` with a
+  probability falling linearly from 1 to 0 (ether/INTERNALS.md). It is off
+  unless given; whether it should default to the 3 dB planned here is open.
 - **`next_instant()` from a heap**: the pending `until`s kept in a heap keyed
   by instant and station, updated on idle, retraction and leave, stale
   entries dropped when popped, instead of a scan of every station per

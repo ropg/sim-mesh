@@ -19,7 +19,7 @@ the testbed; what differs between firmwares beyond it is a **kind**
 | `SIMESH_SEED` | virtual time: the ether's seed, the one its `welcome` carries; the shim keys the station's `getentropy`/`getrandom` by it and `SIMESH_NODE_ID` |
 | `LD_PRELOAD` | virtual time: `radio/build/libsimclock.so`, the time shim |
 | `SIMESH_IDLE` | virtual time, set by a kind whose firmware does not call `simradio_idle()` itself: `threads`, and the shim says the station is idle when every thread is blocked (below) |
-| `SIMESH_CLOCK_PROFILE` | optional, from a kind's `env:`: node time as a function of T, `T:node,T:node,…` in microseconds, both columns increasing, slope 1 outside the points. Absent, node time is T |
+| `SIMESH_CLOCK_PROFILE` | optional, from a kind's `env:`, or from simd's `--clock-ppm` (a crystal off by a draw within that many parts per million, per station): node time as a function of T, `T:node,T:node,…` in microseconds, both columns increasing, slope 1 outside the points. Absent, node time is T |
 | the kind's `env:` | anything the binary needs beyond that |
 
 Nothing else is promised. A station reads its identity from these and from

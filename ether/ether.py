@@ -29,7 +29,11 @@ stretch of its air, it clears thermal noise by its spreading factor's
 demodulation threshold and each class of interference, summed within the
 class, by that class's rejection figure. A station in `CAD` is told a frame is
 arriving, and nothing more, when that frame is decodable there or the energy
-in its band crosses the sense threshold.
+in its band crosses the sense threshold. A slot that starts listening while a
+frame is on the air is judged the same way at that instant: it can still lock
+on while enough of the preamble is to come, and is told the energy otherwise.
+A receiver that leaves RX for anything but TX mid-frame is not told how the
+frame it was following ended.
 
 With `pairwise` set the pairwise rule decides instead, on the same levels: a
 frame is delivered where it is audible, the receiver takes a later frame only
@@ -56,6 +60,7 @@ a virtual one), direction, station id, JSON.
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import heapq
 import json
 import math
@@ -135,6 +140,49 @@ SENSITIVITY_LIMIT_DBM_AT_1KHZ = -117.0
 
 # Pairwise rule only: how far a frame must lead each audible interferer.
 PAIRWISE_CAPTURE_DB = 6.0
+
+# How many symbols of a preamble a receiver needs to find it. Firmware that
+# senses the channel by asking the demodulator measured a blind window of
+# about 4 ms at SF7 and 125 kHz, three boards over 150 trials (the reticulum
+# project's bench; the chip model's kPreambleFoundSymbols is the same figure).
+# So a slot that starts listening while a frame is on the air can still lock
+# on to it if at least this much of the preamble is still to come, and has
+# only its energy otherwise.
+PREAMBLE_FOUND_SYMBOLS = 4.0
+
+# The CRC band: how far above its demodulation threshold a frame that locked
+# may still fail its cyclic redundancy check. A real receiver's packet error
+# rate falls away over a few dB above the threshold, an S-shaped curve; here
+# the chance falls in a straight line, from certain at the threshold to
+# nothing at the band's top. Off (0) unless the medium is given a band
+# (`--crc-margin-db`); INTERNALS.md plans 3 dB. One draw per frame and
+# receiver, hashed from the run's seed (`seeded_draw`), so it is the same
+# whatever order the receptions end in.
+DEFAULT_CRC_MARGIN_DB = 0.0
+
+# Capture as a bench measured it (`--bench-capture`, off unless given): the
+# reticulum project's tools/rncapture of 2026-09-17 (its README, the table of
+# 289 collisions): an SX1262 receiver, SX1262 and LR2021 senders, SF7 at 125
+# kHz, 121-byte frames, two frames at a time whose starts were within about
+# 8 ms (listen-before-talk stayed on). Within 1.2 dB the two are equals: both
+# were lost 9 times in 39, and otherwise one of them survived, either one.
+# From there to 2.7 dB the stronger survived 119 times in 136, and from 6.1 dB
+# every time; the straight line between is an assumption. The weaker never
+# survived. A frame that started after the receiver had passed the first
+# one's preamble was never received, and it spoiled the first unless the
+# first was the stronger (six times in six, at about 2 dB); at equal power
+# the first is assumed to survive as often as equals do not both die. Other
+# spreading factors, bandwidths and start offsets are assumed to behave alike.
+BENCH_EQUAL_DB = 1.2
+BENCH_BOTH_LOST = 9 / 39
+BENCH_STRONGER = 119 / 136
+BENCH_STRONGER_DB = 2.7
+BENCH_CERTAIN_DB = 6.1
+
+# What follows the preamble before `t_pre`: two sync-word symbols and 2.25 of
+# the start-of-frame delimiter (AN1200.13), so a frame's preamble proper ends
+# this many symbols before the `t_pre` its transmitter states.
+SYNC_SYMBOLS = 4.25
 
 # How far apart two carriers may be and still be one carrier, as a fraction
 # of the bandwidth. The synthesizer steps in 32 MHz / 2^25, so two drivers
@@ -302,6 +350,72 @@ def log(msg):
     sys.stderr.flush()
 
 
+def seeded_draw(seed, *parts):
+    """A uniform draw in [0, 1) that is a function of the seed and `parts`
+    alone: the same however often, and in whatever order, it is asked for."""
+    key = ":".join(str(part) for part in (seed,) + parts)
+    return int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big") / 2.0 ** 64
+
+
+def crc_margin_fails(seed, eid, rsid, slot, margin_db, band_db):
+    """Whether a frame `margin_db` over its demodulation threshold fails its
+    CRC anyway, in a band `band_db` wide: certain at the threshold, never at
+    the band's top, a straight line between. One draw per frame and
+    receiving slot."""
+    if band_db <= 0 or margin_db >= band_db:
+        return False
+    return seeded_draw(seed, eid, rsid, slot, "crc") < 1.0 - max(margin_db, 0.0) / band_db
+
+
+def same_class(sf_a, sf_b):
+    """True when two spreading factors meet as one class, by the same-SF
+    figure rather than the inter-SF matrix (`rejection_db`)."""
+    return rejection_db(sf_a, sf_b) == SAME_SF_REJECTION_DB
+
+
+def bench_stronger_odds(lead):
+    """How often the stronger of two frames that met survives, by its lead."""
+    if lead >= BENCH_CERTAIN_DB:
+        return 1.0
+    if lead <= BENCH_STRONGER_DB:
+        return BENCH_STRONGER
+    return BENCH_STRONGER + (1.0 - BENCH_STRONGER) * (
+        (lead - BENCH_STRONGER_DB) / (BENCH_CERTAIN_DB - BENCH_STRONGER_DB))
+
+
+def bench_outcome(seed, first, second, rsid, lead, locked):
+    """Which of two frames that met survive at one receiver, as the bench saw.
+
+    `first` and `second` are the frames' numbers in the order they started,
+    `lead` the first's level over the second's there in dB, and the answer
+    (the first survives, the second survives). A receiver `locked` on the
+    first — following it when the second started after its preamble — never
+    receives the second, however strong, and loses the first too unless the
+    first is the stronger. Frames that started within a preamble of each
+    other are the bench's table. The draws are the pair's and the
+    receiver's, so both frames' verdicts and the lock read one outcome.
+    """
+    lo, hi = min(first, second), max(first, second)
+
+    def draw(what):
+        return seeded_draw(seed, lo, hi, rsid, what)
+
+    if locked:
+        if lead > BENCH_EQUAL_DB:
+            return draw("stronger") < bench_stronger_odds(lead), False
+        if lead < -BENCH_EQUAL_DB:
+            return False, False
+        return draw("equal") >= BENCH_BOTH_LOST, False
+    if abs(lead) <= BENCH_EQUAL_DB:
+        if draw("equal") < BENCH_BOTH_LOST:
+            return False, False
+        first_wins = draw("coin") < 0.5
+        return first_wins, not first_wins
+    if lead > 0:
+        return draw("stronger") < bench_stronger_odds(lead), False
+    return False, draw("stronger") < bench_stronger_odds(-lead)
+
+
 def fspl_1m_db(freq_hz):
     """Free-space path loss over the first metre at this carrier, in dB: the
     log-distance model's anchor, for whatever computes synthetic ground's table."""
@@ -309,21 +423,35 @@ def fspl_1m_db(freq_hz):
 
 
 class Physics:
-    """The medium's own setting beyond path loss: the receivers' noise figure."""
+    """The medium's own settings beyond path loss: the receivers' noise
+    figure, and the CRC band above the demodulation threshold (off unless
+    given). A setting at its default is left out of `as_dict`, so what a run
+    records says only what was asked for."""
 
-    def __init__(self, noise_figure_db=DEFAULT_NOISE_FIGURE_DB):
+    def __init__(self, noise_figure_db=DEFAULT_NOISE_FIGURE_DB,
+                 crc_margin_db=DEFAULT_CRC_MARGIN_DB):
         self.noise_figure_db = float(noise_figure_db)
+        self.crc_margin_db = float(crc_margin_db)
+        if self.crc_margin_db < 0:
+            raise ValueError("the CRC band is a width in dB, not %g" % self.crc_margin_db)
 
     def describe(self):
-        return "noise figure %.1f dB" % self.noise_figure_db
+        text = "noise figure %.1f dB" % self.noise_figure_db
+        if self.crc_margin_db:
+            text += ", a %.1f dB CRC band" % self.crc_margin_db
+        return text
 
     @classmethod
     def from_dict(cls, data):
         data = data or {}
-        return cls(data.get("noise_figure_db", DEFAULT_NOISE_FIGURE_DB))
+        return cls(data.get("noise_figure_db", DEFAULT_NOISE_FIGURE_DB),
+                   data.get("crc_margin_db", DEFAULT_CRC_MARGIN_DB))
 
     def as_dict(self):
-        return {"noise_figure_db": self.noise_figure_db}
+        out = {"noise_figure_db": self.noise_figure_db}
+        if self.crc_margin_db != DEFAULT_CRC_MARGIN_DB:
+            out["crc_margin_db"] = self.crc_margin_db
+        return out
 
 
 class Station:
@@ -416,13 +544,27 @@ class Frame:
         self.sync = msg.get("sync")
         self.power_dbm = msg.get("power_dbm", DEFAULT_POWER_DBM)
         self.payload = msg.get("payload", "")
+        # What a receiver's stated radio is matched against, kept for the
+        # slots that start listening while this frame is on the air.
+        self.radio = {key: msg.get(key) for key in ("freq",) + MATCH_KEYS}
         self.start_us = start_us
         self.end_us = end_us
         self.pre_us = pre_us
         self.hdr_us = hdr_us
         self.interferers = []   # frames that shared this one's band and air
         self.receivers = []     # (sid, slot, level) for each decoding receiver
+        self.receptions = {}    # (sid, slot) -> its Reception there
         self.levels = {}        # rsid -> dBm there, or None: never heard
+
+    def preamble_left(self, now):
+        """True when a receiver that starts listening at `now` still has
+        PREAMBLE_FOUND_SYMBOLS of this frame's preamble to find it by."""
+        try:
+            symbol_us = (1 << int(self.sf)) / float(self.bw) * 1e6
+        except (TypeError, ValueError, ZeroDivisionError):
+            return False
+        preamble_end = self.pre_us - SYNC_SYMBOLS * symbol_us
+        return preamble_end - now >= PREAMBLE_FOUND_SYMBOLS * symbol_us
 
     def shares_air(self, other):
         """True when the two frames overlap in band and in time."""
@@ -438,14 +580,28 @@ class Reception:
     own preamble, or when this one arrived while the receiver was following
     another it did not lead: the rx_end still goes out, as `crc`, and the
     chip, which follows only the last frame it was begun on, drops it.
+    `abandoned` is set when the receiver left RX, for anything but its own
+    transmission, while following this frame: nothing was received, so no
+    rx_end goes out and nothing is recorded as received or lost.
     """
 
-    def __init__(self, frame, rsid, slot, level, lost=False):
+    def __init__(self, frame, rsid, slot, level, lost=False, taken_at=None):
         self.frame = frame
         self.rsid = rsid
         self.slot = slot
         self.level = level
         self.lost = lost
+        self.abandoned = False
+        # When the receiver took this frame, and when a later one took it off
+        # it: the bench rule asks whether it was following the frame when a
+        # second one started.
+        self.taken_at = None if lost else taken_at
+        self.lost_at = None
+
+    def followed_at(self, t):
+        """True when the receiver was following this frame at instant `t`."""
+        return (self.taken_at is not None and self.taken_at <= t
+                and (self.lost_at is None or self.lost_at > t))
 
 
 class Ether(asyncio.DatagramProtocol):
@@ -459,7 +615,7 @@ class Ether(asyncio.DatagramProtocol):
     """
 
     def __init__(self, record_path, physics=None, seed=None, time_mode="real",
-                 pairwise=False, epoch=None):
+                 pairwise=False, epoch=None, bench_capture=False):
         self.transport = None
         self.loop = asyncio.get_event_loop()
         self.mode, self.rate = parse_time_mode(time_mode)
@@ -492,6 +648,10 @@ class Ether(asyncio.DatagramProtocol):
         self.standing = 0           # steps in a row that left T where it was
         self.physics = physics or Physics()
         self.pairwise = bool(pairwise)
+        if bench_capture and self.pairwise:
+            raise ValueError("bench capture is a variant of the receiver-centred rule, "
+                             "not of the pairwise one")
+        self.bench_capture = bool(bench_capture)
         self.stations = {}          # sid -> Station
         self.tables = {}            # band name -> slt.Table
         self.names = {}             # sid -> node name, the table's index
@@ -1268,14 +1428,52 @@ class Ether(asyncio.DatagramProtocol):
     def recv_state(self, sid, addr, msg):
         station = self.station_for(sid, addr)
         slot = msg.get("slot", 0)
+        before = station.state(slot) or {}
         station.states[slot] = msg
-        if msg.get("mode") != "RX":
-            # The chip lets go of what it was demodulating on leaving RX.
-            station.locks.pop(slot, None)
+        mode = msg.get("mode")
+        retuned = any(before.get(key) != msg.get(key) for key in ("freq",) + MATCH_KEYS)
+        if mode != "RX" or retuned:
+            # The chip lets go of what it was demodulating on leaving RX, and
+            # cannot follow it onto another channel. Its own transmission is
+            # half duplex, ruled on at the frame's end as talked over; anything
+            # else abandons the frame, and nothing was received that the
+            # record could count.
+            held = station.locks.pop(slot, None)
+            if held is not None and mode != "TX":
+                held.abandoned = True
         log("station %d slot %s %s freq=%s bw=%s sf=%s sync=%s" % (
-            sid, slot, msg.get("mode"), msg.get("freq"), msg.get("bw"),
+            sid, slot, mode, msg.get("freq"), msg.get("bw"),
             msg.get("sf"), msg.get("sync")))
         self.raise_event(self.on_station, sid, msg)
+        if (mode != before.get("mode") or retuned) and station.listening(slot):
+            self.tell_late(station, slot)
+
+    def tell_late(self, rstation, slot):
+        """The frames already on the air when a slot starts listening.
+
+        A frame reaches the slots listening when it starts. A slot that starts
+        later — back from its own transmission, out of standby, out of a CAD
+        into RX — is judged by the same rules at that instant: while enough of
+        a frame's preamble is still to come it can lock on to it, and
+        otherwise it has missed the preamble and cannot demodulate the frame,
+        which is still on the air for all that: an instantaneous RSSI reads it
+        and a CAD finds it. Without this, carrier sense was blind to every
+        frame that began while a station was not listening, which is every
+        frame that began during its own transmission.
+        """
+        now = self.now()
+        if rstation.tx_until > now:
+            return
+        for frame in list(self.frames):
+            if frame.sid == rstation.sid or not frame.start_us <= now < frame.end_us:
+                continue
+            level = self.level_of(frame, rstation.sid)
+            if level is None:
+                continue
+            if self.pairwise:
+                self.arrive_pairwise(frame, frame.radio, rstation, slot, level, now)
+            else:
+                self.arrive(frame, frame.radio, rstation, slot, level, now)
 
     def recv_tx(self, sid, addr, msg):
         station = self.station_for(sid, addr)
@@ -1335,9 +1533,12 @@ class Ether(asyncio.DatagramProtocol):
 
     # ---- arrival: the lock ----------------------------------------------
 
-    def begin_message(self, frame, slot, level, energy=False):
+    def begin_message(self, frame, slot, level, energy=False, t0=None):
+        """An rx_begin for one slot. `t0` is the instant the slot is told,
+        the frame's own start unless the slot started listening later: the
+        chip measures what is left of the frame from it."""
         begin = {"type": "rx_begin", "slot": slot,
-                 "id": frame.eid, "t0": frame.start_us,
+                 "id": frame.eid, "t0": frame.start_us if t0 is None else t0,
                  "t_pre": frame.pre_us, "t_hdr": frame.hdr_us,
                  "t_end": frame.end_us, "level": round(level)}
         if energy:
@@ -1352,10 +1553,12 @@ class Ether(asyncio.DatagramProtocol):
             held = None
         return held
 
-    def open_reception(self, frame, rstation, slot, level, lost=False):
+    def open_reception(self, frame, rstation, slot, level, lost=False, now=None):
         """Schedule the rx_end for one receiver of a decodable frame."""
-        reception = Reception(frame, rstation.sid, slot, level, lost)
+        reception = Reception(frame, rstation.sid, slot, level, lost,
+                              taken_at=frame.start_us if now is None else now)
         frame.receivers.append((rstation.sid, slot, level))
+        frame.receptions[(rstation.sid, slot)] = reception
         self.call_at(frame.end_us, self.deliver_end, reception, key=rstation.sid)
         return reception
 
@@ -1373,7 +1576,7 @@ class Ether(asyncio.DatagramProtocol):
                 total += dbm_to_mw(level)
         return mw_to_dbm(total)
 
-    def arrive(self, frame, msg, rstation, slot, level):
+    def arrive(self, frame, msg, rstation, slot, level, now=None):
         """A frame reaches one listening slot: the receiver-centred rule.
 
         Off its band, nothing. Decodable — matching its state and over its
@@ -1382,58 +1585,82 @@ class Ether(asyncio.DatagramProtocol):
         by the same-SF figure; a frame that takes the lock loses the earlier
         one. Anything else in band is energy: an rx_begin marked `cad`, and no
         end, when the summed energy there crosses the sense threshold.
+
+        `now` is when a slot that started listening after the frame began is
+        told of it (`tell_late`): it can lock on only while enough of the
+        preamble is still to come, and is otherwise told the energy.
         """
         state = rstation.state(slot)
         if not in_band(frame.freq, frame.bw, state.get("freq"), state.get("bw")):
             return
         decodable = (self.matches(state, msg)
                      and self.audible(level, frame.bw, frame.sf))
-        now = frame.start_us
+        late = now is not None and now > frame.start_us
+        now = frame.start_us if now is None else now
         if not decodable:
             if self.in_band_energy(rstation.sid, state, now) >= \
                     sense_threshold_dbm(state.get("bw")):
-                self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True))
+                self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             return
-        if rstation.sensing(slot):
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True))
+        if rstation.sensing(slot) or (late and not frame.preamble_left(now)):
+            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             return
         held = self.current_lock(rstation, slot, now)
-        if held is not None and level - held.level < SAME_SF_REJECTION_DB:
-            # The demodulator is busy with a frame this one does not lead:
-            # it is energy to this receiver, and lost to it.
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True))
+        if held is not None and not self.takes(held, frame, rstation.sid, level, now):
+            # The demodulator is busy with a frame this one does not take it
+            # off: it is energy to this receiver, and lost to it.
+            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             self.open_reception(frame, rstation, slot, level, lost=True)
             return
         if held is not None:
             held.lost = True
+            held.lost_at = now
             log("frame %d takes station %d off frame %d" % (
                 frame.eid, rstation.sid, held.frame.eid))
-        rstation.locks[slot] = self.open_reception(frame, rstation, slot, level)
-        self.send(rstation.sid, self.begin_message(frame, slot, level))
+        rstation.locks[slot] = self.open_reception(frame, rstation, slot, level, now=now)
+        self.send(rstation.sid, self.begin_message(frame, slot, level, t0=now))
 
-    def arrive_pairwise(self, frame, msg, rstation, slot, level):
+    def takes(self, held, frame, rsid, level, now):
+        """Whether a frame arriving now takes a receiver off the one it is
+        following: by leading it by the same-SF figure, or with bench capture
+        as the bench saw two frames meet — never once the receiver is past
+        the first one's preamble, and otherwise when the pair's outcome says
+        the new one survives, the same outcome its verdict will read."""
+        if not self.bench_capture:
+            return level - held.level >= SAME_SF_REJECTION_DB
+        if now >= held.frame.pre_us:
+            return False
+        return bench_outcome(self.seed, held.frame.eid, frame.eid, rsid,
+                             held.level - level, locked=False)[1]
+
+    def arrive_pairwise(self, frame, msg, rstation, slot, level, now=None):
         """A frame reaches one listening slot: the pairwise rule.
 
         Delivered where it matches and is audible. A later frame takes the
         receiver only when it leads, in the whole dB the station is shown, the
         one in progress by the capture margin; otherwise it is energy and lost
-        to this receiver. A CAD slot is told of every frame it could decode.
+        to this receiver. A CAD slot is told of every frame it could decode,
+        and so is a slot that started listening too late in the preamble
+        (`arrive`).
         """
         state = rstation.state(slot)
         if not self.matches(state, msg) or not self.audible(level, frame.bw, frame.sf):
             return
-        if rstation.sensing(slot):
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True))
+        late = now is not None and now > frame.start_us
+        now = frame.start_us if now is None else now
+        if rstation.sensing(slot) or (late and not frame.preamble_left(now)):
+            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             return
-        held = self.current_lock(rstation, slot, frame.start_us)
+        held = self.current_lock(rstation, slot, now)
         if held is not None and round(level) < round(held.level) + PAIRWISE_CAPTURE_DB:
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True))
+            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             self.open_reception(frame, rstation, slot, level, lost=True)
             return
         if held is not None:
             held.lost = True
-        rstation.locks[slot] = self.open_reception(frame, rstation, slot, level)
-        self.send(rstation.sid, self.begin_message(frame, slot, level))
+            held.lost_at = now
+        rstation.locks[slot] = self.open_reception(frame, rstation, slot, level, now=now)
+        self.send(rstation.sid, self.begin_message(frame, slot, level, t0=now))
 
     # ---- delivery: the verdict ------------------------------------------
 
@@ -1478,15 +1705,43 @@ class Ether(asyncio.DatagramProtocol):
         if not others:
             return "clean"
         by_frame = {id(o): a for o, a in others}
+        worst_same_mw = 0.0
         for piece in self.segments(frame, [o for o, _ in others]):
             classes = {}
+            same_mw = 0.0
             for other in piece:
-                key = other.sf
-                classes[key] = classes.get(key, 0.0) + dbm_to_mw(by_frame[id(other)])
+                mw = dbm_to_mw(by_frame[id(other)])
+                if self.bench_capture and same_class(frame.sf, other.sf):
+                    same_mw += mw
+                    continue
+                classes[other.sf] = classes.get(other.sf, 0.0) + mw
+            worst_same_mw = max(worst_same_mw, same_mw)
             for sf, mw in classes.items():
                 if level - mw_to_dbm(mw) < rejection_db(frame.sf, sf):
                     return "crc"
+        if worst_same_mw > 0.0 and not self.bench_survives(
+                reception, others, level - mw_to_dbm(worst_same_mw)):
+            return "crc"
         return "clean"
+
+    def bench_survives(self, reception, others, lead):
+        """Bench capture's word on a frame against its own class: the
+        pair's outcome (`bench_outcome`) with its strongest same-class
+        interferer, at the frame's lead over the summed class in its worst
+        stretch of air. With one interferer that is the bench's pair exactly;
+        with more, the sum stands in for the second frame. Whether the
+        receiver was locked is read off the first frame's reception: past its
+        preamble, and following it, when the second started."""
+        frame, rsid, slot = reception.frame, reception.rsid, reception.slot
+        same = [(o, a) for o, a in others if same_class(frame.sf, o.sf)]
+        partner = max(same, key=lambda oa: (oa[1], -oa[0].eid))[0]
+        first, second = sorted((frame, partner), key=lambda f: (f.start_us, f.eid))
+        was = first.receptions.get((rsid, slot))
+        locked = (second.start_us >= first.pre_us
+                  and was is not None and was.followed_at(second.start_us))
+        outcome = bench_outcome(self.seed, first.eid, second.eid, rsid,
+                                lead if first is frame else -lead, locked)
+        return outcome[0] if first is frame else outcome[1]
 
     def verdict_pairwise(self, reception):
         """How this frame ends at one receiver: the pairwise rule.
@@ -1515,8 +1770,17 @@ class Ether(asyncio.DatagramProtocol):
         station = self.stations.get(rsid)
         if station is not None and station.locks.get(slot) is reception:
             station.locks.pop(slot, None)
+        if reception.abandoned:
+            log("frame %d from %d -> station %d slot %s: abandoned, it left RX" % (
+                frame.eid, frame.sid, rsid, slot))
+            return
         verdict = (self.verdict_pairwise(reception) if self.pairwise
                    else self.verdict_for(reception))
+        if verdict == "clean" and self.physics.crc_margin_db:
+            margin = level - self.noise(frame.bw) - self.sensitivity(frame.sf)
+            if crc_margin_fails(self.seed, frame.eid, rsid, slot, margin,
+                                self.physics.crc_margin_db):
+                verdict = "crc"
         self.send(rsid, {"type": "rx_end", "slot": slot, "id": frame.eid,
                          "t": self.now(), "verdict": verdict,
                          "payload": frame.payload, "rssi": round(level),
@@ -1537,6 +1801,13 @@ class Ether(asyncio.DatagramProtocol):
             self.transport.close()
         if self.record is not None:
             self.record.close()
+
+
+def rule_name(pairwise, bench_capture=False):
+    """The collision rule, as the logs name it."""
+    if pairwise:
+        return "pairwise"
+    return "receiver-centred, bench capture" if bench_capture else "receiver-centred"
 
 
 def parse_bind(text):
@@ -1575,10 +1846,12 @@ def read_losses(directory):
     return tables
 
 
-async def serve(bind, record_path, physics, losses, time_mode="real", pairwise=False):
+async def serve(bind, record_path, physics, losses, time_mode="real", pairwise=False,
+                seed=None, bench_capture=False):
     loop = asyncio.get_running_loop()
     transport, ether = await loop.create_datagram_endpoint(
-        lambda: Ether(record_path, physics, time_mode=time_mode, pairwise=pairwise),
+        lambda: Ether(record_path, physics, seed=seed, time_mode=time_mode, pairwise=pairwise,
+                      bench_capture=bench_capture),
         local_addr=bind)
     tables, sids, gains = losses
     ether.set_losses(tables, sids, gains)
@@ -1586,8 +1859,7 @@ async def serve(bind, record_path, physics, losses, time_mode="real", pairwise=F
     log("ether listening on %s:%d" % (host, port))
     log("recording to %s" % record_path)
     log("time: %s" % describe_time(ether.mode, ether.rate))
-    log("physics: %s; %s rule" % (physics.describe(),
-                                  "pairwise" if pairwise else "receiver-centred"))
+    log("physics: %s; %s rule" % (physics.describe(), rule_name(pairwise, bench_capture)))
     log("loss tables: %s; nodes: %s" % (
         ", ".join("%s MHz (%d)" % (b, t.n) for b, t in sorted(tables.items())) or "none",
         ", ".join("%s=%d" % (n, s) for n, s in sorted(sids.items(), key=lambda i: i[1]))
@@ -1617,6 +1889,16 @@ def main(argv=None):
     ap.add_argument("--pairwise", action="store_true",
                     help="rule on collisions pairwise, per interferer by the capture "
                          "margin, instead of on the summed interference")
+    ap.add_argument("--bench-capture", action="store_true",
+                    help="rule on two frames of one spreading factor as a bench saw them "
+                         "meet, instead of by the same-SF figure")
+    ap.add_argument("--crc-margin-db", type=float, default=DEFAULT_CRC_MARGIN_DB,
+                    help="the CRC band: how far above its threshold a frame may still "
+                         "fail its CRC, the chance falling linearly to nothing "
+                         "(default %g: none)" % DEFAULT_CRC_MARGIN_DB)
+    ap.add_argument("--seed", type=int,
+                    help="the seed of the medium's draws, handed every station in its "
+                         "welcome (default: drawn at random)")
     ap.add_argument("--time", default="real",
                     help="real (default), max, or <k>x: virtual time as fast as the "
                          "stations allow, or paced at k times the wall clock")
@@ -1627,6 +1909,8 @@ def main(argv=None):
         ap.error(str(err))
     if bool(args.nodeset) != bool(args.losses):
         ap.error("--nodeset and --losses go together")
+    if args.bench_capture and args.pairwise:
+        ap.error("--bench-capture is a variant of the receiver-centred rule, not --pairwise's")
     sids, gains, tables = {}, {}, {}
     if args.nodeset:
         sids, gains = read_nodeset(args.nodeset)
@@ -1635,8 +1919,8 @@ def main(argv=None):
             log("geodata: %s" % args.geodata)
     try:
         asyncio.run(serve(parse_bind(args.bind), args.record,
-                          Physics(args.noise_figure), (tables, sids, gains),
-                          args.time, args.pairwise))
+                          Physics(args.noise_figure, args.crc_margin_db), (tables, sids, gains),
+                          args.time, args.pairwise, args.seed, args.bench_capture))
     except KeyboardInterrupt:
         log("ether stopping")
     return 0

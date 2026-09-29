@@ -209,8 +209,7 @@ the two identical to the medium. A flat cut low enough for SF12 delivers frames
 no SF7 receiver could demodulate, and a nodeset laid out against it draws links
 that do not exist and behaves far worse than it looks. The CRC band just above the
 threshold, where a frame locks but fails its cyclic redundancy check (CRC) at a
-probability, is the next thing this
-could learn; `welcome` already carries a seed for it.
+probability, is there when asked for (`--crc-margin-db`; below).
 
 ## Who is affected, and who can decode
 
@@ -263,6 +262,18 @@ factor make the channel busy, as it does on a bench.
 An RX slot gets the same energy begins for the frames it is not decoding, so
 the chip's instantaneous RSSI and a CAD it starts straight after RX read the
 same air.
+
+A slot that starts listening after a frame began is judged when it does
+(`tell_late`), so that carrier sense is not blind to every frame that began
+while a station was sending, in standby or in a CAD. It can still lock on to
+a decodable frame while `PREAMBLE_FOUND_SYMBOLS` of its preamble are to come:
+a receiver needs about four symbols to find a preamble, the bench's blind
+window, and the chip model raises PreambleDetected at the same four.
+Otherwise the frame is energy to it, in an `rx_begin` marked `cad` whose `t0`
+is the instant it was told, so the chip measures only what is left of the
+frame. "Starts listening" is a `state` into RX or CAD from another mode, or
+one that retunes it; a chip reports standby at the end of its own
+transmission, so a station back from sending is always one.
 
 ## Reception: two tests, the worst piece deciding
 
@@ -354,6 +365,32 @@ by 6 dB, one at a time, with nothing summed and no spreading factor spared.
 CAD is told only of frames it could decode. It is there so a run can be
 compared, frame for frame, with one ruled that way.
 
+## Bench capture
+
+`Ether(bench_capture=True)`, or `--bench-capture`, replaces the same-SF
+figure, and nothing else, with what a bench measured: the reticulum
+project's `tools/rncapture` of 2026-09-17, an SX1262 receiver with an SX1262
+and an LR2021 sending, SF7 at 125 kHz, 121-byte frames, 289 collisions of two
+frames whose starts were within about 8 ms. The figures and what is assumed
+beyond them are in `ether.py`'s table (`BENCH_*`); `bench_outcome` is the
+table as a function of the two frames, the receiver, the first frame's lead
+and whether the receiver was locked on it.
+
+It decides in two places, which must agree. At the lock, a frame arriving
+while the receiver follows another takes it only when the receiver is still
+inside the first one's preamble and the pair's outcome has the new one
+surviving; past the preamble it never does. At the verdict, a frame that is
+not lost must survive its class: its lead is over the summed power of its
+own spreading factor's class in its worst stretch of air, its partner in the
+outcome is the strongest of them, and "locked" is read off the first frame's
+reception at that receiver, whether it was being followed when the second
+started. With two frames that is the bench's pair exactly, and the outcome
+drawn at the lock is the one the verdicts read, because every draw is a hash
+of the seed, the pair and the receiver (`seeded_draw`). With three or more,
+the sum stands in for the second frame, which is an assumption, as are other
+spreading factors, bandwidths and starts further apart than the bench's.
+Inter-SF classes are judged by the matrix as without it.
+
 Matching is on the **last stated** values, not on anything the ether infers.
 This is why a station publishes a `state` on every command that changes its mode
 or carrier, and why a model that forgot to would go deaf silently. The one thing
@@ -377,7 +414,10 @@ across the air, and only the medium can issue one.
 `rx_begin` goes out immediately, so the receiver can arm its preamble, sync and
 header interrupts on the offsets. `rx_end` is a timer at the frame's stated
 span. Nothing re-reads the frame in between — a receiver that leaves `RX`
-mid-frame is not told, and discards the reception itself.
+mid-frame, or is retuned, discards the reception itself, and the ether sends
+it no `rx_end` for it either: nothing was received that the record, and every
+tool reading it, could count. Its own transmission is the exception, ruled on
+at the frame's end as talked over, `crc`, because that loss is the medium's.
 
 Both carry the link's level: `rx_begin` as `level`, which is what an
 instantaneous RSSI reads and what carrier sense acts on, and `rx_end` as `rssi`
@@ -405,11 +445,16 @@ medium: the ether's job is the frames, and everything watching is optional.
 - **Fading and per-frame variation.** A pair's loss is the table's and is
   the same for every frame between them. No shadowing beyond what the table
   was computed with, no multipath, no antenna pattern, no rain.
-- **The CRC band.** The threshold is the spreading factor's own, and above it a
-  frame is delivered. A real receiver also has a few dB above that threshold
-  where a frame locks but fails its CRC at a probability. `welcome` already
-  carries a `seed` so that band, when it arrives, has a reproducible generator
-  to draw from.
+- **The CRC band by default.** The threshold is the spreading factor's own,
+  and above it a frame is delivered. A real receiver also has a few dB above
+  that threshold where a frame locks but fails its CRC at a probability.
+  `Physics.crc_margin_db` (`--crc-margin-db`) gives that band a width: a
+  frame judged clean that stands m dB over its threshold, m under the width,
+  fails with probability 1 − m/width. The straight line stands in for the
+  S-shaped curve a bench measures. The draw is `seeded_draw` of the seed, the
+  frame's number and the receiving slot, not a generator's next number, so a
+  verdict is the same whatever order the receptions end in. It is off unless
+  given, so a run that does not ask is judged as before.
 - **Bandwidth and offset in the rejection figures.** The inter-SF figures
   were measured at one bandwidth on one carrier; a transmission at another
   bandwidth, or partly overlapping the band, is classed by its spreading
