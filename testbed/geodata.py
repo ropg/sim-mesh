@@ -28,6 +28,21 @@ either, and a nodeset made on one synthetic ground stands on any other.
 `terrain: flat` is the only terrain so far: a pair's loss is log-distance
 with the ground's exponent. A node's height is above the ground under it.
 
+**Shadowing**, on either kind, is two keys beside `pack:` or `synthetic:`:
+
+    shadowing_db: 7                     # the spread of each pair's draw, dB
+    shadowing_seed: 3                   # which draws; 0 when absent
+
+Every pair of nodes gets a static draw of its own on top of its loss: one
+standard normal per unordered pair, hashed from the seed and the two node
+names, times `shadowing_db`, the same both ways, in every band and for the
+whole run (`losses.with_shadowing`). Two pairs at one distance then need
+not hear each other alike, which is what makes a hidden node or a lucky
+long link. It is a layer over the tables, never in them, so neither key is
+in `content_hash` and a new spread or seed recomputes nothing. Absent, or
+at 0, there is none, and a file without the keys reads, hashes and is
+written back exactly as it did before they existed.
+
 Coordinates on a pack are its own CRS, absolute easting and northing in
 metres. Packs are UTM on WGS84 (EPSG 326zz north, 327zz south) or on ETRS89
 (258zz), and the transverse Mercator here is Krüger's series to sixth order
@@ -49,6 +64,7 @@ of an export, and of an import. Nodes belong to nodesets.
 
 import contextlib
 import copy
+import difflib
 import hashlib
 import json
 import math
@@ -76,6 +92,13 @@ PACK_MEMBER = "pack"                # where an exported pack goes inside it
 EXPORT_LEVEL = 1                    # deflate's fastest: berlin-city, 450 MB, is 124 MB in 2 s
 NODES_LAYER = "Nodes"
 NODES_NOTICE = "Deployed mesh nodes"   # how the Nodes layer's notice names its source
+SHADOWING_DB, SHADOWING_SEED = "shadowing_db", "shadowing_seed"
+# The keys either kind may add, in the order a file is written in; a file
+# carries one only when it states it.
+STATED = (SHADOWING_DB, SHADOWING_SEED)
+# The keys that are laid over a table rather than computed into it: not in
+# `content_hash`, so a cached table outlives any change to them.
+LAYER_KEYS = (SHADOWING_DB, SHADOWING_SEED)
 
 
 def planner_repo():
@@ -243,8 +266,11 @@ class Geodata:
     def content_hash(self):
         """What a loss table on this ground depends on, hashed: the geodata
         file's content, and for a pack its manifest. A cached table or
-        coverage raster is good while this is unchanged."""
-        text = json.dumps([self.data, self.pack_manifest_hash], sort_keys=True)
+        coverage raster is good while this is unchanged. The layer keys
+        (the shadowing) are left out: they are put on a table, never
+        computed into it, and without them the hash is what it always was."""
+        data = {key: value for key, value in self.data.items() if key not in LAYER_KEYS}
+        text = json.dumps([data, self.pack_manifest_hash], sort_keys=True)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
     @property
@@ -262,6 +288,16 @@ class Geodata:
     @property
     def extent_m(self):
         return self.data[SYNTHETIC]["extent_m"] if not self.is_pack else None
+
+    @property
+    def shadowing_db(self):
+        """The spread of each pair's shadowing draw, in dB; 0 is none."""
+        return self.data.get(SHADOWING_DB, 0.0)
+
+    @property
+    def shadowing_seed(self):
+        """Which draws: the same seed and names are the same ground."""
+        return self.data.get(SHADOWING_SEED, 0)
 
     @property
     def bbox(self):
@@ -314,6 +350,7 @@ class Geodata:
                                  for n in manifest.get("licenses") or () if isinstance(n, dict)])
         else:
             out.update(exponent=self.exponent, terrain=self.terrain, extent_m=self.extent_m)
+        out.update((key, self.data[key]) for key in STATED if key in self.data)
         return out
 
 
@@ -324,7 +361,7 @@ def parse(data, where):
     if PACK in data:
         if not data[PACK]:
             raise store.StoreError("%s: `pack:` names no directory" % where)
-        return {PACK: str(data[PACK])}
+        return {PACK: str(data[PACK]), **_stated(data, where)}
     ground = data.get(SYNTHETIC)
     if not isinstance(ground, dict):
         raise store.StoreError("%s: geodata is `pack: <dir>` or "
@@ -338,7 +375,51 @@ def parse(data, where):
         raise store.StoreError("%s: extent_m must be above 0" % where)
     return {SYNTHETIC: {"terrain": terrain,
                         "exponent": float(ground.get("exponent", DEFAULT_EXPONENT)),
-                        "extent_m": extent}}
+                        "extent_m": extent},
+            **_stated(data, where)}
+
+
+def _stated(data, where):
+    """The keys beyond `pack:` or `synthetic:` a file states, checked. One
+    it does not state is not there at all, so a file without it reads,
+    hashes and is written back as it was before the key existed.
+
+    A key close to one of these but not it (`shadowing_dB`, `shadow_db`) is
+    refused: passed over, it would leave the model silently off, which reads
+    as a run like any other. Any other key is passed over, as before."""
+    for key in data:
+        if key in (PACK, SYNTHETIC) or key in STATED:
+            continue
+        near = difflib.get_close_matches(str(key).lower(), STATED, n=1, cutoff=0.8)
+        if near:
+            raise store.StoreError("%s: geodata has no key %s: did you mean %s?"
+                                   % (where, key, near[0]))
+    out = {}
+    if SHADOWING_DB in data:
+        out[SHADOWING_DB] = _number(data[SHADOWING_DB], SHADOWING_DB, where)
+        if out[SHADOWING_DB] < 0:
+            raise store.StoreError("%s: shadowing_db is a spread in dB, 0 or more, not %g"
+                                   % (where, out[SHADOWING_DB]))
+    if SHADOWING_SEED in data:
+        seed = data[SHADOWING_SEED]
+        whole = isinstance(seed, int) or (isinstance(seed, float) and seed.is_integer())
+        if isinstance(seed, bool) or not whole:
+            raise store.StoreError("%s: shadowing_seed is a whole number, not %r" % (where, seed))
+        out[SHADOWING_SEED] = int(seed)
+    return out
+
+
+def _number(value, key, where):
+    """A finite number, or a StoreError naming the key that is not one. It
+    is held to the nine decimals a file keeps (`store.scalar`), so a copy
+    written into a run reads back as the very number this one holds."""
+    try:
+        out = float(value) if not isinstance(value, bool) else math.nan
+    except (TypeError, ValueError):
+        out = math.nan
+    if not math.isfinite(out):
+        raise store.StoreError("%s: %s is a number, not %r" % (where, key, value))
+    return round(out, 9)
 
 
 def read(path, name=None, refuse_packs=None):
@@ -371,11 +452,14 @@ def load(name, refuse_packs=None):
 
 def dump(data):
     if PACK in data:
-        return "pack: %s\n" % store.scalar(data[PACK])
-    ground = data[SYNTHETIC]
-    return ("synthetic:\n  terrain: %s\n  exponent: %s\n  extent_m: %s\n"
-            % (ground["terrain"], store.scalar(ground["exponent"]),
-               store.scalar(ground["extent_m"])))
+        text = "pack: %s\n" % store.scalar(data[PACK])
+    else:
+        ground = data[SYNTHETIC]
+        text = ("synthetic:\n  terrain: %s\n  exponent: %s\n  extent_m: %s\n"
+                % (ground["terrain"], store.scalar(ground["exponent"]),
+                   store.scalar(ground["extent_m"])))
+    return text + "".join("%s: %s\n" % (key, store.scalar(data[key]))
+                          for key in STATED if key in data)
 
 
 def write(path, data, comment=None):
@@ -439,7 +523,7 @@ def rename(name, to):
     if os.path.basename(pack or "") == name and _own_pack(name, pack) \
             and not os.path.exists(target):
         os.rename(pack, target)
-        data = {PACK: os.path.relpath(target, os.path.dirname(os.path.abspath(dst)))}
+        data[PACK] = os.path.relpath(target, os.path.dirname(os.path.abspath(dst)))
     write(dst, data, comment)
     os.remove(src)
 
@@ -518,7 +602,7 @@ def export_zip(gd, out):
         if not gd.is_pack:
             zf.writestr(GEODATA_MEMBER, head + dump(gd.data))
             return
-        zf.writestr(GEODATA_MEMBER, head + dump({PACK: PACK_MEMBER}))
+        zf.writestr(GEODATA_MEMBER, head + dump({**gd.data, PACK: PACK_MEMBER}))
         manifest, dropped = without_nodes(gd.manifest)
         zf.writestr("%s/%s" % (PACK_MEMBER, MANIFEST), json.dumps(manifest, indent=1))
         skip = set(dropped) | {MANIFEST}
@@ -611,7 +695,7 @@ def import_zip(zip_path, name=None, packs=None):
             if root + MANIFEST not in members:
                 raise store.StoreError("the geodata names pack %s, and the zip has no %s there"
                                        % (data[PACK], MANIFEST))
-            _expand_pack(zf, root, name, packs)
+            _expand_pack(zf, root, name, packs, data)
             return load(name)
     except zipfile.BadZipFile as err:
         raise store.StoreError("not a zip: %s" % err) from err
@@ -619,9 +703,10 @@ def import_zip(zip_path, name=None, packs=None):
         raise store.StoreError("%s: %s" % (GEODATA_MEMBER, err)) from err
 
 
-def _expand_pack(zf, root, name, packs=None):
+def _expand_pack(zf, root, name, packs=None, data=None):
     """The pack under `root` in an open zip, into `packs/<name>/`, and the
-    geodata file that names it."""
+    geodata file that names it, with whatever else `data`, the zip's own
+    geodata, states."""
     packs = packs or packs_dir()
     dest = os.path.join(packs, name)
     if os.path.exists(dest):
@@ -657,5 +742,5 @@ def _expand_pack(zf, root, name, packs=None):
         os.rename(part, dest)
     finally:
         shutil.rmtree(part, ignore_errors=True)
-    write(geodata_path(name), {PACK: os.path.relpath(dest, store.GEODATA_DIR)},
+    write(geodata_path(name), {**(data or {}), PACK: os.path.relpath(dest, store.GEODATA_DIR)},
           "imported pack %s" % manifest.get("name", name))

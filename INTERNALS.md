@@ -357,11 +357,11 @@ to choose from.
 
 ```
 geodata ──┐
-          ├──► loss table (derived, per band, cached) ── + links + antennas + offsets ──┐
-nodeset ──┘  (positions, heights)                                                       │
-nodeset: antenna, role, radio, tags ───────────────────────────────────────────────────┤
-script: firmware() rules, setup ───────────────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
-device files (by the rules' device names, fetched when used) ──────────────────────────┘
+          ├──► loss table (derived, per band, cached) ── + links + shadowing + antennas + offsets ──┐
+nodeset ──┘  (positions, heights)                                                                   │
+nodeset: antenna, role, radio, tags ───────────────────────────────────────────────────────────────┤
+script: firmware() rules, setup ───────────────────────────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
+device files (by the rules' device names, fetched when used) ──────────────────────────────────────┘
 snapshot = geodata + nodeset + script + tables + rules + every station's store
 ```
 
@@ -391,7 +391,8 @@ and each is its own file so that changing one leaves the others alone:
 - the **loss table** follows from the geodata and the nodeset's geometry and
   from nothing else, so it is derived and cached under a hash of exactly
   those, and relabelling a node, changing its antenna, role, radio,
-  firmware, offsets or links, or changing the script, never recomputes it.
+  firmware, offsets or links, the geodata's shadowing, or the script, never
+  recomputes it.
 
 **A firmware rule is a condition, kept.** `firmware(which, device)` holds
 its selection as a condition over each node's facts (`simesh.select`), not
@@ -456,6 +457,22 @@ to it. The figure is the pair's, not a frequency's, so it goes into every
 band's table as stated; within a band the ether moves it to the frame's
 own carrier as it does every cell, a few hundredths of a dB across the
 EU868 channels.
+
+**Shadowing is a layer, one draw per pair.** Log-distance gives every pair
+at one distance the same loss, and P.1812 sees only the ground it is given;
+real links differ by what else stands between them, and that difference is
+what makes a hidden node or a lucky long link.
+A geodata's `shadowing_db` adds to each pair's loss, both ways and in every
+band, that spread times a standard normal drawn from SHA-256 of
+`shadowing_seed` and the pair's two node names (`losses.with_shadowing`).
+The draw is fixed for the run and depends on nothing that happens in it, so
+two runs that differ only in their traffic or their firmware stand on the
+same ground: the common random numbers a paired comparison needs. Names,
+not station ids, because a node keeps its name from one run to the next. A
+loss drawn afresh per frame would be fading, a different thing that lets
+every retry through in the end; this is not that. A pair never heard stays
+so, a measured cell already holds its path's own shadowing, and a stated
+link is the figure as stated, so none of them is drawn on.
 
 A node is referred to **by name** everywhere, and its **id** is stored and
 editable. The name is what a person means; the id is the station's network

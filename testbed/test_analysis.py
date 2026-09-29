@@ -182,6 +182,14 @@ def test_links_reach_the_medium_the_tools_read(tmp_path):
     assert after == pytest.approx(before + model - 100, abs=0.01)
 
 
+def test_shadowing_reaches_the_medium_the_tools_read(tmp_path):
+    run = lay_out(tmp_path)
+    before = RunView(run.dir).medium().level(1, 2, CALLING, 14)
+    geodata.write(run.geodata_path, dict(run.geodata().data, shadowing_db=7, shadowing_seed=3))
+    after = RunView(run.dir).medium().level(1, 2, CALLING, 14)
+    assert after == pytest.approx(before - 7 * losses.shadowing_unit(3, "n01", "n02"), abs=0.01)
+
+
 def test_a_run_with_no_reticulous_station_reads_no_protocol(tmp_path):
     other = lay_out(tmp_path, kind="sergeyculum", bare=True, name="bm")
     view = RunView(other.dir)

@@ -17,8 +17,9 @@ resolved, and the loss tables the ether read.
 - **Kind.** A node's kind is its firmware's, as the run resolved it; what its
   frames mean belongs to that kind's protocol (`simesh.protocol_for`).
 - **Levels** are the medium's own: an `Ether` holding the run's tables with
-  the nodeset's links, antennas (over the grounds the run kept) and offsets
-  on them (`losses.medium_tables`), the names, and the noise figure from
+  the nodeset's links, the geodata's shadowing, the nodeset's antennas (over
+  the grounds the run kept) and offsets on them (`losses.medium_tables`),
+  the names, and the noise figure from
   the run's `physics` (the ether's default when the run names none), asked
   through the ether's own `level` and `audible`. Nothing here recomputes a
   loss from positions.

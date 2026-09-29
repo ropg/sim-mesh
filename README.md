@@ -327,6 +327,27 @@ ground, roads and buildings, with the notices of the sources it was built
 from in its bottom corner, as OpenStreetMap's Open Database Licence (ODbL)
 and Copernicus's terms ask.
 
+**Shadowing** is two keys beside either kind, both absent by default:
+
+```yaml
+# testbed/geodata/plain-27-rough.yaml: the same ground, every pair shadowed
+synthetic:
+  terrain: flat
+  exponent: 2.7
+  extent_m: 150000
+shadowing_db: 7                     # the spread of each pair's draw, dB
+shadowing_seed: 3                   # which draws; 0 when absent
+```
+
+Every pair of nodes then gets a static draw of its own on top of its loss:
+one standard normal per unordered pair, hashed from the seed and the two
+node names, times the spread, the same both ways, in every band and for the
+whole run. Two pairs at one distance need not hear each other alike, which
+is what makes a hidden node or a lucky long link. It is a layer over the
+tables, like a nodeset's offsets, so a new spread or seed recomputes
+nothing; a pair never heard, a measured cell and a pair a nodeset states a
+link for are left as they are.
+
 There are three ways of getting ground, one button each on the Geodata tab:
 **New synthetic…**, **Build from sources…** and **Import zip…**. Nothing else
 makes or moves geodata.
@@ -534,10 +555,10 @@ links:                                # optional
 
 `loss_db` is from the first node to the second, `back_db` the other way
 (`loss_db` again when absent), the same in every band. A link stands in for
-the model's loss; the antennas and any offset still go on top, so a pair
-with both has the offset added to the stated figure. It is a layer like the
-offsets, and a nodeset without links has no `links:` key and is written
-back without one.
+the model's loss and the geodata's shadowing; the antennas and any offset
+still go on top, so a pair with both has the offset added to the stated
+figure. It is a layer like the offsets, and a nodeset without links has no
+`links:` key and is written back without one.
 
 A nodeset is offered on every geodata whose extent holds one of its nodes,
 as a layer of the Nodes tab ([The Nodes tab](#the-nodes-tab)).
@@ -749,9 +770,9 @@ band; the ether adds `20·log10(f/f0)` per frame to move it to the frame's own
 carrier. It is derived, never edited, and cached under
 `testbed/losses/<geodata>/<nodeset geometry>/<band>.bin`, keyed by what it
 depends on: the geodata's content and the nodeset's node set, positions and
-heights. Names, ids, antennas, firmware, radios, tags, offsets and links
-leave it alone: the links, the antennas and the offsets are layers put on it
-when the medium is given it.
+heights. Names, ids, antennas, firmware, radios, tags, offsets, links and
+a geodata's shadowing leave it alone: they are layers put on it when the
+medium is given it.
 [LOSSTABLE.md](LOSSTABLE.md) is the file format. A simulation computes a
 table for the band `globals.py`'s carrier falls in.
 
@@ -799,12 +820,12 @@ L = P_tx + G_tx + G_rx − loss(tx → rx) − offset − 20·log10(f / f0)
 
 with `P_tx` the power the frame went out at, `G_tx` and `G_rx` each antenna's
 gain toward the other end in three dimensions ([Antennas](#antennas)), the
-loss the table's (or the link's) and the offset the nodeset's. A frame that
-arrives below the signal-to-noise ratio its spreading factor needs — −7.5 dB
-at SF7, down to −20 dB at SF12 — is not delivered at all, and that is what
-"out of range" means here. So a link is in range only if it is one the modem
-could actually hold, and moving to a slower spreading factor really does
-reach further.
+loss the table's (or the link's), with the geodata's shadowing draw on it
+when there is one, and the offset the nodeset's. A frame that arrives below
+the signal-to-noise ratio its spreading factor needs — −7.5 dB at SF7, down
+to −20 dB at SF12 — is not delivered at all, and that is what "out of range"
+means here. So a link is in range only if it is one the modem could actually
+hold, and moving to a slower spreading factor really does reach further.
 
 Every transmission whose channel overlaps a receiver's is interference
 there, whatever its spreading factor, and each receiver rules for itself: a
@@ -957,12 +978,13 @@ ground up:
   reaches, coloured by the level it would be heard at, green to amber where
   it decodes, red where it only interferes, dashed where the first Fresnel
   zone is not clear, by the table's own figures without the nodeset's
-  offsets and links (attached, the levels the ether reports for the nodes
-  that decode stand in for those); always drawn while one node is selected:
-  from the run's table, or standalone from that node's row and column, which
-  the front computes from the nodes as they stand, saved or not, keeping each
-  pair both ways by where its ends stand, so selecting the next node or
-  moving one asks only for the pairs that are new (`links`);
+  offsets and links or the geodata's shadowing (attached, the levels the
+  ether reports for the nodes that decode stand in for those); always drawn
+  while one node is selected: from the run's table, or standalone from that
+  node's row and column, which the front computes from the nodes as they
+  stand, saved or not, keeping each pair both ways by where its ends stand,
+  so selecting the next node or moving one asks only for the pairs that are
+  new (`links`);
 - **the other shown layers**' nodes, hollow rings in each layer's colour,
   named on hover;
 - **the nodes**: a dot each with its name, its antenna's height above the
@@ -1406,7 +1428,7 @@ Every analysis tool reads a run directory, and takes names, positions, radio
 settings and levels from it — the run's nodeset (its tags: a role tag the
 node's role, none a `client`, and `no-radio`), the run's copy of
 `globals.py` (every other node's radio, at its maximum power), its geodata, the firmware each
-node ran and its own loss tables with the links, antennas and offsets on them —
+node ran and its own loss tables with the links, shadowing, antennas and offsets on them —
 never the files as they stand now. What a frame means is a protocol's, under
 `testbed/simesh/<protocol>/`, found by each node's firmware kind; the roles are
 what `airtime.py --roles` and the hop counts through forwarding stations use.
@@ -1757,7 +1779,7 @@ code lives in that component's `src/host/`.
 | `planner/` | the Rust workspace: `planner-web` (the sidecar), `planner-job` (a pack's build, a node map's import), `planner-pack` (the compiler, OpenStreetMap from a PBF extract), `planner-buildings`, `planner-import`, and the ground, propagation and coverage crates |
 | `testbed/script.py` | scripts: listing, checking, loading, the `firmware()` rules at a script's top |
 | `testbed/simesh/library.py`, `testbed/simesh/select.py` | the script library, `firmware`, `exec`, `max_tx_pwr`, `send_msg`, and `nodes()` selections |
-| `testbed/losses.py` | a loss table, on synthetic ground or through the sidecar; the cache; links, antennas and offsets as layers, the ground under each node; one node's row |
+| `testbed/losses.py` | a loss table, on synthetic ground or through the sidecar; the cache; links, shadowing, antennas and offsets as layers, the ground under each node; one node's row |
 | `testbed/coverage.py` | a node's coverage raster on a pack, through the sidecar, cached |
 | `testbed/runs.py` | a run directory, and snapshots taken from and loaded into one |
 | `testbed/stations.py` | one firmware process, its pty, its log, its supervisor; the thread every station's pty is read on |

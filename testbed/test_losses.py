@@ -133,6 +133,94 @@ def test_without_links_the_medium_is_given_what_it_was_before_them(stores):
     was = losses.with_offsets(losses.with_antennas(tables, gd, ns), ns)["868"]
     assert got.loss.tobytes() == was.loss.tobytes()
     assert got.flags.tobytes() == was.flags.tobytes()
+    # Nor does a spread of 0, or a seed alone, change a cell.
+    for keys in ({"shadowing_db": 0}, {"shadowing_seed": 5}):
+        got = losses.medium_tables(tables, rough(**keys), ns)["868"]
+        assert got.loss.tobytes() == was.loss.tobytes()
+
+
+# ---- shadowing -----------------------------------------------------------
+
+def rough(exponent=3.1, **keys):
+    """The fixture's flat ground again, with shadowing keys."""
+    geodata.write(geodata.geodata_path("rough"), {"synthetic": {"exponent": exponent}, **keys})
+    return geodata.load("rough")
+
+
+def test_shadowing_is_one_draw_per_pair_the_same_both_ways_and_every_time():
+    draw = losses.shadowing_unit
+    assert draw(3, "a", "b") == draw(3, "b", "a") == draw(3, "a", "b")
+    assert draw(3, "a", "b") != draw(3, "a", "c")
+    assert draw(3, "a", "b") != draw(4, "a", "b")
+    # The same from a cold start, and the same as on the day it was written:
+    # SHA-256 of "0:a:b", Box–Muller. A change here moves every run's ground.
+    draw.cache_clear()
+    assert draw(0, "b", "a") == pytest.approx(-0.9460136480786182, abs=1e-12)
+
+
+def test_shadowing_draws_spread_like_a_standard_normal():
+    draws = [losses.shadowing_unit(7, "n%02d" % a, "n%02d" % b)
+             for a in range(40) for b in range(a + 1, 40)]
+    mean = sum(draws) / len(draws)
+    spread = math.sqrt(sum((d - mean) ** 2 for d in draws) / (len(draws) - 1))
+    assert abs(mean) < 0.12
+    assert spread == pytest.approx(1.0, abs=0.08)
+    assert sum(abs(d) < 1 for d in draws) / len(draws) == pytest.approx(0.683, abs=0.05)
+
+
+def test_shadowing_moves_a_pair_by_its_draw_times_the_spread_both_ways_in_every_band(stores):
+    gd, ns = rough(shadowing_db=7, shadowing_seed=3), nodeset.load("three")
+    tables = {band: losses.synthetic_table(gd, ns, band) for band in ("433", "868")}
+    got = losses.with_shadowing(tables, gd, ns)
+    for band, table in tables.items():
+        assert got[band] is not table
+        for a in table.names:
+            for b in table.names:
+                if a != b:
+                    want = table.get(a, b) + 7 * losses.shadowing_unit(3, a, b)
+                    assert got[band].get(a, b) == pytest.approx(want, abs=1e-4)
+    shift = {band: got[band].get("a", "c") - tables[band].get("a", "c") for band in tables}
+    assert abs(shift["868"]) > 0.1 and shift["433"] == pytest.approx(shift["868"], abs=1e-4)
+    # The draw is the pair's alone: in another nodeset, with another node
+    # and in another order, the pair moves by as much.
+    other = nodeset.create("other")
+    for name in ("e", "c", "a"):
+        node = ns.nodes.get(name) or {"lat": 0.003, "lon": 0.003}
+        other.add_node(name, node["lat"], node["lon"])
+    table = losses.synthetic_table(gd, other, "868")
+    moved = losses.with_shadowing({"868": table}, gd, other)["868"]
+    assert moved.get("c", "a") - table.get("c", "a") == pytest.approx(shift["868"], abs=1e-4)
+    # No spread, no layer: the tables themselves.
+    assert losses.with_shadowing(tables, rough(shadowing_seed=3), ns)["868"] is tables["868"]
+
+
+def test_shadowing_leaves_never_heard_measured_and_stated_cells_as_they_are(stores):
+    gd, ns = rough(shadowing_db=7), nodeset.load("three")
+    table = losses.synthetic_table(gd, ns, "868")
+    table.put("a", "b", slt.NEVER, slt.FLAG_BEYOND_RADIUS)
+    table.put("b", "c", 120.0, slt.FLAG_MEASURED, 12)
+    ns.data["links"] = [{"between": ["c", "d"], "loss_db": 100.0}]
+    got = losses.with_shadowing({"868": table}, gd, ns)["868"]
+
+    def drawn(a, b):
+        return table.get(a, b) + 7 * losses.shadowing_unit(0, a, b)
+    assert got.get("a", "b") == slt.NEVER                   # never heard stays never heard
+    assert got.get("b", "a") == pytest.approx(drawn("b", "a"), abs=1e-4)
+    assert got.get("b", "c") == 120.0                       # the measurement holds its own
+    assert got.get("c", "b") == pytest.approx(drawn("c", "b"), abs=1e-4)
+    assert (got.get("c", "d"), got.get("d", "c")) == (table.get("c", "d"), table.get("d", "c"))
+    # In the medium the stated pair is the link, with no draw on it.
+    medium = losses.medium_tables({"868": table}, gd, ns)["868"]
+    unshadowed = losses.medium_tables({"868": table}, geodata.load("flat"), ns)["868"]
+    assert medium.get("c", "d") == unshadowed.get("c", "d")
+    assert medium.get("d", "c") == unshadowed.get("d", "c")
+
+
+def test_shadowing_is_a_layer_and_never_recomputes_a_table(stores):
+    gd, ns = geodata.load("flat"), nodeset.load("three")
+    path, _ = asyncio.run(losses.compute(gd, ns, "868"))
+    geodata.write(geodata.geodata_path("flat"), dict(gd.data, shadowing_db=7, shadowing_seed=3))
+    assert asyncio.run(losses.compute(geodata.load("flat"), ns, "868")) == (path, True)
 
 
 def test_the_band_is_the_one_globals_carrier_falls_in(stores):
