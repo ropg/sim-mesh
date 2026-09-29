@@ -58,7 +58,8 @@ node's maximum power, among their macros.
 
 Loss tables. The run holds one table per band its nodes' carriers use
 (`losses.bands_of`), and the ether rules on every frame from them, with the
-nodes' antennas and the nodeset's offsets on them (`losses.medium_tables`);
+nodeset's links, the geodata's shadowing, the nodes' antennas and the
+nodeset's offsets on them (`losses.medium_tables`);
 the antennas need the ground under each node, which is asked of the sidecar
 on a pack (`losses.grounds`) and kept in the run as `grounds`. A nodeset edit that changes
 the geometry (a move, a height, a node added) recomputes the touched nodes'
@@ -106,7 +107,7 @@ snapshot {run, geodata, nodeset, script, bands, nodes: [node…], port, clock,
 node {name, id, kind, firmware, device_name, web, lat, lon, height_m, height_from,
       max_dbm, antenna, tags, role, status, stale, mode?, freq?, sf?, bw?}
 node_gone {name}
-nodeset {name, dirty, geometry_hash, nodes, offsets}
+nodeset {name, dirty, geometry_hash, nodes, offsets, links?}
 store {geodata_names, nodesets, scripts, snapshots}   after a snapshot is saved
 losses_progress {band, done, total}                 while a sim_load computes
 levels {name, freq, heard: {name: dBm}}
@@ -455,8 +456,9 @@ class Simd:
             self.broadcast(self.clock_message())
 
     def apply_to_ether(self):
-        """Give the medium the tables with the antennas and the offsets on
-        them, and which station id is which node, wholesale.
+        """Give the medium the tables with the links, the shadowing, the
+        antennas and the offsets on them, and which station id is which node,
+        wholesale.
 
         Cheap enough to redo outright on every change of ids, antennas,
         offsets or the node set; a node the tables have no row for yet is in
@@ -1525,6 +1527,9 @@ class Simd:
         log("run %s: geodata %s (%s), nodeset %s (%d nodes), script %s, tables %s"
             % (run.dir, gd.name, gd.kind, ns.name, len(ns.nodes),
                run.meta.get("script") or "none", ", ".join(sorted(tables)) or "none"))
+        warning = losses_module.shadowing_warning(gd)
+        if warning:
+            log("warning: %s" % warning)
         await self.settle_firmware()
         bare = [n for n in ns.nodes if not self.firmware.get(n)]
         if bare:

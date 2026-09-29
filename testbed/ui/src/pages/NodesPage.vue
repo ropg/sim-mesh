@@ -659,7 +659,7 @@ function askRemove(names: string[]) {
     title: names.length === 1 ? `Remove ${names[0]}` : `Remove ${names.length} nodes`,
     message: nodes.attached
       ? 'Stop them, take them out of this run\'s nodeset and delete their state? This cannot be undone.'
-      : 'Take them out of the nodeset, with their offsets?',
+      : 'Take them out of the nodeset, with their offsets and links?',
     cancel: true, persistent: true,
   }).onOk(() => nodes.remove(names))
 }

@@ -5,7 +5,8 @@ live, and what a name for any of them may be.
     testbed/nodesets/<name>.yaml      which nodes stand where, with their device, role and radio
     testbed/scripts/<name>.py         Python against the simesh library: setup and drivers
     testbed/losses/<geodata>/<nodeset geometry hash>/<band>.bin
-                                      derived loss tables, a cache (not kept in git)
+                                      derived loss tables, a cache (not kept in git);
+                                      <band>-loc<pct>.bin for a pack's stated loc_pct
     testbed/coverage/<geodata>/<key>.bin
                                       one node's coverage raster, a cache (not kept in git)
     testbed/runs/<name>/              one simulation's output (not kept in git)

@@ -137,6 +137,72 @@ def test_geometry_hash_follows_positions_and_heights_only(nodesets_dir):
         assert other.geometry_hash() != base
 
 
+# ---- links ---------------------------------------------------------------
+
+LINKED = """\
+nodes:
+  hub: { id: 1, lat: 0.01, lon: 0.02, height_m: 12, height_from: roof, antenna: { type: whip_sma_quarter_wave }, tags: [transport] }
+  n017: { id: 2, lat: 0.011, lon: 0.021, height_m: 2, height_from: assumed, antenna: { type: whip_sma_quarter_wave }, tags: [] }
+offsets: []
+links:
+  - { between: [hub, n017], loss_db: 131.5, back_db: 133, note: measured }
+"""
+
+
+def test_links_are_written_only_when_there_are_some_and_round_trip(nodesets_dir):
+    (nodesets_dir / "ex.yaml").write_text(SAMPLE)
+    ns = nodeset.load("ex")
+    # Without links nothing is new: not the data, not what the page is told,
+    # not the file.
+    assert ns.links == [] and "links" not in ns.data and "links" not in ns.as_dict()
+    assert nodeset.dump(ns.data) == SAMPLE
+    (nodesets_dir / "ex.yaml").write_text(LINKED)
+    ns = nodeset.load("ex")
+    assert ns.links == [{"between": ["hub", "n017"], "loss_db": 131.5, "back_db": 133,
+                         "note": "measured"}]
+    assert nodeset.dump(ns.data) == LINKED
+    assert ns.as_dict()["links"] == ns.links
+    ns.save_as("again")
+    assert nodeset.load("again").data == ns.data
+
+
+def test_removing_a_node_drops_its_links_and_a_rename_carries_them(nodesets_dir):
+    (nodesets_dir / "ex.yaml").write_text(LINKED)
+    ns = nodeset.load("ex")
+    ns.rename_node("n017", "n018")
+    assert ns.links[0]["between"] == ["hub", "n018"]
+    nodeset.parse(ns.data, "renamed")               # still names only nodes it has
+    ns.remove_node("n018")
+    assert ns.links == [] and "links" not in ns.data
+    assert "links" not in nodeset.dump(ns.data)
+
+
+def test_a_link_without_a_figure_is_refused(tmp_path):
+    head = "nodes:\n  a: { id: 1, lat: 0, lon: 0 }\n  b: { id: 2, lat: 0, lon: 0.01 }\nlinks:"
+    for text, match in (
+            ("\n  - { between: [a, b] }\n", "a link is"),
+            ("\n  - { between: [a, b], loss_db: loud }\n", "a link is"),
+            ("\n  - { between: [a], loss_db: 110 }\n", "a link is"),
+            ("\n  - { between: [a, b, c], loss_db: 110 }\n", "a link is"),
+            ("\n  - { between: ab, loss_db: 110 }\n", "a link is"),
+            ("\n  - between\n", "a link is"),
+            (" 110\n", "links is a list"),
+            ("\n  - { between: [a, z], loss_db: 110 }\n", "not a node"),
+            ("\n  - { between: [a, a], loss_db: 110 }\n", "itself"),
+            # A misspelt back_db would make the link the same both ways.
+            ("\n  - { between: [a, b], loss_db: 110, back_dB: 130 }\n", "has no back_dB"),
+            ("\n  - { between: [a, b], loss_db: .inf }\n", "finite"),
+            ("\n  - { between: [a, b], loss_db: 110, back_db: .nan }\n", "finite"),
+            ("\n  - { between: [a, b], loss_db: -3 }\n", "0 or more"),
+            ("\n  - { between: [a, b], loss_db: 1e39 }\n", "finite"),      # past float32
+            ("\n  - { between: [a, b], loss_db: 110 }\n  - { between: [b, a], loss_db: 120 }\n",
+             "stated twice")):
+        path = tmp_path / "f.yaml"
+        path.write_text(head + text)
+        with pytest.raises(store.StoreError, match=match):
+            nodeset.read(str(path))
+
+
 def test_a_nodeset_is_inside_an_extent_when_one_node_is(nodesets_dir):
     (nodesets_dir / "ex.yaml").write_text(SAMPLE)
     ns = nodeset.load("ex")
@@ -230,6 +296,22 @@ def test_shown_layers_merge_top_first():
     got = nodeset.merge([("a", layer(("n", 1, 1, 1, []), ("n-b", 2, 2, 2, []))),
                          ("b", layer(("n", 1, 3, 3, [])))])
     assert sorted(got["nodes"]) == ["n", "n-b", "n-b-2"]
+
+
+def test_a_link_comes_along_where_both_its_ends_do():
+    town = dict(layer(("gw", 1, 0.0, 0.0, []), ("hill", 2, 0.01, 0.01, [])),
+                links=[{"between": ["gw", "hill"], "loss_db": 120}])
+    meshcore = dict(layer(("mast", 1, 0.000027, 0.0, []), ("gw", 2, 0.02, 0.02, []),
+                          ("far", 7, 0.03, 0.03, [])),
+                    links=[{"between": ["mast", "far"], "loss_db": 130},
+                           {"between": ["gw", "far"], "loss_db": 125, "back_db": 127}])
+    got = nodeset.merge([("town", town), ("meshcore", meshcore)])
+    # The mast is the town's gw, so its link stays behind; the other is renamed.
+    assert got["links"] == [{"between": ["gw", "hill"], "loss_db": 120},
+                            {"between": ["gw-meshcore", "far"], "loss_db": 125, "back_db": 127}]
+    nodeset.parse(got, "merged")
+    plain = nodeset.merge([("a", layer(("n", 1, 1, 1, []))), ("b", layer(("m", 2, 2, 2, [])))])
+    assert "links" not in plain
 
 
 def test_a_delete_takes_the_nodesets_own_setup_with_it(nodesets_dir):

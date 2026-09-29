@@ -2567,6 +2567,29 @@ struct LinkQuery {
     /// operator running a 5.8 dBi collinear was previously unable to say so.
     tx_gain_dbi: Option<f64>,
     rx_gain_dbi: Option<f64>,
+    /// Percentage of locations the loss is not exceeded at, pL of P.1812
+    /// §4.7 eq. (69), both ways of the both-way mean. Left unset, the model's
+    /// own (`LinkParams::eu868_defaults`, 90), so every URL that worked before
+    /// returns the number it did. A caller that lays its own location spread
+    /// over the answer, as SIMesh's shadowing does, asks for the median: at
+    /// 90 the spread is counted twice.
+    loc_pct: Option<f64>,
+}
+
+/// The location percentage a link is judged at: the caller's, held to
+/// P.1812's own range (`p1812::lb_from_arrays` refuses anything outside
+/// 1..=99), else the model's default.
+///
+/// Checked here rather than left to the model. A P.1812 call that fails is
+/// answered below with the near-field model, as if the path were inside the
+/// 0.25 km floor, so an out-of-range pL would come back as a confident
+/// free-space number instead of a 4xx.
+fn resolve_loc_pct(loc_pct: Option<f64>) -> Result<f64, String> {
+    match loc_pct {
+        None => Ok(planner_core::model::LinkParams::eu868_defaults().loc_pct),
+        Some(p) if (1.0..=99.0).contains(&p) => Ok(p),
+        Some(p) => Err(format!("loc_pct must be in [1, 99], not {p}")),
+    }
 }
 
 /// The budget a link reply was judged against, and what it is made of.
@@ -2645,6 +2668,10 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
         rx_gain_dbi: rx_gain,
         gains_given,
     } = resolve_budget(q.budget_db, q.tx_gain_dbi, q.rx_gain_dbi);
+    let loc_pct = match resolve_loc_pct(q.loc_pct) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
     let a = st.clamp(Xy { x: q.ax, y: q.ay });
     let b = st.clamp(Xy { x: q.bx, y: q.by });
     let dist = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
@@ -2895,6 +2922,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     link.delta_n = st.manifest.region.delta_n;
     link.n0 = st.manifest.region.n0;
     link.path_center_lat_deg = lat;
+    link.loc_pct = loc_pct;
 
     let d_total = dist / 1000.0;
     let x = planner_propag::p1812::ArrayInputs {
@@ -4276,6 +4304,33 @@ mod tests {
         let forced = resolve_budget(Some(150.0), Some(5.8), Some(9.0));
         assert_eq!(forced.budget_db, 150.0);
         assert!(forced.source.contains("caller"));
+    }
+
+    /// `loc_pct` is the one way to ask for another location percentage, and
+    /// a URL without it must keep the number it always had.
+    #[test]
+    fn the_location_percentage_is_the_models_unless_the_caller_names_one() {
+        let dflt = planner_core::model::LinkParams::eu868_defaults().loc_pct;
+        assert_eq!(dflt, 90.0);
+        assert_eq!(resolve_loc_pct(None), Ok(dflt), "an untouched URL must not change");
+        for good in [1.0, 50.0, 99.0] {
+            assert_eq!(resolve_loc_pct(Some(good)), Ok(good));
+        }
+        // Refused, not handed to the model, whose refusal would turn into a
+        // near-field answer.
+        for bad in [0.0, 0.5, 99.5, 100.0, -50.0, f64::NAN, f64::INFINITY] {
+            assert!(resolve_loc_pct(Some(bad)).is_err(), "loc_pct {bad} must be refused");
+        }
+        // As axum parses the query: absent is None, the name is known, and
+        // a misspelling is still a 4xx rather than the default.
+        let parse = |extra: &str| {
+            let uri: axum::http::Uri =
+                format!("/link.json?ax=1&ay=2&bx=3&by=4{extra}").parse().unwrap();
+            Query::<LinkQuery>::try_from_uri(&uri).map(|Query(q)| q.loc_pct)
+        };
+        assert_eq!(parse("").unwrap(), None);
+        assert_eq!(parse("&loc_pct=50").unwrap(), Some(50.0));
+        assert!(parse("&loc=50").is_err());
     }
 
     use super::*;

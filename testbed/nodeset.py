@@ -35,17 +35,30 @@ What a node runs is not the nodeset's either: a script says it
 A nodeset names no geodata. It is offered on every geodata whose extent holds
 one of its nodes (`inside`); synthetic ground lies at 0°, 0°.
 
-A node's name is how everything refers to it: scripts, offsets, snapshots and
-the page. Its id is its network identity, stored and editable: the station's
-loopback address and MAC follow from it (`stations.bind_addr`), so changing
-it moves the station, and anything already set up with its old `{id}` or
-`{addr}` is stale. A new node takes the lowest id not in use.
+A node's name is how everything refers to it: scripts, offsets, links,
+snapshots and the page. Its id is its network identity, stored and
+editable: the station's loopback address and MAC follow from it
+(`stations.bind_addr`), so changing it moves the station, and anything
+already set up with its old `{id}` or `{addr}` is stale. A new node takes
+the lowest id not in use.
 
 **Offsets** are dB added to the computed loss of one pair, both ways, on any
 geodata: where a measurement says the model is wrong, and by how much. They
 are a layer over the loss table, applied when the medium is given it, so the
 table itself (`geometry_hash`: which nodes, where, how high) is cached
 without them and an offset never forces a recompute.
+
+**Links** state a pair's loss outright, where a better figure than the
+model's is known, measured or worked out elsewhere:
+
+    links:
+      - { between: [a, b], loss_db: 131.5, back_db: 133, note: measured }
+
+a→b is `loss_db` and b→a `back_db`, `loss_db` again when it has none, the
+same figure in every band with no correction between bands. A link is a
+layer too (`losses.with_links`): it stands in for the model's loss and the
+geodata's shadowing, and the antennas and any offset still go on top of it.
+A file without links has no `links:` key, and is written back without one.
 """
 
 import copy
@@ -54,6 +67,7 @@ import hashlib
 import json
 import math
 import os
+from array import array
 
 import yaml
 
@@ -70,6 +84,8 @@ DEFAULT_HEIGHT_M = 2.0
 MERGE_WITHIN_M = 5.0                # two layers' nodes this close are one node
 EARTH_RADIUS_M = 6371008.8
 KEEP = object()                     # set_node: a fact not given, left as it is
+LINK_KEYS = ("between", "loss_db", "back_db", "note")
+LINK_FORM = "{ between: [a, b], loss_db, back_db?, note? }"
 
 
 def nodeset_path(name):
@@ -122,7 +138,10 @@ def parse(data, where):
 
     Two nodes under one id would be two processes answering the ether as
     one station and two sockets on one address, so that is refused here,
-    as is an offset naming a node the nodeset does not have.
+    as is an offset naming a node the nodeset does not have. So is a link
+    that is no figure: one without a loss, naming a node there is not,
+    from a node to itself, or stating a pair a second time, which leaves
+    the pair's loss to whichever came last.
     """
     if not isinstance(data, dict):
         raise store.StoreError("%s: not a nodeset" % where)
@@ -177,7 +196,61 @@ def parse(data, where):
         if offset.get("note"):
             entry["note"] = str(offset["note"])
         out["offsets"].append(entry)
+    stated = data.get("links") or []
+    if not isinstance(stated, list):
+        raise store.StoreError("%s: links is a list, each %s" % (where, LINK_FORM))
+    links = [check_link(link, out["nodes"], where) for link in stated]
+    pairs = set()
+    for link in links:
+        pair = frozenset(link["between"])
+        if pair in pairs:
+            raise store.StoreError("%s: the link between %s and %s is stated twice"
+                                   % ((where,) + tuple(link["between"])))
+        pairs.add(pair)
+    if links:
+        out["links"] = links
     return out
+
+
+def check_link(link, nodes, where):
+    """One link, checked: its two ends, its loss one way and, when it
+    states one, the other.
+
+    A key it does not know is refused rather than passed over: a
+    misspelt `back_db` would otherwise make the link the same both ways,
+    a wrong number with nothing to say so. A loss is 0 dB or more, and
+    one a table's float32 cell can hold, since a figure too large for it
+    would silently become never heard.
+    """
+    if not isinstance(link, dict):
+        raise store.StoreError("%s: a link is %s" % (where, LINK_FORM))
+    unknown = sorted(str(key) for key in link if key not in LINK_KEYS)
+    if unknown:
+        raise store.StoreError("%s: a link has no %s: it is %s"
+                               % (where, ", ".join(unknown), LINK_FORM))
+    try:
+        ends = link["between"]
+        if not isinstance(ends, (list, tuple)) or len(ends) != 2:
+            raise ValueError("not two nodes")
+        a, b = (str(n) for n in ends)
+        figures = {"loss_db": float(link["loss_db"])}
+        if "back_db" in link:
+            figures["back_db"] = float(link["back_db"])
+    except (KeyError, TypeError, ValueError) as err:
+        raise store.StoreError("%s: a link is %s" % (where, LINK_FORM)) from err
+    for end in (a, b):
+        if end not in nodes:
+            raise store.StoreError("%s: link names %s, which is not a node" % (where, end))
+    if a == b:
+        raise store.StoreError("%s: a link joins two nodes, not %s to itself" % (where, a))
+    for key, value in figures.items():
+        if not (value >= 0 and math.isfinite(array("f", [value])[0])):
+            raise store.StoreError("%s: the link between %s and %s states %s %s: a loss is "
+                                   "a finite number of dB, 0 or more" % (where, a, b, key, value))
+    entry = {"between": [a, b], **figures}
+    if link.get("note"):
+        entry["note"] = str(link["note"])
+    return entry
 
 
 def check_id(node_id):
@@ -235,6 +308,17 @@ def dump(data, comment=None):
         note = ", note: %s" % store.scalar(offset["note"]) if offset.get("note") else ""
         out.append("  - { between: [%s, %s], db: %s%s }"
                    % (offset["between"][0], offset["between"][1], store.scalar(offset["db"]), note))
+    links = data.get("links") or []
+    if links:
+        out.append("links:")
+    for link in links:
+        parts = ["between: %s" % store.flow(link["between"]),
+                 "loss_db: %s" % store.scalar(link["loss_db"])]
+        if "back_db" in link:
+            parts.append("back_db: %s" % store.scalar(link["back_db"]))
+        if link.get("note"):
+            parts.append("note: %s" % store.scalar(link["note"]))
+        out.append("  - { %s }" % ", ".join(parts))
     return "\n".join(out) + "\n"
 
 
@@ -294,6 +378,11 @@ class Nodeset:
     @property
     def offsets(self):
         return self.data["offsets"]
+
+    @property
+    def links(self):
+        """The pairs whose loss is stated, [] when the file states none."""
+        return self.data.get("links") or []
 
     def node(self, name):
         node = self.nodes.get(name)
@@ -363,18 +452,24 @@ class Nodeset:
         self.node(name)
         del self.nodes[name]
         self.data["offsets"] = [o for o in self.offsets if name not in o["between"]]
+        if "links" in self.data:
+            links = [link for link in self.links if name not in link["between"]]
+            if links:
+                self.data["links"] = links
+            else:
+                del self.data["links"]
         self.dirty = True
 
     def rename_node(self, name, new):
-        """Give a node another name, and carry its offsets over."""
+        """Give a node another name, and carry its offsets and links over."""
         node = self.node(name)
         store.check_name(new, "node")
         if new in self.nodes:
             raise store.StoreError("there is already a node called %r" % new)
         self.data["nodes"] = {(new if key == name else key): value
                               for key, value in self.nodes.items()}
-        for offset in self.offsets:
-            offset["between"] = [new if end == name else end for end in offset["between"]]
+        for pair in self.offsets + self.links:
+            pair["between"] = [new if end == name else end for end in pair["between"]]
         self.dirty = True
         return node
 
@@ -458,11 +553,15 @@ class Nodeset:
         return Nodeset(self.name, copy.deepcopy(self.data), path or self.path)
 
     def as_dict(self):
-        """What the page is told about the nodeset."""
-        return {"name": self.name, "dirty": self.dirty,
-                "geometry_hash": self.geometry_hash(),
-                "nodes": copy.deepcopy(self.nodes),
-                "offsets": copy.deepcopy(self.offsets)}
+        """What the page is told about the nodeset. Its links, when it has
+        any, go along for the page to hand back on a save; it edits none."""
+        out = {"name": self.name, "dirty": self.dirty,
+               "geometry_hash": self.geometry_hash(),
+               "nodes": copy.deepcopy(self.nodes),
+               "offsets": copy.deepcopy(self.offsets)}
+        if self.links:
+            out["links"] = copy.deepcopy(self.links)
+        return out
 
 
 def load(name):
@@ -543,7 +642,8 @@ def merge(layers):
     MERGE_WITHIN_M of a node of an earlier layer is that node, the earlier
     layer's, and is left out; a name an earlier layer took gets the layer's
     name appended (and a number, should that be taken too); an id taken gets
-    the lowest free one. An offset comes along where both its ends do.
+    the lowest free one. An offset or a link comes along where both its ends
+    do.
     """
     layers = [(layer, parse(data, "layer %s" % layer)) for layer, data in layers]
     if len(layers) == 1:
@@ -569,6 +669,11 @@ def merge(layers):
             a, b = offset["between"]
             if a in renamed and b in renamed:
                 out["offsets"].append(dict(copy.deepcopy(offset), between=[renamed[a], renamed[b]]))
+        for link in data.get("links") or []:
+            a, b = link["between"]
+            if a in renamed and b in renamed:
+                out.setdefault("links", []).append(
+                    dict(copy.deepcopy(link), between=[renamed[a], renamed[b]]))
     return out
 
 
