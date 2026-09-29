@@ -1358,7 +1358,11 @@ crystal — drift, an offset — goes. f is the identity unless the station's
 environment has `SIMESH_CLOCK_PROFILE`, a piecewise-linear map given as
 `T:node` pairs in microseconds, both increasing, slope 1 outside them
 ([STATION.md](STATION.md#the-environment)); `nodeOf` / `conductorOf` are the
-only place it is defined.
+only place it is defined. `simd --clock-ppm P` gives every station one: a
+straight line from T 0 whose slope is off by a draw uniform within ±P parts
+per million, hashed from the seed and the node's name, so each station keeps
+its own time and keeps it again in a run with the same seed. A crystal is
+typically within ±20 ppm, 72 ms an hour. The radio's timers stay on T.
 
 **The C library's time is answered by a preloaded shim**,
 `radio/build/libsimclock.so` (built from `radio/shim/simclock.c`), which every

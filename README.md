@@ -1179,8 +1179,9 @@ run directory, default `testbed/runs/simd/`; a run loaded later that would
 land on one there goes beside it as `-2`, `-3`…), `--build`, `--sidecar` (the
 planner-web a pack's moved rows are recomputed through), `--stagger`,
 `--net`, `--time`, `--noise-figure`, `--pairwise` or `--bench-capture`, and
-`--crc-margin-db` (the ether's receivers, its rule and its CRC band), and
-`--seed` and `--epoch` (the seed the ether's welcome
+`--crc-margin-db` (the ether's receivers, its rule and its CRC band),
+`--clock-ppm` (in virtual time, each station's crystal off by a draw within
+that many parts per million), and `--seed` and `--epoch` (the seed the ether's welcome
 carries, which in a virtual-time run also keys every station's randomness,
 and the wall clock T 0 stands for; two runs of one network given both draw the
 same random bytes and the same timestamps).
