@@ -1178,8 +1178,8 @@ foreground: Ctrl-C stops it, and everything it started. It takes `--bind`
 run directory, default `testbed/runs/simd/`; a run loaded later that would
 land on one there goes beside it as `-2`, `-3`…), `--build`, `--sidecar` (the
 planner-web a pack's moved rows are recomputed through), `--stagger`,
-`--net`, `--time`, `--noise-figure` and `--pairwise` (the ether's receivers
-and its rule), and `--seed` and `--epoch` (the seed the ether's welcome
+`--net`, `--time`, `--noise-figure`, `--pairwise` and `--crc-margin-db` (the
+ether's receivers, its rule and its CRC band), and `--seed` and `--epoch` (the seed the ether's welcome
 carries, which in a virtual-time run also keys every station's randomness,
 and the wall clock T 0 stands for; two runs of one network given both draw the
 same random bytes and the same timestamps).

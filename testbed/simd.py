@@ -380,7 +380,7 @@ class Simd:
             os.makedirs(record_dir, exist_ok=True)
             record = os.path.join(record_dir, "record.tsv")
         bind = ether_module.parse_bind(self.ether_addr)
-        physics = ether_module.Physics(self.args.noise_figure)
+        physics = ether_module.Physics(self.args.noise_figure, self.args.crc_margin_db)
         self.ether_transport, self.ether = await loop.create_datagram_endpoint(
             lambda: ether_module.Ether(record, physics=physics, time_mode=self.args.time,
                                        pairwise=self.args.pairwise, seed=self.args.seed,
@@ -1749,6 +1749,11 @@ def parse_args(argv):
     ap.add_argument("--pairwise", action="store_true",
                     help="rule on collisions pairwise, per interferer by the capture "
                          "margin, instead of on the summed interference")
+    ap.add_argument("--crc-margin-db", type=float,
+                    default=ether_module.DEFAULT_CRC_MARGIN_DB,
+                    help="the CRC band: how far above its threshold a frame may still "
+                         "fail its CRC, the chance falling linearly to nothing "
+                         "(default %g: none)" % ether_module.DEFAULT_CRC_MARGIN_DB)
     ap.add_argument("--seed", type=int,
                     help="the ether's seed, which its welcome hands every station "
                          "(default: drawn at random)")

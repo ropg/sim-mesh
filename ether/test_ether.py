@@ -171,10 +171,11 @@ class Bench:
     stated before then — the table is written once, as a run's is.
     """
 
-    def __init__(self, tmp_path, time_mode="real", pairwise=False):
+    def __init__(self, tmp_path, time_mode="real", pairwise=False, *flags):
         self.tmp_path = tmp_path
         self.time_mode = time_mode
         self.pairwise = pairwise
+        self.flags = list(flags)    # more of the ether's own, as its command line takes them
         self.record = tmp_path / "record.tsv"
         self.proc = None
         self.port = None
@@ -215,6 +216,7 @@ class Bench:
             argv += ["--nodeset", str(nodes), "--losses", str(losses)]
         if self.pairwise:
             argv.append("--pairwise")
+        argv += self.flags
         self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE, text=True)
         lines = queue.Queue()
@@ -692,6 +694,70 @@ def test_a_receiver_retuned_mid_frame_is_not_told_how_it_ended(ether):
     time.sleep(0.05)
     b.state("RX", freq=FREQ + 600_000)
     b.expect_nothing(timeout=LONG_US / 1e6 + 0.2)
+
+
+# ---- the CRC band ----------------------------------------------------------
+
+def test_the_crc_band_fails_frames_in_proportion_to_how_near_the_threshold_they_are():
+    """Certain at the threshold, never at the band's top, and in between in
+    proportion: a straight line down, over many frames."""
+    band = 2.0
+    for margin, expected in ((-1.0, 1.0), (0.0, 1.0), (0.5, 0.75), (1.0, 0.5),
+                             (1.5, 0.25), (2.0, 0.0), (5.0, 0.0)):
+        failed = sum(ether_module.crc_margin_fails(7, eid, 2, 0, margin, band)
+                     for eid in range(4000))
+        assert failed / 4000 == pytest.approx(expected, abs=0.03), margin
+    assert not any(ether_module.crc_margin_fails(7, eid, 2, 0, -3.0, 0.0)
+                   for eid in range(100)), "no band, no failures"
+
+
+def test_a_physics_without_a_crc_band_says_nothing_of_one():
+    """A run records what was asked for: no band, no key; a band round-trips."""
+    assert ether_module.Physics().as_dict() == {"noise_figure_db": 6.0}
+    physics = ether_module.Physics(5.0, 2.5)
+    assert physics.as_dict() == {"noise_figure_db": 5.0, "crc_margin_db": 2.5}
+    assert ether_module.Physics.from_dict(physics.as_dict()).crc_margin_db == 2.5
+    with pytest.raises(ValueError):
+        ether_module.Physics(6.0, -1.0)
+
+
+def test_the_crc_band_verdict_is_the_draw_for_that_frame_and_receiver(tmp_path):
+    """A frame 1 dB over SF9's threshold, in a 2 dB band, fails half the
+    time: each one as its own draw from the seed says, whichever that is."""
+    bench = Bench(tmp_path, "real", False, "--crc-margin-db", "2", "--seed", "11")
+    try:
+        loss = POWER_DBM - (NOISE_DBM - 12.5 + 1.0)       # 1 dB over the threshold
+        bench.link(1, 2, loss)
+        a, b = bench(1), bench(2)
+        seed = a.hello()["seed"]
+        assert seed == 11
+        b.hello()
+        b.state("RX")
+        time.sleep(0.1)
+        margin = level_for(loss) - NOISE_DBM + 12.5
+        verdicts = []
+        for n in range(8):
+            a.tx(70 + n, payload=b"near the edge %d" % n, span_us=100_000)
+            begin = b.expect("rx_begin")
+            end = b.expect("rx_end")
+            assert end["id"] == begin["id"]
+            fails = ether_module.crc_margin_fails(seed, end["id"], 2, 0, margin, 2.0)
+            assert end["verdict"] == ("crc" if fails else "clean")
+            verdicts.append(end["verdict"])
+        assert set(verdicts) == {"crc", "clean"}
+    finally:
+        bench.close()
+
+
+def test_without_a_crc_band_a_frame_over_its_threshold_is_clean(ether):
+    """Off by default: a frame half a dB over its threshold is delivered."""
+    loss = POWER_DBM - (NOISE_DBM - 12.5 + 0.5)
+    ether.link(1, 2, loss)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+    for n in range(4):
+        a.tx(80 + n, span_us=100_000)
+        assert b.expect("rx_end")["verdict"] == "clean"
 
 
 def test_a_station_is_deaf_while_its_own_frame_is_going_out(ether):
