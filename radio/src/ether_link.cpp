@@ -148,6 +148,15 @@ void handleMessage(const char* text, size_t len)
 
 /* ---- Outbound ---- */
 
+void etherPublishFloor(bool station)
+{
+    if (!conductor::isVirtual() || !conductor::joined()) return;
+    char line[96];
+    int n = snprintf(line, sizeof line, "{\"type\":\"floor\",\"sid\":%d,\"to\":\"%s\"}",
+                     s_sid, station ? "station" : "tool");
+    sendLine(line, (size_t)n);
+}
+
 void etherPublishState(const EtherState& s)
 {
     if (s_fd < 0) return;

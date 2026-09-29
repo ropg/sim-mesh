@@ -85,6 +85,15 @@ void simradio_wake_at(int wake, int64_t node_us);      /* INT64_MAX clears it */
  * grant tells the ether; later ones only when the next wake has moved closer. */
 void simradio_idle(void);
 
+/* The station's host door changed hands (virtual time; nothing in real time):
+ * `station` nonzero once the station has read what a host wrote to it, zero
+ * once it has answered. A testbed tool talks to a station on the wall clock;
+ * the ether keeps T still while the tool has the floor, and lets it run while
+ * the station has, so the station reads each line and answers it at a T the
+ * run decides. Said before the bytes are handed on, and after the answer is
+ * written. The station owes an idle after it, as after anything it says. */
+void simradio_host_floor(int station);
+
 /* A host whose own clock is a function of node time — a kernel tick counted
  * from it — learns of every move: `moved()` runs each time a grant moves T, on
  * the thread that received it, with no lock held, before any wake or timer

@@ -580,6 +580,11 @@ extern "C" int64_t simradio_now_us(void)
  * not taken in outside RX and CAD (modelRxBegin, modelRxEnd), and nothing but
  * a command ends TX early, which the polling driver would be the one to send.
  * TX_DONE is seen at the first node time whose T has reached the frame's end. */
+extern "C" void simradio_host_floor(int station)
+{
+    etherPublishFloor(station != 0);
+}
+
 extern "C" int64_t simradio_quiet_for_us(simradio_t* c)
 {
     if (!c || !conductor::isVirtual()) return -1;
