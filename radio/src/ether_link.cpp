@@ -18,6 +18,7 @@
 #include "services.h"
 #include "simradio.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -33,6 +34,13 @@ constexpr size_t kMaxPayload = 256;
 
 /* How long, in wall time, station_open waits for the ether's welcome. */
 constexpr int kJoinWaitMs = 60 * 1000;
+
+/* How long, in wall time, a station that has read a host's bytes waits for
+ * the ether to bring it to the run's T before it goes on without. */
+constexpr int kFloorWaitMs = 2000;
+
+/* Runs the ether sent in answer to a floor to the station, applied. */
+std::atomic<uint64_t> s_floorRuns{0};
 
 const struct simradio_services* S() { return conductor::modelServices(); }
 
@@ -148,6 +156,7 @@ void handleMessage(const char* text, size_t len)
      * does not understand. */
 
     if (timed) conductor::granted((uint64_t)msg.num("seq", 0));
+    if (timed && type == "run" && msg.num("floor", 0)) s_floorRuns.fetch_add(1);
 }
 
 }  // namespace
@@ -157,10 +166,24 @@ void handleMessage(const char* text, size_t len)
 void etherPublishFloor(bool station)
 {
     if (!conductor::isVirtual() || !conductor::joined()) return;
+    uint64_t answered = s_floorRuns.load();
     char line[96];
     int n = snprintf(line, sizeof line, "{\"type\":\"floor\",\"sid\":%d,\"to\":\"%s\"}",
                      s_sid, station ? "station" : "tool");
     sendLine(line, (size_t)n);
+    if (!station) return;
+    /* A station that has been idle has the T it was last given, which may
+     * be long past: the run went on without it. What the host wrote is to be
+     * taken at the run's T, so the ether answers a floor to the station with
+     * a run at it (marked `floor`, so a run already on its way for another
+     * reason does not pass for it), and the host's bytes wait for that. Raw
+     * sleeps: the time shim's would wait on T. */
+    struct timespec step = {0, 50 * 1000};
+    for (int i = 0; i < kFloorWaitMs * 20 && s_floorRuns.load() == answered; i++)
+        syscall(SYS_nanosleep, &step, nullptr);
+    if (s_floorRuns.load() == answered)
+        S()->log(SIMRADIO_LOG_WARN, "ether: no run after a host's bytes in %d ms; going on",
+                 kFloorWaitMs);
 }
 
 void etherPublishState(const EtherState& s)

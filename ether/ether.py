@@ -752,6 +752,11 @@ class Ether(asyncio.DatagramProtocol):
         station.addr = addr
         self.mark(station, False)
         floor, to = self.floors.get(sid), msg.get("to")
+        if to == "station":
+            # It has read a host's bytes and waits to be brought to the run's
+            # T before it takes them: an idle station has the T it was last
+            # told, which the run may have long left behind.
+            self.send(sid, {"type": "run", "floor": 1})
         if floor == "tool" and to == "station":
             self.floors[sid] = "station"
             self.holds -= 1

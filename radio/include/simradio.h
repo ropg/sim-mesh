@@ -93,7 +93,9 @@ void simradio_idle(void);
  * the ether keeps T still while the tool has the floor, and lets it run while
  * the station has, so the station reads each line and answers it at a T the
  * run decides. Said before the bytes are handed on, and after the answer is
- * written. The station owes an idle after it, as after anything it says. */
+ * written. The station owes an idle after it, as after anything it says.
+ * With `station` it returns once the ether has brought the station to the
+ * run's T (a `run` marked `floor`), which an idle station is behind. */
 void simradio_host_floor(int station);
 
 /* A host whose own clock is a function of node time — a kernel tick counted
