@@ -11,7 +11,7 @@ and knows a frame only as a carrier, a duration and a payload it never opens.
 ```sh
 python3 ether.py --bind 127.0.0.1:7000 --record record.tsv \
     --geodata <geodata.yaml> --nodeset <nodeset.yaml> --losses <dir> \
-    [--noise-figure 6] [--pairwise] [--crc-margin-db 0] [--seed N]
+    [--noise-figure 6] [--pairwise | --bench-capture] [--crc-margin-db 0] [--seed N]
     [--time real|max|<k>x]
 ```
 
@@ -120,6 +120,19 @@ the one in progress by 6 dB in the whole dB the station is shown, and a frame
 survives only by leading each audible interferer on its carrier by 6 dB, one
 at a time, whatever their spreading factors, with nothing summed. It is there
 to compare against.
+
+**Bench capture** (`--bench-capture`, or `Ether(bench_capture=True)`) rules
+on two frames of one spreading factor the way a bench saw them meet (289
+collisions of an SX1262 receiver, SF7 at 125 kHz), instead of by the same-SF
+figure. Within 1.2 dB the two are equals: both are lost about one time in
+four, and otherwise one of them survives. From there the stronger survives
+seven times in eight, rising to always at 6.1 dB, and the weaker never does.
+A frame that starts after the receiver has passed the first one's preamble
+never takes it, and spoils the first unless the first is the stronger. Each
+outcome is a draw from the seed, the pair and the receiver, so the lock and
+both verdicts read the same one. Against three or more frames of its class a
+frame's lead is over their sum. Inter-SF rejection and the noise threshold
+are as without it.
 
 Absent at this depth: fading and a referee. A pair's loss is the table's and
 does not change from one frame to the next.

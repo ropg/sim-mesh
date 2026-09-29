@@ -760,6 +760,149 @@ def test_without_a_crc_band_a_frame_over_its_threshold_is_clean(ether):
         assert b.expect("rx_end")["verdict"] == "clean"
 
 
+# ---- bench capture ---------------------------------------------------------
+#
+# The table's cases are the reticulum project's rnscale medium tests
+# (tools/rnscale/src/medium.rs): the bench at both ends of its table, a late
+# stronger frame costing both, a late weaker one lost alone, and two frames
+# each kept by the listener nearer its sender.
+
+def outcomes(lead, locked=False, pairs=3000):
+    """bench_outcome over many pairs of frames at one receiver."""
+    return [ether_module.bench_outcome(11, 2 * n + 1, 2 * n + 2, 5, lead, locked)
+            for n in range(pairs)]
+
+
+def test_bench_equals_are_both_lost_one_time_in_four_and_never_both_kept():
+    seen = outcomes(0.5)
+    assert (True, True) not in seen
+    both_lost = seen.count((False, False)) / len(seen)
+    assert both_lost == pytest.approx(9 / 39, abs=0.03)
+    first = seen.count((True, False)) / (len(seen) - seen.count((False, False)))
+    assert first == pytest.approx(0.5, abs=0.04)
+
+
+def test_bench_keeps_the_stronger_nine_times_in_ten_at_2_db_and_never_the_weaker():
+    seen = outcomes(2.0)
+    assert all(second is False for _, second in seen)
+    kept = sum(first for first, _ in seen) / len(seen)
+    assert kept == pytest.approx(119 / 136, abs=0.025)
+    assert set(outcomes(-2.0)) <= {(False, True), (False, False)}
+
+
+def test_bench_keeps_the_stronger_every_time_from_6_1_db():
+    assert set(outcomes(6.1, pairs=500)) == {(True, False)}
+    assert set(outcomes(-7.0, pairs=500)) == {(False, True)}
+
+
+def test_bench_a_late_frame_is_never_received_and_a_stronger_one_spoils_both():
+    assert set(outcomes(-2.0, locked=True, pairs=500)) == {(False, False)}
+    assert set(outcomes(7.0, locked=True, pairs=500)) == {(True, False)}
+    assert all(second is False for _, second in outcomes(0.0, locked=True))
+
+
+@pytest.fixture
+def bench(tmp_path):
+    """The ether with bench capture, its seed pinned."""
+    bed = Bench(tmp_path, "real", False, "--bench-capture", "--seed", "3")
+    try:
+        yield bed
+    finally:
+        bed.close()
+
+
+def test_bench_capture_keeps_a_frame_8_db_up_as_the_same_sf_figure_does(bench):
+    """The hidden terminal, judged as the bench saw it: 8 dB is past 6.1."""
+    bench.link(1, 2, 110.0)
+    bench.link(3, 2, 118.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    listen(a, b, c)
+
+    a.tx(151, payload=b"from a")
+    c.tx(152, payload=b"from c")
+    ends = b.ends(2)
+    assert ends[b"from a"]["verdict"] == "clean"
+    assert ends[b"from c"]["verdict"] == "crc"
+
+
+def test_bench_capture_frames_a_decibel_apart_end_as_their_pairs_draw(bench):
+    """1 dB apart, the two are equals, and which survives, if either, is the
+    pair's draw from the seed: the lock and both verdicts read the same one."""
+    bench.link(1, 2, 110.0)
+    bench.link(3, 2, 111.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    seed = a.hello()["seed"]
+    listen(b, c)
+    lead = level_for(110.0) - level_for(111.0)
+    for n in range(5):
+        a.tx(160 + n, payload=b"a %d" % n, pre_us=100_000, hdr_us=120_000)
+        c.tx(170 + n, payload=b"c %d" % n, pre_us=100_000, hdr_us=120_000)
+        first, second = b.expect("rx_begin"), b.expect("rx_begin")
+        ends = b.ends(2)
+        want = ether_module.bench_outcome(seed, first["id"], second["id"], 2, lead, False)
+        assert ends[b"a %d" % n]["verdict"] == ("clean" if want[0] else "crc")
+        assert ends[b"c %d" % n]["verdict"] == ("clean" if want[1] else "crc")
+        assert ("cad" in second) == (not want[1]), "the second takes b only if it survives"
+
+
+def test_bench_capture_a_stronger_frame_after_the_preamble_spoils_both(bench):
+    """b follows a's frame; c's lands after its preamble, 8 dB louder: it
+    never takes b, and a is lost as well."""
+    bench.link(1, 2, 118.0)
+    bench.link(3, 2, 110.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    listen(a, b, c)
+
+    a.tx(181, payload=b"from a")
+    assert "cad" not in b.expect("rx_begin")
+    time.sleep(FRAME_US / 4e6)          # past a's preamble, a tenth of the frame
+    c.tx(182, payload=b"from c")
+    assert b.expect("rx_begin")["cad"] is True
+    ends = b.ends(2)
+    assert ends[b"from a"]["verdict"] == "crc"
+    assert ends[b"from c"]["verdict"] == "crc"
+
+
+def test_bench_capture_a_weaker_frame_after_the_preamble_leaves_the_first(bench):
+    """b follows a's frame; c's lands after its preamble, 8 dB quieter."""
+    bench.link(1, 2, 110.0)
+    bench.link(3, 2, 118.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    listen(a, b, c)
+
+    a.tx(191, payload=b"from a")
+    b.expect("rx_begin")
+    time.sleep(FRAME_US / 4e6)
+    c.tx(192, payload=b"from c")
+    assert b.expect("rx_begin")["cad"] is True
+    ends = b.ends(2)
+    assert ends[b"from a"]["verdict"] == "clean"
+    assert ends[b"from c"]["verdict"] == "crc"
+
+
+def test_bench_capture_keeps_each_frame_at_the_listener_nearer_its_sender(bench):
+    """Two frames that meet are each kept where their sender is 10 dB nearer."""
+    bench.link(1, 2, 105.0)
+    bench.link(3, 2, 115.0)
+    bench.link(1, 4, 115.0)
+    bench.link(3, 4, 105.0)
+    a, near_a, c, near_c = bench(1), bench(2), bench(3), bench(4)
+    listen(a, near_a, c, near_c)
+
+    a.tx(201, payload=b"from a")
+    c.tx(202, payload=b"from c")
+    at_a, at_c = near_a.ends(2), near_c.ends(2)
+    assert at_a[b"from a"]["verdict"] == "clean" and at_a[b"from c"]["verdict"] == "crc"
+    assert at_c[b"from c"]["verdict"] == "clean" and at_c[b"from a"]["verdict"] == "crc"
+
+
+def test_bench_capture_is_not_a_variant_of_the_pairwise_rule(tmp_path):
+    done = subprocess.run([sys.executable, ETHER, "--bench-capture", "--pairwise",
+                           "--record", str(tmp_path / "r.tsv")],
+                          capture_output=True, text=True, timeout=30)
+    assert done.returncode == 2 and "--bench-capture" in done.stderr
+
+
 def test_a_station_is_deaf_while_its_own_frame_is_going_out(ether):
     """Half duplex: a radio transmitting hears nothing, however loud."""
     ether.link(1, 2, NEAR_DB)
