@@ -394,10 +394,16 @@ def parse(data, where):
         raise store.StoreError("%s: terrain is one of %s, not %r"
                                % (where, ", ".join(TERRAINS), terrain))
     extent = float(ground.get("extent_m", DEFAULT_EXTENT_M))
+    exponent = float(ground.get("exponent", DEFAULT_EXPONENT))
+    # A NaN or an infinity is no ground, and no file could be written with
+    # one (store.scalar).
+    for key, value in (("exponent", exponent), ("extent_m", extent)):
+        if not math.isfinite(value):
+            raise store.StoreError("%s: %s is a number, not %r" % (where, key, value))
     if extent <= 0:
         raise store.StoreError("%s: extent_m must be above 0" % where)
     return {SYNTHETIC: {"terrain": terrain,
-                        "exponent": float(ground.get("exponent", DEFAULT_EXPONENT)),
+                        "exponent": exponent,
                         "extent_m": extent},
             **_stated(data, where)}
 

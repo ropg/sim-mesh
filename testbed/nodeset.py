@@ -179,10 +179,15 @@ def parse(data, where):
         if "board" in node:
             raise store.StoreError("%s: a node has no board: every node is an SX1262, and "
                                    "`max_dbm` is its maximum power" % here)
-        out["nodes"][name] = node_record(
+        record = node_record(
             node_id, lat, lon, node.get("height_m", DEFAULT_HEIGHT_M), height_from,
             antennas_module.check(node.get("antenna"), here), check_tags(node.get("tags")),
             boards_module.check(node.get("max_dbm"), here))
+        for key in ("lat", "lon", "height_m"):
+            if not math.isfinite(record[key]):
+                raise store.StoreError("%s: %s is a finite number, not %r"
+                                       % (here, key, record[key]))
+        out["nodes"][name] = record
     for offset in data.get("offsets") or []:
         try:
             a, b = (str(n) for n in list(offset["between"])[:2])
@@ -192,6 +197,9 @@ def parse(data, where):
         for end in (a, b):
             if end not in out["nodes"]:
                 raise store.StoreError("%s: offset names %s, which is not a node" % (where, end))
+        if not math.isfinite(db):
+            raise store.StoreError("%s: the offset between %s and %s states db %s: an offset "
+                                   "is a finite number of dB" % (where, a, b, db))
         entry = {"between": [a, b], "db": db}
         if offset.get("note"):
             entry["note"] = str(offset["note"])
