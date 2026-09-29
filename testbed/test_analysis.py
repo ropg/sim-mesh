@@ -388,6 +388,18 @@ def test_airtime_and_links_read_a_real_time_record_across_midnight(tmp_path):
     assert code == 0 and json.loads(text)["usable_links_one_way"] == 1
 
 
+def test_seq_reads_a_real_time_record_across_midnight(tmp_path):
+    rec = WallRecord()
+    sent(rec, 0.5, 1, announce(0), 0.2, own=1000.0)
+    sent(rec, 1.5, 2, announce(1), 0.2, own=2000.0)                  # after the midnight
+    path = str(tmp_path / "record.tsv")
+    rec.write(path)
+    frames = seq.read_record(path)
+    assert frames[1].at - frames[0].at == pytest.approx(1.0)
+    code, text = call(seq.main, ["--record", path])
+    assert code == 0 and [line.split()[0] for line in text.splitlines()[1:3]] == ["0.000", "1.000"]
+
+
 def test_frames_alike_in_their_bytes_at_one_instant_keep_their_own_receptions(tmp_path):
     """n01 and n02 send the same bytes at the same T: n04 receives n01's,
     and n03 loses n02's."""

@@ -77,7 +77,8 @@ def read_record(path, reader=None, level_at=None):
     halves = rframes.Halves()
     for line, (stamp, direction, sid, msg) in enumerate(record_module.lines(path)):
         if direction == "in" and msg.get("type") == "tx":
-            frame = Frame(record_module.parse_time(stamp), sid, msg)
+            # With its date: a real-time record's time of day wraps at midnight.
+            frame = Frame(referee.to_us(stamp) / 1e6, sid, msg)
             frame.reader = reader
             frame.part = halves.part(sid, frame.payload)
             frames[line] = frame
