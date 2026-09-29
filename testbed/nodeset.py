@@ -56,9 +56,9 @@ model's is known, measured or worked out elsewhere:
 
 a→b is `loss_db` and b→a `back_db`, `loss_db` again when it has none, the
 same figure in every band with no correction between bands. A link is a
-layer too (`losses.with_links`): it stands in for the model's loss, and the
-antennas and any offset still go on top of it. A file without links has no
-`links:` key, and is written back without one.
+layer too (`losses.with_links`): it stands in for the model's loss and the
+geodata's shadowing, and the antennas and any offset still go on top of it.
+A file without links has no `links:` key, and is written back without one.
 """
 
 import copy

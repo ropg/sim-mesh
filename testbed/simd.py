@@ -58,8 +58,8 @@ node's maximum power, among their macros.
 
 Loss tables. The run holds one table per band its nodes' carriers use
 (`losses.bands_of`), and the ether rules on every frame from them, with the
-nodeset's links, the nodes' antennas and the nodeset's offsets on them
-(`losses.medium_tables`);
+nodeset's links, the geodata's shadowing, the nodes' antennas and the
+nodeset's offsets on them (`losses.medium_tables`);
 the antennas need the ground under each node, which is asked of the sidecar
 on a pack (`losses.grounds`) and kept in the run as `grounds`. A nodeset edit that changes
 the geometry (a move, a height, a node added) recomputes the touched nodes'
@@ -454,8 +454,9 @@ class Simd:
             self.broadcast(self.clock_message())
 
     def apply_to_ether(self):
-        """Give the medium the tables with the links, the antennas and the
-        offsets on them, and which station id is which node, wholesale.
+        """Give the medium the tables with the links, the shadowing, the
+        antennas and the offsets on them, and which station id is which node,
+        wholesale.
 
         Cheap enough to redo outright on every change of ids, antennas,
         offsets or the node set; a node the tables have no row for yet is in

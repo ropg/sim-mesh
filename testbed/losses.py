@@ -13,14 +13,15 @@ in the SLT1 format (`ether/slt.py`). A run works on its own copy; a node
 moved during a run has its row and column recomputed into that copy, never
 into the cache.
 
-A nodeset's **links**, **antennas** and **offsets** are not in the table:
-they are layers over it, put on when the medium is given the tables
-(`medium_tables`), so the cached table is the model's own and none of them
-forces a recompute. A link states a pair's loss in place of the model's.
-The antenna layer takes each pair's gains off its loss, each end's pattern
-toward the other in three dimensions, which needs the ground under each
-node (`grounds`: 0 on synthetic ground, the pack's terrain through the
-sidecar).
+A nodeset's **links**, **antennas** and **offsets** and the geodata's
+**shadowing** are not in the table: they are layers over it, put on when
+the medium is given the tables (`medium_tables`), so the cached table is
+the model's own and none of them forces a recompute. A link states a pair's
+loss in place of the model's. Shadowing adds each pair's own static draw,
+off unless the geodata asks for it. The antenna layer takes each pair's
+gains off its loss, each end's pattern toward the other in three
+dimensions, which needs the ground under each node (`grounds`: 0 on
+synthetic ground, the pack's terrain through the sidecar).
 
 Synthetic ground is computed here:
 
@@ -85,6 +86,8 @@ numbers are really for, and asking for another band is refused.
 import argparse
 import asyncio
 import datetime
+import functools
+import hashlib
 import json
 import math
 import os
@@ -219,8 +222,10 @@ def with_antennas(tables, gd, ns, grounds=None):
 
 def medium_tables(tables, gd, ns, grounds=None):
     """What the medium is given: the model's tables with the nodeset's links
-    stated on them, then the antennas and the offsets on top."""
-    return with_offsets(with_antennas(with_links(tables, ns), gd, ns, grounds), ns)
+    stated on them and the geodata's shadowing, then the antennas and the
+    offsets on top."""
+    tables = with_shadowing(with_links(tables, ns), gd, ns)
+    return with_offsets(with_antennas(tables, gd, ns, grounds), ns)
 
 
 def with_links(tables, ns):
@@ -242,6 +247,57 @@ def with_links(tables, ns):
             if a in new.index and b in new.index and a != b:
                 new.loss[new.cell(a, b)] = link["loss_db"]
                 new.loss[new.cell(b, a)] = link.get("back_db", link["loss_db"])
+        out[band] = new
+    return out
+
+
+# Ported from this repository's feat/shadowing (cc1fd56, ether/ether.py:133-148),
+# where the pair was two station ids.
+@functools.lru_cache(maxsize=65536)
+def shadowing_unit(seed, a, b):
+    """One pair's shadowing in standard deviations, the same draw every time.
+
+    A standard normal, by Box–Muller, from SHA-256 of the seed and the
+    unordered pair's node names, so it depends on those three and nothing
+    else: not on the order nodes were added in, not on which end transmits,
+    not on traffic or event order, not on the platform. Names rather than
+    ids, because a node keeps its name from run to run where its id may
+    change. The geodata's `shadowing_db` scales it, so runs that differ only
+    in the spread stand on the same ground, one of it rougher, and paired
+    runs share every draw.
+    """
+    lo, hi = (a, b) if a <= b else (b, a)
+    digest = hashlib.sha256(("%d:%s:%s" % (seed, lo, hi)).encode()).digest()
+    u1 = (int.from_bytes(digest[:8], "big") + 1) / 2.0 ** 64     # (0, 1]
+    u2 = int.from_bytes(digest[8:16], "big") / 2.0 ** 64         # [0, 1)
+    return math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+
+
+def with_shadowing(tables, gd, ns):
+    """Copies of `tables` (band -> slt.Table) with the geodata's shadowing
+    added to both directions of each pair: `shadowing_db` times the pair's
+    own draw, one draw for every band. Left as they are: a cell never heard,
+    which stays so; a measured one, which already holds its path's
+    shadowing; and a pair the nodeset states a link for. The draw is fixed
+    for the run, since a loss drawn afresh for every frame would let every
+    retry through in the end. The tables themselves when there is none."""
+    spread, seed = gd.shadowing_db, gd.shadowing_seed
+    if not spread:
+        return dict(tables)
+    stated = {frozenset(link["between"]) for link in ns.links}
+    out = {}
+    for band, table in tables.items():
+        new = slt.Table(table.header, array("f", table.loss), array("B", table.flags),
+                        array("H", table.samples))
+        names = new.names
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                if stated and frozenset((a, b)) in stated:
+                    continue
+                shadow = spread * shadowing_unit(seed, a, b)
+                for cell in (new.cell(a, b), new.cell(b, a)):
+                    if math.isfinite(new.loss[cell]) and not new.flags[cell] & slt.FLAG_MEASURED:
+                        new.loss[cell] += shadow
         out[band] = new
     return out
 
