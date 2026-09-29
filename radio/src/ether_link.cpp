@@ -159,6 +159,29 @@ void handleMessage(const char* text, size_t len)
     if (timed && type == "run" && msg.num("floor", 0)) s_floorRuns.fetch_add(1);
 }
 
+/* A datagram: one message, or several, one per line, all of one instant (a
+ * station that says `lines` in its hello is sent every message of an instant
+ * in one). They are applied together: the host is told of nothing (its waits
+ * that fall due, DIO1) until all are in, so a thread woken at T finds the
+ * whole of T, and not whatever part of it the reader had got to. */
+void handleDatagram(const char* text, size_t len)
+{
+    conductor::hold();
+    modelHoldPins();
+    const char* p = text;
+    const char* end = text + len;
+    while (p < end) {
+        const char* nl = static_cast<const char*>(memchr(p, '\n', (size_t)(end - p)));
+        size_t n = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        if (n) handleMessage(p, n);
+        if (!nl) break;
+        p = nl + 1;
+    }
+    /* DIO1 first: a host thread the release wakes reads the pin at once. */
+    modelReleasePins();
+    conductor::release();
+}
+
 }  // namespace
 
 /* ---- Outbound ---- */
@@ -248,14 +271,14 @@ extern "C" int simradio_station_open(int sid, const char* bind_addr, const char*
     conductor::setIdleSender(sendIdle);
     conductor::start();
 
-    if (S()->spawn_reader(fd, handleMessage) != 0) {
+    if (S()->spawn_reader(fd, handleDatagram) != 0) {
         S()->log(SIMRADIO_LOG_ERROR, "ether: no reader");
         return -1;
     }
 
     char hello[160];
     int n = snprintf(hello, sizeof hello,
-        "{\"type\":\"hello\",\"sid\":%d,\"t\":%lld,\"slots\":[0]}",
+        "{\"type\":\"hello\",\"sid\":%d,\"t\":%lld,\"slots\":[0],\"lines\":1}",
         s_sid, (long long)S()->now_us());
     sendRaw(hello, (size_t)n);
     S()->log(SIMRADIO_LOG_INFO, "ether: %s, station %d", ether_addr, s_sid);

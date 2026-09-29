@@ -20,8 +20,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <string>
+#include <vector>
 
 /* ---- The SX126x command and register surface the drivers use ---- */
 
@@ -396,14 +399,31 @@ namespace {
 constexpr int kMaxSlots = 8;
 simradio* s_chips[kMaxSlots] = {};
 
-/* Who to tell when DIO1 moves, taken under the lock and called outside it. */
+/* Who to tell when DIO1 moves, taken under the lock and called outside it:
+ * at once, or, while a datagram from the ether is applied, when it is in. */
 struct PinCall {
     void (*fn)(void*, int, int) = nullptr;
     void* ctx = nullptr;
     bool  high = false;
 
-    void operator()() const { if (fn) fn(ctx, SIMRADIO_PIN_DIO1, high ? 1 : 0); }
+    void operator()() const;
+    void tell() const { if (fn) fn(ctx, SIMRADIO_PIN_DIO1, high ? 1 : 0); }
 };
+
+std::atomic<bool>    s_pinsHeld{false};
+std::mutex           s_pinsMu;
+std::vector<PinCall> s_pinsKept;
+
+void PinCall::operator()() const
+{
+    if (!fn) return;
+    if (s_pinsHeld.load()) {
+        std::lock_guard<std::mutex> g(s_pinsMu);
+        s_pinsKept.push_back(*this);
+        return;
+    }
+    tell();
+}
 
 PinCall dio1Of(const simradio* c)
 {
@@ -530,6 +550,22 @@ simradio* modelChip(int slot)
     simradio* c = s_chips[slot];
     S()->unlock();
     return c;
+}
+
+void modelHoldPins()
+{
+    s_pinsHeld.store(true);
+}
+
+void modelReleasePins()
+{
+    std::vector<PinCall> kept;
+    {
+        std::lock_guard<std::mutex> g(s_pinsMu);
+        kept.swap(s_pinsKept);
+        s_pinsHeld.store(false);
+    }
+    for (const PinCall& p : kept) p.tell();
 }
 
 extern "C" simradio_t* simradio_open(int slot, void (*on_pin)(void*, int, int), void* ctx)

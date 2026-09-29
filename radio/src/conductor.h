@@ -53,6 +53,14 @@ bool    joined();
  *  run, in time order. Called with no lock held. */
 void advanceTo(int64_t t);
 
+/** While a datagram from the ether is applied (every message in it, all for
+ *  one instant): the chip's own timers still run as T moves, but the host
+ *  is not told. Its waits that fall due, and the advance hook, wait for
+ *  `release`, which runs them, in time order, once the whole datagram is in.
+ *  So a host thread woken at T finds everything the ether said for T. */
+void hold();
+void release();
+
 /** The ether's welcome: the run's mode, T at join, the epoch. */
 void welcome(bool isVirtualRun, int64_t t, int64_t epochUs, uint64_t seq);
 
