@@ -459,19 +459,28 @@ class Station:
 
     def __init__(self, sid, addr, slots):
         self.sid = sid
-        self.addr = addr
         self.slots = slots
         self.states = {}        # slot -> the last `state` message for it
         self.locks = {}         # slot -> the Reception its demodulator follows
         self.tx_until = 0       # while its own frame is on the air, it is deaf
-        # The conductor's view of it, in a virtual-time run: the last sequence
-        # number sent to it, whether it has said it is idle since, and the
-        # conductor time it next needs to run at (None: never, on its own).
+        self.on_idle = []       # callbacks for its next idle
+        # The power its last frame went out at. A station states this per
+        # transmission rather than in its `state`, so it is learned by
+        # listening — and it is what `levels()` must answer with, or the map
+        # would draw a reach the station does not have.
+        self.power_dbm = DEFAULT_POWER_DBM
+        self.init_conductor(addr)
+
+    def init_conductor(self, addr):
+        """The conductor's view of it, in a virtual-time run: where it last
+        wrote from, the last sequence number sent to it, whether it has said
+        it is idle since, and the conductor time it next needs to run at
+        (None: never, on its own). A CoreStation keeps these in the core."""
+        self.addr = addr
         self.seq = 0
         self.idle = False
         self.until = None
         self.told = 0           # the T it was last sent, which is the T it has
-        self.on_idle = []       # callbacks for its next idle
         self.asking = 0         # TCP writes it is waiting to be let make
         self.asked_at = 0       # its seq when it last asked
         self.standing = 0       # idles in a row that asked for T itself
@@ -481,11 +490,6 @@ class Station:
         self.resent_at = 0.0    # the wall clock of the last resend to it
         self.stale_said = None  # the number of the last idle it said for an older message
         self.slow_idles = 0     # idles that took the busy watchdog's time or more
-        # The power its last frame went out at. A station states this per
-        # transmission rather than in its `state`, so it is learned by
-        # listening — and it is what `levels()` must answer with, or the map
-        # would draw a reach the station does not have.
-        self.power_dbm = DEFAULT_POWER_DBM
 
     def state(self, slot):
         return self.states.get(slot)
@@ -935,26 +939,35 @@ class Ether(asyncio.DatagramProtocol):
             self.standing = 0
         self.clock.t = t
         self.barriers += 1
+        self.run_due()
+        for sid in sorted(self.stations):
+            st = self.stations[sid]
+            if st.idle and st.until is not None and st.until <= t:
+                self.send(sid, {"type": "run"})
+
+    def run_due(self):
+        """Everything on the ether's clock due at T, in its order."""
         while True:
             due = self.clock.pop_due()
             if due is None:
                 break
             callback, args = due
             callback(*args)
-        for sid in sorted(self.stations):
-            st = self.stations[sid]
-            if st.idle and st.until is not None and st.until <= t:
-                self.send(sid, {"type": "run"})
 
     def flush_pending(self):
-        """What stations said while T stood still, in station order.
+        """What stations said while T stood still, in station order."""
+        batch = sorted(self.pending, key=lambda p: (p[0], p[1]))
+        self.pending = []
+        self.take_held((sid, addr, msg) for sid, _, addr, msg in batch)
+
+    def take_held(self, batch):
+        """The medium takes what stations said while T stood still: `batch`,
+        (sid, addr, msg) in station order.
 
         A message that cannot be taken is logged and dropped on its own, as
         a datagram is in a real-time run: the batch is every station's at
         this instant, and one malformed `tx` must not silence the rest."""
-        batch = sorted(self.pending, key=lambda p: (p[0], p[1]))
-        self.pending = []
-        for sid, _, addr, msg in batch:
+        for sid, addr, msg in batch:
             self.write_record("in", sid, msg)
             if sid not in self.stations:
                 continue
@@ -1898,6 +1911,361 @@ class Ether(asyncio.DatagramProtocol):
             self.record.close()
 
 
+# ---- the conductor in Rust ----------------------------------------------------
+#
+# In a virtual-time run most of the ether's work is the barrier: an idle in, T
+# moved, the stations due sent a `run`. ether_core, built from ether/core
+# (`simesh build ether`), does that in Rust on the ether's socket, in the
+# event loop's thread; CoreEther is Ether with that conductor and everything
+# else as Ether has it, called at the same points. Ether's own conductor stays
+# the reference, and SIMESH_ETHER_CORE picks: `python` for it, `rust` for the
+# core (an error when it is not built), unset for the core when it is built.
+
+CORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "build", "ether_core.abi3.so")
+_core_module = None
+
+
+def core_module():
+    """ether_core, or None when the Python conductor is to run."""
+    global _core_module
+    wanted = os.environ.get("SIMESH_ETHER_CORE", "")
+    if wanted not in ("", "rust", "python"):
+        raise ValueError("SIMESH_ETHER_CORE is rust or python, not %r" % wanted)
+    if wanted == "python":
+        return None
+    if _core_module is None:
+        if not os.path.exists(CORE_PATH):
+            if wanted == "rust":
+                raise RuntimeError("SIMESH_ETHER_CORE=rust, and there is no %s "
+                                   "(simesh build ether)" % CORE_PATH)
+            return None
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ether_core", CORE_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _core_module = module
+    return _core_module
+
+
+class CoreClock(VirtualClock):
+    """Conductor time as the core holds it. The events stay on this heap, in
+    Python; the core is told whenever the earliest of them changes."""
+
+    def __init__(self, core):
+        self.core = core
+        self.heap = []
+        self.count = 0
+
+    @property
+    def t(self):
+        return self.core.t
+
+    def call_at(self, t_us, callback, *args, key=0):
+        VirtualClock.call_at(self, t_us, callback, *args, key=key)
+        self.core.due = self.heap[0][0]
+
+    def pop_due(self):
+        due = VirtualClock.pop_due(self)
+        if due is not None:
+            self.core.due = self.heap[0][0] if self.heap else None
+        return due
+
+
+class CoreStation(Station):
+    """A station whose conductor half the core keeps: what Python still asks
+    of it is read from there, and the rest is not here to be asked."""
+
+    def __init__(self, sid, addr, slots, core):
+        self.core = core
+        Station.__init__(self, sid, addr, slots)
+
+    def init_conductor(self, addr):
+        pass                    # the core's, from when it was first heard from
+
+    addr = property(lambda self: self.core.addr(self.sid),
+                    lambda self, addr: self.core.set_addr(self.sid, addr))
+    seq = property(lambda self: self.core.seq(self.sid))
+    idle = property(lambda self: self.core.idle(self.sid))
+    until = property(lambda self: self.core.until(self.sid),
+                     lambda self, until: self.core.set_until(self.sid, until))
+    told = property(lambda self: self.core.told(self.sid))
+    asking = property(lambda self: self.core.asking(self.sid),
+                      lambda self, n: self.core.set_asking(self.sid, n))
+    asked_at = property(lambda self: self.core.asked_at(self.sid),
+                        lambda self, seq: self.core.set_asked_at(self.sid, seq))
+    slow_idles = property(lambda self: self.core.slow_idles(self.sid))
+
+
+class _Expected:
+    """The stations started and not yet heard from, which the core keeps, as
+    Ether uses its set of them."""
+
+    def __init__(self, core):
+        self.core = core
+
+    def add(self, sid):
+        self.core.expect(sid)
+
+    def discard(self, sid):
+        self.core.unexpect(sid)
+
+    def __iter__(self):
+        return iter(self.core.expected())
+
+    def __len__(self):
+        return len(self.core.expected())
+
+
+class _Asks(list):
+    """The writes waiting for a go-ahead, which the core counts."""
+
+    def __init__(self, core, asks=()):
+        list.__init__(self, asks)
+        self.core = core
+        core.asks = len(self)
+
+    def append(self, ask):
+        list.append(self, ask)
+        self.core.asks = len(self)
+
+    def remove(self, ask):
+        list.remove(self, ask)
+        self.core.asks = len(self)
+
+
+class _CoreTransport:
+    """What Ether asks of its transport, on the core's socket."""
+
+    def __init__(self, ether):
+        self.ether = ether
+
+    def sendto(self, data, addr):
+        self.ether.core.sendto(data, addr)
+
+    def get_extra_info(self, name, default=None):
+        if name == "socket":
+            return self.ether.sock
+        if name == "sockname":
+            return self.ether.sock.getsockname()
+        return default
+
+    def close(self):
+        self.ether.sock.close()
+
+
+def _core_count(name):
+    """One of the conductor's counts, which the core keeps; Ether's start
+    sets it to the zero it already is."""
+    def get(self):
+        return getattr(self.core, name)
+
+    def set_(self, n):
+        if n != getattr(self.core, name):
+            raise AttributeError("%s is counted by the core" % name)
+    return property(get, set_)
+
+
+class CoreEther(Ether):
+    """Ether with its conductor in ether_core. `sock` is the ether's bound
+    UDP socket, which the core reads and writes in the loop's thread; the
+    core calls back into the methods named `_core_*` below at the points
+    Ether's own conductor does that work, so a run takes the same steps."""
+
+    def __init__(self, sock, record_path, physics=None, seed=None, time_mode="max",
+                 pairwise=False, epoch=None, bench_capture=False, module=None):
+        mode, rate = parse_time_mode(time_mode)
+        if mode != "virtual":
+            raise ValueError("the core conducts virtual-time runs; this one is %s" % mode)
+        module = module or core_module()
+        if module is None:
+            raise RuntimeError("no ether core to conduct with")
+        sock.setblocking(False)
+        self.sock = sock
+        self.core = module.Core(sock.fileno(), self, rate is not None, STANDING_LIMIT,
+                                STANDING_QUANTUM_US, SLOW_IDLE_S, RESEND_GAP_S)
+        self._on_drain = None
+        Ether.__init__(self, record_path, physics, seed=seed, time_mode=time_mode,
+                       pairwise=pairwise, epoch=epoch, bench_capture=bench_capture)
+        self.clock = CoreClock(self.core)
+        self.expected = _Expected(self.core)
+        # The core's now: what is left of them here would only go stale.
+        del self.busy_count, self.pending, self.dirty, self.advancing
+        self.transport = _CoreTransport(self)
+        self.loop.add_reader(sock.fileno(), self.core.pump)
+
+    holds = property(lambda self: self.core.holds,
+                     lambda self, n: setattr(self.core, "holds", n))
+    unread = property(lambda self: self.core.unread,
+                      lambda self, n: setattr(self.core, "unread", n))
+    barriers = _core_count("barriers")
+    runs = _core_count("runs")
+    resends = _core_count("resends")
+    standing = _core_count("standing")
+
+    @property
+    def on_drain(self):
+        return self._on_drain
+
+    @on_drain.setter
+    def on_drain(self, handler):
+        self._on_drain = handler
+        self.core.drain = handler is not None
+
+    @property
+    def asks(self):
+        return self._asks
+
+    @asks.setter
+    def asks(self, asks):
+        self._asks = _Asks(self.core, asks)
+
+    # ---- Ether's conductor, which the core does ---------------------------
+
+    def kick(self):
+        self.core.kick()
+
+    def busy(self):
+        return self.core.busy()
+
+    def next_instant(self):
+        return self.core.next_instant()
+
+    def mark(self, station, idle):
+        self.core.mark(station.sid, idle)
+
+    def recv_idle(self, sid, msg):
+        seq, until = msg.get("seq"), msg.get("until")
+        if isinstance(seq, int):
+            self.core.recv_idle(sid, seq, int(until) if isinstance(until, (int, float)) else None)
+
+    def step_to(self, t):
+        raise NotImplementedError("the core moves T")
+
+    def flush_pending(self):
+        raise NotImplementedError("the core holds what stations said")
+
+    def resend(self, station, answered):
+        raise NotImplementedError("the core keeps what it sent")
+
+    def send(self, sid, msg):
+        granted = self.core.grant(sid, msg.get("t"))
+        if granted is None:
+            return
+        seq, t = granted
+        msg = dict(msg, seq=seq)
+        msg.setdefault("t", t)
+        run = msg.get("type") == "run"
+        if not run:
+            self.write_record("out", sid, msg)
+        self.core.post(sid, seq, json.dumps(msg).encode("utf-8"), run)
+
+    def station_for(self, sid, addr, slots=None):
+        station = self.stations.get(sid)
+        if station is None:
+            self.core.add(sid, addr)            # not idle until it says so
+            station = CoreStation(sid, addr, slots or [0], self.core)
+            self.stations[sid] = station
+            log("station %d joined from %s:%d" % (sid, addr[0], addr[1]))
+        else:
+            station.addr = addr
+            if slots:
+                station.slots = slots
+        return station
+
+    def forget(self, sid):
+        station = self.stations.pop(sid, None)
+        if station is None:
+            return False
+        self.core.forget(sid)
+        self.asks = [a for a in self.asks if a[0] != sid]
+        for key, channel in list(self.channels.items()):
+            if sid in (channel.writer, channel.reader):
+                self.drop_channel(channel)
+        self.endpoints = {e: s for e, s in self.endpoints.items() if s != sid}
+        return True
+
+    def sync(self, sid, done):
+        station = self.stations.get(sid)
+        if station is None or (station.idle and station.told >= self.clock.t):
+            done()
+            return
+        station.on_idle.append(done)
+        self.core.notify(sid)
+        if station.told < self.clock.t:
+            self.send(sid, {"type": "run"})
+
+    def close(self):
+        if self.sock.fileno() >= 0:
+            self.loop.remove_reader(self.sock.fileno())
+        self.core.close()
+        Ether.close(self)
+
+    # ---- what the core calls out to ---------------------------------------
+
+    def _core_datagram(self, data, addr):
+        """A datagram that is not the conductor's: Ether takes it."""
+        Ether.datagram_received(self, data, addr)
+
+    def _core_flush(self, batch):
+        """What stations said while T stood still, (sid, addr, datagram) in
+        station order (flush_pending)."""
+        self.take_held((sid, addr, json.loads(data.decode("utf-8")))
+                       for sid, addr, data in batch)
+
+    def _core_due(self):
+        self.run_due()
+
+    def _core_drain(self, sids):
+        """True when none of `sids` printed anything, which on_drain says
+        with False: nothing to read, nothing set going."""
+        return self.on_drain(sids, self.drained) is False
+
+    def _core_ask(self):
+        """True when the run was quiet enough to let the first write asked
+        for go ahead (kick)."""
+        if self.asks and self.quiet():
+            self.answer_ask()
+            return True
+        return False
+
+    def _core_paced(self, t):
+        return self.paced(t)
+
+    def _core_idle(self, sid):
+        """A station that `sync` waits on said its idle: what waited runs."""
+        station = self.stations.get(sid)
+        if station is not None and station.on_idle:
+            waiting, station.on_idle = station.on_idle, []
+            for callback in waiting:
+                callback()
+
+    def _core_log(self, msg):
+        log(msg)
+
+
+async def open_ether(bind, record_path, physics=None, time_mode="real", **kw):
+    """The ether on `bind`, as (transport, ether): with its conductor in the
+    core when the run is in virtual time and the core is there to be had."""
+    loop = asyncio.get_running_loop()
+    mode, _ = parse_time_mode(time_mode)
+    module = core_module() if mode == "virtual" else None
+    if module is None:
+        return await loop.create_datagram_endpoint(
+            lambda: Ether(record_path, physics, time_mode=time_mode, **kw), local_addr=bind)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
+        sock.bind(bind)
+        ether = CoreEther(sock, record_path, physics, time_mode=time_mode, module=module, **kw)
+    except BaseException:
+        sock.close()
+        raise
+    log("the conductor is ether_core's")
+    return ether.transport, ether
+
+
 def rule_name(pairwise, bench_capture=False):
     """The collision rule, as the logs name it."""
     if pairwise:
@@ -1944,10 +2312,9 @@ def read_losses(directory):
 async def serve(bind, record_path, physics, losses, time_mode="real", pairwise=False,
                 seed=None, bench_capture=False):
     loop = asyncio.get_running_loop()
-    transport, ether = await loop.create_datagram_endpoint(
-        lambda: Ether(record_path, physics, seed=seed, time_mode=time_mode, pairwise=pairwise,
-                      bench_capture=bench_capture),
-        local_addr=bind)
+    transport, ether = await open_ether(bind, record_path, physics, time_mode=time_mode,
+                                        pairwise=pairwise, seed=seed,
+                                        bench_capture=bench_capture)
     tables, sids, gains = losses
     ether.set_losses(tables, sids, gains)
     host, port = transport.get_extra_info("sockname")[:2]

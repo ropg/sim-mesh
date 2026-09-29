@@ -384,19 +384,16 @@ class Simd:
             # A transport lets go of its socket on the loop's next turn.
             for _ in range(3):
                 await asyncio.sleep(0)
-        loop = asyncio.get_running_loop()
         record = None
         if record_dir is not None:
             os.makedirs(record_dir, exist_ok=True)
             record = os.path.join(record_dir, "record.tsv")
         bind = ether_module.parse_bind(self.ether_addr)
         physics = ether_module.Physics(self.args.noise_figure, self.args.crc_margin_db)
-        self.ether_transport, self.ether = await loop.create_datagram_endpoint(
-            lambda: ether_module.Ether(record, physics=physics, time_mode=self.args.time,
-                                       pairwise=self.args.pairwise, seed=self.args.seed,
-                                       epoch=self.args.epoch,
-                                       bench_capture=self.args.bench_capture),
-            local_addr=bind)
+        self.ether_transport, self.ether = await ether_module.open_ether(
+            bind, record, physics=physics, time_mode=self.args.time,
+            pairwise=self.args.pairwise, seed=self.args.seed, epoch=self.args.epoch,
+            bench_capture=self.args.bench_capture)
         self.ether.on_tx = self.ether_tx
         self.ether.on_rx = self.ether_rx
         self.ether.on_station = self.ether_station
