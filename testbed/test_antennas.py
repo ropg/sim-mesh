@@ -1,5 +1,6 @@
 """Antennas: the catalogue, the pattern, and a pair's gain in three dimensions."""
 
+import math
 import os
 import sys
 
@@ -42,6 +43,23 @@ def test_an_antenna_is_checked_and_a_directional_one_aimed():
     assert antennas.check({"type": "rubber_duck", "azimuth_deg": 5}, "n") == {"type": "rubber_duck"}
     with pytest.raises(store.StoreError, match="no antenna of type"):
         antennas.check({"type": "dish"}, "n")
+
+
+def test_an_aim_that_is_no_finite_number_is_refused_by_its_key():
+    """A NaN elevation was read as straight up, and an infinite one clamped
+    to straight up or down, where a NaN or infinite azimuth was refused."""
+    for aim, match in (({"elevation_deg": math.nan}, "elevation_deg is a finite number of "
+                                                     "degrees, not nan"),
+                       ({"elevation_deg": math.inf}, "elevation_deg .* not inf"),
+                       ({"elevation_deg": -math.inf}, "elevation_deg .* not -inf"),
+                       ({"azimuth_deg": math.nan}, "azimuth_deg .* not nan"),
+                       ({"azimuth_deg": -math.inf}, "azimuth_deg .* not -inf"),
+                       ({"elevation_deg": "up"}, "elevation_deg .* not 'up'"),
+                       ({"azimuth_deg": [90]}, r"azimuth_deg .* not \[90\]")):
+        with pytest.raises(store.StoreError, match="n: an antenna's " + match):
+            antennas.check({"type": "panel_directional", **aim}, "n")
+    assert antennas.check({"type": "panel_directional", "azimuth_deg": 450,
+                           "elevation_deg": -100}, "n")["elevation_deg"] == -90.0
 
 
 def test_the_direction_between_two_antennas_is_in_three_dimensions():
