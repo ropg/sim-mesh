@@ -466,7 +466,9 @@ class Nodeset:
         store.check_name(name, "node")
         if name in self.nodes:
             raise store.StoreError("there is already a node called %r" % name)
-        self.nodes[name] = node_record(self.next_id(), lat, lon)
+        where = "node %s" % name
+        self.nodes[name] = node_record(self.next_id(), finite(lat, "lat", where),
+                                       finite(lon, "lon", where))
         try:
             self.set_node(name, **fields)
         except store.StoreError:
@@ -502,7 +504,8 @@ class Nodeset:
 
     def move_node(self, name, lat, lon):
         node = self.node(name)
-        node["lat"], node["lon"] = float(lat), float(lon)
+        where = "node %s" % name
+        node["lat"], node["lon"] = finite(lat, "lat", where), finite(lon, "lon", where)
         self.dirty = True
 
     def set_node(self, name, id=None, lat=None, lon=None, height_m=None, height_from=None,
@@ -515,9 +518,10 @@ class Nodeset:
         and one with state must be restarted for it to take.
         """
         node = self.node(name)
+        where = "node %s" % name
         changed_id = False
-        if id is not None and int(id) != node["id"]:
-            node_id = int(id)
+        node_id = None if id is None else int(finite(id, "id", where))
+        if node_id is not None and node_id != node["id"]:
             check_id(node_id)
             other = self.by_id(node_id)
             if other is not None:
@@ -525,19 +529,19 @@ class Nodeset:
             node["id"] = node_id
             changed_id = True
         if lat is not None:
-            node["lat"] = float(lat)
+            node["lat"] = finite(lat, "lat", where)
         if lon is not None:
-            node["lon"] = float(lon)
+            node["lon"] = finite(lon, "lon", where)
         if height_m is not None:
-            node["height_m"] = float(height_m)
+            node["height_m"] = finite(height_m, "height_m", where)
         if height_from is not None:
             if height_from not in HEIGHT_FROM:
                 raise store.StoreError("height_from is one of %s" % ", ".join(HEIGHT_FROM))
             node["height_from"] = height_from
         if antenna is not None:
-            node["antenna"] = antennas_module.check(antenna, "node %s" % name)
+            node["antenna"] = antennas_module.check(antenna, where)
         if max_dbm is not KEEP:
-            max_dbm = boards_module.check(max_dbm, "node %s" % name)
+            max_dbm = boards_module.check(max_dbm, where)
             if max_dbm is None:
                 node.pop("max_dbm", None)
             else:
@@ -550,10 +554,11 @@ class Nodeset:
     def set_offset(self, a, b, db, note=None):
         """Set the dB added between two nodes; 0 removes it."""
         self.node(a), self.node(b)
+        db = finite(db, "db", "the offset between %s and %s" % (a, b))
         pair = {a, b}
         self.data["offsets"] = [o for o in self.offsets if set(o["between"]) != pair]
         if db:
-            entry = {"between": [a, b], "db": float(db)}
+            entry = {"between": [a, b], "db": db}
             if note:
                 entry["note"] = str(note)
             self.offsets.append(entry)
