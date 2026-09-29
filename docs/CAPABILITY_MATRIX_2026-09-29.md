@@ -440,7 +440,7 @@ These are drafted for Rop in the report, not filed.
 ### Our branches
 
 - All ten were written against the distance-formula ether, which main has replaced. The stacked six conflict in 17 to 39 hunks each.
-- The four chip commits (#1, #3, #9, #10) note that iface-lora carries its own copy of the chip model and needs the same change.
+- The four chip commits (#1, #3, #9, #10) note that iface-lora carries its own copy of the chip model and needs the same change. That is no longer so: since iface-lora e651bca (25 September) its host build links SIMesh's own chip library (`radio/`), and the in-tree copy is gone. A chip fix in this fork's `radio/` therefore reaches reticulous stations built against it, and iface-lora's own PR branches #2–#5, written against the removed copy, are superseded. The same note in three `integration/medium` commit messages (1106a99, b4c2c7a, 0f051d6) is wrong for the same reason.
 
 ### mesh
 
