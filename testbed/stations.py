@@ -11,7 +11,9 @@ binary and how to talk to it. It gets:
   supervisor holds the master end and reads it on the pty thread (`Ptys`),
   which takes framed-RPC replies out of what the station writes (rpc.py) and
   hands them to the station's client, appends everything else to `log`, and
-  passes the same bytes to whoever is watching the console;
+  passes the same bytes to whoever is watching the console; or, for a kind
+  whose console need not be a terminal (`console_tty`), a pipe each way,
+  read the same way, which holds none of the host's ptys;
 - a **loopback address** its id fixes in the testbed's network (`bind_addr`),
   where its sockets bind;
 - a **supervisor** that starts it again when it exits, because a restart on
@@ -360,9 +362,14 @@ class Station:
         ptys().call(self.log_file.write, b"\n--- station %s starting ---\n"
                     % self.name.encode("utf-8"))
 
-        master, slave = pty.openpty()
-        tty.setraw(slave)       # a serial line has no echo and no translation
-        self.master = master
+        if getattr(self.kind, "console_tty", True):
+            master, slave = pty.openpty()
+            tty.setraw(slave)       # a serial line has no echo and no translation
+            reader, child_in, child_out = master, slave, slave
+        else:
+            reader, child_out = os.pipe()
+            child_in, master = os.pipe()
+        self.master = master        # what is typed at it goes here
         if self.rpc is not None:
             self.rpc.close()
         self.rpc = rpc_module.RpcClient(
@@ -379,15 +386,18 @@ class Station:
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 self.kind.elf, cwd=self.dir, env=self.env(),
-                stdin=slave, stdout=slave, stderr=slave,
+                stdin=child_in, stdout=child_out, stderr=child_out,
                 preexec_fn=functools.partial(os.sched_setaffinity, 0, (self.cpu,)))
         except OSError:
             if self.clock is not None:
                 self.clock.leave(self.node_id)
             raise
-        os.close(slave)
+        finally:
+            for fd in {child_in, child_out}:
+                os.close(fd)
         os.set_blocking(master, False)
-        self.drain = Drain(self, master, self.rpc, asyncio.get_running_loop())
+        os.set_blocking(reader, False)
+        self.drain = Drain(self, reader, self.rpc, asyncio.get_running_loop())
         ptys().call(self.drain.attach)
         log("station %s (%d, %s) up as pid %d on %s" % (
             self.name, self.node_id, self.kind.name, self.proc.pid, self.addr))
@@ -412,8 +422,11 @@ class Station:
         except (OSError, ValueError):
             pass
         # The pty thread reads what is left, then closes the pty: from here on
-        # this loop neither reads nor writes it.
+        # this loop neither reads nor writes it. A console of pipes has an
+        # input end of its own, closed here.
         if self.drain is not None:
+            if self.drain.master != self.master:
+                os.close(self.master)
             ptys().call(self.drain.close)
         else:
             os.close(self.master)

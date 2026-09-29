@@ -550,6 +550,40 @@ def test_only_a_station_that_printed_is_read_through_the_pty_thread():
     asyncio.run(go())
 
 
+def test_a_console_that_need_not_be_a_terminal_is_a_pipe_each_way(tmp_path):
+    """A kind with console_tty False: the station's stdin and stdout are
+    pipes, not a pty; what it prints reaches its log, what is typed at it
+    reaches it."""
+    import stat as stat_module
+    import stations
+
+    script = tmp_path / "echo.sh"
+    script.write_text("#!/bin/sh\necho hello\nwhile read line; do echo \"got $line\"; done\n")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+    class Piped(Stub):
+        console_tty = False
+
+    kind = Piped({"elf": str(script)})
+    kind.elf = str(script)
+
+    async def go():
+        station = stations.Station("p", 7, str(tmp_path / "p"), kind, "127.0.0.1:9")
+        os.makedirs(station.dir, exist_ok=True)
+        await station.start()
+        try:
+            assert stat_module.S_ISFIFO(os.fstat(station.master).st_mode)
+            assert stat_module.S_ISFIFO(os.fstat(station.drain.master).st_mode)
+            station.write(b"ping\n")
+            text = lambda: open(station.log_path, "rb").read()
+            assert await until(lambda: b"got ping" in text())
+            assert b"hello" in text()
+        finally:
+            await station.stop()
+
+    asyncio.run(go())
+
+
 def test_a_role_the_station_forgets_is_said_again_after_a_reset(stores, monkeypatch):
     monkeypatch.setattr(Stub, "role_volatile", True)
 

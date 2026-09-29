@@ -213,6 +213,12 @@ class Kind:
     # role intents of its first-boot rules are then said at every boot.
     role_volatile = False
 
+    # Whether its console must be a terminal: a firmware that sets the line
+    # up, reads keys, or buffers its output unless it is on a tty. False
+    # gives the station a pipe each way instead, which holds none of the
+    # host's ptys; its output must then reach the pipe line by line.
+    console_tty = True
+
     def describe(self):
         return "%s: %s (%s) %s" % (self.device.get("ref"), self.label, self.type_name,
                                    self.elf or "no binary")
