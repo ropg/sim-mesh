@@ -116,11 +116,11 @@ class FakeStation:
     def state(self, mode="RX", **over):
         self.send(dict({"type": "state", "slot": 0}, **radio(mode, **over)))
 
-    def tx(self, fid, payload=b"hello", span_us=FRAME_US, **over):
+    def tx(self, fid, payload=b"hello", span_us=FRAME_US, pre_us=None, hdr_us=None, **over):
         t0 = self.t
         self.send(dict({"type": "tx", "slot": 0, "id": fid, "t0": t0,
-                        "t_pre": t0 + span_us // 10,
-                        "t_hdr": t0 + span_us // 5,
+                        "t_pre": t0 + (span_us // 10 if pre_us is None else pre_us),
+                        "t_hdr": t0 + (span_us // 5 if hdr_us is None else hdr_us),
                         "t_end": t0 + span_us, "power_dbm": POWER_DBM,
                         "payload": base64.b64encode(payload).decode()},
                        **radio("TX", **over)))
@@ -554,6 +554,144 @@ def test_carrier_sense_hears_energy_over_the_threshold_at_any_sf(ether):
     quiet.tx(2, sf=7)
     sensing.expect_nothing()
     receiving.expect_nothing()
+
+
+# A frame long enough to start listening in the middle of. Its stated sync
+# word is a tenth of the way in, 40 ms, so its preamble proper ends 17 ms
+# before that at SF9 and a slot starting 100 ms in has long missed it.
+LONG_US = 400_000
+
+
+@pytest.mark.parametrize("mode", ["RX", "CAD"])
+def test_a_station_that_starts_listening_mid_frame_is_told_its_energy_only(ether, mode):
+    """A frame reaches the slots listening when it starts. One that starts
+    listening later, here out of standby, has missed the preamble and cannot
+    demodulate the frame; its RSSI still reads it and a CAD still finds it.
+    It is told the energy, from the instant it was told to the frame's end,
+    and nothing else."""
+    ether.link(1, 2, NEAR_DB)
+    sender, late = ether(1), ether(2)
+    sender.hello()
+    late.hello()
+    late.state("STDBY_RC")
+    time.sleep(0.05)
+
+    sender.tx(44, payload=b"already on the air", span_us=LONG_US)
+    time.sleep(0.1)
+    late.state(mode)
+    begin = late.expect("rx_begin")
+    assert begin["cad"] is True
+    assert begin["level"] == round(level_for(NEAR_DB))
+    assert 0 < begin["t_end"] - begin["t0"] < LONG_US - 50_000     # what is left
+    late.expect_nothing(timeout=LONG_US / 1e6)                     # and no rx_end
+
+
+def test_a_station_that_starts_listening_early_in_a_long_preamble_still_locks_on(ether):
+    """With four symbols or more of the preamble still to come, a slot that
+    starts listening finds it as one listening all along would, and receives
+    the frame."""
+    ether.link(1, 2, NEAR_DB)
+    sender, late = ether(1), ether(2)
+    sender.hello()
+    late.hello()
+    late.state("STDBY_RC")
+    time.sleep(0.05)
+
+    sender.tx(45, payload=b"a long preamble", span_us=LONG_US, pre_us=300_000,
+              hdr_us=320_000)
+    time.sleep(0.05)
+    late.state("RX")
+    begin = late.expect("rx_begin")
+    assert "cad" not in begin
+    assert begin["t_pre"] - begin["t0"] < 300_000       # measured from when it was told
+    end = late.expect("rx_end")
+    assert end["verdict"] == "clean"
+    assert base64.b64decode(end["payload"]) == b"a long preamble"
+
+
+def test_a_late_listener_is_told_only_of_frames_it_could_have_been_told_of(ether):
+    """By the rules a frame's start would have applied: not a frame already
+    over, not one at another spreading factor under the sense threshold, but
+    one at another spreading factor over it, as energy."""
+    ether.link(1, 3, 90.0)          # −76 dBm, over the −81 dBm threshold
+    ether.link(2, 3, 110.0)         # −96 dBm, under it
+    loud, quiet, late = ether(1), ether(2), ether(3)
+    for station in (loud, quiet, late):
+        station.hello()
+    late.state("STDBY_RC")
+    time.sleep(0.05)
+
+    quiet.tx(46, span_us=100_000)
+    time.sleep(0.2)
+    late.state("RX")                # it ended before anyone listened
+    late.expect_nothing()
+
+    late.state("STDBY_RC")
+    quiet.tx(47, span_us=LONG_US, sf=7)
+    time.sleep(0.1)
+    late.state("RX")                # another SF, and under the threshold
+    late.expect_nothing(timeout=LONG_US / 1e6)
+
+    late.state("STDBY_RC")
+    loud.tx(48, span_us=LONG_US, sf=7)
+    time.sleep(0.1)
+    late.state("RX")                # another SF, over the threshold
+    begin = late.expect("rx_begin")
+    assert begin["cad"] is True
+    assert begin["level"] == round(level_for(90.0))
+    late.expect_nothing(timeout=LONG_US / 1e6)
+
+
+def test_a_station_back_from_its_own_frame_is_told_of_one_that_began_meanwhile(ether):
+    """Half duplex hides a frame that begins while a station is sending, and
+    it is the frame carrier sense most needs: the station, done sending,
+    wants the channel again. Back in RX, it is told the frame's energy."""
+    ether.link(1, 2, NEAR_DB)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+
+    a.tx(51, payload=b"a first", span_us=100_000)
+    b.expect("rx_begin")
+    time.sleep(0.02)
+    b.tx(52, payload=b"b over it", span_us=LONG_US)
+    a.expect_nothing(timeout=0.15)  # sending, and then not told: not listening
+    a.state("STDBY_RC")
+    a.state("RX")
+    begin = a.expect("rx_begin")
+    assert begin["cad"] is True
+
+
+def test_a_receiver_that_leaves_rx_mid_frame_is_not_told_how_it_ended(ether):
+    """Out of RX into standby, the chip lets go of the frame it was following,
+    and the medium rules on nothing it did not receive: no rx_end, and none in
+    the record."""
+    ether.link(1, 2, NEAR_DB)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+
+    a.tx(53, payload=b"left behind", span_us=LONG_US)
+    assert "cad" not in b.expect("rx_begin")
+    time.sleep(0.05)
+    b.state("STDBY_RC")
+    b.expect_nothing(timeout=LONG_US / 1e6 + 0.2)
+    time.sleep(0.1)
+    ends = [line for line in ether.record.read_text().splitlines()
+            if '"type":"rx_end"' in line]
+    assert ends == []
+
+
+def test_a_receiver_retuned_mid_frame_is_not_told_how_it_ended(ether):
+    """Retuned while in RX, the demodulator cannot follow a frame on the
+    channel it left, so that reception is abandoned as if it had left RX."""
+    ether.link(1, 2, NEAR_DB)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+
+    a.tx(54, payload=b"on the old channel", span_us=LONG_US)
+    assert "cad" not in b.expect("rx_begin")
+    time.sleep(0.05)
+    b.state("RX", freq=FREQ + 600_000)
+    b.expect_nothing(timeout=LONG_US / 1e6 + 0.2)
 
 
 def test_a_station_is_deaf_while_its_own_frame_is_going_out(ether):

@@ -29,7 +29,11 @@ stretch of its air, it clears thermal noise by its spreading factor's
 demodulation threshold and each class of interference, summed within the
 class, by that class's rejection figure. A station in `CAD` is told a frame is
 arriving, and nothing more, when that frame is decodable there or the energy
-in its band crosses the sense threshold.
+in its band crosses the sense threshold. A slot that starts listening while a
+frame is on the air is judged the same way at that instant: it can still lock
+on while enough of the preamble is to come, and is told the energy otherwise.
+A receiver that leaves RX for anything but TX mid-frame is not told how the
+frame it was following ended.
 
 With `pairwise` set the pairwise rule decides instead, on the same levels: a
 frame is delivered where it is audible, the receiver takes a later frame only
@@ -135,6 +139,20 @@ SENSITIVITY_LIMIT_DBM_AT_1KHZ = -117.0
 
 # Pairwise rule only: how far a frame must lead each audible interferer.
 PAIRWISE_CAPTURE_DB = 6.0
+
+# How many symbols of a preamble a receiver needs to find it. Firmware that
+# senses the channel by asking the demodulator measured a blind window of
+# about 4 ms at SF7 and 125 kHz, three boards over 150 trials (the reticulum
+# project's bench; the chip model's kPreambleFoundSymbols is the same figure).
+# So a slot that starts listening while a frame is on the air can still lock
+# on to it if at least this much of the preamble is still to come, and has
+# only its energy otherwise.
+PREAMBLE_FOUND_SYMBOLS = 4.0
+
+# What follows the preamble before `t_pre`: two sync-word symbols and 2.25 of
+# the start-of-frame delimiter (AN1200.13), so a frame's preamble proper ends
+# this many symbols before the `t_pre` its transmitter states.
+SYNC_SYMBOLS = 4.25
 
 # How far apart two carriers may be and still be one carrier, as a fraction
 # of the bandwidth. The synthesizer steps in 32 MHz / 2^25, so two drivers
@@ -416,6 +434,9 @@ class Frame:
         self.sync = msg.get("sync")
         self.power_dbm = msg.get("power_dbm", DEFAULT_POWER_DBM)
         self.payload = msg.get("payload", "")
+        # What a receiver's stated radio is matched against, kept for the
+        # slots that start listening while this frame is on the air.
+        self.radio = {key: msg.get(key) for key in ("freq",) + MATCH_KEYS}
         self.start_us = start_us
         self.end_us = end_us
         self.pre_us = pre_us
@@ -423,6 +444,16 @@ class Frame:
         self.interferers = []   # frames that shared this one's band and air
         self.receivers = []     # (sid, slot, level) for each decoding receiver
         self.levels = {}        # rsid -> dBm there, or None: never heard
+
+    def preamble_left(self, now):
+        """True when a receiver that starts listening at `now` still has
+        PREAMBLE_FOUND_SYMBOLS of this frame's preamble to find it by."""
+        try:
+            symbol_us = (1 << int(self.sf)) / float(self.bw) * 1e6
+        except (TypeError, ValueError, ZeroDivisionError):
+            return False
+        preamble_end = self.pre_us - SYNC_SYMBOLS * symbol_us
+        return preamble_end - now >= PREAMBLE_FOUND_SYMBOLS * symbol_us
 
     def shares_air(self, other):
         """True when the two frames overlap in band and in time."""
@@ -438,6 +469,9 @@ class Reception:
     own preamble, or when this one arrived while the receiver was following
     another it did not lead: the rx_end still goes out, as `crc`, and the
     chip, which follows only the last frame it was begun on, drops it.
+    `abandoned` is set when the receiver left RX, for anything but its own
+    transmission, while following this frame: nothing was received, so no
+    rx_end goes out and nothing is recorded as received or lost.
     """
 
     def __init__(self, frame, rsid, slot, level, lost=False):
@@ -446,6 +480,7 @@ class Reception:
         self.slot = slot
         self.level = level
         self.lost = lost
+        self.abandoned = False
 
 
 class Ether(asyncio.DatagramProtocol):
@@ -1268,14 +1303,52 @@ class Ether(asyncio.DatagramProtocol):
     def recv_state(self, sid, addr, msg):
         station = self.station_for(sid, addr)
         slot = msg.get("slot", 0)
+        before = station.state(slot) or {}
         station.states[slot] = msg
-        if msg.get("mode") != "RX":
-            # The chip lets go of what it was demodulating on leaving RX.
-            station.locks.pop(slot, None)
+        mode = msg.get("mode")
+        retuned = any(before.get(key) != msg.get(key) for key in ("freq",) + MATCH_KEYS)
+        if mode != "RX" or retuned:
+            # The chip lets go of what it was demodulating on leaving RX, and
+            # cannot follow it onto another channel. Its own transmission is
+            # half duplex, ruled on at the frame's end as talked over; anything
+            # else abandons the frame, and nothing was received that the
+            # record could count.
+            held = station.locks.pop(slot, None)
+            if held is not None and mode != "TX":
+                held.abandoned = True
         log("station %d slot %s %s freq=%s bw=%s sf=%s sync=%s" % (
-            sid, slot, msg.get("mode"), msg.get("freq"), msg.get("bw"),
+            sid, slot, mode, msg.get("freq"), msg.get("bw"),
             msg.get("sf"), msg.get("sync")))
         self.raise_event(self.on_station, sid, msg)
+        if (mode != before.get("mode") or retuned) and station.listening(slot):
+            self.tell_late(station, slot)
+
+    def tell_late(self, rstation, slot):
+        """The frames already on the air when a slot starts listening.
+
+        A frame reaches the slots listening when it starts. A slot that starts
+        later — back from its own transmission, out of standby, out of a CAD
+        into RX — is judged by the same rules at that instant: while enough of
+        a frame's preamble is still to come it can lock on to it, and
+        otherwise it has missed the preamble and cannot demodulate the frame,
+        which is still on the air for all that: an instantaneous RSSI reads it
+        and a CAD finds it. Without this, carrier sense was blind to every
+        frame that began while a station was not listening, which is every
+        frame that began during its own transmission.
+        """
+        now = self.now()
+        if rstation.tx_until > now:
+            return
+        for frame in list(self.frames):
+            if frame.sid == rstation.sid or not frame.start_us <= now < frame.end_us:
+                continue
+            level = self.level_of(frame, rstation.sid)
+            if level is None:
+                continue
+            if self.pairwise:
+                self.arrive_pairwise(frame, frame.radio, rstation, slot, level, now)
+            else:
+                self.arrive(frame, frame.radio, rstation, slot, level, now)
 
     def recv_tx(self, sid, addr, msg):
         station = self.station_for(sid, addr)
@@ -1335,9 +1408,12 @@ class Ether(asyncio.DatagramProtocol):
 
     # ---- arrival: the lock ----------------------------------------------
 
-    def begin_message(self, frame, slot, level, energy=False):
+    def begin_message(self, frame, slot, level, energy=False, t0=None):
+        """An rx_begin for one slot. `t0` is the instant the slot is told,
+        the frame's own start unless the slot started listening later: the
+        chip measures what is left of the frame from it."""
         begin = {"type": "rx_begin", "slot": slot,
-                 "id": frame.eid, "t0": frame.start_us,
+                 "id": frame.eid, "t0": frame.start_us if t0 is None else t0,
                  "t_pre": frame.pre_us, "t_hdr": frame.hdr_us,
                  "t_end": frame.end_us, "level": round(level)}
         if energy:
@@ -1373,7 +1449,7 @@ class Ether(asyncio.DatagramProtocol):
                 total += dbm_to_mw(level)
         return mw_to_dbm(total)
 
-    def arrive(self, frame, msg, rstation, slot, level):
+    def arrive(self, frame, msg, rstation, slot, level, now=None):
         """A frame reaches one listening slot: the receiver-centred rule.
 
         Off its band, nothing. Decodable — matching its state and over its
@@ -1382,26 +1458,31 @@ class Ether(asyncio.DatagramProtocol):
         by the same-SF figure; a frame that takes the lock loses the earlier
         one. Anything else in band is energy: an rx_begin marked `cad`, and no
         end, when the summed energy there crosses the sense threshold.
+
+        `now` is when a slot that started listening after the frame began is
+        told of it (`tell_late`): it can lock on only while enough of the
+        preamble is still to come, and is otherwise told the energy.
         """
         state = rstation.state(slot)
         if not in_band(frame.freq, frame.bw, state.get("freq"), state.get("bw")):
             return
         decodable = (self.matches(state, msg)
                      and self.audible(level, frame.bw, frame.sf))
-        now = frame.start_us
+        late = now is not None and now > frame.start_us
+        now = frame.start_us if now is None else now
         if not decodable:
             if self.in_band_energy(rstation.sid, state, now) >= \
                     sense_threshold_dbm(state.get("bw")):
-                self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True))
+                self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             return
-        if rstation.sensing(slot):
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True))
+        if rstation.sensing(slot) or (late and not frame.preamble_left(now)):
+            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             return
         held = self.current_lock(rstation, slot, now)
         if held is not None and level - held.level < SAME_SF_REJECTION_DB:
             # The demodulator is busy with a frame this one does not lead:
             # it is energy to this receiver, and lost to it.
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True))
+            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             self.open_reception(frame, rstation, slot, level, lost=True)
             return
         if held is not None:
@@ -1409,31 +1490,35 @@ class Ether(asyncio.DatagramProtocol):
             log("frame %d takes station %d off frame %d" % (
                 frame.eid, rstation.sid, held.frame.eid))
         rstation.locks[slot] = self.open_reception(frame, rstation, slot, level)
-        self.send(rstation.sid, self.begin_message(frame, slot, level))
+        self.send(rstation.sid, self.begin_message(frame, slot, level, t0=now))
 
-    def arrive_pairwise(self, frame, msg, rstation, slot, level):
+    def arrive_pairwise(self, frame, msg, rstation, slot, level, now=None):
         """A frame reaches one listening slot: the pairwise rule.
 
         Delivered where it matches and is audible. A later frame takes the
         receiver only when it leads, in the whole dB the station is shown, the
         one in progress by the capture margin; otherwise it is energy and lost
-        to this receiver. A CAD slot is told of every frame it could decode.
+        to this receiver. A CAD slot is told of every frame it could decode,
+        and so is a slot that started listening too late in the preamble
+        (`arrive`).
         """
         state = rstation.state(slot)
         if not self.matches(state, msg) or not self.audible(level, frame.bw, frame.sf):
             return
-        if rstation.sensing(slot):
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True))
+        late = now is not None and now > frame.start_us
+        now = frame.start_us if now is None else now
+        if rstation.sensing(slot) or (late and not frame.preamble_left(now)):
+            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             return
-        held = self.current_lock(rstation, slot, frame.start_us)
+        held = self.current_lock(rstation, slot, now)
         if held is not None and round(level) < round(held.level) + PAIRWISE_CAPTURE_DB:
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True))
+            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             self.open_reception(frame, rstation, slot, level, lost=True)
             return
         if held is not None:
             held.lost = True
         rstation.locks[slot] = self.open_reception(frame, rstation, slot, level)
-        self.send(rstation.sid, self.begin_message(frame, slot, level))
+        self.send(rstation.sid, self.begin_message(frame, slot, level, t0=now))
 
     # ---- delivery: the verdict ------------------------------------------
 
@@ -1515,6 +1600,10 @@ class Ether(asyncio.DatagramProtocol):
         station = self.stations.get(rsid)
         if station is not None and station.locks.get(slot) is reception:
             station.locks.pop(slot, None)
+        if reception.abandoned:
+            log("frame %d from %d -> station %d slot %s: abandoned, it left RX" % (
+                frame.eid, frame.sid, rsid, slot))
+            return
         verdict = (self.verdict_pairwise(reception) if self.pairwise
                    else self.verdict_for(reception))
         self.send(rsid, {"type": "rx_end", "slot": slot, "id": frame.eid,
