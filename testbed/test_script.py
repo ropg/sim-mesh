@@ -104,6 +104,39 @@ def test_declarations_are_collected_until_the_script_does_something(scripts_dir,
         library.time_mode("fast")
 
 
+def test_a_new_simulation_is_started_empty_and_given_its_rules_once_driven(runtime,
+                                                                           monkeypatch):
+    """A script's new simulation runs nothing, so T stands, until the script's
+    driver has the floor: it is started with no rules, and its firmware and
+    first-boot rules then come in their order, as to a simulation attached to.
+    Started with them, its stations ran for as long as attaching took on the
+    host, and the script began at a T the host decided."""
+    import asyncio
+    from simesh import sim as sim_module
+
+    calls = []
+
+    class Driven:
+        async def firmware(self, rules):
+            calls.append(("firmware", rules))
+
+        async def first_boot(self, rules):
+            calls.append(("first_boot", rules))
+
+    async def start(geodata, nodesets, script=None, time="real", name=None, build=None,
+                    firmware_rules=None, first_boot_rules=None, port=None, session=None):
+        calls.append(("start", firmware_rules, first_boot_rules))
+        return Driven()
+    monkeypatch.setattr(sim_module, "start", start)
+    runtime.configure(geodata="g", nodesets=["n"])
+    runtime.firmware_rules = [{"which": {"all": True}, "firmware": "ours"}]
+    runtime.first_boot_rules = [{"which": {"all": True}, "lines": ["hello"]}]
+    asyncio.run(runtime._begin())
+    assert calls == [("start", None, None),
+                     ("firmware", runtime.firmware_rules),
+                     ("first_boot", runtime.first_boot_rules)]
+
+
 def test_the_repositorys_scripts_all_parse_and_declare_what_they_run(runtime, monkeypatch,
                                                                     tmp_path):
     monkeypatch.syspath_prepend(store.SCRIPTS_DIR)

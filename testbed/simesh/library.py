@@ -214,10 +214,18 @@ class Runtime:
             raise ScriptError("this script says no firmware(), so no node would run anything: "
                               "a script that is included by others (startup.py) is run "
                               "through one of them")
-        return await sim_module.start(
+        # Started with no rules, a new simulation runs nothing, and T stands,
+        # until this script's driver has the floor; the rules then come as an
+        # attached script's do. Started with them, its stations would run for
+        # however long attaching took on the host, and the script would begin
+        # at a T the host had decided.
+        sim = await sim_module.start(
             world["geodata"], world["nodesets"], world.get("script"), self.time or "real",
-            world.get("name"), world.get("build"), self.firmware_rules, self.first_boot_rules,
-            port)
+            world.get("name"), world.get("build"), None, None, port)
+        await sim.firmware(self.firmware_rules)
+        if self.first_boot_rules:
+            await sim.first_boot(self.first_boot_rules)
+        return sim
 
     def close(self):
         if self.loop is None:
