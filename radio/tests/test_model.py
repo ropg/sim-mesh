@@ -395,6 +395,39 @@ def test_rx_end_with_a_crc_verdict_raises_crc_err(chip):
     assert chip.irq() & (RX_DONE | CRC_ERR) == RX_DONE | CRC_ERR
 
 
+def test_snr_reads_no_more_than_a_lora_receiver_reports(chip):
+    chip.configure()
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+
+    # 50 m away at +14 dBm: -63 dBm, 54 dB over the noise. The estimate
+    # saturates a little above 10 dB, so the link reads +12 dB, where the
+    # signed byte x/4 would have wrapped 54 dB round to -10 dB.
+    chip.ether.rx_begin(111, -63, 10_000, 20_000, 50_000)
+    chip.wait_irq(HEADER_VALID)
+    chip.ether.rx_end(111, b"near", rssi=-63, snr=54)
+    chip.wait_irq(RX_DONE)
+    rssi, snr, signal = chip.read(GET_PACKET_STATUS, 3)
+    assert rssi == 126 and signal == 126          # -2 x -63
+    assert snr == 48                              # 4 x 12, not 216: -10 dB
+
+
+def test_packet_status_reads_a_faint_frame_at_its_registers_ends(chip):
+    chip.configure()
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+
+    # As faint as SF12 hears: -135 dBm, 18 dB under the noise. RSSI holds at
+    # the register's floor, and an SNR inside the register's range is kept.
+    chip.ether.rx_begin(112, -135, 10_000, 20_000, 50_000)
+    chip.wait_irq(HEADER_VALID)
+    chip.ether.rx_end(112, b"far", rssi=-135, snr=-18)
+    chip.wait_irq(RX_DONE)
+    rssi, snr, signal = chip.read(GET_PACKET_STATUS, 3)
+    assert rssi == 254 and signal == 254          # -127 dBm, not 270: -7 dBm
+    assert snr == (-18 * 4) & 0xFF                # under the ceiling, unchanged
+
+
 def test_a_long_preamble_is_found_long_before_its_sync_word(chip):
     """PreambleDetected comes four symbols into a frame, however long the
     preamble is. Firmware that senses the channel by asking the demodulator

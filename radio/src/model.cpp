@@ -254,6 +254,21 @@ static int connectorDbm(int chipDbm)
     return fe.ant[fe.n - 1];
 }
 
+/* SNR as the packet status reports it: x/4 dB in a signed byte. Cast straight
+ * into that byte, a level past either end wraps round, so a link 54 dB over the
+ * noise would read -10 dB and the strongest links would pass for the weakest,
+ * to anything that weighs a link by its SNR. A LoRa receiver's estimate stops
+ * well short of the byte's +31.75 dB anyway: it saturates a little above 10 dB
+ * however strong the link (an LR2021 on a desk read 14 dB at -16 dBm). So a
+ * link reads no more than +12 dB, and no less than the byte's -32 dB. */
+static const int kSnrCeilingDb = 12;
+
+static uint8_t snrRegister(int db)
+{
+    const int v = 4 * (db > kSnrCeilingDb ? kSnrCeilingDb : db);
+    return (uint8_t)(int8_t)(v < -128 ? -128 : v);
+}
+
 /* A connector level as the chip reads it, in its -x/2 byte's range. The LNA
  * raises signal and noise alike, so SNR is left as the ether gave it. */
 static int chipLevelDbm(int connectorLevel)
@@ -859,7 +874,7 @@ void rxEndCb(void* arg)
         d.rxPtr = d.rxBase;
         d.rssiPkt    = (uint8_t)(-2 * chipLevelDbm(d.pendingEnd.rssiDbm));
         d.sigRssiPkt = d.rssiPkt;
-        d.snrPkt     = (uint8_t)(int8_t)(d.pendingEnd.snrDb * 4);
+        d.snrPkt     = snrRegister(d.pendingEnd.snrDb);
         bits = IRQ_RX_DONE;
         if (!d.pendingEnd.crcOk)    bits |= IRQ_CRC_ERR;
         if (!d.pendingEnd.headerOk) bits |= IRQ_HEADER_ERR;
