@@ -952,6 +952,9 @@ class Simd:
                 "status": station.status if station else stations_module.STOPPED,
                 "role": station.role if station else None,
                 "stale": name in self.stale,
+                # The T it is said at: a station's `up` comes at the instant it
+                # came up, which is the run's, whenever a driver hears it.
+                "t": self.ether.now() if self.ether is not None else None,
                 **self.radio_of(node["id"])}
 
     def nodeset_message(self):
