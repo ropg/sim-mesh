@@ -133,6 +133,19 @@ def check_tags(tags):
     return list(dict.fromkeys(tags))
 
 
+def finite(value, key, where):
+    """A nodeset's number as a float, or a StoreError naming its key when it
+    is none: a word, or a NaN or an infinity, which YAML and JSON read as
+    numbers but no file could be written with (store.scalar)."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        out = math.nan
+    if not math.isfinite(out):
+        raise store.StoreError("%s: %s is a finite number, not %r" % (where, key, value))
+    return out
+
+
 def parse(data, where):
     """A nodeset file's mapping, checked and filled out.
 
@@ -155,7 +168,7 @@ def parse(data, where):
         try:
             node_id = int(node["id"])
             lat, lon = float(node["lat"]), float(node["lon"])
-        except (KeyError, TypeError, ValueError) as err:
+        except (KeyError, TypeError, ValueError, OverflowError) as err:
             raise store.StoreError("%s: node %s needs id, lat and lon" % (where, name)) from err
         if node_id in ids:
             raise store.StoreError("%s: nodes %s and %s share id %d"
@@ -179,15 +192,11 @@ def parse(data, where):
         if "board" in node:
             raise store.StoreError("%s: a node has no board: every node is an SX1262, and "
                                    "`max_dbm` is its maximum power" % here)
-        record = node_record(
-            node_id, lat, lon, node.get("height_m", DEFAULT_HEIGHT_M), height_from,
+        out["nodes"][name] = node_record(
+            node_id, finite(lat, "lat", here), finite(lon, "lon", here),
+            finite(node.get("height_m", DEFAULT_HEIGHT_M), "height_m", here), height_from,
             antennas_module.check(node.get("antenna"), here), check_tags(node.get("tags")),
             boards_module.check(node.get("max_dbm"), here))
-        for key in ("lat", "lon", "height_m"):
-            if not math.isfinite(record[key]):
-                raise store.StoreError("%s: %s is a finite number, not %r"
-                                       % (here, key, record[key]))
-        out["nodes"][name] = record
     offsets = data.get("offsets") or []
     if not isinstance(offsets, list):
         raise store.StoreError("%s: offsets is a list, each { between: [a, b], db, note? }"
@@ -197,7 +206,9 @@ def parse(data, where):
             ends = offset["between"]
             if not isinstance(ends, (list, tuple)):
                 raise TypeError("not a list of nodes")      # a string's letters are no nodes
-            a, b = (str(n) for n in list(ends)[:2])
+            if len(ends) != 2:
+                raise ValueError("not two nodes")
+            a, b = (str(n) for n in ends)
             db = float(offset.get("db", 0))
         except (KeyError, TypeError, ValueError) as err:
             raise store.StoreError("%s: an offset is { between: [a, b], db, note? }" % where) from err
@@ -455,7 +466,9 @@ class Nodeset:
         store.check_name(name, "node")
         if name in self.nodes:
             raise store.StoreError("there is already a node called %r" % name)
-        self.nodes[name] = node_record(self.next_id(), lat, lon)
+        where = "node %s" % name
+        self.nodes[name] = node_record(self.next_id(), finite(lat, "lat", where),
+                                       finite(lon, "lon", where))
         try:
             self.set_node(name, **fields)
         except store.StoreError:
@@ -491,7 +504,8 @@ class Nodeset:
 
     def move_node(self, name, lat, lon):
         node = self.node(name)
-        node["lat"], node["lon"] = float(lat), float(lon)
+        where = "node %s" % name
+        node["lat"], node["lon"] = finite(lat, "lat", where), finite(lon, "lon", where)
         self.dirty = True
 
     def set_node(self, name, id=None, lat=None, lon=None, height_m=None, height_from=None,
@@ -504,9 +518,10 @@ class Nodeset:
         and one with state must be restarted for it to take.
         """
         node = self.node(name)
+        where = "node %s" % name
         changed_id = False
-        if id is not None and int(id) != node["id"]:
-            node_id = int(id)
+        node_id = None if id is None else int(finite(id, "id", where))
+        if node_id is not None and node_id != node["id"]:
             check_id(node_id)
             other = self.by_id(node_id)
             if other is not None:
@@ -514,19 +529,19 @@ class Nodeset:
             node["id"] = node_id
             changed_id = True
         if lat is not None:
-            node["lat"] = float(lat)
+            node["lat"] = finite(lat, "lat", where)
         if lon is not None:
-            node["lon"] = float(lon)
+            node["lon"] = finite(lon, "lon", where)
         if height_m is not None:
-            node["height_m"] = float(height_m)
+            node["height_m"] = finite(height_m, "height_m", where)
         if height_from is not None:
             if height_from not in HEIGHT_FROM:
                 raise store.StoreError("height_from is one of %s" % ", ".join(HEIGHT_FROM))
             node["height_from"] = height_from
         if antenna is not None:
-            node["antenna"] = antennas_module.check(antenna, "node %s" % name)
+            node["antenna"] = antennas_module.check(antenna, where)
         if max_dbm is not KEEP:
-            max_dbm = boards_module.check(max_dbm, "node %s" % name)
+            max_dbm = boards_module.check(max_dbm, where)
             if max_dbm is None:
                 node.pop("max_dbm", None)
             else:
@@ -539,10 +554,11 @@ class Nodeset:
     def set_offset(self, a, b, db, note=None):
         """Set the dB added between two nodes; 0 removes it."""
         self.node(a), self.node(b)
+        db = finite(db, "db", "the offset between %s and %s" % (a, b))
         pair = {a, b}
         self.data["offsets"] = [o for o in self.offsets if set(o["between"]) != pair]
         if db:
-            entry = {"between": [a, b], "db": float(db)}
+            entry = {"between": [a, b], "db": db}
             if note:
                 entry["note"] = str(note)
             self.offsets.append(entry)
