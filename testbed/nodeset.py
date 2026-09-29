@@ -206,7 +206,9 @@ def parse(data, where):
             ends = offset["between"]
             if not isinstance(ends, (list, tuple)):
                 raise TypeError("not a list of nodes")      # a string's letters are no nodes
-            a, b = (str(n) for n in list(ends)[:2])
+            if len(ends) != 2:
+                raise ValueError("not two nodes")
+            a, b = (str(n) for n in ends)
             db = float(offset.get("db", 0))
         except (KeyError, TypeError, ValueError) as err:
             raise store.StoreError("%s: an offset is { between: [a, b], db, note? }" % where) from err
