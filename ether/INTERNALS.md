@@ -461,4 +461,5 @@ medium: the ether's job is the frames, and everything watching is optional.
   factor and counted at its whole power.
 - **A referee.** The ether does not judge a station's behaviour — it does not
   check that a transmission was preceded by carrier sense, or that a duty cycle
-  was respected. The record is there so something else can.
+  was respected. The record is there so something else can:
+  `testbed/compliance.py` and `testbed/referee.py` do, after a run.
