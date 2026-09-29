@@ -397,16 +397,19 @@ export interface LinkReply {
   [key: string]: unknown
 }
 
-/** link.json between two points, or the sidecar's refusal as an Error. */
+/** link.json between two points, or the sidecar's refusal as an Error.
+ *  `locPct` is the geodata's percentage of locations, when it states one:
+ *  the one its loss tables were asked at. */
 export async function link(base: string, a: [number, number], b: [number, number],
                            txH: number, rxH: number, txGain?: number, rxGain?: number,
-                           signal?: AbortSignal): Promise<LinkReply> {
+                           signal?: AbortSignal, locPct?: number): Promise<LinkReply> {
   const q = new URLSearchParams({
     ax: String(a[0]), ay: String(a[1]), bx: String(b[0]), by: String(b[1]),
     tx_h: String(txH), rx_h: String(rxH),
   })
   if (txGain !== undefined) q.set('tx_gain_dbi', String(txGain))
   if (rxGain !== undefined) q.set('rx_gain_dbi', String(rxGain))
+  if (locPct !== undefined) q.set('loc_pct', String(locPct))
   const r = await getWithBackoff(`${base}/link.json?${q}`, signal)
   if (!r.ok) throw new Error((await r.text()).trim() || `link.json ${r.status}`)
   return await r.json() as LinkReply

@@ -85,7 +85,7 @@ A JSON object. Readers ignore keys they do not know.
 | `band` | the band's name, as in the table above |
 | `f0_hz` | the frequency the losses are for, in Hz |
 | `model` | `"P.1812-8"` (ITU-R Recommendation P.1812-8 over the ground data) or `"log-distance"` (flat synthetic ground) |
-| `p_time_pct`, `p_loc_pct` | the time and location percentages P.1812 was judged at; null for `log-distance` |
+| `p_time_pct`, `p_loc_pct` | the time and location percentages P.1812 was judged at; null for `log-distance`. A table at 50 % of locations is a median, the one to lay shadowing over |
 | `exponent` | `log-distance` only: the path-loss exponent `n` in `FSPL(1 m, f0) + 10·n·log10(d)` |
 | `radius_m` | the compute radius in metres: pairs farther apart are never heard, flagged beyond radius. Absent when there is none |
 | `planner_version` | the version of the propagation planner that computed the table, or null |

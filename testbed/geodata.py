@@ -43,6 +43,22 @@ in `content_hash` and a new spread or seed recomputes nothing. Absent, or
 at 0, there is none, and a file without the keys reads, hashes and is
 written back exactly as it did before they existed.
 
+**`loc_pct`**, on a pack only, is the percentage of locations its tables'
+P.1812 figures are not exceeded at, 1 to 99, and 90, the planner's own, when
+absent:
+
+    pack: ../../packs/berlin-city
+    loc_pct: 50
+
+A figure at 90 % of locations already holds the spread of losses between
+locations, and shadowing laid over it counts that spread twice, so a pack
+with shadowing wants its tables at the median. One with shadowing at any
+other percentage, 90 included, is warned about, not refused
+(`losses.shadowing_warning`). Unlike shadowing it is the table's own
+(`losses.header_for` records it as `p_loc_pct`), so it is in `content_hash`,
+and a table at one percentage never stands in for another. The page's
+coverage rasters are the planner's own sweep, at 90 % whatever this says.
+
 Coordinates on a pack are its own CRS, absolute easting and northing in
 metres. Packs are UTM on WGS84 (EPSG 326zz north, 327zz south) or on ETRS89
 (258zz), and the transverse Mercator here is Krüger's series to sixth order
@@ -92,10 +108,11 @@ PACK_MEMBER = "pack"                # where an exported pack goes inside it
 EXPORT_LEVEL = 1                    # deflate's fastest: berlin-city, 450 MB, is 124 MB in 2 s
 NODES_LAYER = "Nodes"
 NODES_NOTICE = "Deployed mesh nodes"   # how the Nodes layer's notice names its source
-SHADOWING_DB, SHADOWING_SEED = "shadowing_db", "shadowing_seed"
-# The keys either kind may add, in the order a file is written in; a file
+LOC_PCT, SHADOWING_DB, SHADOWING_SEED = "loc_pct", "shadowing_db", "shadowing_seed"
+LOC_PCT_RANGE = (1.0, 99.0)         # P.1812's own (planner-propag p1812::lb_from_arrays)
+# The keys a file may add, in the order a file is written in; a file
 # carries one only when it states it.
-STATED = (SHADOWING_DB, SHADOWING_SEED)
+STATED = (LOC_PCT, SHADOWING_DB, SHADOWING_SEED)
 # The keys that are laid over a table rather than computed into it: not in
 # `content_hash`, so a cached table outlives any change to them.
 LAYER_KEYS = (SHADOWING_DB, SHADOWING_SEED)
@@ -290,6 +307,12 @@ class Geodata:
         return self.data[SYNTHETIC]["extent_m"] if not self.is_pack else None
 
     @property
+    def loc_pct(self):
+        """The percentage of locations a pack's tables are asked at when the
+        file states one; None: the planner's own."""
+        return self.data.get(LOC_PCT)
+
+    @property
     def shadowing_db(self):
         """The spread of each pair's shadowing draw, in dB; 0 is none."""
         return self.data.get(SHADOWING_DB, 0.0)
@@ -395,6 +418,15 @@ def _stated(data, where):
             raise store.StoreError("%s: geodata has no key %s: did you mean %s?"
                                    % (where, key, near[0]))
     out = {}
+    if LOC_PCT in data:
+        if PACK not in data:
+            raise store.StoreError("%s: loc_pct is a pack's: synthetic ground's log-distance "
+                                   "has no percentage of locations" % where)
+        out[LOC_PCT] = _number(data[LOC_PCT], LOC_PCT, where)
+        low, high = LOC_PCT_RANGE
+        if not low <= out[LOC_PCT] <= high:
+            raise store.StoreError("%s: loc_pct is %g to %g, not %g"
+                                   % (where, low, high, out[LOC_PCT]))
     if SHADOWING_DB in data:
         out[SHADOWING_DB] = _number(data[SHADOWING_DB], SHADOWING_DB, where)
         if out[SHADOWING_DB] < 0:

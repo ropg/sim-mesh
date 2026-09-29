@@ -472,7 +472,12 @@ not station ids, because a node keeps its name from one run to the next. A
 loss drawn afresh per frame would be fading, a different thing that lets
 every retry through in the end; this is not that. A pair never heard stays
 so, a measured cell already holds its path's own shadowing, and a stated
-link is the figure as stated, so none of them is drawn on.
+link is the figure as stated, so none of them is drawn on. On a pack the
+table it is laid over must be a median: P.1812 at 90 % of locations already
+adds up to 1.28 σ_L of location spread (about 2.5 dB, with σ_L ≈ 1.96 dB at
+868 MHz), and the draw on top would count that spread twice. So a pack
+geodata with shadowing states `loc_pct: 50`, and simd warns of one that does
+not.
 
 A node is referred to **by name** everywhere, and its **id** is stored and
 editable. The name is what a person means; the id is the station's network
@@ -582,12 +587,17 @@ front ── GET /loss/start, /loss/status, /loss.bin, one node at a time ──
 - **What the sidecar decides, and what it does not.** `link.json` takes no
   carrier and judges at the planner's EU868 parameters, 869.525 MHz, 50 % of
   time and 90 % of locations; a pack therefore has an 868 table only,
-  and its header says so. A pair with an end off the pack is never heard
-  here rather than asked, because the sidecar would clamp the point onto the
-  pack's edge and answer for a place the node is not. A sidecar answers
-  from the clutter raster alone until it has indexed the pack's buildings, a
-  different number by tens of dB, so a table waits for the index before its
-  first pair and throws away a reply given before it.
+  and its header says so. The percentage of locations is the one parameter
+  a request may change (`loc_pct`, from the geodata), for both ways of the
+  both-way mean. SIMesh's copy of the planner holds it to P.1812's range,
+  1 to 99, itself: a failed P.1812 call is answered with the near-field
+  model, which would turn a bad value into a confident number. A pair with
+  an end off the pack is never heard here rather than asked, because the
+  sidecar would clamp the point onto the pack's edge and answer for a place
+  the node is not. A sidecar answers from the clutter raster alone until it
+  has indexed the pack's buildings, a different number by tens of dB, so a
+  table waits for the index before its first pair and throws away a reply
+  given before it.
 - **Coverage is the planner's own sweep, one node at a time.** A node's
   coverage raster is `planner-coverage`'s point-to-area sweep from its
   antenna, cut to a square around it by `loss.bin` and cached by the
@@ -1565,8 +1575,8 @@ linked by the interface that drives it rather than by the board that wires it.
   fails its CRC (cyclic redundancy check) at a probability, and no noise
   floor but the thermal one; a pair's loss is the table's and is the same
   for every frame between them. On real ground that loss is P.1812's
-  statistical figure at 50 % of time and 90 % of locations, not a
-  measurement of that path. See
+  statistical figure at 50 % of time and 90 % of locations (or the
+  geodata's `loc_pct`), not a measurement of that path. See
   [`ether/INTERNALS.md`](ether/INTERNALS.md) for what the medium does
   and does not decide.
 - Anything below the C: the compiler, the ABI and the word size are the

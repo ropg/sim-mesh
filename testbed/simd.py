@@ -1505,6 +1505,9 @@ class Simd:
         log("run %s: geodata %s (%s), nodeset %s (%d nodes), script %s, tables %s"
             % (run.dir, gd.name, gd.kind, ns.name, len(ns.nodes),
                run.meta.get("script") or "none", ", ".join(sorted(tables)) or "none"))
+        warning = losses_module.shadowing_warning(gd)
+        if warning:
+            log("warning: %s" % warning)
         await self.settle_firmware()
         bare = [n for n in ns.nodes if not self.firmware.get(n)]
         if bare:

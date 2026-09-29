@@ -348,6 +348,16 @@ tables, like a nodeset's offsets, so a new spread or seed recomputes
 nothing; a pair never heard, a measured cell and a pair a nodeset states a
 link for are left as they are.
 
+**`loc_pct`**, on a pack only, is the percentage of locations its tables
+are asked for, 1 to 99, and the planner's own 90 when absent. P.1812's
+figure at 90 % of locations already holds the spread of losses between
+locations, and shadowing over it counts that spread twice, so a pack with
+shadowing wants `loc_pct: 50`, the median; the simulation's log warns of
+one left at 90, or at anything but 50. The percentage is the table's own:
+it is sent with every request and kept in the table's header, and a table
+at one percentage is cached apart from, and never used for, another. The
+coverage rasters stay the planner's own sweep at 90 %.
+
 There are three ways of getting ground, one button each on the Geodata tab:
 **New synthetic…**, **Build from sources…** and **Import zip…**. Nothing else
 makes or moves geodata.
@@ -768,11 +778,11 @@ A loss table is every ordered pair's path loss for one nodeset on one
 geodata, in one band (433, 868 or 915 MHz), computed at one frequency in the
 band; the ether adds `20·log10(f/f0)` per frame to move it to the frame's own
 carrier. It is derived, never edited, and cached under
-`testbed/losses/<geodata>/<nodeset geometry>/<band>.bin`, keyed by what it
-depends on: the geodata's content and the nodeset's node set, positions and
-heights. Names, ids, antennas, firmware, radios, tags, offsets, links and
-a geodata's shadowing leave it alone: they are layers put on it when the
-medium is given it.
+`testbed/losses/<geodata>/<nodeset geometry>/<band>.bin` (`<band>-loc50.bin`
+for a pack at `loc_pct: 50`), keyed by what it depends on: the geodata's
+content and the nodeset's node set, positions and heights. Names, ids,
+antennas, firmware, radios, tags, offsets, links and a geodata's shadowing
+leave it alone: they are layers put on it when the medium is given it.
 [LOSSTABLE.md](LOSSTABLE.md) is the file format. A simulation computes a
 table for the band `globals.py`'s carrier falls in.
 
@@ -782,9 +792,9 @@ table for the band `globals.py`'s carrier falls in.
   request per ordered pair: P.1812 where the path allows, a near-field
   model where the two are too close for it, with the model used and whether
   the first Fresnel zone is clear kept per cell. The planner judges at
-  869.525 MHz, 50 % of time and 90 % of locations, so a pack has an 868
-  table only. The sidecar answers one request at a time, a few milliseconds
-  each: 169 nodes is a few minutes.
+  869.525 MHz, 50 % of time and 90 % of locations (or the geodata's
+  `loc_pct`), so a pack has an 868 table only. The sidecar answers one
+  request at a time, a few milliseconds each: 169 nodes is a few minutes.
 - **Every pair is computed**, not only pairs strong enough to carry a frame,
   because a pair far too weak to decode still adds to a receiver's
   interference. Pairs more than 30 km apart, or with an end off the pack,

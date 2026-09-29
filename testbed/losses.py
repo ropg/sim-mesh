@@ -9,7 +9,8 @@ nodeset's geometry, and is cached as
 
     testbed/losses/<geodata>/<nodeset geometry hash>/<band>.bin
 
-in the SLT1 format (`ether/slt.py`). A run works on its own copy; a node
+(`<band>-loc<pct>.bin` for a pack whose geodata states `loc_pct`) in the
+SLT1 format (`ether/slt.py`). A run works on its own copy; a node
 moved during a run has its row and column recomputed into that copy, never
 into the cache.
 
@@ -80,7 +81,13 @@ The command prints JSON lines: `{"event": "progress", "done", "total"}`,
 `link.json` takes no carrier: it always judges at the planner's EU868 link
 parameters, 869.525 MHz, 50 % of time and 90 % of locations. So a pack
 has an 868 table only, its header's `f0_hz` is 869.525 MHz, the carrier the
-numbers are really for, and asking for another band is refused.
+numbers are really for, and asking for another band is refused. The
+percentage of locations is the one thing a request may change: a geodata's
+`loc_pct` goes to every request as `loc_pct` and into the header as
+`p_loc_pct`, and a geodata without one asks exactly as before, at 90 %. The
+key is in the geodata's content hash and in the cached file's name, so a
+table at 50 % never serves one at 90 %, from the cache or as another
+table's donor, and the two are cached side by side.
 """
 
 import argparse
@@ -127,9 +134,13 @@ class LossError(store.StoreError):
     """A table could not be computed, for a reason the page can show."""
 
 
-def cache_path(geodata_name, geometry_hash, band):
+def cache_path(geodata_name, geometry_hash, band, loc_pct=None):
+    """Where a table is cached. One at a percentage of locations the
+    geodata states (`loc_pct`) is a file of its own beside the planner's
+    default, so switching a geodata between the two recomputes neither."""
+    leaf = band if loc_pct is None else "%s-loc%s" % (band, store.scalar(float(loc_pct)))
     return os.path.join(store.LOSSES_DIR, store.check_name(geodata_name, "geodata"),
-                        geometry_hash, "%s.bin" % band)
+                        geometry_hash, "%s.bin" % leaf)
 
 
 def _check_band(band):
@@ -155,13 +166,30 @@ def header_for(gd, ns, band, radius_m=DEFAULT_RADIUS_M, planner_version=None):
             "nodes": _nodes_header(ns), "computed_at": now}
     if gd.is_pack:
         head.update(pack_manifest_hash=gd.pack_manifest_hash, f0_hz=LINK_F0_HZ,
-                    model="P.1812-8", p_time_pct=LINK_P_TIME_PCT, p_loc_pct=LINK_P_LOC_PCT,
+                    model="P.1812-8", p_time_pct=LINK_P_TIME_PCT, p_loc_pct=loc_pct_of(gd),
                     radius_m=radius_m, planner_version=planner_version)
     else:
         head.update(pack_manifest_hash=None, f0_hz=slt.f0_of(band), model="log-distance",
                     exponent=gd.exponent, p_time_pct=None, p_loc_pct=None,
                     planner_version=None)
     return head
+
+
+def loc_pct_of(gd):
+    """The percentage of locations a pack's tables are judged at: the
+    geodata's `loc_pct`, else the planner's own."""
+    return LINK_P_LOC_PCT if gd.loc_pct is None else float(gd.loc_pct)
+
+
+def shadowing_warning(gd):
+    """A sentence when `gd` lays shadowing over pack tables that are not
+    medians, which counts the spread between locations twice; else None.
+    A warning, not a refusal, since it may be meant."""
+    if not (gd.is_pack and gd.shadowing_db) or loc_pct_of(gd) == 50.0:
+        return None
+    return ("geodata %s lays %g dB of shadowing over P.1812 tables at %g %% of locations, "
+            "which already hold the spread between locations: `loc_pct: 50` asks for "
+            "medians" % (gd.name, gd.shadowing_db, loc_pct_of(gd)))
 
 
 def free_space_db(f_hz, d_m):
@@ -401,14 +429,16 @@ def synthetic_table(gd, ns, band, progress=None):
 # ---- pack ----------------------------------------------------------------
 
 class Sidecar:
-    """The questions a table asks a running planner-web, over one session."""
+    """The questions a table asks a running planner-web, over one session.
+    `loc_pct` goes with every pair when it is not None."""
 
-    def __init__(self, base_url, session, concurrency, notice=None):
+    def __init__(self, base_url, session, concurrency, notice=None, loc_pct=None):
         self.base = base_url.rstrip("/")
         self.session = session
         self.gate = asyncio.Semaphore(concurrency)
         self.extent = None
         self.notice = notice
+        self.loc_pct = loc_pct
         self.indexed = False
         self.index_lock = asyncio.Lock()
 
@@ -430,6 +460,8 @@ class Sidecar:
         params = {"ax": "%.3f" % a_xy[0], "ay": "%.3f" % a_xy[1],
                   "bx": "%.3f" % b_xy[0], "by": "%.3f" % b_xy[1],
                   "tx_h": "%g" % tx_h, "rx_h": "%g" % rx_h}
+        if self.loc_pct is not None:
+            params["loc_pct"] = repr(float(self.loc_pct))     # the header's figure, exactly
         pause = RETRY_FIRST_S
         while True:
             async with self.gate:
@@ -530,7 +562,7 @@ async def _fill_pack(table, gd, ns, pairs, base_url, progress=None,
     if own:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
     try:
-        car = Sidecar(base_url, session, concurrency, notice)
+        car = Sidecar(base_url, session, concurrency, notice, gd.loc_pct)
         try:
             await car.pack()
             if pairs:
@@ -635,7 +667,7 @@ def cached(gd, ns, band):
     """The cached table's path when there is a usable one, else None. A
     cached table counts only while its geodata is unchanged: the geodata
     file, and for a pack its manifest (`Geodata.content_hash`)."""
-    path = cache_path(gd.name, ns.geometry_hash(), _check_band(band))
+    path = cache_path(gd.name, ns.geometry_hash(), _check_band(band), gd.loc_pct)
     if not os.path.isfile(path):
         return None
     try:
@@ -667,8 +699,9 @@ def nearest_cached(gd, ns, band, radius_m=DEFAULT_RADIUS_M, planner_version=None
     root = os.path.join(store.LOSSES_DIR, store.check_name(gd.name, "geodata"))
     here = {name: _spot(node) for name, node in ns.nodes.items()}
     best, best_same = None, set()
+    leaf = os.path.basename(cache_path(gd.name, ns.geometry_hash(), band, gd.loc_pct))
     for entry in sorted(os.listdir(root)) if os.path.isdir(root) else ():
-        path = os.path.join(root, entry, "%s.bin" % band)
+        path = os.path.join(root, entry, leaf)
         if entry == ns.geometry_hash() or not os.path.isfile(path):
             continue
         try:
@@ -714,7 +747,7 @@ async def compute(gd, ns, band, base_url=None, progress=None, radius_m=DEFAULT_R
     else:
         table = await build(gd, ns, band, base_url, progress, radius_m, concurrency,
                             planner_version=planner_version, notice=notice)
-    path = cache_path(gd.name, ns.geometry_hash(), band)
+    path = cache_path(gd.name, ns.geometry_hash(), band, gd.loc_pct)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     write_table(table, path)
     return path, False
@@ -756,8 +789,14 @@ async def update_nodes(table, gd, ns, names, base_url=None, progress=None,
     This is one node's row and column after a move, and equally a node
     added (its row is new) or removed (it is simply gone from the copy). A
     pair whose ends were both in the old table and neither is in `names`
-    keeps its old cell.
+    keeps its old cell, which is why a pack table judged at another
+    percentage of locations than the geodata's is refused: its cells would
+    sit beside new ones of another statistic.
     """
+    judged_at = table.header.get("p_loc_pct", LINK_P_LOC_PCT)
+    if gd.is_pack and judged_at != loc_pct_of(gd):
+        raise LossError("the table is at %s %% of locations and geodata %s at %g %%"
+                        % (judged_at, gd.name, loc_pct_of(gd)))
     names = set(names)
     head = dict(table.header)
     head["nodes"] = _nodes_header(ns)
