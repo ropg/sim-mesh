@@ -39,6 +39,7 @@ import re
 import sys
 import time
 
+import referee
 from simesh import record as record_module
 from simesh.reticulum import delivery
 from simesh.reticulum import frames as rframes
@@ -154,10 +155,6 @@ class Run:
                 self.owner.setdefault(dest, sid)
             else:
                 self.forwarded[sid] += 1
-        # The ether numbers the frame in the rx_begin that follows; the record
-        # keeps them in order, so the next rx messages naming a new id are
-        # this frame's.
-        self.last_tx = (sid, info, at)
 
     def received(self, rsid, msg, at, arriving):
         verdict = msg.get("verdict")
@@ -213,25 +210,12 @@ class Run:
         return collections.Counter(p for p, _ in self.heard_at.values())
 
 
-def rx_senders(path):
-    """Ether frame id -> the station that sent it, from the order of the record."""
-    senders = {}
-    current = None
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) != 4:
-                continue
-            try:
-                msg = json.loads(fields[3])
-            except ValueError:
-                continue
-            kind = msg.get("type")
-            if kind == "tx" and fields[1] == "in":
-                current = int(fields[2])
-            elif kind == "rx_begin" and fields[1] == "out" and current is not None:
-                senders.setdefault(msg.get("id"), current)
-    return senders
+def rx_senders(path, level_at=None):
+    """Ether frame id -> the station that sent it, as the referee ties a
+    reception to its frame (`referee.Record`): by the ether's number, not by
+    the `tx` recorded last, which is another station's whenever several send
+    at one T of a virtual-time run."""
+    return {eid: frame.sid for eid, frame in referee.Record(path, level_at).by_eid.items()}
 
 
 def log_deliveries(run_dir, run):
@@ -385,7 +369,7 @@ def main(argv=None):
     starts = [float(s) for s in args.starts.split(",")] if args.starts else []
     for i, view in enumerate(views):
         path = view.record_path
-        senders = rx_senders(path)
+        senders = rx_senders(path, referee.Air(view.medium()).level)
         run = Run.__new__(Run)
         run.sender_of = senders.get
         run.until = args.until

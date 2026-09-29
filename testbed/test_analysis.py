@@ -3,10 +3,12 @@ stations (testdata/four.yaml) on plain-27, its loss table computed there, and a
 hand-written record and station logs; and the traffic driver against a
 stand-in simulation."""
 
+import argparse
 import asyncio
 import base64
 import calendar
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -73,8 +75,8 @@ class Record:
         b64 = base64.b64encode(payload).decode()
         self.add(t, "in", sid, {"type": "tx", "t0": t0, "t_end": t_end, "freq": freq,
                                 "power_dbm": power, "sf": 8, "bw": 125000, "payload": b64})
+        self.eid += 1               # the ether numbers the frame, once, heard or not
         for rsid, verdict in heard.items():
-            self.eid += 1
             self.add(t, "out", rsid, {"type": "rx_begin", "id": self.eid, "t0": t0,
                                       "t_end": t_end})
             self.add(t + span, "out", rsid, {"type": "rx_end", "id": self.eid,
@@ -83,6 +85,18 @@ class Record:
     def write(self, path):
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(self.lines) + "\n")
+
+
+class WallRecord(Record):
+    """A real-time run's record: stamped with the wall clock, `t` seconds
+    after a second before a midnight."""
+
+    MIDNIGHT = datetime.datetime(2026, 9, 29, 23, 59, 59, tzinfo=datetime.timezone.utc)
+
+    def add(self, t, direction, sid, msg):
+        stamp = (self.MIDNIGHT + datetime.timedelta(seconds=t)).isoformat(timespec="microseconds")
+        self.lines.append("%s\t%s\t%d\t%s" % (stamp, direction, sid,
+                                                 json.dumps(msg, separators=(",", ":"))))
 
 
 def lay_out(tmp_path, kind="reticulous", bare=False, name="run"):
@@ -278,6 +292,20 @@ def test_compliance_over(tmp_path):
     assert "n04 sent 1 frame (0.2 s)" in text and "within PSA" in text
 
 
+def test_compliance_says_when_the_worst_hour_began_on_the_runs_clock(tmp_path):
+    """A real-time run: a station's `tx` states its own clock, here 1000 s
+    ahead of the record's, and the hour's start is told on the record's."""
+    run = lay_out(tmp_path)
+    rec = WallRecord()
+    rec.add(0.0, "in", 1, {"type": "hello", "sid": 1, "slots": [0], "t": 0})
+    sent(rec, 5.0, 1, data_packet(), 0.5, own=1000.0)
+    sent(rec, 65.0, 1, data_packet(), 0.5, own=1000.0)
+    rec.write(os.path.join(run.dir, "record.tsv"))
+    row = compliance.analyse(run.dir)["n01"]["rows"][0]
+    assert row["worst_hour_s"] == pytest.approx(1.0) and row["worst_hour_from"] == 5.0
+    assert "1.0 s (0.03 %) from T 00:00:05" in compliance.section(run.dir)
+
+
 def test_seq(run):
     code, text = call(seq.main, [run.dir])
     assert code == 0
@@ -297,6 +325,115 @@ def test_compare(run, tmp_path):
     assert "n01" in text and "LXMF messages proven delivered" in text
     rows = [line.split() for line in text.splitlines() if line.startswith("n01 ")]
     assert rows[0] == ["n01", "7", "7"]            # delivered 7 s after the first hello
+
+
+def told(rec, t, rsid, eid, t0, t_end, cad=False):
+    """An rx_begin, as the ether records one."""
+    msg = {"type": "rx_begin", "slot": 0, "id": eid, "t0": t0, "t_end": t_end}
+    if cad:
+        msg["cad"] = True
+    rec.add(t, "out", rsid, msg)
+
+
+def ended(rec, t, rsid, eid, verdict, payload):
+    rec.add(t, "out", rsid, {"type": "rx_end", "slot": 0, "id": eid, "verdict": verdict,
+                             "payload": base64.b64encode(payload).decode()})
+
+
+def sent(rec, t, sid, payload, span, own=0.0):
+    """A `tx`, its timeline on the station's clock: T, or in a real-time run
+    its own, `own` seconds ahead of the record's."""
+    t0 = int(round((t + own) * 1e6))
+    rec.add(t, "in", sid, {"type": "tx", "sid": sid, "t0": t0, "t_end": t0 + int(span * 1e6),
+                           "freq": CALLING, "sf": 8, "bw": 125000, "power_dbm": 14,
+                           "payload": base64.b64encode(payload).decode()})
+
+
+def test_a_reception_is_tied_to_its_frame_by_the_ethers_number(tmp_path):
+    """At 5 s n04's tx reaches the ether first, but the barrier numbers n01's
+    frame 1 and n04's 2, and tells their receivers in that order. At 7 s n03
+    comes to RX during n02's frame 3, after n04's frame 4 has gone out, and
+    is told of frame 3 then."""
+    run = lay_out(tmp_path)
+    rec = Record()
+    sent(rec, 5.0, 4, b"four", 0.3)
+    sent(rec, 5.0, 1, b"one", 0.2)
+    told(rec, 5.0, 2, 1, 5_000_000, 5_200_000)
+    told(rec, 5.0, 3, 2, 5_000_000, 5_300_000)
+    ended(rec, 5.2, 2, 1, "clean", b"one")
+    ended(rec, 5.3, 3, 2, "crc", b"four")
+    sent(rec, 7.0, 2, b"two", 0.5)
+    told(rec, 7.0, 1, 3, 7_000_000, 7_500_000)
+    sent(rec, 7.1, 4, b"quick", 0.1)
+    rec.add(7.15, "in", 3, {"type": "state", "slot": 0, "mode": "RX", "freq": CALLING, "sf": 8})
+    told(rec, 7.15, 3, 3, 7_150_000, 7_500_000, cad=True)
+    ended(rec, 7.5, 1, 3, "clean", b"two")
+    path = os.path.join(run.dir, "record.tsv")
+    rec.write(path)
+
+    heard = {f.payload: f.heard for f in seq.read_record(path, seq.read_bytes)}
+    assert heard == {b"four": {3: "crc"}, b"one": {2: "clean"},
+                     b"two": {1: "clean", 3: "cad"}, b"quick": {}}
+    assert compare.rx_senders(path) == {1: 1, 2: 4, 3: 2}
+
+
+def test_airtime_and_links_read_a_real_time_record_across_midnight(tmp_path):
+    """Stamps are the wall clock with its date; a `tx` states its station's
+    own clock and an rx_begin the ether's, neither of them the record's."""
+    run = lay_out(tmp_path)
+    rec = WallRecord()
+    ether_us = lambda t: 7_000_000_000 + int(round(t * 1e6))       # noqa: E731
+    sent(rec, 0.5, 1, announce(0), 0.2, own=1000.0)
+    told(rec, 0.5, 2, 1, ether_us(0.5), ether_us(0.7))
+    ended(rec, 0.7, 2, 1, "clean", announce(0))
+    sent(rec, 1.5, 2, announce(1), 0.2, own=2000.0)                  # after the midnight
+    told(rec, 1.5, 1, 2, ether_us(1.5), ether_us(1.7))
+    ended(rec, 1.7, 1, 2, "crc", announce(1))
+    rec.write(os.path.join(run.dir, "record.tsv"))
+    code, text = call(airtime.main, [run.dir, "--busy"])
+    out = json.loads(text)
+    assert code == 0 and out["frames"] == 2 and out["window_s"] == pytest.approx(1.2)
+    assert out["losses"]["receptions_clean"] == 1 and out["losses"]["receptions_crc"] == 1
+    assert dict(out["busy_calling"]["top"]) == {"n01": pytest.approx(0.4 / 1.2),
+                                                "n02": pytest.approx(0.4 / 1.2)}
+    # --from counts from the record's first line.
+    assert json.loads(call(airtime.main, [run.dir, "--from", "1"])[1])["frames"] == 1
+    code, text = call(links.main, [run.dir, "--min-clean", "1"])
+    assert code == 0 and json.loads(text)["usable_links_one_way"] == 1
+
+
+def test_seq_reads_a_real_time_record_across_midnight(tmp_path):
+    rec = WallRecord()
+    sent(rec, 0.5, 1, announce(0), 0.2, own=1000.0)
+    sent(rec, 1.5, 2, announce(1), 0.2, own=2000.0)                  # after the midnight
+    path = str(tmp_path / "record.tsv")
+    rec.write(path)
+    frames = seq.read_record(path)
+    assert frames[1].at - frames[0].at == pytest.approx(1.0)
+    code, text = call(seq.main, ["--record", path])
+    assert code == 0 and [line.split()[0] for line in text.splitlines()[1:3]] == ["0.000", "1.000"]
+
+
+def test_frames_alike_in_their_bytes_at_one_instant_keep_their_own_receptions(tmp_path):
+    """n01 and n02 send the same bytes at the same T: n04 receives n01's,
+    and n03 loses n02's."""
+    run = lay_out(tmp_path)
+    rec = Record()
+    sent(rec, 5.0, 1, data_packet(), 0.2)
+    sent(rec, 5.0, 2, data_packet(), 0.2)
+    told(rec, 5.0, 4, 1, 5_000_000, 5_200_000)
+    told(rec, 5.0, 3, 2, 5_000_000, 5_200_000)
+    ended(rec, 5.2, 4, 1, "clean", data_packet())
+    ended(rec, 5.2, 3, 2, "crc", data_packet())
+    path = os.path.join(run.dir, "record.tsv")
+    rec.write(path)
+    losses_now = json.loads(call(airtime.main, [run.dir])[1])["losses"]
+    assert losses_now["frames_received_somewhere"] == 2
+    assert losses_now["frames_lost_at_every_receiver"] == 1
+    assert losses_now["frames_nobody_received"] == 0
+    got = {f["sid"]: (f["clean"], f["crc"])
+           for f in links.read(argparse.Namespace(record=path, frm=None, to=None))}
+    assert got == {1: ({4}, 0), 2: (set(), 1)}
 
 
 def test_delivery(run, tmp_path):

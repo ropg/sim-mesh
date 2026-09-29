@@ -137,6 +137,18 @@ def test_the_old_ethers_plane_is_kept_where_it_was_wrong():
     assert any("off the great circle" in w for w in conv["warnings"])
 
 
+def test_a_name_yaml_would_read_as_something_else_is_carried_over_as_itself():
+    # Bare, `no` reads back as a boolean and `010` as the number 8: in the
+    # nodes, the offsets (a gain) and the links the conversion writes.
+    data = old({"no": {"id": 1, "pos": (0, 0), "gain_db": 3}, "010": {"id": 2, "pos": (900, 0)}},
+               links=[{"between": ["no", "010"], "loss_db": 101.5}])
+    _, written = xy_of(cs.convert(data, DEVICES, "words"))
+    assert set(written["nodes"]) == {"no", "010"}
+    assert written["offsets"] and all(set(o["between"]) == {"no", "010"}
+                                      for o in written["offsets"])
+    assert [link["between"] for link in written["links"]] == [["no", "010"]]
+
+
 def test_links_walls_gains_kinds_and_first_boot_lines_carry_over():
     conv = cs.convert(MIXED, {"reticulous": "reticulous_dev_latest",
                               "berlinmesh": "sergeyculum_local_latest"}, "mixed")

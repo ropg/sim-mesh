@@ -21,6 +21,8 @@ import json
 import os
 import re
 
+import yaml
+
 SIM_DIR = os.path.dirname(os.path.abspath(__file__))
 GEODATA_DIR = os.path.join(SIM_DIR, "geodata")
 NODESETS_DIR = os.path.join(SIM_DIR, "nodesets")
@@ -31,6 +33,9 @@ RUNS_DIR = os.path.join(SIM_DIR, "runs")
 SNAPSHOTS_DIR = os.path.join(SIM_DIR, "snapshots")
 
 NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
+# What a plain scalar reads as, by the rules the readers' yaml.safe_load uses.
+PLAIN = yaml.resolver.Resolver()
+STR_TAG = "tag:yaml.org,2002:str"
 
 
 class StoreError(Exception):
@@ -84,6 +89,16 @@ def scalar(value):
             "true", "false", "yes", "no", "on", "off", "null", "y", "n", "~"):
         return text
     return json.dumps(text, ensure_ascii=False)
+
+
+def name_scalar(name):
+    """A name as a YAML scalar: bare, as a nodeset has always written one,
+    unless YAML would read it bare as something other than the name, and
+    then quoted. A name may be a YAML word or number: bare, `no` and `on`
+    read as booleans, `null` as nothing and `010` as the number 8."""
+    if NAME_RE.match(name) and PLAIN.resolve(yaml.ScalarNode, name, (True, False)) == STR_TAG:
+        return name
+    return json.dumps(name, ensure_ascii=False)
 
 
 def flow(value):

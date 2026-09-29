@@ -80,6 +80,36 @@ def test_names_ids_and_heights_are_checked_and_nodes_declare_nothing(tmp_path):
             nodeset.read(str(path))
 
 
+def test_a_number_no_file_could_hold_is_refused_where_it_is_read(tmp_path):
+    """NaN and infinity read as numbers, and store.scalar cannot write them:
+    a nodeset holding one loaded, and could then not be saved."""
+    node = ("nodes:\n  a: { id: 1, lat: %s, lon: %s, height_m: %s%s }\n"
+            "  b: { id: 2, lat: 0, lon: 1 }\n")
+    aimed = ", antenna: { type: panel_directional, azimuth_deg: .inf }"
+    for text, match in (
+            (node % (".nan", 0, 2, ""), "node a: lat is a finite number, not nan"),
+            (node % (0, "-.inf", 2, ""), "node a: lon is a finite number, not -inf"),
+            (node % (0, 0, ".inf", ""), "node a: height_m is a finite number, not inf"),
+            (node % (0, 0, 2, aimed), "node a: an antenna's azimuth_deg is a finite number"),
+            (node % (0, 0, 2, "") + "offsets:\n  - { between: [a, b], db: .nan }\n",
+             "offset between a and b states db nan")):
+        path = tmp_path / "f.yaml"
+        path.write_text(text)
+        with pytest.raises(store.StoreError, match=match):
+            nodeset.read(str(path))
+
+
+def test_offsets_are_a_list_and_an_offsets_ends_a_list_of_nodes(tmp_path):
+    # A string's letters were read as the ends: `ab` joined nodes a and b.
+    head = "nodes:\n  a: { id: 1, lat: 0, lon: 0 }\n  b: { id: 2, lat: 0, lon: 0.01 }\n"
+    for text, match in (("offsets:\n  - { between: ab, db: 3 }\n", "an offset is"),
+                        ("offsets: 5\n", "offsets is a list")):
+        path = tmp_path / "f.yaml"
+        path.write_text(head + text)
+        with pytest.raises(store.StoreError, match=match):
+            nodeset.read(str(path))
+
+
 def test_edits_mark_it_dirty_and_ids_are_the_lowest_free(nodesets_dir):
     ns = nodeset.create("new")
     assert ns.add_node("a", 0.0, 0.0)["id"] == 1
@@ -201,6 +231,43 @@ def test_a_link_without_a_figure_is_refused(tmp_path):
         path.write_text(head + text)
         with pytest.raises(store.StoreError, match=match):
             nodeset.read(str(path))
+
+
+def test_a_name_yaml_would_read_as_something_else_is_quoted_and_reads_back(tmp_path):
+    """A name may be a YAML word or number. Bare, `no` and `on` read back as
+    booleans and `null` as nothing, none of which is a name, and `010` as
+    the number 8; as nodes, offsets and links they are quoted."""
+    data = nodeset.blank()
+    for i, name in enumerate(("no", "on", "null", "010", "0x1f", "123", "2026-09-29"), 1):
+        data["nodes"][name] = nodeset.node_record(i, i / 100, 0.02)
+    data["offsets"] = [{"between": ["no", "010"], "db": 3.0}]
+    data["links"] = [{"between": ["on", "null"], "loss_db": 120.0}]
+    path = tmp_path / "words.yaml"
+    nodeset.write(str(path), data)
+    assert nodeset.read(str(path)) == data
+    text = path.read_text()
+    assert '\n  "no": { id: 1,' in text and '{ between: ["no", "010"], db: 3 }' in text
+
+
+BARE = """\
+nodes:
+  1st-floor: { id: 1, lat: 0.01, lon: 0.02, height_m: 2, height_from: assumed, antenna: { type: whip_sma_quarter_wave }, tags: [] }
+  08: { id: 2, lat: 0.011, lon: 0.021, height_m: 2, height_from: assumed, antenna: { type: whip_sma_quarter_wave }, tags: [] }
+  nord: { id: 3, lat: 0.012, lon: 0.022, height_m: 2, height_from: assumed, antenna: { type: whip_sma_quarter_wave }, tags: [] }
+offsets:
+  - { between: [1st-floor, 08], db: 3 }
+links:
+  - { between: [nord, "08"], loss_db: 120 }
+"""
+
+
+def test_a_name_yaml_reads_as_itself_is_written_as_before(tmp_path):
+    """Bare, as it always was, however it starts: only a name YAML would
+    read as something else is quoted. (A link's ends were always written as
+    any other string.)"""
+    path = tmp_path / "bare.yaml"
+    path.write_text(BARE)
+    assert nodeset.dump(nodeset.read(str(path))) == BARE
 
 
 def test_a_nodeset_is_inside_an_extent_when_one_node_is(nodesets_dir):

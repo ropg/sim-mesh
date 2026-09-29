@@ -876,17 +876,24 @@ class Ether(asyncio.DatagramProtocol):
                 self.send(sid, {"type": "run"})
 
     def flush_pending(self):
-        """What stations said while T stood still, in station order."""
+        """What stations said while T stood still, in station order.
+
+        A message that cannot be taken is logged and dropped on its own, as
+        a datagram is in a real-time run: the batch is every station's at
+        this instant, and one malformed `tx` must not silence the rest."""
         batch = sorted(self.pending, key=lambda p: (p[0], p[1]))
         self.pending = []
         for sid, _, addr, msg in batch:
             if sid not in self.stations:
                 continue
             kind = msg.get("type")
-            if kind == "state":
-                self.recv_state(sid, addr, msg)
-            elif kind == "tx":
-                self.recv_tx(sid, addr, msg)
+            try:
+                if kind == "state":
+                    self.recv_state(sid, addr, msg)
+                elif kind == "tx":
+                    self.recv_tx(sid, addr, msg)
+            except Exception as err:            # noqa: BLE001 - see docstring
+                log("station %d's %s could not be taken, dropped: %r" % (sid, kind, err))
 
     def recv_idle(self, sid, msg):
         """A station idle after the message numbered `seq`.
