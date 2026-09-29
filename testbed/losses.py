@@ -754,9 +754,11 @@ async def compute(gd, ns, band, base_url=None, progress=None, radius_m=DEFAULT_R
 
 
 def write_table(table, path):
-    """Write a table whole, through a temporary beside it."""
+    """Write a table whole, through a temporary beside it: this process's
+    own, since two runs of one checkout may write the same table at once, and
+    a shared temporary is one the other has already renamed away."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     table.write(tmp)
     os.replace(tmp, path)
 
