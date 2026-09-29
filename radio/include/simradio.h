@@ -25,7 +25,9 @@ typedef struct simradio simradio_t;
 enum { SIMRADIO_PIN_DIO1 = 1, SIMRADIO_PIN_BUSY = 2 };
 
 /* The station's one link to the ether. Idempotent. An empty `ether_addr`
- * means "no ether": models exist, transmissions go nowhere. */
+ * means "no ether": models exist, transmissions go nowhere. In a virtual-time
+ * run it returns once the ether's welcome has set T (or after a minute
+ * without one), so the host starts at the instant it joins. */
 int simradio_station_open(int sid, const char* bind_addr, const char* ether_addr);
 
 /* One chip per radio slot. `on_pin(ctx, pin, level)` runs on whatever
