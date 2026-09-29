@@ -290,6 +290,7 @@ class Simd:
         self.pages = {}                     # the control websockets -> quiet
         self.consoles = {}                  # node name -> set of websockets
         self.poller = None
+        self.role_wake = asyncio.Event()    # set when a page or a station comes or goes
         self.stopping = False
         self.control_port = None            # where the aiohttp app really listens
         self.front = None
@@ -601,6 +602,7 @@ class Simd:
     def station_status(self, station, status):
         if self.stations.get(station.name) is station:
             self.broadcast(self.node_message(station.name))
+        self.role_wake.set()
 
     def station_output(self, station, data):
         """Console bytes go to whoever has that station's terminal open."""
@@ -843,15 +845,36 @@ class Simd:
             if self.stations.get(station.name) is station:
                 self.broadcast(self.node_message(station.name))
 
+    def roles_wanted(self):
+        """Whether a live role has anyone to go to: a page that draws the map
+        is open, and a station is up to be asked. A quiet socket is a
+        driver's, and a script goes by a node's role tag until a role is
+        reported (simesh.sim)."""
+        return (any(not quiet for quiet in self.pages.values())
+                and any(s.status == stations_module.UP for s in self.stations.values()))
+
     async def poll_roles(self):
-        """Every ROLE_POLL_S of the run's clock: of T in a virtual run, so the
-        questions reach the stations at the same instants in every run."""
+        """Every ROLE_POLL_S of the run's clock while roles are wanted: of T
+        in a virtual run, so the questions reach the stations at the same
+        instants in every run.
+
+        Only then. A question is a tool run against the station's console,
+        which wakes the station and holds T while it answers: a Berlin run
+        asked 170 stations every six seconds for a map nobody had open. And
+        a sleep on T while nothing runs moves T as fast as the host goes, so
+        a virtual run began wherever that had taken T by the time its
+        stations started, which is a matter of the host's speed."""
         while not self.stopping:
+            if not self.roles_wanted():
+                self.role_wake.clear()
+                await self.role_wake.wait()
+                continue
             await self.sleep(ROLE_POLL_S)
+            if not self.roles_wanted():
+                continue
             running = [s for s in self.stations.values() if s.status == stations_module.UP]
-            if running:
-                await asyncio.gather(*(self.read_role(s) for s in running),
-                                     return_exceptions=True)
+            await asyncio.gather(*(self.read_role(s) for s in running),
+                                 return_exceptions=True)
 
     # ---- talking to the page ---------------------------------------------
 
@@ -1594,6 +1617,7 @@ class Simd:
         socket = web.WebSocketResponse(heartbeat=30, max_msg_size=0)
         await socket.prepare(request)
         self.pages[socket] = request.query.get("quiet", "") not in ("", "0")
+        self.role_wake.set()
         await socket.send_str(json.dumps(self.snapshot()))
         try:
             async for message in socket:
