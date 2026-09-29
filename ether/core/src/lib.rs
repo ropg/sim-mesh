@@ -22,14 +22,16 @@ use pyo3::types::{PyBytes, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::ErrorKind;
 use std::mem::ManuallyDrop;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
-/// Datagrams taken off the socket in one turn of the event loop, at most.
+/// Datagrams handled in one turn of the event loop, at most.
 const PUMP_BATCH: usize = 256;
 
 /// The largest datagram UDP carries.
@@ -39,6 +41,88 @@ const DATAGRAM_MAX: usize = 65_536;
 /// many times, as the event loop's transport would have buffered it.
 const SEND_RETRY_MS: i32 = 100;
 const SEND_RETRIES: usize = 50;
+
+/// A pipe, both ends non-blocking and closed on exec: (read, write).
+fn pipe() -> std::io::Result<(RawFd, RawFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: two ints for the kernel to write.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
+
+fn poke(fd: RawFd) {
+    // SAFETY: one byte from a local; a full pipe already says what this would.
+    unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
+}
+
+fn empty(fd: RawFd) {
+    let mut buf = [0u8; 64];
+    // SAFETY: reading into a local buffer of the stated length.
+    while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+}
+
+/// The datagrams the reader thread has taken off the ether's socket, in the
+/// order they came, waiting for the loop's thread.
+///
+/// The socket's receive buffer is the kernel's, capped by net.core.rmem_max,
+/// and a burst — a frame's end told to a hundred and seventy receivers, each
+/// answering at once — fills it while the loop's thread is busy elsewhere. A
+/// datagram the kernel drops then is a `state` or a `tx` the medium never
+/// hears, and the run is not the run. So a thread of its own does nothing but
+/// move datagrams from the socket to here, as fast as they come, and wakes the
+/// loop (`wake`); the conductor handles them there, in the same order.
+struct Inbox {
+    queue: Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
+    /// A byte is in `wake` for what is queued, or about to be.
+    signaled: AtomicBool,
+    stop: AtomicBool,
+    /// Read end for the event loop, write end for the reader.
+    wake: (RawFd, RawFd),
+    /// Wakes the reader's poll to stop it.
+    halt: (RawFd, RawFd),
+}
+
+impl Inbox {
+    fn signal(&self) {
+        if !self.signaled.swap(true, Ordering::SeqCst) {
+            poke(self.wake.1);
+        }
+    }
+
+    /// The reader thread: the socket's datagrams into the queue, until stopped.
+    fn read(self: Arc<Self>, fd: RawFd) {
+        // SAFETY: the socket stays open until `stop` is set and this returns.
+        let sock = ManuallyDrop::new(unsafe { UdpSocket::from_raw_fd(fd) });
+        let mut buf = vec![0u8; DATAGRAM_MAX];
+        while !self.stop.load(Ordering::SeqCst) {
+            let mut fds = [
+                libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: self.halt.0, events: libc::POLLIN, revents: 0 },
+            ];
+            // SAFETY: two valid pollfds; interrupted or not, the loop looks again.
+            unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            let mut took = false;
+            loop {
+                match sock.recv_from(&mut buf) {
+                    Ok((n, addr)) => {
+                        self.queue
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push_back((buf[..n].to_vec(), addr));
+                        took = true;
+                    }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            if took {
+                self.signal();
+            }
+        }
+    }
+}
 
 /// time.monotonic(), which the event loop's clock is.
 fn monotonic() -> f64 {
@@ -312,6 +396,8 @@ struct Core {
     owner: RefCell<Option<PyObject>>,
     /// The ether's socket, which Python owns and closes.
     sock: ManuallyDrop<UdpSocket>,
+    inbox: Arc<Inbox>,
+    reader: RefCell<Option<JoinHandle<()>>>,
     paced: bool,
     standing_limit: i64,
     standing_quantum_us: i64,
@@ -644,6 +730,14 @@ impl Core {
         Ok(())
     }
 
+    fn stop_reader(&self) {
+        if let Some(reader) = self.reader.borrow_mut().take() {
+            self.inbox.stop.store(true, Ordering::SeqCst);
+            poke(self.inbox.halt.1);
+            let _ = reader.join();
+        }
+    }
+
     fn with_station<R>(&self, sid: i64, f: impl FnOnce(&mut Station) -> R) -> PyResult<R> {
         let mut s = self.s.borrow_mut();
         match s.stations.get_mut(&sid) {
@@ -667,8 +761,21 @@ impl Core {
         standing_quantum_us: i64,
         slow_idle_s: f64,
         resend_gap_s: f64,
-    ) -> Self {
-        Core {
+    ) -> PyResult<Self> {
+        let inbox = Arc::new(Inbox {
+            queue: Mutex::new(VecDeque::new()),
+            signaled: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            wake: pipe()?,
+            halt: pipe()?,
+        });
+        let reader = {
+            let inbox = Arc::clone(&inbox);
+            std::thread::Builder::new()
+                .name("ether-reader".into())
+                .spawn(move || inbox.read(fd))?
+        };
+        Ok(Core {
             s: RefCell::new(State {
                 t: 0,
                 stations: BTreeMap::new(),
@@ -694,29 +801,53 @@ impl Core {
             owner: RefCell::new(Some(owner)),
             // SAFETY: a socket fd the caller keeps open until close().
             sock: ManuallyDrop::new(unsafe { UdpSocket::from_raw_fd(fd) }),
+            inbox,
+            reader: RefCell::new(Some(reader)),
             paced,
             standing_limit,
             standing_quantum_us,
             slow_idle_s,
             resend_gap_s,
-        }
+        })
     }
 
-    /// Everything waiting on the socket, taken in the order it came; the
-    /// event loop calls this when the socket is readable.
+    /// What the event loop waits on: readable when datagrams are queued.
+    #[getter]
+    fn wake_fd(&self) -> i32 {
+        self.inbox.wake.0
+    }
+
+    /// The datagrams queued, handled in the order they came; the event loop
+    /// calls this when `wake_fd` is readable. What is not handled here, past
+    /// the batch or behind a call out that raised, stays queued ahead of
+    /// anything newer, and the loop is woken for it again.
     fn pump(&self, py: Python<'_>) -> PyResult<()> {
-        let mut buf = vec![0u8; DATAGRAM_MAX];
-        for _ in 0..PUMP_BATCH {
+        self.inbox.signaled.store(false, Ordering::SeqCst);
+        empty(self.inbox.wake.0);
+        let mut batch = {
+            let mut queue = self.inbox.queue.lock().unwrap_or_else(|p| p.into_inner());
+            let n = queue.len().min(PUMP_BATCH);
+            queue.drain(..n).collect::<VecDeque<_>>()
+        };
+        let mut result = Ok(());
+        while let Some((data, addr)) = batch.pop_front() {
             if self.s.borrow().closed {
+                return Ok(());
+            }
+            if let Err(err) = self.datagram(py, &data, addr) {
+                result = Err(err);
                 break;
             }
-            match self.sock.recv_from(&mut buf) {
-                Ok((n, addr)) => self.datagram(py, &buf[..n], addr)?,
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
         }
-        Ok(())
+        let mut queue = self.inbox.queue.lock().unwrap_or_else(|p| p.into_inner());
+        while let Some(item) = batch.pop_back() {
+            queue.push_front(item);
+        }
+        if !queue.is_empty() {
+            drop(queue);
+            self.inbox.signal();
+        }
+        result
     }
 
     /// Move T as far as the barrier lets it, now.
@@ -730,10 +861,12 @@ impl Core {
         self.recv_idle_inner(py, sid, seq, until)
     }
 
-    /// No more sends and no more calls out; the socket is the caller's to close.
+    /// No more sends and no more calls out, and the reader stopped: the socket
+    /// is the caller's to close.
     fn close(&self) {
         self.s.borrow_mut().closed = true;
         self.owner.borrow_mut().take();
+        self.stop_reader();
     }
 
     fn busy(&self) -> bool {
@@ -1000,6 +1133,16 @@ impl Core {
     fn __clear__(&mut self) {
         self.owner.get_mut().take();
         self.s.get_mut().watches.clear();
+    }
+}
+
+impl Drop for Core {
+    fn drop(&mut self) {
+        self.stop_reader();
+        for fd in [self.inbox.wake.0, self.inbox.wake.1, self.inbox.halt.0, self.inbox.halt.1] {
+            // SAFETY: the pipes are the core's own, and the reader has stopped.
+            unsafe { libc::close(fd) };
+        }
     }
 }
 

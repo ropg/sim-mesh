@@ -204,15 +204,24 @@ def free_run_dir(path):
     return candidate
 
 
-def udp_drops():
-    """The kernel's count of UDP datagrams dropped on a full receive buffer
-    in this network namespace (Linux's /proc/net/snmp), or None."""
+def socket_drops(sock):
+    """The datagrams the kernel has dropped on `sock`'s full receive buffer:
+    the last field of its row in /proc/net/udp (or udp6), found by its inode.
+    None when there is no such row to read."""
     try:
-        with open("/proc/net/snmp", encoding="ascii") as handle:
-            rows = [line.split() for line in handle if line.startswith("Udp:")]
-        return int(dict(zip(rows[0][1:], rows[1][1:]))["RcvbufErrors"])
-    except (OSError, IndexError, KeyError, ValueError):
+        inode = str(os.fstat(sock.fileno()).st_ino)
+    except (AttributeError, OSError, ValueError):
         return None
+    for table in ("/proc/net/udp", "/proc/net/udp6"):
+        try:
+            with open(table, encoding="ascii") as handle:
+                for line in handle:
+                    fields = line.split()
+                    if len(fields) >= 13 and fields[9] == inode:
+                        return int(fields[12])
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def store_lists():
@@ -425,23 +434,32 @@ class Simd:
                 "t": self.ether.now(), "observed": self.observed_rate,
                 "barriers": self.ether.barriers, "runs": self.ether.runs,
                 "slow_idles": sum(st.slow_idles for st in self.ether.stations.values()),
+                "ether_drops": self.ether_drops(),
                 "plan": self.plan}
+
+    def ether_drops(self):
+        """What the kernel has dropped on the ether's socket, or None."""
+        transport = self.ether.transport if self.ether is not None else None
+        if transport is None:
+            return None
+        return socket_drops(transport.get_extra_info("socket"))
 
     async def watch_clock(self):
         """Tell the page how fast T is going, once a second of wall."""
         loop = asyncio.get_running_loop()
         last_wall, last_t = loop.time(), self.ether.now()
         slow_seen = {}
-        dropped = udp_drops()
+        dropped = self.ether_drops()
         while not self.stopping:
             await asyncio.sleep(CLOCK_REPORT_S)
             wall, t = loop.time(), self.ether.now()
-            now_dropped = udp_drops()
+            now_dropped = self.ether_drops()
             if dropped is not None and now_dropped is not None and now_dropped > dropped:
                 # A drop between two stations and the ether is resent (the
                 # ether's `resend`); anything else lost is lost, so say so.
-                log("the kernel dropped %d UDP datagram(s) on a full receive buffer at "
-                    "T %.3f s (net.core.rmem_max is the ceiling)" % (now_dropped - dropped, t / 1e6))
+                log("the kernel dropped %d datagram(s) on the ether's full receive buffer "
+                    "by T %.3f s: what a station said may be lost, and the run with it "
+                    "(net.core.rmem_max is the ceiling)" % (now_dropped - dropped, t / 1e6))
             dropped = now_dropped
             if t < last_t:                  # a new run, a new ether
                 last_t, slow_seen = t, {}

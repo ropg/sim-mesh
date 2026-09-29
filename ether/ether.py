@@ -2108,7 +2108,7 @@ class CoreEther(Ether):
         # The core's now: what is left of them here would only go stale.
         del self.busy_count, self.pending, self.dirty, self.advancing
         self.transport = _CoreTransport(self)
-        self.loop.add_reader(sock.fileno(), self.core.pump)
+        self.loop.add_reader(self.core.wake_fd, self.core.pump)
 
     holds = property(lambda self: self.core.holds,
                      lambda self, n: setattr(self.core, "holds", n))
@@ -2235,8 +2235,7 @@ class CoreEther(Ether):
             self.core.unwatch(sid, marks)
 
     def close(self):
-        if self.sock.fileno() >= 0:
-            self.loop.remove_reader(self.sock.fileno())
+        self.loop.remove_reader(self.core.wake_fd)
         self.core.close()
         Ether.close(self)
 
