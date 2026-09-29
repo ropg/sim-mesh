@@ -51,9 +51,14 @@ EVENTS = (
 
 
 def hellos(record_path):
-    """station id -> the T, in seconds, of each of its hellos, in order."""
+    """station id -> the T, in seconds, of each of its hellos, in order.
+    A virtual-time record's only: the driver's instants are T, and a real-time
+    record's stamps are the wall clock, so ValueError for one of those."""
     out = collections.defaultdict(list)
     for stamp, direction, sid, msg in record.lines(record_path):
+        if ":" in stamp:
+            raise ValueError("%s is a real-time record; a station configured with rncfg is "
+                             "counted in virtual time only" % record_path)
         if direction == "in" and msg.get("type") == "hello":
             out[sid].append(record.parse_time(stamp))
     return out

@@ -518,6 +518,18 @@ def test_delivery_counts_each_sender_by_its_own_stations_logs(tmp_path):
     assert any(w.startswith("not sent: error: send") for w in words)
 
 
+def test_a_real_time_record_is_not_counted_for_rncfg_stations(tmp_path):
+    """Their logs are placed in T at the hellos, which a real-time record
+    stamps with the wall clock: refused rather than miscounted."""
+    from simesh.reticulum import rncfg_delivery
+    path = tmp_path / "record.tsv"
+    path.write_text("# 2026-09-29T00:00:00+00:00\tether record: stamp\tdir\tsid\tjson\n"
+                    "2026-09-29T23:59:59.000000+00:00\tin\t1\t"
+                    '{"sid":1,"slots":[0],"t":0,"type":"hello"}\n')
+    with pytest.raises(ValueError, match="virtual time only"):
+        rncfg_delivery.hellos(str(path))
+
+
 # ---- the traffic driver, against a stand-in simd ------------------------
 
 class FakeSim:
