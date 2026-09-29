@@ -92,7 +92,16 @@ class Sergeyculum(Kind):
         if not self.rncfg:
             raise CommandError("no rncfg: name it under the kind's tools: or put it on PATH")
         async with self.lock_for(station):
-            return await run_tool([self.rncfg, verb, self.kiss(station), *args], timeout)
+            # In a virtual-time run the tool and the station take turns (the
+            # ether's tool_session): T stands while rncfg has the floor and
+            # runs while the station works on what it read.
+            end = (station.clock.tool_session(station.node_id)
+                   if station.clock is not None else None)
+            try:
+                return await run_tool([self.rncfg, verb, self.kiss(station), *args], timeout)
+            finally:
+                if end is not None:
+                    end()
 
     async def wait_up(self, station, timeout):
         loop = asyncio.get_running_loop()

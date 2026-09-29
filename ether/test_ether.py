@@ -1680,6 +1680,42 @@ def test_a_line_typed_at_a_station_waits_for_it_to_have_t_and_holds_t_until_read
     in_process(test)
 
 
+def test_a_tool_session_holds_t_while_the_tool_has_the_floor():
+    """tool_session(): T stands from the start until the station says it has
+    read what the tool wrote (`floor` to the station), runs while the
+    station works, stands again once it has answered (`floor` to the tool),
+    and goes when the session ends. A floor outside a session holds nothing."""
+    async def test(bed):
+        ether = bed.ether
+        await bed.join()
+        ether.call_at(1_000_000, lambda: None)
+        end = ether.tool_session(1)
+        ether.kick()
+        await asyncio.sleep(0.05)
+        assert ether.now() == 0                 # the tool has the floor
+        bed.send({"type": "floor", "to": "station"})
+        await asyncio.sleep(0.05)
+        assert ether.now() == 0                 # the station spoke: it owes an idle
+        seq = ether.stations[1].seq
+        bed.send({"type": "idle", "seq": seq, "until": 2_000_000})
+        await asyncio.sleep(0.05)
+        run = await bed.recv()                  # the station's floor: T runs, to its wake
+        assert (run["type"], run["t"]) == ("run", 2_000_000)
+        assert ether.now() == 2_000_000
+        bed.send({"type": "floor", "to": "tool"})
+        await asyncio.sleep(0.05)
+        assert ether.holds == 1
+        end()
+        await asyncio.sleep(0.05)
+        assert ether.holds == 0 and 1 not in ether.floors
+        # No session: a floor is only the station speaking.
+        bed.send({"type": "floor", "to": "tool"})
+        await asyncio.sleep(0.05)
+        assert ether.holds == 0
+
+    in_process(test)
+
+
 def test_t_does_not_wait_on_a_drain_that_found_nothing_printed():
     """A drain that says False has read nothing and set nothing going, and
     is not waited for: T moves on at once, with no turn of the loop taken."""
