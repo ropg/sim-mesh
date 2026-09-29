@@ -287,7 +287,7 @@ def dump_node(name, node):
         parts.append("max_dbm: %s" % store.scalar(node["max_dbm"]))
     parts.append("antenna: %s" % dump_antenna(node["antenna"]))
     parts.append("tags: %s" % store.flow(node["tags"]))
-    return "  %s: { %s }" % (name, ", ".join(parts))
+    return "  %s: { %s }" % (store.name_scalar(name), ", ".join(parts))
 
 
 def dump(data, comment=None):
@@ -307,7 +307,8 @@ def dump(data, comment=None):
     for offset in offsets:
         note = ", note: %s" % store.scalar(offset["note"]) if offset.get("note") else ""
         out.append("  - { between: [%s, %s], db: %s%s }"
-                   % (offset["between"][0], offset["between"][1], store.scalar(offset["db"]), note))
+                   % (store.name_scalar(offset["between"][0]),
+                      store.name_scalar(offset["between"][1]), store.scalar(offset["db"]), note))
     links = data.get("links") or []
     if links:
         out.append("links:")
