@@ -51,6 +51,11 @@ export interface NodeRecord {
 
 export interface Offset { between: [string, string]; db: number; note?: string }
 
+/** A pair's loss stated outright (nodeset.py). The page draws and edits
+ *  none: it carries them through a rename, drops a removed node's, and
+ *  hands the rest back on a save. */
+export interface Link { between: [string, string]; loss_db: number; back_db?: number; note?: string }
+
 /** A nodeset as the front and simd describe it (nodeset.Nodeset.as_dict). */
 export interface NodesetData {
   name: string | null
@@ -58,6 +63,8 @@ export interface NodesetData {
   geometry_hash?: string
   nodes: Record<string, NodeRecord>
   offsets: Offset[]
+  /** Only when the file states some. */
+  links?: Link[]
 }
 
 /** One node as the page shows it: its record, and when a simulation runs it, how it is. */
@@ -302,14 +309,14 @@ export const useNodes = defineStore('nodes', {
       }
     },
 
-    /** A node's name is its reference everywhere, so a rename carries its offsets. */
+    /** A node's name is its reference everywhere, so a rename carries its offsets and links. */
     rename(name: string, to: string): boolean {
       const ns = this.nodeset
       if (this.attached || !ns?.nodes[name] || ns.nodes[to] || this.aside[to] || !to) return false
       const nodes: Record<string, NodeRecord> = {}
       for (const [k, v] of Object.entries(ns.nodes)) nodes[k === name ? to : k] = v
       ns.nodes = nodes
-      for (const o of ns.offsets) o.between = o.between.map(n => (n === name ? to : n)) as [string, string]
+      for (const o of [...ns.offsets, ...(ns.links ?? [])]) o.between = o.between.map(n => (n === name ? to : n)) as [string, string]
       this.selection = this.selection.map(n => (n === name ? to : n))
       if (this.pair) this.pair = this.pair.map(n => (n === name ? to : n)) as [string, string]
       this.touched(true)
@@ -321,6 +328,7 @@ export const useNodes = defineStore('nodes', {
       else if (this.nodeset) {
         for (const n of names) delete this.nodeset.nodes[n]
         this.nodeset.offsets = this.nodeset.offsets.filter(o => !o.between.some(e => names.includes(e)))
+        if (this.nodeset.links) this.nodeset.links = this.nodeset.links.filter(l => !l.between.some(e => names.includes(e)))
         this.touched(true)
       }
       this.selection = this.selection.filter(n => !names.includes(n))
@@ -358,7 +366,8 @@ export const useNodes = defineStore('nodes', {
      *  aside go back in as they were. */
     fileData(): Record<string, unknown> {
       const d = this.data!
-      return { nodes: this.attached ? d.nodes : { ...this.aside, ...d.nodes }, offsets: d.offsets }
+      return { nodes: this.attached ? d.nodes : { ...this.aside, ...d.nodes }, offsets: d.offsets,
+               ...(d.links?.length ? { links: d.links } : {}) }
     },
 
     /** Another geodata to stand on: whatever was open on the one before is
@@ -508,7 +517,11 @@ export const useNodes = defineStore('nodes', {
         const own = l.name === this.active || (l.name === 'unnamed' && this.active === '')
         const data = own ? this.nodeset : this.others[l.name]
         const nodes = data ? Object.fromEntries(Object.entries(data.nodes).filter(([, n]) => within(this.bbox, n))) : {}
-        return { name: l.name, data: data ? { nodes, offsets: data.offsets } : null }
+        // A link comes along where both its nodes do; the merge refuses one naming a node it has not.
+        const kept = new Set(Object.keys(nodes))
+        const stated: Link[] = data?.links ?? []
+        const links = stated.filter(k => k.between.every(e => kept.has(e)))
+        return { name: l.name, data: data ? { nodes, offsets: data.offsets, ...(links.length ? { links } : {}) } : null }
       }).filter(l => l.data)
       if (!layers.length) return 'no layer is shown'
       const r = await request('nodeset_merge', { name, layers })

@@ -13,13 +13,14 @@ in the SLT1 format (`ether/slt.py`). A run works on its own copy; a node
 moved during a run has its row and column recomputed into that copy, never
 into the cache.
 
-A nodeset's **antennas** and **offsets** are not in the table: they are
-layers over it, put on when the medium is given the tables
-(`medium_tables`), so the cached table is the model's own and neither a new
-antenna nor an offset forces a recompute. The antenna layer takes each
-pair's gains off its loss, each end's pattern toward the other in three
-dimensions, which needs the ground under each node (`grounds`: 0 on
-synthetic ground, the pack's terrain through the sidecar).
+A nodeset's **links**, **antennas** and **offsets** are not in the table:
+they are layers over it, put on when the medium is given the tables
+(`medium_tables`), so the cached table is the model's own and none of them
+forces a recompute. A link states a pair's loss in place of the model's.
+The antenna layer takes each pair's gains off its loss, each end's pattern
+toward the other in three dimensions, which needs the ground under each
+node (`grounds`: 0 on synthetic ground, the pack's terrain through the
+sidecar).
 
 Synthetic ground is computed here:
 
@@ -185,7 +186,7 @@ def _pairs_to_do(table, names, only=None):
     return out
 
 
-# ---- offsets -------------------------------------------------------------
+# ---- layers --------------------------------------------------------------
 
 def with_antennas(tables, gd, ns, grounds=None):
     """Copies of `tables` (band -> slt.Table) with each pair's antenna gains
@@ -217,9 +218,32 @@ def with_antennas(tables, gd, ns, grounds=None):
 
 
 def medium_tables(tables, gd, ns, grounds=None):
-    """What the medium is given: the model's tables with the antennas and
-    the offsets on them."""
-    return with_offsets(with_antennas(tables, gd, ns, grounds), ns)
+    """What the medium is given: the model's tables with the nodeset's links
+    stated on them, then the antennas and the offsets on top."""
+    return with_offsets(with_antennas(with_links(tables, ns), gd, ns, grounds), ns)
+
+
+def with_links(tables, ns):
+    """Copies of `tables` (band -> slt.Table) with each of the nodeset's
+    links in place of the model's loss: a→b its `loss_db`, b→a its
+    `back_db`, `loss_db` again when it has none. The figure is the pair's
+    own, measured or worked out elsewhere, so it goes into every band's
+    table as stated, with no correction from one band to another, and into
+    a cell the model never heard too. The tables themselves when there are
+    none; a pair either table does not hold is left out."""
+    if not ns.links:
+        return dict(tables)
+    out = {}
+    for band, table in tables.items():
+        new = slt.Table(table.header, array("f", table.loss), array("B", table.flags),
+                        array("H", table.samples))
+        for link in ns.links:
+            a, b = link["between"]
+            if a in new.index and b in new.index and a != b:
+                new.loss[new.cell(a, b)] = link["loss_db"]
+                new.loss[new.cell(b, a)] = link.get("back_db", link["loss_db"])
+        out[band] = new
+    return out
 
 
 async def grounds(gd, ns, sidecar, names=None, session=None):

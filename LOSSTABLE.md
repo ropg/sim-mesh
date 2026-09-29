@@ -81,7 +81,7 @@ A JSON object. Readers ignore keys they do not know.
 | `geodata` | the geodata's name |
 | `geodata_hash` | an opaque string identifying the geodata's content (its file, and for ground data its manifest); a table whose `geodata_hash` differs from the geodata's current one is stale |
 | `pack_manifest_hash` | an opaque string identifying the ground data's manifest, or null for geodata with none |
-| `nodeset_geometry` | an opaque string identifying what of the nodeset the losses depend on: the set of nodes, their positions and heights. Names, ids, gains, devices, radios, tags and offsets are not part of it |
+| `nodeset_geometry` | an opaque string identifying what of the nodeset the losses depend on: the set of nodes, their positions and heights. Names, ids, gains, devices, radios, tags, offsets and links are not part of it |
 | `band` | the band's name, as in the table above |
 | `f0_hz` | the frequency the losses are for, in Hz |
 | `model` | `"P.1812-8"` (ITU-R Recommendation P.1812-8 over the ground data) or `"log-distance"` (flat synthetic ground) |

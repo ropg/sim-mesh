@@ -141,8 +141,8 @@ Run alone, `--nodeset` names the nodes, their ids and `antenna.gain_dbi` (a
 file of the ether's own: a SIMesh nodeset's antenna is a type, and gives 0),
 and `--losses` is the directory holding `<band>.bin` for each band computed.
 `--geodata` is named in the log and read for nothing else: the tables already
-belong to it. The tables are handed over as they are: whatever offsets a
-nodeset holds are the caller's to add first.
+belong to it. The tables are handed over as they are: whatever links and
+offsets a nodeset holds are the caller's to put on first.
 
 ## Watching the air
 

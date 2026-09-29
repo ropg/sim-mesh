@@ -171,6 +171,17 @@ def test_offsets_reach_the_medium_the_tools_read(tmp_path):
     assert RunView(run.dir).medium().level(1, 2, CALLING, 14) == pytest.approx(before - 20)
 
 
+def test_links_reach_the_medium_the_tools_read(tmp_path):
+    run = lay_out(tmp_path)
+    ns = run.nodeset()
+    before = RunView(run.dir).medium().level(1, 2, CALLING, 14)
+    model = slt.Table.read(run.table_path("868")).get("n01", "n02")
+    ns.data["links"] = [{"between": ["n01", "n02"], "loss_db": 100.0}]
+    ns.save()
+    after = RunView(run.dir).medium().level(1, 2, CALLING, 14)
+    assert after == pytest.approx(before + model - 100, abs=0.01)
+
+
 def test_a_run_with_no_reticulous_station_reads_no_protocol(tmp_path):
     other = lay_out(tmp_path, kind="sergeyculum", bare=True, name="bm")
     view = RunView(other.dir)
