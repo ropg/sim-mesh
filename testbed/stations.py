@@ -29,6 +29,7 @@ import functools
 import ipaddress
 import os
 import pty
+import select
 import sys
 import threading
 import tty
@@ -128,6 +129,27 @@ def catch_up(drains, main, done):
     main.call_soon_threadsafe(done)
 
 
+def printed(drains):
+    """Of `drains`, the ones with output the testbed may not have taken in:
+    bytes on the pty, or bytes the pty thread has read since its last
+    `catch_up` and handed to the main loop. On the main thread, before T moves.
+
+    Most barriers find none, and then cost no hand-off to the pty thread and
+    back. The ptys are polled first — a poll of a pty master that finds
+    nothing waits for the kernel to carry across what the station wrote, as
+    a read does — and the pty thread's marks after, so bytes it took off a
+    pty in between are still counted: `taking` is up before it reads, and
+    `taken` moves once what it read has been handed on."""
+    live = {d.master: d for d in drains if d.reading}
+    if not live:
+        return []
+    poller = select.poll()
+    for fd in live:
+        poller.register(fd, select.POLLIN)
+    hit = {fd for fd, _ in poller.poll(0)}
+    return [d for fd, d in live.items() if fd in hit or d.taking or d.taken != d.caught]
+
+
 _ptys = None
 
 
@@ -156,6 +178,10 @@ class Drain:
         self.marker = rpc_module.MarkerWatch()
         self.resync = None
         self.reading = False
+        # Written on the pty thread, read on the main one (`printed`).
+        self.taking = False     # inside a read and the handing on of what it got
+        self.taken = 0          # reads handed on, or that found the end
+        self.caught = 0         # `taken` when the last catch_up had read everything
 
     # ---- on the pty thread -------------------------------------------------
 
@@ -175,26 +201,33 @@ class Drain:
         handed on."""
         while self.reading and self.read_once():
             pass
+        self.caught = self.taken
 
     def read_once(self):
         """One read of the pty and what it delivers; False when it had
         nothing."""
+        self.taking = True
         try:
-            data = os.read(self.master, 65536)
-        except BlockingIOError:
-            return False
-        except OSError:
-            data = b""          # the station let go of the far end
-        if not data:
-            self.stop_reading()
-            self.main.call_soon_threadsafe(self.station.pty_closed, self)
-            return False
-        loop = asyncio.get_running_loop()
-        text, frames = self.demux.feed(data, loop.time())
-        self.deliver(text, frames)
-        if self.demux.pending and self.resync is None:
-            self.resync = loop.call_later(rpc_module.RESYNC_S, self.resync_due)
-        return True
+            try:
+                data = os.read(self.master, 65536)
+            except BlockingIOError:
+                return False
+            except OSError:
+                data = b""          # the station let go of the far end
+            if not data:
+                self.stop_reading()
+                self.main.call_soon_threadsafe(self.station.pty_closed, self)
+                self.taken += 1
+                return False
+            loop = asyncio.get_running_loop()
+            text, frames = self.demux.feed(data, loop.time())
+            self.deliver(text, frames)
+            if self.demux.pending and self.resync is None:
+                self.resync = loop.call_later(rpc_module.RESYNC_S, self.resync_due)
+            self.taken += 1
+            return True
+        finally:
+            self.taking = False
 
     def resync_due(self):
         self.resync = None

@@ -486,15 +486,17 @@ class Simd:
     def drain_consoles(self, sids, done):
         """The ether is about to move T past stations `sids`, which have run
         since it last did: read everything they printed first (their replies,
-        the marker), so what it makes the testbed do happens at this T."""
+        the marker), so what it makes the testbed do happens at this T. False,
+        and `done` not called, when none of them printed anything
+        (stations.printed), which is most of the time."""
         wanted = set(sids)
-        drains = [s.drain for s in self.stations.values()
-                  if s.node_id in wanted and s.drain is not None]
+        drains = stations_module.printed([s.drain for s in self.stations.values()
+                                          if s.node_id in wanted and s.drain is not None])
         if not drains:
-            done()
-            return
+            return False
         stations_module.ptys().call(stations_module.catch_up, drains,
                                     asyncio.get_running_loop(), done)
+        return True
 
     def ether_tx(self, sid, eid, freq, t_start, t_end):
         name = self.name_of(sid)
