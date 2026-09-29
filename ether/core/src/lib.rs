@@ -822,8 +822,13 @@ impl Core {
     /// the batch or behind a call out that raised, stays queued ahead of
     /// anything newer, and the loop is woken for it again.
     fn pump(&self, py: Python<'_>) -> PyResult<()> {
-        self.inbox.signaled.store(false, Ordering::SeqCst);
+        // The pipe emptied first, then the flag: a datagram queued in between
+        // leaves the flag set and so no byte of its own, but it is queued
+        // before the batch below is taken. The other way round a byte could
+        // be emptied from under a flag still set, and what came after it
+        // would wait with nothing to wake the loop.
         empty(self.inbox.wake.0);
+        self.inbox.signaled.store(false, Ordering::SeqCst);
         let mut batch = {
             let mut queue = self.inbox.queue.lock().unwrap_or_else(|p| p.into_inner());
             let n = queue.len().min(PUMP_BATCH);

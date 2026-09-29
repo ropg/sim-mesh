@@ -1890,6 +1890,37 @@ def test_a_burst_the_kernel_could_not_hold_is_heard_whole_by_the_core():
     in_process(test, conductors=("rust",))
 
 
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (simesh build ether)")
+def test_datagrams_that_come_while_the_core_is_handling_others_are_all_heard():
+    """Datagrams keep coming from another thread while the loop handles the
+    ones before them: every one is heard, none left queued with nothing to
+    wake the loop for it."""
+    async def test(bed):
+        ether = bed.ether
+
+        def send_all():
+            socks = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(4)]
+            try:
+                for sid in range(2, 3002):
+                    hello = {"type": "hello", "sid": sid, "slots": [0], "t": 0}
+                    socks[sid % 4].sendto(json.dumps(hello).encode(), bed.addr)
+                    if sid % 50 == 0:
+                        time.sleep(0.001)
+            finally:
+                for s in socks:
+                    s.close()
+        sender = threading.Thread(target=send_all)
+        sender.start()
+        for _ in range(600):
+            await asyncio.sleep(0.01)
+            if len(ether.stations) == 3000 and not sender.is_alive():
+                break
+        sender.join()
+        assert len(ether.stations) == 3000
+
+    in_process(test, conductors=("rust",))
+
+
 def test_what_stations_printed_is_read_before_t_moves():
     async def test(bed):
         ether = bed.ether
