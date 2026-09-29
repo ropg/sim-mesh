@@ -15,11 +15,13 @@ import math
 import os
 import queue
 import re
+import select
 import socket
 import subprocess
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -1802,6 +1804,58 @@ def test_t_does_not_wait_on_a_drain_that_found_nothing_printed():
         assert asked == [([1], 0)]
         assert ether.now() == 3_000_000         # in the same kick, no hold left
         assert ether.holds == 0
+
+    in_process(test)
+
+
+def test_a_watched_console_holds_t_only_once_it_has_printed():
+    """With drains_watched, on_drain answers exactly whether a watched
+    console shows something: T goes on at once past a station that printed
+    nothing, and waits for the read of one that did. A core looks at the
+    console itself and asks only then; Ether's own conductor asks each time."""
+    async def test(bed):
+        ether = bed.ether
+        r, w = os.pipe()
+        os.set_blocking(r, False)
+        marks = ether.console_marks(r)
+        if marks is None:
+            marks = types.SimpleNamespace(master=r, reading=False, taking=False,
+                                          taken=0, caught=0)
+        marks.reading = True
+        asked = []
+
+        def on_drain(sids, done):
+            asked.append((sids, ether.now()))
+            if not select.select([r], [], [], 0)[0]:
+                return False
+            os.read(r, 100)
+            bed.loop.call_later(0.05, done)
+            return True
+        ether.watch(1, marks)
+        ether.on_drain = on_drain
+        ether.drains_watched = True
+        ether.call_at(1_000_000, lambda: None)
+        try:
+            bed.send({"type": "hello", "slots": [0], "t": 0})
+            welcome = await bed.recv()
+            bed.send({"type": "idle", "seq": welcome["seq"], "until": 500_000})
+            run = await bed.recv()                  # nothing printed: T went on
+            assert (run["type"], run["t"]) == ("run", 500_000)
+            os.write(w, b"hello\n")                 # it prints, and is idle
+            bed.send({"type": "idle", "seq": run["seq"], "until": None})
+            await asyncio.sleep(0.02)
+            assert ether.now() == 500_000           # held for the read
+            assert asked[-1] == ([1], 500_000)
+            await asyncio.sleep(0.1)
+            assert ether.now() == 1_000_000         # read, and T went on
+            if isinstance(ether, ether_module.CoreEther):
+                assert asked == [([1], 500_000)]    # never asked about nothing
+            else:
+                assert asked == [([1], 0), ([1], 500_000)]
+        finally:
+            ether.unwatch(1, marks)
+            os.close(r)
+            os.close(w)
 
     in_process(test)
 
