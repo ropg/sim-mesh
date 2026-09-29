@@ -1883,6 +1883,7 @@ def test_a_burst_the_kernel_could_not_hold_is_heard_whole_by_the_core():
                 if len(ether.stations) == 1500:
                     break
             assert len(ether.stations) == 1500
+            assert ether.core.drops == 0
         finally:
             for s in socks:
                 s.close()
@@ -1919,6 +1920,46 @@ def test_datagrams_that_come_while_the_core_is_handling_others_are_all_heard():
         assert len(ether.stations) == 3000
 
     in_process(test, conductors=("rust",))
+
+
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (simesh build ether)")
+def test_the_core_counts_what_the_kernel_dropped_on_its_socket():
+    """Datagrams the kernel could not hold before anyone read them are
+    counted, from what it says with the next one (SO_RXQ_OVFL), and simd
+    reports them as what may void the run."""
+    async def test():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        sock.bind(("127.0.0.1", 0))
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            for _ in range(500):            # far past a 4 KB buffer, nobody reading
+                sender.sendto(b'{"type": "hello"}', sock.getsockname())
+            ether = ether_module.CoreEther(sock, None, time_mode="max",
+                                           module=ether_module.core_module())
+            try:
+                # The kernel stamps its count on a datagram as it queues it,
+                # from when the core has asked for it: the next one says.
+                for _ in range(100):
+                    await asyncio.sleep(0.01)
+                    sender.sendto(b'{"type": "hello"}', sock.getsockname())
+                    if ether.core.drops:
+                        break
+                assert ether.core.drops > 0
+            finally:
+                ether.close()
+        finally:
+            sender.close()
+
+    before = os.environ.get("SIMESH_ETHER_CORE")
+    os.environ["SIMESH_ETHER_CORE"] = "rust"
+    try:
+        asyncio.run(test())
+    finally:
+        if before is None:
+            os.environ.pop("SIMESH_ETHER_CORE", None)
+        else:
+            os.environ["SIMESH_ETHER_CORE"] = before
 
 
 def test_what_stations_printed_is_read_before_t_moves():
