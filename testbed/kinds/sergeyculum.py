@@ -62,6 +62,9 @@ POLL_S = 0.5                # how often a booting station is asked whether it is
 class Sergeyculum(Kind):
     type_name = "sergeyculum"
     role_volatile = True
+    # Its console is log lines out (a line at a time, as Rust's stdout
+    # writes) and a line reader that answers with where the KISS door is.
+    console_tty = False
 
     def __init__(self, device):
         super().__init__(device)
