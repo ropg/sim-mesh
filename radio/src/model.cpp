@@ -277,6 +277,19 @@ static int chipLevelDbm(int connectorLevel)
     return dbm < -127 ? -127 : dbm > 0 ? 0 : dbm;
 }
 
+/* One frame on the air at this antenna, as the ether has told of it: its
+ * number, its level and when it leaves the air. */
+struct AirFrame {
+    int     id = 0;
+    int     levelDbm = 0;
+    int64_t endUs = 0;
+};
+
+/* How many frames at once the instantaneous RSSI keeps track of. More than a
+ * channel carries at once in practice; past it, the frame that leaves the air
+ * first makes room. */
+constexpr int kAirFrames = 16;
+
 /* The chip's state: everything a power cycle puts back. */
 struct ChipState {
     const char* mode = "STDBY_RC";
@@ -309,9 +322,11 @@ struct ChipState {
 
     /* The air, and the one frame being demodulated out of it. A receiver
      * follows a single frame at a time: the rest is energy, which is what an
-     * instantaneous RSSI reads and what carrier sense acts on. */
-    int      airLevel = 0;           /* the strongest level in flight */
-    int64_t  airEndUs = 0;           /* when the last of it is over */
+     * instantaneous RSSI reads and what carrier sense acts on. The reading
+     * is the power of everything in flight summed, as the ether's own busy
+     * test sums it, not the strongest part of it: two frames at -80 dBm read
+     * -77. Each frame counts once, however often the ether tells of it. */
+    AirFrame air[kAirFrames];
     int      lockId = 0;             /* the frame this receiver is following */
 
     /* When the last frame this antenna has been told of leaves the air. Not
@@ -461,9 +476,39 @@ void dropLock(simradio* c)
  * on the air, and it is what a CAD is for. */
 void abandonReception(simradio* c)
 {
-    c->st.airLevel = 0;
-    c->st.airEndUs = 0;
+    for (AirFrame& a : c->st.air) a = AirFrame();
     dropLock(c);
+}
+
+/* A frame's energy arriving at this antenna: kept until it leaves the air,
+ * once per frame number. */
+void feelAir(ChipState& d, int id, int levelDbm, int64_t endUs, int64_t now)
+{
+    int room = -1, soonest = 0;
+    for (int i = 0; i < kAirFrames; i++) {
+        AirFrame& a = d.air[i];
+        if (a.endUs > now && a.id == id) {          /* told again: one frame */
+            a.levelDbm = levelDbm;
+            a.endUs = endUs;
+            return;
+        }
+        if (a.endUs <= now && room < 0) room = i;
+        if (a.endUs < d.air[soonest].endUs) soonest = i;
+    }
+    AirFrame& a = d.air[room >= 0 ? room : soonest];
+    a.id = id;
+    a.levelDbm = levelDbm;
+    a.endUs = endUs;
+}
+
+/* What the instantaneous RSSI reads at the connector: the frames in flight,
+ * their powers summed, or the floor when there are none. */
+int airLevelDbm(const ChipState& d, int64_t now)
+{
+    double mw = 0.0;
+    for (const AirFrame& a : d.air)
+        if (a.endUs > now) mw += std::pow(10.0, a.levelDbm / 10.0);
+    return mw > 0.0 ? (int)std::lround(10.0 * std::log10(mw)) : kNoiseFloorDbm;
 }
 
 void txDoneCb(void* arg);
@@ -730,7 +775,7 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
     case CMD_GET_RSSI_INST:
         if (len >= 3) {
             /* The chip's -x/2 encoding, and nothing at all outside RX. */
-            int dbm = chipLevelDbm(S()->now_us() < d.airEndUs ? d.airLevel : kNoiseFloorDbm);
+            int dbm = chipLevelDbm(airLevelDbm(d, S()->now_us()));
             in[2] = strcmp(d.mode, "RX") == 0 ? (uint8_t)(-2 * dbm) : 0xFF;
         }
         break;
@@ -919,9 +964,7 @@ void modelRxBegin(simradio* c, const VirtualRxBegin& f)
     /* Energy first: every frame in the air raises the instantaneous reading,
      * whether or not this receiver is following it. */
     int64_t endUs = now + (f.tEnd - f.t0);
-    if (now >= d.airEndUs) d.airLevel = 0;
-    if (f.levelDbm > d.airLevel || d.airLevel == 0) d.airLevel = f.levelDbm;
-    if (endUs > d.airEndUs) d.airEndUs = endUs;
+    feelAir(d, f.id, f.levelDbm, endUs, now);
     if (endUs > d.heardEndUs) d.heardEndUs = endUs;
 
     /* A CAD senses; it demodulates nothing. Nor does an RX slot follow a frame

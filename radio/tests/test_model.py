@@ -524,6 +524,28 @@ def test_rssi_inst_reads_the_air_then_the_floor_and_nothing_outside_rx(chip):
     assert chip.read(GET_RSSI_INST, 1)[0] == 0xFF
 
 
+def test_rssi_inst_reads_the_power_of_everything_on_the_air_summed(chip):
+    """Two frames at -80 dBm read -77, as the ether's busy test sums them;
+    a frame the ether tells of twice, as it does a slot that starts
+    listening again mid-frame, counts once."""
+    chip.configure()
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+    chip.ether.rx_begin(402, -80, 10_000, 20_000, 600_000, cad=True)
+    settle(0.03)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 160        # -2 x -80
+    chip.ether.rx_begin(402, -80, 10_000, 20_000, 570_000, cad=True)
+    settle(0.03)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 160        # the same frame, once
+    chip.ether.rx_begin(403, -80, 10_000, 20_000, 150_000, cad=True)
+    settle(0.03)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 154        # -2 x -77: both
+    settle(0.2)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 160        # the second has left
+    settle(0.45)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 220        # and the first: the floor
+
+
 # ---------------------------------------------------------------------------
 # 9. The sync word
 # ---------------------------------------------------------------------------
