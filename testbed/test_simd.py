@@ -4,6 +4,7 @@ move recomputed into the run's copy, an id change, levels, commands and
 intents on chosen stations, snapshots."""
 
 import asyncio
+import copy
 import json
 import os
 import socket
@@ -305,6 +306,53 @@ def test_moves_offsets_ids_and_levels(stores):
         assert daemon.ether.names.get(9) == "c" and 3 not in daemon.ether.names
         assert any(m["type"] == "notice" and "id 9" in m["text"] for m in daemon.said)
         assert await until(lambda: daemon.stations["c"].node_id == 9)
+        await daemon.stop_all(flush=False)
+        daemon.ether.close()
+    asyncio.run(go())
+
+
+def test_an_edit_with_a_number_no_file_could_hold_is_refused(stores):
+    """JSON reads NaN, Infinity and 1e999 as numbers, and store.scalar cannot
+    write them. An edit carrying one went into the run's nodeset, which could
+    then not be saved, and an infinite id or height took the page's socket
+    down with an OverflowError. Each is refused as a bad edit is, with the
+    key it names, and leaves the nodeset as it was."""
+    async def go():
+        daemon = make_simd(stores)
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three"})    # nothing runs
+        before = copy.deepcopy(daemon.nodeset.data)
+        for text, match in (
+                ('{"type": "nodeset_move", "name": "b", "lat": NaN, "lon": 0.03}',
+                 "node b: lat is a finite number, not nan"),
+                ('{"type": "nodeset_move", "name": "b", "lat": 0, "lon": -Infinity, '
+                 '"settle": false}', "node b: lon is a finite number, not -inf"),
+                ('{"type": "nodeset_move", "name": "b", "lat": 0, "lon": 0.006, '
+                 '"height_m": 1e999}', "node b: height_m is a finite number, not inf"),
+                ('{"type": "nodeset_add", "name": "d", "lat": NaN, "lon": 0.001}',
+                 "node d: lat is a finite number, not nan"),
+                ('{"type": "nodeset_add", "name": "d", "lat": 0.001, "lon": 0.001, '
+                 '"height_m": Infinity}', "node d: height_m is a finite number, not inf"),
+                ('{"type": "nodeset_add", "name": "d", "lat": 0.001, "lon": 0.001, '
+                 '"id": Infinity}', "node d: id is a finite number, not inf"),
+                ('{"type": "nodeset_set", "name": "a", "lat": NaN}',
+                 "node a: lat is a finite number, not nan"),
+                ('{"type": "nodeset_set", "name": "a", "id": -Infinity}',
+                 "node a: id is a finite number, not -inf"),
+                ('{"type": "nodeset_set", "name": "a", "antenna": {"type": "yagi_directional", '
+                 '"elevation_deg": NaN}}', "node a: an antenna's elevation_deg is a finite"),
+                ('{"type": "nodeset_set", "name": "c", "max_dbm": Infinity}',
+                 "node c: max_dbm is -9 to 27 dBm, not inf"),
+                ('{"type": "nodeset_offset", "between": ["a", "b"], "db": NaN}',
+                 "the offset between a and b: db is a finite number, not nan")):
+            said = len(daemon.said)
+            await daemon.handle(json.loads(text))       # as the page's socket reads it
+            errors = [m["text"] for m in daemon.said[said:] if m["type"] == "error"]
+            assert len(errors) == 1 and match in errors[0], (text, errors)
+            assert daemon.nodeset.data == before, text
+        # Nothing no file could hold went in: the next edit is written.
+        await daemon.handle({"type": "nodeset_offset", "between": ["a", "b"], "db": 3})
+        assert daemon.run.nodeset().offsets == [{"between": ["a", "b"], "db": 3.0}]
         await daemon.stop_all(flush=False)
         daemon.ether.close()
     asyncio.run(go())

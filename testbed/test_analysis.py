@@ -414,6 +414,39 @@ def test_seq_reads_a_real_time_record_across_midnight(tmp_path):
     assert code == 0 and [line.split()[0] for line in text.splitlines()[1:3]] == ["0.000", "1.000"]
 
 
+def test_compare_reads_a_real_time_record_longer_than_a_day(tmp_path):
+    """compare read a stamp's time of day and undid one midnight, and that
+    only after the zero: a station that joined after the midnight joined a
+    day before the first, and a frame a day on was seconds in."""
+    run = lay_out(tmp_path)
+    path = os.path.join(run.dir, "record.tsv")
+
+    def record(joins):
+        rec = WallRecord()
+        for sid, t in joins:
+            rec.add(t, "in", sid, {"type": "hello", "sid": sid, "slots": [0], "t": 0})
+        sent(rec, 86_403.5, 3, announce(0), 0.2, own=1000.0)
+        rec.write(path)
+
+    def last_joined(*argv):
+        code, text = call(compare.main, [run.dir, *argv])
+        assert code == 0
+        return next(line.split()[-1] for line in text.splitlines()
+                    if line.startswith("last station joined"))
+
+    record([(1, 0.5), (2, 1.5), (3, 86_402.5)])         # after the midnight, and a day on
+    got = compare.Run(path, {})
+    assert got.joined == {1: 0.0, 2: pytest.approx(1.0, abs=1e-3),
+                          3: pytest.approx(86_402.0, abs=1e-3)}
+    assert got.first_announce == {3: pytest.approx(86_403.0, abs=1e-3)}
+    assert got.end == pytest.approx(86_403.0, abs=1e-3)
+    # --starts is a real run's time of day: 23:59:59, the second before the midnight,
+    # also for a record whose first line comes after it.
+    assert last_joined("--starts", "86399") == "86402.5"
+    record([(2, 1.5), (3, 86_402.5)])
+    assert last_joined("--starts", "86399") == "86402.5"
+
+
 def test_frames_alike_in_their_bytes_at_one_instant_keep_their_own_receptions(tmp_path):
     """n01 and n02 send the same bytes at the same T: n04 receives n01's,
     and n03 loses n02's."""
