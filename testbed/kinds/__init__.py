@@ -130,6 +130,9 @@ class Kind:
                        LD_PRELOAD=SHIM)
         if getattr(station, "board", None):
             env["SIMESH_BOARD"] = station.board
+        profile = getattr(station, "clock_profile", None)
+        if station.clock is not None and profile:
+            env["SIMESH_CLOCK_PROFILE"] = profile
         env.update(self.extra_env)
         return env
 
