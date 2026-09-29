@@ -2184,9 +2184,12 @@ class CoreEther(Ether):
         msg = dict(msg, seq=seq)
         msg.setdefault("t", t)
         run = msg.get("type") == "run"
-        if not run:
-            self.write_record("out", sid, msg)
-        self.core.post(sid, seq, json.dumps(msg).encode("utf-8"), run)
+        # One encoding for the record and the wire: a station reads the
+        # members of a message by name, in whatever order and spacing.
+        text = json.dumps(msg, separators=(",", ":"), sort_keys=True)
+        if not run and self.record is not None:
+            self.record.write("%s\t%s\t%s\t%s\n" % (self.stamp(), "out", sid, text))
+        self.core.post(sid, seq, text.encode("utf-8"), run)
 
     def station_for(self, sid, addr, slots=None):
         station = self.stations.get(sid)
