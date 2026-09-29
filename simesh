@@ -29,9 +29,10 @@
 #     simesh devices delete DEVICE   remove a saved build
 #     simesh devices import ZIP      a device zip into the saved builds
 #     simesh devices resolve DEVICE  what a device name runs, as JSON
-#     simesh build [page|radio|planner]…
-#                                    build the page, the chip library and the planner
-#                                    (all three when none is named)
+#     simesh build [page|radio|ether|planner]…
+#                                    build the page, the chip library, the ether's
+#                                    conductor and the planner (all four when none is
+#                                    named)
 #
 # The simulation verbs (new, stop, pause, resume, list, plan, run) take --port, the front's
 # (default 8800).
@@ -178,6 +179,17 @@ build_radio() {
     cmake --build "$ROOT/radio/build" -j "$(nproc 2>/dev/null || echo 2)"
 }
 
+# The ether's conductor in Rust (ether/core), a Python extension module the
+# ether loads from ether/build/; without it the ether's own conductor, in
+# Python, runs a virtual-time run, and gives the same run.
+build_ether() {
+    command -v cargo >/dev/null || die "the ether's conductor needs cargo"
+    say "the ether's conductor: ether_core (cargo build --release)"
+    (cd "$ROOT/ether/core" && PYO3_PYTHON="$(pick_python)" \
+        cargo build --release --target-dir "$ROOT/ether/build/target")
+    cp "$ROOT/ether/build/target/release/libether_core.so" "$ROOT/ether/build/ether_core.abi3.so"
+}
+
 # planner-web embeds planner-wasm's output (crates/planner-web/static), so the
 # wasm goes first when wasm-pack is there; without it, planner-web embeds the
 # output already in the tree.
@@ -209,14 +221,15 @@ build_planner() {
 
 cmd_build() {
     local parts=("$@")
-    [ ${#parts[@]} -gt 0 ] || parts=(page radio planner)
+    [ ${#parts[@]} -gt 0 ] || parts=(page radio ether planner)
     local p
     for p in "${parts[@]}"; do
         case "$p" in
             page) build_page ;;
             radio) build_radio ;;
+            ether) build_ether ;;
             planner) build_planner ;;
-            *) die "build: no part '$p' (page, radio, planner)" ;;
+            *) die "build: no part '$p' (page, radio, ether, planner)" ;;
         esac
     done
 }
@@ -237,6 +250,9 @@ cmd_front() {
     local py
     py=$(pick_python)
     [ -f "$ROOT/radio/build/libsimclock.so" ] || build_radio
+    [ -f "$ROOT/ether/build/ether_core.abi3.so" ] \
+        || { command -v cargo >/dev/null && build_ether; } \
+        || say "the ether's conductor in Rust is not built; its Python one runs"
     [ -f "$ROOT/testbed/ui/dist/spa/index.html" ] || build_page \
         || say "the page did not build; the front will say so when it is opened"
     say "the page: $URL"
