@@ -647,6 +647,7 @@ class Ether(asyncio.DatagramProtocol):
         self.dirty = set()          # stations that have run since their output was read
         self.on_drain = None        # (sids, done): read what they printed, then done();
                                     # or False, done not called: none of them printed
+        self.drains_watched = False     # on_drain is stations.printed over the watched consoles
         self.arrivals = 0
         self.advancing = False
         self.pace_timer = None
@@ -1266,6 +1267,20 @@ class Ether(asyncio.DatagramProtocol):
             channel.timer.cancel()
             channel.timer = None
         self.channels.pop(channel.key, None)
+
+    # ---- the testbed's console readers --------------------------------------
+
+    def console_marks(self, fd):
+        """The marks a reader of the console on `fd` keeps for
+        stations.printed, or None for the testbed's own: Ether's conductor
+        asks on_drain at every barrier and looks at none of them."""
+        return None
+
+    def watch(self, sid, marks):
+        """Station `sid`'s console reader, from this start of it on."""
+
+    def unwatch(self, sid, marks):
+        """Station `sid`'s console reader `marks` has been let go."""
 
     # ---- the loss table -------------------------------------------------
 
@@ -2082,6 +2097,7 @@ class CoreEther(Ether):
             raise RuntimeError("no ether core to conduct with")
         sock.setblocking(False)
         self.sock = sock
+        self.core_module = module
         self.core = module.Core(sock.fileno(), self, rate is not None, STANDING_LIMIT,
                                 STANDING_QUANTUM_US, SLOW_IDLE_S, RESEND_GAP_S)
         self._on_drain = None
@@ -2111,6 +2127,18 @@ class CoreEther(Ether):
     def on_drain(self, handler):
         self._on_drain = handler
         self.core.drain = handler is not None
+
+    @property
+    def drains_watched(self):
+        return self._drains_watched
+
+    @drains_watched.setter
+    def drains_watched(self, on):
+        """on_drain answers exactly stations.printed over the consoles watched
+        here, so the core looks at them itself and asks it only when one
+        shows something printed."""
+        self._drains_watched = bool(on)
+        self.core.watching = bool(on)
 
     @property
     def asks(self):
@@ -2194,6 +2222,17 @@ class CoreEther(Ether):
         self.core.notify(sid)
         if station.told < self.clock.t:
             self.send(sid, {"type": "run"})
+
+    def console_marks(self, fd):
+        return self.core_module.Marks(fd)
+
+    def watch(self, sid, marks):
+        if isinstance(marks, self.core_module.Marks):
+            self.core.watch(sid, marks)
+
+    def unwatch(self, sid, marks):
+        if isinstance(marks, self.core_module.Marks):
+            self.core.unwatch(sid, marks)
 
     def close(self):
         if self.sock.fileno() >= 0:

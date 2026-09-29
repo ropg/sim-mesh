@@ -507,12 +507,20 @@ def test_roles_are_asked_only_for_a_page_that_draws_them(stores, monkeypatch):
     asyncio.run(watched_or_not())
 
 
-def test_only_a_station_that_printed_is_read_through_the_pty_thread():
+@pytest.mark.parametrize("marks", ["testbed", "core"])
+def test_only_a_station_that_printed_is_read_through_the_pty_thread(marks):
     """stations.printed polls the ptys on the main thread: a station that
     printed is found, one that did not is not, and bytes the pty thread has
-    taken and handed on count until a catch_up has seen them through."""
+    taken and handed on count until a catch_up has seen them through. The
+    same with the marks an ether core keeps."""
     import stations
     import types
+
+    module = None
+    if marks == "core":
+        module = simd.ether_module.core_module()
+        if module is None:
+            pytest.skip("no ether core built (simesh build ether)")
 
     async def go():
         main = asyncio.get_running_loop()
@@ -524,8 +532,9 @@ def test_only_a_station_that_printed_is_read_through_the_pty_thread():
                                         console_out=lambda text: None)
         rpc = types.SimpleNamespace(on_marker=lambda: None,
                                     on_frame=lambda fid, payload: got.append(payload))
-        drain = stations.Drain(station, master, rpc, main)
-        drain.reading = True                    # read only when asked, below
+        drain = stations.Drain(station, master, rpc, main,
+                               module.Marks(master) if module is not None else None)
+        drain.marks.reading = True              # read only when asked, below
         try:
             assert stations.printed([drain]) == []
             os.write(slave, b"hello\n")
@@ -536,7 +545,7 @@ def test_only_a_station_that_printed_is_read_through_the_pty_thread():
             stations.ptys().call(lambda: (drain.read_once(),
                                           main.call_soon_threadsafe(done.set_result, None)))
             await done
-            assert drain.taken == 1 and drain.caught == 0
+            assert drain.marks.taken == 1 and drain.marks.caught == 0
             assert stations.printed([drain]) == [drain]
             finished = main.create_future()
             stations.ptys().call(stations.catch_up, [drain], main,

@@ -27,6 +27,7 @@ use std::io::ErrorKind;
 use std::mem::ManuallyDrop;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Datagrams taken off the socket in one turn of the event loop, at most.
 const PUMP_BATCH: usize = 256;
@@ -78,6 +79,79 @@ fn parse_addr(addr: (String, u16)) -> PyResult<SocketAddr> {
         .parse()
         .map_err(|_| PyValueError::new_err(format!("not an address: {}", addr.0)))?;
     Ok(SocketAddr::new(ip, addr.1))
+}
+
+/// How far the testbed's reader of one station's console has got (its
+/// `Drain`): whether it is reading at all, whether it is inside a read and
+/// the handing on of what it got, how many reads it has handed on, and how
+/// many of those the last catch-up had taken in. Written on the reader's
+/// thread, read on the loop's, here as in stations.printed.
+#[pyclass(frozen, module = "ether_core")]
+struct Marks {
+    fd: i32,
+    reading: AtomicBool,
+    taking: AtomicBool,
+    taken: AtomicU64,
+    caught: AtomicU64,
+}
+
+#[pymethods]
+impl Marks {
+    #[new]
+    fn new(fd: i32) -> Self {
+        Marks {
+            fd,
+            reading: AtomicBool::new(false),
+            taking: AtomicBool::new(false),
+            taken: AtomicU64::new(0),
+            caught: AtomicU64::new(0),
+        }
+    }
+
+    #[getter]
+    fn master(&self) -> i32 {
+        self.fd
+    }
+
+    #[getter]
+    fn reading(&self) -> bool {
+        self.reading.load(Ordering::SeqCst)
+    }
+
+    #[setter]
+    fn set_reading(&self, on: bool) {
+        self.reading.store(on, Ordering::SeqCst)
+    }
+
+    #[getter]
+    fn taking(&self) -> bool {
+        self.taking.load(Ordering::SeqCst)
+    }
+
+    #[setter]
+    fn set_taking(&self, on: bool) {
+        self.taking.store(on, Ordering::SeqCst)
+    }
+
+    #[getter]
+    fn taken(&self) -> u64 {
+        self.taken.load(Ordering::SeqCst)
+    }
+
+    #[setter]
+    fn set_taken(&self, n: u64) {
+        self.taken.store(n, Ordering::SeqCst)
+    }
+
+    #[getter]
+    fn caught(&self) -> u64 {
+        self.caught.load(Ordering::SeqCst)
+    }
+
+    #[setter]
+    fn set_caught(&self, n: u64) {
+        self.caught.store(n, Ordering::SeqCst)
+    }
 }
 
 /// The conductor's view of one station (ether.py's `Station`, its conductor
@@ -140,6 +214,11 @@ struct State {
     dirty: BTreeSet<i64>,
     /// Whether Python reads what the stations printed before T moves.
     drain: bool,
+    /// Whether that reading needs doing only when a console here shows
+    /// something printed (`watches`), so Python is asked only then.
+    watching: bool,
+    /// Each station's console reader, as the testbed registered it.
+    watches: BTreeMap<i64, Py<Marks>>,
     advancing: bool,
     barriers: i64,
     runs: i64,
@@ -175,6 +254,33 @@ impl State {
             }
         }
         best.map(|b| b.max(self.t))
+    }
+
+    /// stations.printed over the watched consoles of `sids`: true when one
+    /// has bytes waiting, or its reader is in a read or has handed on reads
+    /// since it last caught up. The consoles are polled first, the marks
+    /// looked at after, so bytes the reader took in between still count.
+    fn printed(&self, sids: &[i64]) -> bool {
+        let live: Vec<&Marks> = sids
+            .iter()
+            .filter_map(|sid| self.watches.get(sid))
+            .map(|marks| marks.get())
+            .filter(|marks| marks.reading.load(Ordering::SeqCst))
+            .collect();
+        if live.is_empty() {
+            return false;
+        }
+        let mut fds: Vec<libc::pollfd> = live
+            .iter()
+            .map(|marks| libc::pollfd { fd: marks.fd, events: libc::POLLIN, revents: 0 })
+            .collect();
+        // SAFETY: a valid array of pollfds, polled without waiting.
+        let found = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
+        live.iter().zip(fds.iter()).any(|(marks, fd)| {
+            (found > 0 && fd.revents != 0)
+                || marks.taking.load(Ordering::SeqCst)
+                || marks.taken.load(Ordering::SeqCst) != marks.caught.load(Ordering::SeqCst)
+        })
     }
 
     /// Ether.send, up to the datagram: the station owes an idle for `seq`.
@@ -448,6 +554,11 @@ impl Core {
                     // What the stations printed at this T is read before T
                     // moves: a reply the testbed acts on is acted on here.
                     let sids: Vec<i64> = std::mem::take(&mut s.dirty).into_iter().collect();
+                    if s.watching && !s.printed(&sids) {
+                        // None of them printed: what the testbed would have
+                        // answered (False), without asking it.
+                        continue;
+                    }
                     s.holds += 1;
                     Step::Drain(sids)
                 } else {
@@ -570,6 +681,8 @@ impl Core {
                 asks: 0,
                 dirty: BTreeSet::new(),
                 drain: false,
+                watching: false,
+                watches: BTreeMap::new(),
                 advancing: false,
                 barriers: 0,
                 runs: 0,
@@ -671,6 +784,26 @@ impl Core {
     #[setter]
     fn set_drain(&self, on: bool) {
         self.s.borrow_mut().drain = on;
+    }
+
+    /// The drain handler answers exactly stations.printed over the watched
+    /// consoles, so it need be asked only when one of them shows something.
+    #[setter]
+    fn set_watching(&self, on: bool) {
+        self.s.borrow_mut().watching = on;
+    }
+
+    /// Station `sid`'s console reader, from this start of it on.
+    fn watch(&self, sid: i64, marks: Py<Marks>) {
+        self.s.borrow_mut().watches.insert(sid, marks);
+    }
+
+    /// Station `sid`'s console reader `marks` has been let go.
+    fn unwatch(&self, sid: i64, marks: Py<Marks>) {
+        let mut s = self.s.borrow_mut();
+        if s.watches.get(&sid).is_some_and(|held| held.is(&marks)) {
+            s.watches.remove(&sid);
+        }
     }
 
     #[setter]
@@ -856,16 +989,23 @@ impl Core {
                 visit.call(owner)?;
             }
         }
+        if let Ok(s) = self.s.try_borrow() {
+            for marks in s.watches.values() {
+                visit.call(marks)?;
+            }
+        }
         Ok(())
     }
 
     fn __clear__(&mut self) {
         self.owner.get_mut().take();
+        self.s.get_mut().watches.clear();
     }
 }
 
 #[pymodule]
 fn ether_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Core>()?;
+    m.add_class::<Marks>()?;
     Ok(())
 }

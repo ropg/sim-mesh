@@ -398,6 +398,7 @@ class Simd:
         self.ether.on_rx = self.ether_rx
         self.ether.on_station = self.ether_station
         self.ether.on_drain = self.drain_consoles
+        self.ether.drains_watched = True        # the stations' readers are watched there
         if record is not None:
             log("ether on %s, recording to %s" % (self.ether_addr, record))
             log("time: %s; %s; %s rule" % (
