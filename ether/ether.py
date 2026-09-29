@@ -490,6 +490,8 @@ class Station:
         self.resent_at = 0.0    # the wall clock of the last resend to it
         self.stale_said = None  # the number of the last idle it said for an older message
         self.slow_idles = 0     # idles that took the busy watchdog's time or more
+        self.lines = False      # takes several messages to a datagram (its hello)
+        self.outbox = []        # the barrier's messages to it at this instant
 
     def state(self, slot):
         return self.states.get(slot)
@@ -650,6 +652,7 @@ class Ether(asyncio.DatagramProtocol):
         self.drains_watched = False     # on_drain is stations.printed over the watched consoles
         self.arrivals = 0
         self.advancing = False
+        self.outboxed = []          # stations with messages waiting for the barrier to stop
         self.pace_timer = None
         self.pace_origin = None     # (wall seconds, T) a paced run is measured from
         self.barriers = 0           # times T has moved
@@ -904,6 +907,7 @@ class Ether(asyncio.DatagramProtocol):
                 self.step_to(t)
         finally:
             self.advancing = False
+            self.send_outboxes()
 
     def paced(self, t):
         """True when a paced run may move to `t` now; else a timer comes back."""
@@ -1498,7 +1502,24 @@ class Ether(asyncio.DatagramProtocol):
             self.write_record("out", sid, msg)
         else:
             self.runs += 1
+        if data is not None and self.advancing and station.lines:
+            # The barrier's: this instant's datagram, sent when it stops.
+            if not station.outbox:
+                self.outboxed.append(sid)
+            station.outbox.append(data)
+            return
         self.transport.sendto(data or json.dumps(msg).encode("utf-8"), station.addr)
+
+    def send_outboxes(self):
+        """Each station's messages of this instant in one datagram, a line
+        each: it applies them together, so none of its threads sees part of T."""
+        sids, self.outboxed = self.outboxed, []
+        for sid in sids:
+            station = self.stations.get(sid)
+            if station is None or not station.outbox or self.transport is None:
+                continue
+            lines, station.outbox = station.outbox, []
+            self.transport.sendto(b"\n".join(lines), station.addr)
 
     def stamp(self):
         """What heads a record line: the wall clock, or T in a virtual run."""
@@ -1545,6 +1566,7 @@ class Ether(asyncio.DatagramProtocol):
                 self.holds += 1
                 self.settle(self.release)
         station.until = None
+        station.lines = bool(msg.get("lines"))
         self.send(sid, {"type": "welcome", "t": self.now(), "mode": self.mode,
                         "rate": self.rate, "epoch": self.epoch, "seed": self.seed})
 
@@ -2010,6 +2032,8 @@ class CoreStation(Station):
     asked_at = property(lambda self: self.core.asked_at(self.sid),
                         lambda self, seq: self.core.set_asked_at(self.sid, seq))
     slow_idles = property(lambda self: self.core.slow_idles(self.sid))
+    lines = property(lambda self: self.core.lines(self.sid),
+                     lambda self, on: self.core.set_lines(self.sid, on))
 
 
 class _Expected:

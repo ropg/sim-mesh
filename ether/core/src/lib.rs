@@ -323,6 +323,12 @@ struct Station {
     slow_idles: i64,
     /// Python holds callbacks for its next idle (`sync`).
     notify: bool,
+    /// It takes several messages to a datagram, a line each (`lines` in its
+    /// hello), and applies them as one.
+    lines: bool,
+    /// What the barrier has told it at this instant, sent as one datagram
+    /// when the barrier stops (`kick_inner`).
+    outbox: Vec<Vec<u8>>,
 }
 
 impl Station {
@@ -343,6 +349,8 @@ impl Station {
             stale_said: None,
             slow_idles: 0,
             notify: false,
+            lines: false,
+            outbox: Vec::new(),
         }
     }
 }
@@ -370,6 +378,8 @@ struct State {
     /// Each station's console reader, as the testbed registered it.
     watches: BTreeMap<i64, Py<Marks>>,
     advancing: bool,
+    /// Stations with something in their outbox, in the order they first had.
+    outboxed: Vec<i64>,
     barriers: i64,
     runs: i64,
     resends: i64,
@@ -682,7 +692,27 @@ impl Core {
         }
         let result = self.advance(py);
         self.s.borrow_mut().advancing = false;
+        self.send_outboxes();
         result
+    }
+
+    /// Each station's messages of this instant in one datagram, a line each:
+    /// it applies them together, so none of its threads sees part of T.
+    fn send_outboxes(&self) {
+        let out: Vec<(SocketAddr, Vec<u8>)> = {
+            let mut s = self.s.borrow_mut();
+            let sids = std::mem::take(&mut s.outboxed);
+            sids.into_iter()
+                .filter_map(|sid| {
+                    let st = s.stations.get_mut(&sid)?;
+                    let lines = std::mem::take(&mut st.outbox);
+                    (!lines.is_empty()).then(|| (st.addr, lines.join(&b'\n')))
+                })
+                .collect()
+        };
+        for (addr, data) in out {
+            self.send_raw(&data, addr);
+        }
     }
 
     fn advance(&self, py: Python<'_>) -> PyResult<()> {
@@ -858,6 +888,7 @@ impl Core {
                 watching: false,
                 watches: BTreeMap::new(),
                 advancing: false,
+                outboxed: Vec::new(),
                 barriers: 0,
                 runs: 0,
                 resends: 0,
@@ -1176,13 +1207,35 @@ impl Core {
             if run {
                 s.runs += 1;
             }
+            let advancing = s.advancing;
             let Some(st) = s.stations.get_mut(&sid) else {
                 return Err(PyKeyError::new_err(sid));
             };
             st.unanswered.push((seq, data.to_vec()));
+            if advancing && st.lines {
+                // The barrier's: this instant's datagram, sent when it stops.
+                let first = st.outbox.is_empty();
+                st.outbox.push(data.to_vec());
+                if first {
+                    s.outboxed.push(sid);
+                }
+                return Ok(());
+            }
             st.addr
         };
         self.send_raw(data, addr);
+        Ok(())
+    }
+
+    fn lines(&self, sid: i64) -> PyResult<bool> {
+        self.with_station(sid, |st| st.lines)
+    }
+
+    /// Whether the station takes several messages to a datagram (its hello).
+    fn set_lines(&self, sid: i64, on: bool) -> PyResult<()> {
+        let mut s = self.s.borrow_mut();
+        let st = s.stations.get_mut(&sid).ok_or_else(|| PyKeyError::new_err(sid))?;
+        st.lines = on;
         Ok(())
     }
 

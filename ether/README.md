@@ -244,7 +244,11 @@ reader → ether    idle {seq: 13, …}
 station → ether   read {ch: "tty", total: 36}            the console, typed by the testbed
 ```
 
-JSON, one message per datagram, payloads base64, times in microseconds.
+JSON, payloads base64, times in microseconds. A station sends one message
+per datagram. The ether sends one too, except to a station whose `hello`
+says `"lines": 1`: that station gets, in a virtual-time run, everything the
+barrier tells it at one go in one datagram, a message a line. It applies
+the lines as one, telling its host of nothing until all are in (below).
 Losses and positions are not on it in either direction: a station never
 learns where it is.
 
@@ -252,7 +256,7 @@ learns where it is.
 
 | Message | Says |
 |---|---|
-| `hello` | this station exists, and which radio slots it has |
+| `hello` | this station exists, and which radio slots it has; `"lines": 1`, it takes several messages to a datagram |
 | `state` | a slot's mode and carrier — the ether matches on these |
 | `tx` | a transmission: its carrier, its power, its three instants, and its payload |
 | `idle` | virtual time: the station has done everything the message numbered `seq` gave it to do, and next needs to run at T `until` (`null`: not on its own) |
@@ -297,6 +301,15 @@ sends — a `state`, a `tx`, a second `hello` — means it is not idle.
 - **What stations say while T stands is held** and taken when every station
   is idle again, in station-id order, so two stations acting at one instant
   are ruled on the same way every run.
+- **A station takes an instant whole.** What the barrier tells a station at
+  one go, such as a frame that ends at T and another that begins there,
+  reaches a station that said `lines` as one datagram. The station's chip
+  library applies every line, its own timers running as T moves, before it
+  tells its host anything: the host's waits that fall due, and DIO1. A host
+  thread woken at T then finds all of T. Told message by message, it had
+  been woken as T first moved. Whether it looked at the chip before or after
+  the reader applied the rest depended on how the host scheduled two threads,
+  and so, now and then, did a run.
 - **Input from outside the air lands at an instant.** A station with bytes
   it has not read — typed at its console, written to it over TCP by another
   station — holds T until its `read` says it has them, and is then sent a

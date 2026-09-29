@@ -1608,10 +1608,14 @@ class InProcess:
         self.sock.sendto(json.dumps(dict(msg, sid=1)).encode(), self.addr)
 
     async def recv(self, timeout=1.0):
+        raw = await self.recv_raw(timeout)
+        return None if raw is None else json.loads(raw)
+
+    async def recv_raw(self, timeout=1.0):
         end = self.loop.time() + timeout
         while self.loop.time() < end:
             try:
-                return json.loads(self.sock.recv(65535))
+                return self.sock.recv(65535)
             except BlockingIOError:
                 await asyncio.sleep(0.005)
         return None
@@ -1648,6 +1652,36 @@ def in_process(test, conductors=None):
                 os.environ.pop("SIMESH_ETHER_CORE", None)
             else:
                 os.environ["SIMESH_ETHER_CORE"] = before
+
+
+def test_a_station_that_takes_lines_is_told_an_instant_in_one_datagram():
+    """What the barrier tells a station at one instant in one go (here two
+    things that fell due there) goes as one datagram, a line each, to a
+    station that said `lines` in its hello: it applies them as one, so none
+    of its threads sees part of the instant. One that did not say so gets
+    one a datagram. Its run comes, as ever, once it has said it is idle."""
+    def check(lines):
+        async def test(bed):
+            ether = bed.ether
+            bed.send({"type": "hello", "slots": [0], "t": 0, **({"lines": 1} if lines else {})})
+            welcome = await bed.recv()
+            for n in (1, 2):
+                ether.call_at(1_000_000, lambda n=n: ether.send(1, {"type": "note", "n": n}))
+            bed.send({"type": "idle", "seq": welcome["seq"], "until": 1_000_000})
+            got = [await bed.recv_raw()]
+            if not lines:
+                got.append(await bed.recv_raw())
+            assert await bed.recv_raw(0.1) is None
+            said = [json.loads(line) for raw in got for line in raw.split(b"\n")]
+            assert [(m["type"], m["n"]) for m in said] == [("note", 1), ("note", 2)]
+            assert [m["seq"] for m in said] == [welcome["seq"] + 1, welcome["seq"] + 2]
+            assert all(m["t"] == 1_000_000 for m in said)
+            bed.send({"type": "idle", "seq": said[-1]["seq"], "until": 1_000_000})
+            run = await bed.recv()
+            assert run["type"] == "run" and run["t"] == 1_000_000
+        in_process(test)
+    check(lines=True)
+    check(lines=False)
 
 
 def test_t_stays_at_a_sleeps_end_until_what_it_woke_has_run():
