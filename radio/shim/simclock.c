@@ -1122,8 +1122,13 @@ static int is_timerfd(int fd)
     return yes;
 }
 
-/* Whether any thread of the process but this one is on the CPU or waiting
- * for it; and the user and system time, in clock ticks, of all of them. */
+/* What the process's other threads are doing: WORKING_CPU when one is on the
+ * CPU or waiting for it, WORKING_DISK when one waits on the disk (state D: a
+ * read or write it started, which ends on its own); and the user and system
+ * time, in clock ticks, of all of them. */
+#define WORKING_CPU  1
+#define WORKING_DISK 2
+
 static int others_running(long long* user, long long* sys)
 {
     *user = *sys = 0;
@@ -1152,7 +1157,8 @@ static int others_running(long long* user, long long* sys)
              * stime; the name may hold anything, so from its last ')'. */
             char* p = strrchr(stat, ')');
             if (!p || p[1] != ' ') continue;
-            if (p[2] == 'R') running = 1;
+            if (p[2] == 'R') running |= WORKING_CPU;
+            if (p[2] == 'D') running |= WORKING_DISK;
             p += 3;
             for (int field = 0; field < 10 && p; field++) p = strchr(p + 1, ' ');
             if (!p) continue;
@@ -1173,7 +1179,11 @@ static int64_t mono_ns(void)
 }
 
 /* The timer `fd` has expired and `buf` holds the count: hand it on once no
- * other thread is computing. */
+ * other thread is computing or waiting on the disk. A thread in a disk wait
+ * is in the middle of work: let go, T would move under it, and it would
+ * carry on at an instant that depends on the disk. Nor is it a spin, which
+ * is told by time spent and nothing read or written: its write is under way,
+ * and takes no CPU while it waits. */
 static ssize_t hold_expiry(int fd, void* buf)
 {
     int64_t start = mono_ns();
@@ -1186,9 +1196,11 @@ static ssize_t hold_expiry(int fd, void* buf)
         if (timerfd_settime(fd, 0, &again, NULL) != 0) break;
         ssize_t rc = REAL(read)(fd, buf, sizeof(uint64_t));
         if (rc != (ssize_t)sizeof(uint64_t)) return rc;
-        if (!others_running(&user, &sys)) break;
+        int working = others_running(&user, &sys);
+        if (!working) break;
         int64_t spent = mono_ns() - start;
         if (spent >= WATCH_CAP_NS) break;
+        if (working & WORKING_DISK) continue;
         if (spent >= WATCH_SPIN_NS && sys - sys0 >= user - user0
             && atomic_load(&s_ioCalls) == io0)
             break;
