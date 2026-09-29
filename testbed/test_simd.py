@@ -507,6 +507,49 @@ def test_roles_are_asked_only_for_a_page_that_draws_them(stores, monkeypatch):
     asyncio.run(watched_or_not())
 
 
+def test_only_a_station_that_printed_is_read_through_the_pty_thread():
+    """stations.printed polls the ptys on the main thread: a station that
+    printed is found, one that did not is not, and bytes the pty thread has
+    taken and handed on count until a catch_up has seen them through."""
+    import stations
+    import types
+
+    async def go():
+        main = asyncio.get_running_loop()
+        master, slave = os.openpty()
+        os.set_blocking(master, False)
+        got = []
+        station = types.SimpleNamespace(log_file=open(os.devnull, "wb"), watchers=0,
+                                        pty_closed=lambda drain: None,
+                                        console_out=lambda text: None)
+        rpc = types.SimpleNamespace(on_marker=lambda: None,
+                                    on_frame=lambda fid, payload: got.append(payload))
+        drain = stations.Drain(station, master, rpc, main)
+        drain.reading = True                    # read only when asked, below
+        try:
+            assert stations.printed([drain]) == []
+            os.write(slave, b"hello\n")
+            assert stations.printed([drain]) == [drain]
+            # The pty thread takes it on its own; until a catch_up has seen
+            # it through, it still counts.
+            done = main.create_future()
+            stations.ptys().call(lambda: (drain.read_once(),
+                                          main.call_soon_threadsafe(done.set_result, None)))
+            await done
+            assert drain.taken == 1 and drain.caught == 0
+            assert stations.printed([drain]) == [drain]
+            finished = main.create_future()
+            stations.ptys().call(stations.catch_up, [drain], main,
+                                 lambda: finished.set_result(None))
+            await finished
+            assert stations.printed([drain]) == []
+        finally:
+            os.close(slave)
+            os.close(master)
+            station.log_file.close()
+    asyncio.run(go())
+
+
 def test_a_role_the_station_forgets_is_said_again_after_a_reset(stores, monkeypatch):
     monkeypatch.setattr(Stub, "role_volatile", True)
 

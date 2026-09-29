@@ -638,7 +638,8 @@ class Ether(asyncio.DatagramProtocol):
         self.endpoints = {}         # "addr:port" -> the station a TCP endpoint is
         self.asks = []              # (sid, arrival, channel, n, reply, addr): writes waiting
         self.dirty = set()          # stations that have run since their output was read
-        self.on_drain = None        # (sids, done): read what they printed, then done()
+        self.on_drain = None        # (sids, done): read what they printed, then done();
+                                    # or False, done not called: none of them printed
         self.arrivals = 0
         self.advancing = False
         self.pace_timer = None
@@ -818,7 +819,10 @@ class Ether(asyncio.DatagramProtocol):
                     # moves: a reply the testbed acts on is acted on here.
                     sids, self.dirty = sorted(self.dirty), set()
                     self.holds += 1
-                    self.on_drain(sids, self.drained)
+                    if self.on_drain(sids, self.drained) is False:
+                        # Nothing printed, so nothing to read and nothing set
+                        # going: T need not wait a turn of the loop for it.
+                        self.holds -= 1
                     continue
                 t = self.next_instant()
                 if t is None:

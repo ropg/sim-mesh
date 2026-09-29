@@ -1680,6 +1680,27 @@ def test_a_line_typed_at_a_station_waits_for_it_to_have_t_and_holds_t_until_read
     in_process(test)
 
 
+def test_t_does_not_wait_on_a_drain_that_found_nothing_printed():
+    """A drain that says False has read nothing and set nothing going, and
+    is not waited for: T moves on at once, with no turn of the loop taken."""
+    async def test(bed):
+        ether = bed.ether
+        asked = []
+
+        def on_drain(sids, done):
+            asked.append((sids, ether.now()))
+            return False
+        ether.on_drain = on_drain
+        await bed.join()
+        ether.call_at(3_000_000, lambda: None)
+        ether.kick()
+        assert asked == [([1], 0)]
+        assert ether.now() == 3_000_000         # in the same kick, no hold left
+        assert ether.holds == 0
+
+    in_process(test)
+
+
 def test_what_stations_printed_is_read_before_t_moves():
     async def test(bed):
         ether = bed.ether
