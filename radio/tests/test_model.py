@@ -304,6 +304,21 @@ def test_set_tx_publishes_a_frame_timed_by_the_toa_formula(chip):
     assert base64.b64decode(tx["payload"]) == payload
 
 
+def test_in_real_time_a_chip_is_never_said_to_be_quiet(chip):
+    """simradio_quiet_for_us is a virtual-time answer: -1 in a real-time run,
+    transmitting or not."""
+    quiet = chip.lib.simradio_quiet_for_us
+    quiet.argtypes = [ctypes.c_void_p]
+    quiet.restype = ctypes.c_int64
+    assert quiet(chip.handle) == -1
+    chip.configure(length=42)
+    chip.frame([WRITE_BUFFER, 0x00, *range(42)])
+    chip.ether.clear()
+    chip.write(SET_TX, 0x00, 0x00, 0x00)
+    chip.ether.expect("tx")
+    assert quiet(chip.handle) == -1
+
+
 def test_tx_done_lands_at_the_end_and_the_chip_falls_back(chip):
     chip.configure(length=10, dio1=TX_DONE)
     chip.write(SET_RXTX_FALLBACK, 0x40)          # FS after a transmission

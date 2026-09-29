@@ -46,6 +46,13 @@ int simradio_pin(simradio_t*, int pin);
  * In a virtual-time run this is conductor time, T. */
 int64_t simradio_now_us(void);
 
+/* Virtual time: how long, in µs of node time from now, nothing a driver can
+ * read of this chip will change — while it transmits, until TX_DONE lands,
+ * since a transmitting chip takes in nothing from the air — or -1 when it may
+ * change at any moment, and always in real time. A driver polling the chip
+ * may sleep that long in one go and see what its polls would have seen. */
+int64_t simradio_quiet_for_us(simradio_t*);
+
 void simradio_close(simradio_t*);
 
 /* ---- The station's clock ----

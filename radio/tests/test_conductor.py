@@ -267,6 +267,76 @@ def test_a_run_reaching_a_model_timer_fires_it(virtual):
     pin  # held
 
 
+def transmitting(lib, cond, payload=10):
+    """A chip on the station, set up and sent into TX at T = cond.t: the
+    chip, its frame helper, and the frame's time on air in µs."""
+    lib.simradio_quiet_for_us.argtypes = [ctypes.c_void_p]
+    lib.simradio_quiet_for_us.restype = ctypes.c_int64
+    pin = PIN_CB(lambda ctx, p, level: None)
+    chip = lib.simradio_open(0, pin, None)
+    transmitting.pins.append(pin)
+
+    def frame(*out):
+        out = bytes(out)
+        reply = ctypes.create_string_buffer(len(out))
+        lib.simradio_transfer(chip, out, len(out), reply)
+        return reply.raw
+
+    frame(SET_DIO_IRQ_PARAMS, ALL_IRQ >> 8, ALL_IRQ & 0xFF, ALL_IRQ >> 8, ALL_IRQ & 0xFF, 0, 0, 0, 0)
+    frame(SET_PACKET_PARAMS, PRE >> 8, PRE & 0xFF, 0x00, payload, 0x01, 0x00)
+    frame(WRITE_BUFFER, 0x00, *range(payload))
+    assert lib.simradio_quiet_for_us(chip) == -1      # standby: nothing on its way
+    frame(SET_TX, 0, 0, 0)
+    cond.expect("tx")
+    return chip, frame, int(toa_seconds(payload) * 1e6)
+
+
+transmitting.pins = []
+
+
+def test_a_transmitting_chip_is_quiet_until_tx_done_lands(virtual):
+    """simradio_quiet_for_us: while the chip transmits, the node time left
+    until TX_DONE can be read; -1 once it has landed and in receive."""
+    lib, cond = virtual
+    join(lib, cond)
+    idle(lib, cond)
+    chip, frame, toa = transmitting(lib, cond)
+    assert lib.simradio_quiet_for_us(chip) == toa
+    idle(lib, cond)
+    cond.run(T_JOIN + 1000)
+    idle(lib, cond)
+    assert lib.simradio_quiet_for_us(chip) == toa - 1000
+    cond.run(T_JOIN + toa)
+    idle(lib, cond)
+    assert frame(GET_IRQ, 0, 0, 0)[3] & TX_DONE
+    assert lib.simradio_quiet_for_us(chip) == -1
+    frame(SET_RX, 0xFF, 0xFF, 0xFF)
+    assert lib.simradio_quiet_for_us(chip) == -1
+    lib.simradio_close(ctypes.c_void_p(chip))
+
+
+def test_on_a_drifting_clock_quiet_ends_at_the_first_node_time_that_sees_tx_done(tmp_path):
+    """20 ppm fast: the quiet ends at the first node time whose T has reached
+    the frame's end, and not a microsecond sooner or later."""
+    lib = load_copy(tmp_path, "libsimradio_quiet.so",
+                    {"SIMESH_TIME": "virtual",
+                     "SIMESH_CLOCK_PROFILE": "0:0,1000000000:1000020000"})
+    cond = Conductor()
+    cond.t = 400_003
+    try:
+        join(lib, cond)
+        idle(lib, cond)
+        chip, _, toa = transmitting(lib, cond)
+        end = 400_003 + toa
+        quiet = lib.simradio_quiet_for_us(chip)
+        seen = lib.simradio_node_us() + quiet
+        assert lib.simradio_node_to_conductor(seen) >= end
+        assert lib.simradio_node_to_conductor(seen - 1) < end
+        lib.simradio_close(ctypes.c_void_p(chip))
+    finally:
+        cond.sock.close()
+
+
 def test_the_link_survives_a_lost_datagram_either_way(virtual):
     lib, cond = virtual
     seq = join(lib, cond)
