@@ -456,6 +456,57 @@ def test_firmware_rules_start_restart_and_leave_idle(stores):
     asyncio.run(go())
 
 
+def test_roles_are_asked_only_for_a_page_that_draws_them(stores, monkeypatch):
+    """A role question runs a tool against the station's console: it is asked
+    only while a page that draws the map is open and a station is up. Until
+    then T does not move for it, so a virtual run's T stays where the load
+    left it until its stations start."""
+    asked = []
+
+    async def role(self, station):
+        asked.append(station.name)
+        return "client"
+    monkeypatch.setattr(Stub, "role", role)
+    monkeypatch.setattr(simd, "ROLE_POLL_S", 0.05)
+
+    async def unwatched_virtual():
+        daemon = make_simd(stores, "--time", "max")
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three"})
+        daemon.pages["page"] = False
+        daemon.poller = asyncio.ensure_future(daemon.poll_roles())
+        await asyncio.sleep(0.3)
+        assert daemon.ether.now() == 0
+        daemon.poller.cancel()
+        daemon.ether.close()
+    asyncio.run(unwatched_virtual())
+
+    async def watched_or_not():
+        daemon = make_simd(stores)
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three", **FAR})
+        assert await until(lambda: len(daemon.stations) == 3 and all(
+            s.status == "up" for s in daemon.stations.values()))
+        daemon.pages["driver"] = True
+        daemon.poller = asyncio.ensure_future(daemon.poll_roles())
+        await asyncio.sleep(0.3)
+        asked.clear()
+        await asyncio.sleep(0.3)
+        assert asked == []
+        daemon.pages["page"] = False
+        daemon.role_wake.set()
+        assert await until(lambda: set(asked) == {"a", "b", "c"})
+        del daemon.pages["page"]
+        await asyncio.sleep(0.2)
+        asked.clear()
+        await asyncio.sleep(0.3)
+        assert asked == []
+        daemon.poller.cancel()
+        await daemon.stop_all(flush=False)
+        daemon.ether.close()
+    asyncio.run(watched_or_not())
+
+
 def test_a_role_the_station_forgets_is_said_again_after_a_reset(stores, monkeypatch):
     monkeypatch.setattr(Stub, "role_volatile", True)
 
