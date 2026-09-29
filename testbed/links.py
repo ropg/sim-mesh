@@ -38,13 +38,13 @@ Positions are the run's nodeset as it ended, in the geodata's metres
 distances are metres on that plane.
 """
 import argparse
-import base64
 import collections
-import hashlib
 import json
 import math
 import sys
 
+import referee
+from simesh import record as record_module
 from simesh.view import RunView
 
 BIN_M = 200
@@ -88,39 +88,35 @@ def diameter(adj, nodes, via=None):
     return {"hops": worst, "pairs_unreached": unreached}
 
 
-def read(args):
-    """Frames in the window: sender, start, span, carrier, power, sf, bw, clean receivers."""
+def read(args, level_at=None):
+    """Frames in the window: sender, start, span, carrier, power, sf, bw, clean receivers.
+
+    The window is in seconds of T in a virtual-time run, of the wall clock
+    since the record's first line in a real one. A reception is its frame's
+    by the ether's own number for the frame, tied as the referee ties them
+    (`referee.Record`, at the run's levels), not by when the frame went on
+    the air and what it carried, which two frames can share."""
     lo = int(args.frm * 1e6) if args.frm is not None else None
     hi = int(args.to * 1e6) if args.to is not None else None
-    frames, by_key, begins = [], {}, {}
-    for line in open(args.record, encoding="utf-8"):
-        is_tx = '"type":"tx"' in line
-        if not is_tx and '"type":"rx_' not in line:
-            continue
-        stamp, direction, sid, blob = line.rstrip("\n").split("\t", 3)
-        msg = json.loads(blob)
-        if is_tx and direction == "in":
-            t_us = int(round(float(stamp) * 1e6))
+    record = referee.Record(args.record, level_at)
+    tx_line = {eid: f.line for eid, f in record.by_eid.items()}   # ether frame id -> its `tx`
+    frames, at_line = [], {}
+    for line, (stamp, direction, sid, msg) in enumerate(record_module.lines(args.record)):
+        if direction == "in" and msg.get("type") == "tx":
+            t_us = referee.to_us(stamp) - record.origin
             if (lo is not None and t_us < lo) or (hi is not None and t_us >= hi):
                 continue
-            payload = base64.b64decode(msg.get("payload") or "")
-            f = {"sid": int(sid), "t": t_us, "span": max(0, int(msg.get("t_end", 0)) - int(msg.get("t0", 0))),
+            f = {"sid": sid, "t": t_us, "span": max(0, int(msg.get("t_end", 0)) - int(msg.get("t0", 0))),
                  "freq": msg.get("freq"), "power": msg.get("power_dbm"), "sf": msg.get("sf"),
                  "bw": msg.get("bw"), "clean": set(), "crc": 0}
-            by_key[(t_us, hashlib.blake2b(payload, digest_size=8).digest())] = f
+            at_line[line] = f
             frames.append(f)
-        elif direction == "out" and msg.get("type") == "rx_begin" and not msg.get("cad"):
-            begins[(int(sid), msg["id"])] = int(msg["t0"])
         elif direction == "out" and msg.get("type") == "rx_end":
-            t0 = begins.pop((int(sid), msg["id"]), None)
-            if t0 is None:
-                continue
-            f = by_key.get((t0, hashlib.blake2b(base64.b64decode(msg.get("payload") or ""),
-                                                digest_size=8).digest()))
+            f = at_line.get(tx_line.get(msg.get("id")))
             if f is None:
                 continue
             if msg.get("verdict") == "clean":
-                f["clean"].add(int(sid))
+                f["clean"].add(sid)
             else:
                 f["crc"] += 1
     return frames
@@ -280,7 +276,7 @@ def main(argv=None):
         args.calling = view.calling_hz()
     pos = view.positions()
     forwarders = view.forwarders()
-    frames = read(args)
+    frames = read(args, referee.Air(view.medium()).level)
     out = geometry(frames, pos, view.names, forwarders, args)
     out["model"] = model(view, sorted(pos), forwarders, args)
     if args.power:
