@@ -215,7 +215,7 @@ def test_intents_are_said_in_each_kinds_lines_or_refused():
     assert ret.lines("announce") == ["lora 0 a"]
     assert bm.lines("announce") == ["announce now"]
     assert ret.lines("message", dest="ab" * 16, text="hi there") == ["lxmf send %s hi there" % ("ab" * 16)]
-    assert bm.lines("message", dest="cd" * 16, text="hi") == ["send %s hi" % ("cd" * 16)]
+    assert bm.lines("message", dest="cd" * 16, text="hi") == ["send --no-wait %s hi" % ("cd" * 16)]
     assert ret.lines("peer_tcp", addr="127.0.0.5", port=4965) == ["tcp peer add 127.0.0.5:4965"]
     assert ret.lines("tx_power", dbm=10) == ["lora 0 txp 10"]
     assert bm.lines("tx_power", dbm=10.4) == ["set --txpower-dbm 10"]
