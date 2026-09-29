@@ -645,6 +645,7 @@ class Ether(asyncio.DatagramProtocol):
         self.pace_timer = None
         self.pace_origin = None     # (wall seconds, T) a paced run is measured from
         self.barriers = 0           # times T has moved
+        self.runs = 0               # `run`s sent: a station woken, once each
         self.resends = 0            # messages sent again to a station that missed them
         self.standing = 0           # steps in a row that left T where it was
         self.physics = physics or Physics()
@@ -1393,6 +1394,8 @@ class Ether(asyncio.DatagramProtocol):
             station.unanswered.append((station.seq, data))
         if msg.get("type") != "run":
             self.write_record("out", sid, msg)
+        else:
+            self.runs += 1
         self.transport.sendto(data or json.dumps(msg).encode("utf-8"), station.addr)
 
     def stamp(self):

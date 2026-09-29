@@ -417,7 +417,7 @@ class Simd:
             return None
         return {"type": "clock", "mode": self.ether.mode, "rate": self.ether.rate,
                 "t": self.ether.now(), "observed": self.observed_rate,
-                "barriers": self.ether.barriers,
+                "barriers": self.ether.barriers, "runs": self.ether.runs,
                 "slow_idles": sum(st.slow_idles for st in self.ether.stations.values()),
                 "plan": self.plan}
 
