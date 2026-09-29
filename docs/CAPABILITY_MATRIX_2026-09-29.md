@@ -12,7 +12,7 @@ main does and the fork lacks it.
 | SIMesh | this repository, main `50e2c31` (upstream reticulous/SIMesh main on 29 September) | the ether (Python), the chip model (C++), the testbed, and SIMesh's own copy of the planner under `planner/` (added in `7cbb06b`) |
 | branches | this repository, our ten upstream PR branches on `01d9b1f` (six commits behind main), `demo/integration` `4589d40`, `wip/virtual-time-2026-09-25` `b0b5ddc`, `wip/testbed-scenarios-2026-09-25` `7fb2f9f` | fixes and models written against the ether before main replaced it |
 | mesh | mesh `c2ff69d`: `crates/emulator` and `crates/core` | a discrete-event emulator running the real `lora-core` node code in-process |
-| planner | planner `f3d897a` | ITU-R propagation and coverage planning (Apache-2.0) |
+| planner | planner `f3d897a`, which planner's rewrite of 29 September made `06ff759`; the work published since is `830f221` (its crates are the same at `bd1019d`) | ITU-R propagation and coverage planning (Apache-2.0) |
 | reticulum | reticulum `feat/supe` `b2b4302`: `tools/rnscale`, `tools/rncapture`, `tools/simether`, `fw/simesh` with `crates/simesh-hal` and `crates/simesh-radio-sys` | an in-process mesh simulator, the bench capture measurement, a Rust port of SIMesh's older ether, and our stack as a SIMesh station |
 
 Our PR branches:
@@ -51,7 +51,7 @@ bullet, at the commit above. The rows were surveyed read-only. The claims marked
 | 1 | Free-space anchor and exponent | SIMesh | upstream | keep; sweep n through the geodata's exponent |
 | 2 | ITU-R P.1812-8 terrain | SIMesh (its planner copy) | upstream, on packs | add a `loc_pct` pass-through, default 90 |
 | 3 | P.2108 clutter | SIMesh = planner (§3.1 only) | upstream, on packs | keep |
-| 4 | Building entry | SIMesh (P.2109 median at an indoor end) | upstream, on packs | keep; the indoor measurement is planner, unpublished |
+| 4 | Building entry | SIMesh (P.2109 median at an indoor end); planner's measured interior increment a candidate | upstream, on packs | keep; the interior increment is a candidate |
 | 5 | Near field | SIMesh | upstream | keep |
 | 6 | Antenna height, gain, pattern | SIMesh | upstream | keep |
 | 7 | Shadowing | ours (`feat/shadowing`, rnscale) | branch, on the removed ether | re-implement as a layer on the tables, off by default |
@@ -102,7 +102,7 @@ bullet, at the commit above. The rows were surveyed read-only. The claims marked
   - It carries the same P.1812-8 implementation (`crates/planner-propag/src/p1812/`, module map at `mod.rs:7-14`), with validity checks at `mod.rs:126-151`.
   - It is validated black-box against Py1812: 108 of 108 vectors within 0.1 dB (`README.md:17`).
   - Its `/link.json` runs one direction.
-  - The query is `deny_unknown_fields` with no `erp_dbm`, `loc_pct` or `time_pct` (`crates/planner-web/src/main.rs:2435-2458` ✓). `loc_pct` is a committed model parameter, default 90 (`crates/planner-core/src/model.rs`), that the query does not expose. `erp_dbm` exists only as an uncommitted change in a local planner tree: planner, unpublished.
+  - The query is `deny_unknown_fields` with no `erp_dbm`, `loc_pct` or `time_pct` (`crates/planner-web/src/main.rs:2435-2458` ✓). `loc_pct` is a committed model parameter, default 90 (`crates/planner-core/src/model.rs`), that the query does not expose. Since `830f221` the query also takes `erp_dbm` (a budget each way from the e.r.p. cap and the receiving antenna's gain toward the sender) and an antenna, azimuth and tilt at each end (`crates/planner-web/src/main.rs:3169-3232` at `bd1019d`); the loss is still computed once, one way.
 - **mesh, reticulum:** no terrain. mesh adds 3 dB per 50 m of height difference and checks no line of sight (`crates/emulator/src/propagation.rs:335-344`).
 - **Verdict:** SIMesh, whose planner copy is ahead of planner on reciprocity.
   - The tables are 90 %-of-locations values. The shadowing layer (row 7) must start from a median, or location variability is counted twice. P.1812's own term at 90 % is at most about 2.5 dB (1.28·σ_L, with σ_L ≈ 1.96 dB at w_a = 100 m; `planner/crates/planner-propag/src/p1812/location.rs:8-35`).
@@ -126,10 +126,13 @@ bullet, at the commit above. The rows were surveyed read-only. The claims marked
 - **planner:** has P.2109-2, Table 1, with its σ (`crates/planner-core/src/entry_loss.rs:46-54, 188-220`), but only the web census uses it (`crates/planner-web/src/main.rs:3486-3489`).
 - **mesh:** the clutter constants of row 3.
 - **Measurement.** The one Berlin measurement named for this work is 35 indoor links, 28–511 m: P.1812 optimistic by a median 19.6 dB, and a fitted multi-wall law with a leave-one-out RMSE of 7.4 dB.
-  - The write-up and the model code exist only uncommitted in a local planner tree: planner, unpublished.
+  - Published at `830f221`: planner-core's `multiwall.rs` and `linkray.rs`, and the write-up in `TODO.md:933-949` at `bd1019d`.
+    - The fitted law is `38.2 + 25.2·log10 d + 1.26·interior_m`, interior metres capped at 25. Leave-one-out it is 7.4 dB against 7.9 dB for distance alone, and the wall count could not be told from the interior metres on those links (`crates/planner-web/src/main.rs:1719-1735`).
+    - Planner uses only its interior term, as an increment on its P.1812 street raster for an outdoor node and an indoor home, never better than the building's best wall (`crates/planner-coverage/src/indoor.rs:215-223`), and not in `/link.json`. The file warns against using the law for a region it has not seen (`multiwall.rs:28-34`).
+    - Reconciling that increment with P.2109's traditional-stock median of about 14 dB is planner's own open item (`TODO.md:20-21`).
   - The survey logs hold a receiver's home position. Neither they nor anything derived from them comes into this fork.
   - A multi-wall fitter with no data beside it is in reticulum (`tools/bench/multiwall.py` at `2783599`). It compares log-distance, FSPL + wall losses, and both, by leave-one-out error.
-- **Verdict:** SIMesh. Validating P.1812 plus P.2109 against the measurement waits until the planner owners publish it.
+- **Verdict:** SIMesh, with planner's interior increment a candidate for an indoor end on a pack, behind a key: 1.26 dB per metre of building between the antenna and the wall its path leaves through, capped at 25 m, in place of the P.2109 median. The sidecar already finds an antenna inside a footprint; the metres to the exit wall along the bearing would be new. No pack is at hand to test it on, so it is not planned in this round.
 
 ### 5. Near field
 
@@ -360,7 +363,7 @@ bullet, at the commit above. The rows were surveyed read-only. The claims marked
   - Tables are cached per geometry, and a new nodeset reuses the nearest cached table (`testbed/losses.py:554-640`).
   - Packs are built from public sources by `planner-job pack-build` (`INTERNALS.md:597-660`).
 - **planner:** no pairwise export.
-  - `site_pair_loss` exists only as an uncommitted change in a local planner tree: planner, unpublished. It is on no ref, and not in SIMesh's copy.
+  - `site_pair_loss` is published at `830f221` (`crates/planner-coverage/src/gaps.rs:1287`): P.1812 from one end to the other, whatever the budget, with `LinkParams` as its inputs, so `loc_pct`, `time_pct` and frequency are the caller's. It is one direction, gives nothing under 250 m, adds no P.2108, and only `planner optimize` calls it.
   - The nearest code is the private `backbone_graph`, which discards pairs over their budget and gives NaN under 250 m (`crates/planner-coverage/src/gaps.rs:1236-1404`).
 - **branches**
   - `feat/links` is superseded by SLT1.
