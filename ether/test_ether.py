@@ -1747,10 +1747,11 @@ def test_a_tool_session_holds_t_while_the_tool_has_the_floor():
         await asyncio.sleep(0.05)
         assert ether.now() == 0                 # the tool has the floor
         bed.send({"type": "floor", "to": "station"})
+        brought = await bed.recv()              # brought to the run's T first
+        assert (brought["type"], brought["t"], brought["floor"]) == ("run", 0, 1)
         await asyncio.sleep(0.05)
-        assert ether.now() == 0                 # the station spoke: it owes an idle
-        seq = ether.stations[1].seq
-        bed.send({"type": "idle", "seq": seq, "until": 2_000_000})
+        assert ether.now() == 0                 # it owes an idle for that
+        bed.send({"type": "idle", "seq": brought["seq"], "until": 2_000_000})
         await asyncio.sleep(0.05)
         run = await bed.recv()                  # the station's floor: T runs, to its wake
         assert (run["type"], run["t"]) == ("run", 2_000_000)

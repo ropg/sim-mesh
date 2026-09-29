@@ -363,14 +363,24 @@ def test_station_open_returns_only_once_the_welcome_has_set_t(virtual):
 
 def test_the_host_floor_is_said_and_owes_an_idle(virtual):
     """simradio_host_floor: `floor` to the station once it has read a host's
-    bytes, to the tool once it has answered; either is the station speaking,
-    so an idle is owed after it."""
+    bytes, which returns only once the ether's run marked `floor` has brought
+    it to the run's T (an ordinary run does not pass for it); `floor` to the
+    tool once it has answered. Either is the station speaking."""
     lib, cond = virtual
     join(lib, cond)
     idle(lib, cond)
-    lib.simradio_host_floor(1)
+    done = []
+    floor = threading.Thread(target=lambda: done.append(lib.simradio_host_floor(1)), daemon=True)
+    floor.start()
     assert cond.expect("floor") == {"type": "floor", "sid": 9, "to": "station"}
-    assert idle(lib, cond)["seq"] == cond.seq          # owed, with no grant
+    cond.run(T_JOIN + 500)                              # not the answer
+    time.sleep(0.1)
+    assert done == []
+    cond.t = T_JOIN + 1000
+    cond.send({"type": "run", "t": cond.t, "floor": 1})
+    floor.join(3)
+    assert done and lib.simradio_node_us() == T_JOIN + 1000
+    idle(lib, cond)
     lib.simradio_host_floor(0)
     assert cond.expect("floor") == {"type": "floor", "sid": 9, "to": "tool"}
     idle(lib, cond)
