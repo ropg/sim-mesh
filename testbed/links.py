@@ -17,8 +17,8 @@ nodes declare) unless --all-carriers. For them:
 - hop diameter over usable links both ways, and through forwarding
   stations only (those carrying a role tag: transport, router, repeater);
 - the run's own medium beside them (`model`): the pairs the ether would
-  deliver on the calling channel by the run's loss table, offsets and
-  antenna gains, each transmitter at its declared power, SF and bandwidth, against the
+  deliver on the calling channel by the run's loss table, links, shadowing,
+  offsets and antenna gains, each transmitter at its declared power, SF and bandwidth, against the
   noise figure the run's ether had; their count, distances, the neighbour
   count and the diameter they give. A run with no table for the calling
   channel's band has no model.

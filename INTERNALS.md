@@ -357,11 +357,11 @@ to choose from.
 
 ```
 geodata ──┐
-          ├──► loss table (derived, per band, cached) ── + antennas + offsets ──┐
-nodeset ──┘  (positions, heights)                                               │
-nodeset: antenna, role, radio, tags ───────────────────────────────────────────┤
-script: firmware() rules, setup ───────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
-device files (by the rules' device names, fetched when used) ──────────────────┘
+          ├──► loss table (derived, per band, cached) ── + links + shadowing + antennas + offsets ──┐
+nodeset ──┘  (positions, heights)                                                                   │
+nodeset: antenna, role, radio, tags ───────────────────────────────────────────────────────────────┤
+script: firmware() rules, setup ───────────────────────────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
+device files (by the rules' device names, fetched when used) ──────────────────────────────────────┘
 snapshot = geodata + nodeset + script + tables + rules + every station's store
 ```
 
@@ -391,7 +391,8 @@ and each is its own file so that changing one leaves the others alone:
 - the **loss table** follows from the geodata and the nodeset's geometry and
   from nothing else, so it is derived and cached under a hash of exactly
   those, and relabelling a node, changing its antenna, role, radio,
-  firmware or offsets, or changing the script, never recomputes it.
+  firmware, offsets or links, the geodata's shadowing, or the script, never
+  recomputes it.
 
 **A firmware rule is a condition, kept.** `firmware(which, device)` holds
 its selection as a condition over each node's facts (`simesh.select`), not
@@ -447,6 +448,36 @@ model, and they are added when the tables are handed to the ether
 (`losses.with_offsets`), in simd and in the analysis tools alike. The cached
 table stays the model's own, so an offset is changed without a recompute,
 and the model's error is the offsets themselves, to be driven towards zero.
+
+**Links are a layer too, and the first.** A nodeset's link states one
+pair's loss outright, a figure better than the model's (a measurement, or
+another model's), and it replaces the model's cell before anything else
+goes on (`losses.with_links`), so the antennas and the offsets still add
+to it. The figure is the pair's, not a frequency's, so it goes into every
+band's table as stated; within a band the ether moves it to the frame's
+own carrier as it does every cell, a few hundredths of a dB across the
+EU868 channels.
+
+**Shadowing is a layer, one draw per pair.** Log-distance gives every pair
+at one distance the same loss, and P.1812 sees only the ground it is given;
+real links differ by what else stands between them, and that difference is
+what makes a hidden node or a lucky long link.
+A geodata's `shadowing_db` adds to each pair's loss, both ways and in every
+band, that spread times a standard normal drawn from SHA-256 of
+`shadowing_seed` and the pair's two node names (`losses.with_shadowing`).
+The draw is fixed for the run and depends on nothing that happens in it, so
+two runs that differ only in their traffic or their firmware stand on the
+same ground: the common random numbers a paired comparison needs. Names,
+not station ids, because a node keeps its name from one run to the next. A
+loss drawn afresh per frame would be fading, a different thing that lets
+every retry through in the end; this is not that. A pair never heard stays
+so, a measured cell already holds its path's own shadowing, and a stated
+link is the figure as stated, so none of them is drawn on. On a pack the
+table it is laid over must be a median: P.1812 at 90 % of locations already
+adds up to 1.28 σ_L of location spread (about 2.5 dB, with σ_L ≈ 1.96 dB at
+868 MHz), and the draw on top would count that spread twice. So a pack
+geodata with shadowing states `loc_pct: 50`, and simd warns of one that does
+not.
 
 A node is referred to **by name** everywhere, and its **id** is stored and
 editable. The name is what a person means; the id is the station's network
@@ -556,12 +587,17 @@ front ── GET /loss/start, /loss/status, /loss.bin, one node at a time ──
 - **What the sidecar decides, and what it does not.** `link.json` takes no
   carrier and judges at the planner's EU868 parameters, 869.525 MHz, 50 % of
   time and 90 % of locations; a pack therefore has an 868 table only,
-  and its header says so. A pair with an end off the pack is never heard
-  here rather than asked, because the sidecar would clamp the point onto the
-  pack's edge and answer for a place the node is not. A sidecar answers
-  from the clutter raster alone until it has indexed the pack's buildings, a
-  different number by tens of dB, so a table waits for the index before its
-  first pair and throws away a reply given before it.
+  and its header says so. The percentage of locations is the one parameter
+  a request may change (`loc_pct`, from the geodata), for both ways of the
+  both-way mean. SIMesh's copy of the planner holds it to P.1812's range,
+  1 to 99, itself: a failed P.1812 call is answered with the near-field
+  model, which would turn a bad value into a confident number. A pair with
+  an end off the pack is never heard here rather than asked, because the
+  sidecar would clamp the point onto the pack's edge and answer for a place
+  the node is not. A sidecar answers from the clutter raster alone until it
+  has indexed the pack's buildings, a different number by tens of dB, so a
+  table waits for the index before its first pair and throws away a reply
+  given before it.
 - **Coverage is the planner's own sweep, one node at a time.** A node's
   coverage raster is `planner-coverage`'s point-to-area sweep from its
   antenna, cut to a square around it by `loss.bin` and cached by the
@@ -1551,8 +1587,8 @@ linked by the interface that drives it rather than by the board that wires it.
   fails its CRC (cyclic redundancy check) at a probability, and no noise
   floor but the thermal one; a pair's loss is the table's and is the same
   for every frame between them. On real ground that loss is P.1812's
-  statistical figure at 50 % of time and 90 % of locations, not a
-  measurement of that path. See
+  statistical figure at 50 % of time and 90 % of locations (or the
+  geodata's `loc_pct`), not a measurement of that path. See
   [`ether/INTERNALS.md`](ether/INTERNALS.md) for what the medium does
   and does not decide.
 - Anything below the C: the compiler, the ABI and the word size are the

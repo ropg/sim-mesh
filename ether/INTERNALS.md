@@ -169,7 +169,8 @@ The loss is read, not computed: every ordered pair of nodes has one per
 band, computed at one frequency `f0` in the band by whatever made the table
 ([`../LOSSTABLE.md`](../LOSSTABLE.md) is the format) — the
 planner's P.1812 over real ground for a pack, log-distance for synthetic
-ground, with the nodeset's offsets added by whoever hands the tables over —
+ground, with the nodeset's links and offsets and the geodata's shadowing
+put on by whoever hands the tables over —
 and the medium has one code path for all of them.
 Every pair is in it, not only the pairs strong enough to carry a frame,
 because a pair far too weak to be decoded still adds to a receiver's
@@ -443,8 +444,9 @@ medium: the ether's job is the frames, and everything watching is optional.
 ## What is deliberately not here
 
 - **Fading and per-frame variation.** A pair's loss is the table's and is
-  the same for every frame between them. No shadowing beyond what the table
-  was computed with, no multipath, no antenna pattern, no rain.
+  the same for every frame between them. No shadowing beyond what the tables
+  are handed with (the testbed's is one static draw per pair), no multipath,
+  no antenna pattern, no rain.
 - **The CRC band by default.** The threshold is the spreading factor's own,
   and above it a frame is delivered. A real receiver also has a few dB above
   that threshold where a frame locks but fails its CRC at a probability.

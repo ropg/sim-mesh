@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 import pytest
+from aiohttp import web
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -81,6 +82,146 @@ def test_offsets_are_a_layer_added_both_ways(stores):
     assert layered.get("a", "b") == table.get("a", "b")
     ns.set_offset("a", "c", 0)
     assert losses.with_offsets({"868": table}, ns)["868"] is table
+
+
+def test_a_link_states_a_pairs_loss_whatever_the_distance(stores):
+    """Ten kilometres apart and heard as the stated 110 dB, not the 150-odd
+    the distance would cost: in every band's table, and in a cell the model
+    never heard."""
+    gd, ns = geodata.load("flat"), nodeset.load("three")
+    ns.add_node("far", 0.09, 0.0)
+    tables = {band: losses.synthetic_table(gd, ns, band) for band in ("433", "868")}
+    assert tables["868"].get("a", "far") > 150
+    for a, b in (("b", "far"), ("far", "b")):
+        tables["433"].put(a, b, slt.NEVER, slt.FLAG_BEYOND_RADIUS)
+    ns.data["links"] = [{"between": ["a", "far"], "loss_db": 110.0},
+                        {"between": ["far", "b"], "loss_db": 120.0}]
+    got = losses.with_links(tables, ns)
+    for band in ("433", "868"):
+        assert got[band] is not tables[band]
+        assert got[band].get("a", "far") == 110 == got[band].get("far", "a")
+        assert got[band].get("b", "far") == 120 == got[band].get("far", "b")
+        assert got[band].get("a", "b") == tables[band].get("a", "b")
+    assert tables["868"].get("a", "far") > 150                  # the model's table left alone
+    del ns.data["links"]
+    assert losses.with_links(tables, ns)["868"] is tables["868"]
+
+
+def test_a_link_is_the_same_both_ways_unless_it_says_otherwise_and_an_offset_still_adds(stores):
+    gd, ns = geodata.load("flat"), nodeset.load("three")      # 25 dB offset between a and c
+    tables = {"868": losses.synthetic_table(gd, ns, "868")}
+    model = tables["868"]
+    gains = losses.with_antennas(tables, gd, ns)["868"]
+
+    def gain(x, y):
+        """Both ends' gains toward each other, as the antenna layer takes them off."""
+        return model.get(x, y) - gains.get(x, y)
+    ns.data["links"] = [{"between": ["a", "c"], "loss_db": 100.0},
+                        {"between": ["a", "b"], "loss_db": 90.0, "back_db": 95.5}]
+    medium = losses.medium_tables(tables, gd, ns)["868"]
+    # The link stands in for the model's loss alone: the gains and the offset go on top.
+    assert medium.get("a", "c") == pytest.approx(100 - gain("a", "c") + 25, abs=1e-3)
+    assert medium.get("c", "a") == pytest.approx(100 - gain("c", "a") + 25, abs=1e-3)
+    assert medium.get("a", "b") == pytest.approx(90 - gain("a", "b"), abs=1e-3)
+    assert medium.get("b", "a") == pytest.approx(95.5 - gain("b", "a"), abs=1e-3)
+    assert medium.get("b", "c") == pytest.approx(model.get("b", "c") - gain("b", "c"), abs=1e-3)
+
+
+def test_without_links_the_medium_is_given_what_it_was_before_them(stores):
+    gd, ns = geodata.load("flat"), nodeset.load("three")
+    tables = {"868": losses.synthetic_table(gd, ns, "868")}
+    got = losses.medium_tables(tables, gd, ns)["868"]
+    was = losses.with_offsets(losses.with_antennas(tables, gd, ns), ns)["868"]
+    assert got.loss.tobytes() == was.loss.tobytes()
+    assert got.flags.tobytes() == was.flags.tobytes()
+    # Nor does a spread of 0, or a seed alone, change a cell.
+    for keys in ({"shadowing_db": 0}, {"shadowing_seed": 5}):
+        got = losses.medium_tables(tables, rough(**keys), ns)["868"]
+        assert got.loss.tobytes() == was.loss.tobytes()
+
+
+# ---- shadowing -----------------------------------------------------------
+
+def rough(exponent=3.1, **keys):
+    """The fixture's flat ground again, with shadowing keys."""
+    geodata.write(geodata.geodata_path("rough"), {"synthetic": {"exponent": exponent}, **keys})
+    return geodata.load("rough")
+
+
+def test_shadowing_is_one_draw_per_pair_the_same_both_ways_and_every_time():
+    draw = losses.shadowing_unit
+    assert draw(3, "a", "b") == draw(3, "b", "a") == draw(3, "a", "b")
+    assert draw(3, "a", "b") != draw(3, "a", "c")
+    assert draw(3, "a", "b") != draw(4, "a", "b")
+    # The same from a cold start, and the same as on the day it was written:
+    # SHA-256 of "0:a:b", Box–Muller. A change here moves every run's ground.
+    draw.cache_clear()
+    assert draw(0, "b", "a") == pytest.approx(-0.9460136480786182, abs=1e-12)
+
+
+def test_shadowing_draws_spread_like_a_standard_normal():
+    draws = [losses.shadowing_unit(7, "n%02d" % a, "n%02d" % b)
+             for a in range(40) for b in range(a + 1, 40)]
+    mean = sum(draws) / len(draws)
+    spread = math.sqrt(sum((d - mean) ** 2 for d in draws) / (len(draws) - 1))
+    assert abs(mean) < 0.12
+    assert spread == pytest.approx(1.0, abs=0.08)
+    assert sum(abs(d) < 1 for d in draws) / len(draws) == pytest.approx(0.683, abs=0.05)
+
+
+def test_shadowing_moves_a_pair_by_its_draw_times_the_spread_both_ways_in_every_band(stores):
+    gd, ns = rough(shadowing_db=7, shadowing_seed=3), nodeset.load("three")
+    tables = {band: losses.synthetic_table(gd, ns, band) for band in ("433", "868")}
+    got = losses.with_shadowing(tables, gd, ns)
+    for band, table in tables.items():
+        assert got[band] is not table
+        for a in table.names:
+            for b in table.names:
+                if a != b:
+                    want = table.get(a, b) + 7 * losses.shadowing_unit(3, a, b)
+                    assert got[band].get(a, b) == pytest.approx(want, abs=1e-4)
+    shift = {band: got[band].get("a", "c") - tables[band].get("a", "c") for band in tables}
+    assert abs(shift["868"]) > 0.1 and shift["433"] == pytest.approx(shift["868"], abs=1e-4)
+    # The draw is the pair's alone: in another nodeset, with another node
+    # and in another order, the pair moves by as much.
+    other = nodeset.create("other")
+    for name in ("e", "c", "a"):
+        node = ns.nodes.get(name) or {"lat": 0.003, "lon": 0.003}
+        other.add_node(name, node["lat"], node["lon"])
+    table = losses.synthetic_table(gd, other, "868")
+    moved = losses.with_shadowing({"868": table}, gd, other)["868"]
+    assert moved.get("c", "a") - table.get("c", "a") == pytest.approx(shift["868"], abs=1e-4)
+    # No spread, no layer: the tables themselves.
+    assert losses.with_shadowing(tables, rough(shadowing_seed=3), ns)["868"] is tables["868"]
+
+
+def test_shadowing_leaves_never_heard_measured_and_stated_cells_as_they_are(stores):
+    gd, ns = rough(shadowing_db=7), nodeset.load("three")
+    table = losses.synthetic_table(gd, ns, "868")
+    table.put("a", "b", slt.NEVER, slt.FLAG_BEYOND_RADIUS)
+    table.put("b", "c", 120.0, slt.FLAG_MEASURED, 12)
+    ns.data["links"] = [{"between": ["c", "d"], "loss_db": 100.0}]
+    got = losses.with_shadowing({"868": table}, gd, ns)["868"]
+
+    def drawn(a, b):
+        return table.get(a, b) + 7 * losses.shadowing_unit(0, a, b)
+    assert got.get("a", "b") == slt.NEVER                   # never heard stays never heard
+    assert got.get("b", "a") == pytest.approx(drawn("b", "a"), abs=1e-4)
+    assert got.get("b", "c") == 120.0                       # the measurement holds its own
+    assert got.get("c", "b") == pytest.approx(drawn("c", "b"), abs=1e-4)
+    assert (got.get("c", "d"), got.get("d", "c")) == (table.get("c", "d"), table.get("d", "c"))
+    # In the medium the stated pair is the link, with no draw on it.
+    medium = losses.medium_tables({"868": table}, gd, ns)["868"]
+    unshadowed = losses.medium_tables({"868": table}, geodata.load("flat"), ns)["868"]
+    assert medium.get("c", "d") == unshadowed.get("c", "d")
+    assert medium.get("d", "c") == unshadowed.get("d", "c")
+
+
+def test_shadowing_is_a_layer_and_never_recomputes_a_table(stores):
+    gd, ns = geodata.load("flat"), nodeset.load("three")
+    path, _ = asyncio.run(losses.compute(gd, ns, "868"))
+    geodata.write(geodata.geodata_path("flat"), dict(gd.data, shadowing_db=7, shadowing_seed=3))
+    assert asyncio.run(losses.compute(geodata.load("flat"), ns, "868")) == (path, True)
 
 
 def test_the_band_is_the_one_globals_carrier_falls_in(stores):
@@ -202,6 +343,118 @@ def test_link_json_replies_become_cells():
     assert loss == pytest.approx(ether.fspl_1m_db(869.525e6) + 20)
     with pytest.raises(losses.LossError):
         losses.cell_from_reply((500, "boom"), 1, 1)
+
+
+# ---- a pack's percentage of locations, through a sidecar of the test's own --
+
+LINK_FIELDS = {"ax", "ay", "bx", "by", "tx_h", "rx_h", "budget_db", "tx_gain_dbi", "rx_gain_dbi",
+               "loc_pct"}
+SEA = {"name": "sea", "region": {"crs_epsg": 32631, "bbox": [2.9, 0.1, 3.1, 0.3]}, "layers": []}
+
+
+def fake_sidecar(asked):
+    """/api/pack and /link.json as planner-web answers them, for a pack out
+    at sea: every pair 120 dB at 90 % of locations and 113 dB at the median,
+    and a field link.json does not know refused, as its `deny_unknown_fields`
+    refuses one. Each link.json query is kept in `asked`."""
+    async def pack(request):
+        return web.json_response({"extent": {"minx": 300000, "miny": 0,
+                                             "maxx": 700000, "maxy": 100000}})
+
+    async def link(request):
+        query = dict(request.query)
+        asked.append(query)
+        loc = float(query.get("loc_pct", 90))
+        if set(query) - LINK_FIELDS or not 1 <= loc <= 99:
+            return web.Response(status=400, text="Failed to deserialize query string")
+        return web.json_response({"lb_db": 113 + 7 * (loc - 50) / 40,
+                                  "fresnel": {"verdict": "grazing"},
+                                  "profile_evidence": {"model": losses.P1812_MODEL,
+                                                       "buildings_index": "ready"}})
+
+    app = web.Application()
+    app.router.add_get("/api/pack", pack)
+    app.router.add_get("/link.json", link)
+    return app
+
+
+def serving(app, go):
+    """`go(url)` with `app` answering at url, on one loop."""
+    async def main():
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        try:
+            await go("http://127.0.0.1:%d" % site._server.sockets[0].getsockname()[1])
+        finally:
+            await runner.cleanup()
+    asyncio.run(main())
+
+
+def test_a_packs_loc_pct_goes_to_every_request_the_header_and_the_cache_key(stores, tmp_path):
+    pack = tmp_path / "packs" / "sea"
+    pack.mkdir(parents=True)
+    (pack / "manifest.json").write_text(json.dumps(SEA))
+    geodata.write(geodata.geodata_path("sea"), {"pack": str(pack)})
+    ns = nodeset.create("buoys")
+    for i in range(3):
+        ns.add_node("b%d" % i, 0.2, 3.0 + 0.01 * i, height_m=10)
+    moved = ns.copy()
+    moved.move_node("b2", 0.21, 3.02)
+    asked = []
+
+    async def go(url):
+        at90 = geodata.load("sea")
+        path90, _ = await losses.compute(at90, ns, "868", url)
+        # Without the key, every request is what it was before the key existed.
+        assert asked and all(set(q) == {"ax", "ay", "bx", "by", "tx_h", "rx_h"} for q in asked)
+        assert path90 == losses.cache_path("sea", ns.geometry_hash(), "868")
+        table = slt.Table.read(path90)
+        assert table.header["p_loc_pct"] == 90.0 and table.get("b0", "b1") == 120
+        # At the median every request says so, and neither the cache nor a
+        # donor offers the 90 % table, which would otherwise serve.
+        geodata.write(geodata.geodata_path("sea"), {"pack": str(pack), "loc_pct": 50})
+        median = geodata.load("sea")
+        assert losses.cached(median, ns, "868") is None
+        assert losses.nearest_cached(at90, moved, "868")[0] is not None
+        assert losses.nearest_cached(median, moved, "868") == (None, None)
+        del asked[:]
+        path50, hit = await losses.compute(median, ns, "868", url)
+        assert not hit and path50 != path90
+        assert asked and all(q["loc_pct"] == "50.0" for q in asked)
+        table = slt.Table.read(path50)
+        assert table.header["p_loc_pct"] == 50.0 and table.get("b0", "b1") == 113
+        # Side by side: back at 90 %, the cache still has its table, and a
+        # moved node's donor is the table at its own percentage.
+        assert losses.cached(at90, ns, "868") == path90
+        assert losses.cached(median, ns, "868") == path50
+        for gd, pct in ((at90, 90.0), (median, 50.0)):
+            donor, fresh = losses.nearest_cached(gd, moved, "868")
+            assert donor.header["p_loc_pct"] == pct and fresh == {"b2"}
+        # One node's row, as the page's links ask for it, is at the median too.
+        del asked[:]
+        row = await losses.row(median, ns, "b0", "868", url)
+        assert row["b1"][:2] == (113, 113) and all(q["loc_pct"] == "50.0" for q in asked)
+        # A table at one percentage is never carried into another.
+        with pytest.raises(losses.LossError, match="of locations"):
+            await losses.update_nodes(table, at90, moved, ["b2"], url)
+    serving(fake_sidecar(asked), go)
+
+
+def test_shadowing_over_a_pack_that_is_no_median_is_warned_about_not_refused(tmp_path):
+    (tmp_path / "manifest.json").write_text(json.dumps(SEA))
+
+    def sea(**keys):
+        return geodata.Geodata("sea", geodata.parse({"pack": str(tmp_path), **keys}, "sea"))
+    assert losses.shadowing_warning(sea()) is None
+    assert losses.shadowing_warning(sea(loc_pct=50)) is None
+    assert losses.shadowing_warning(sea(shadowing_db=7, loc_pct=50)) is None
+    said = losses.shadowing_warning(sea(shadowing_db=7))
+    assert "at 90 % of locations" in said and "loc_pct: 50" in said
+    assert "at 70 % of locations" in losses.shadowing_warning(sea(shadowing_db=7, loc_pct=70))
+    flat = geodata.Geodata("flat", geodata.parse({"synthetic": {}, "shadowing_db": 7}, "flat"))
+    assert losses.shadowing_warning(flat) is None
 
 
 # ---- a pack, through a real sidecar --------------------------------------
