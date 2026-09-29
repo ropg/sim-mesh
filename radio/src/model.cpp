@@ -384,6 +384,7 @@ struct simradio {
     /* Every scheduled instant of a frame in flight, in or out. Created on
      * first use and kept for the chip's life. */
     void* tTxDone = nullptr;
+    int64_t txEnd = 0;          /* when tTxDone lands, on the model's clock */
     void* tPre = nullptr;
     void* tSync = nullptr;
     void* tHdr = nullptr;
@@ -575,6 +576,22 @@ extern "C" int64_t simradio_now_us(void)
     return S()->now_us();
 }
 
+/* A transmitting chip changes only when TX_DONE lands: the ether's frames are
+ * not taken in outside RX and CAD (modelRxBegin, modelRxEnd), and nothing but
+ * a command ends TX early, which the polling driver would be the one to send.
+ * TX_DONE is seen at the first node time whose T has reached the frame's end. */
+extern "C" int64_t simradio_quiet_for_us(simradio_t* c)
+{
+    if (!c || !conductor::isVirtual()) return -1;
+    S()->lock();
+    int64_t end = strcmp(c->st.mode, "TX") == 0 ? c->txEnd : -1;
+    int64_t now = S()->now_us();
+    S()->unlock();
+    if (end <= now) return -1;
+    int64_t left = conductor::firstNodeAt(end) - conductor::nodeNowUs();
+    return left > 0 ? left : -1;
+}
+
 /* ---- The lines ---- */
 
 extern "C" int simradio_pin(simradio_t* c, int pin)
@@ -662,6 +679,7 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
         frame.payload = txPayload;
         frame.len = d.payloadLen;
         publishTx = true;
+        c->txEnd = frame.tEnd;
         armOnce(c, &c->tTxDone, txDoneCb, frame.tEnd - now);
         break;
     }

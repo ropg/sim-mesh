@@ -38,6 +38,10 @@ int64_t conductorOf(int64_t node);
 int64_t nodeNowUs();
 int64_t epochUs();
 
+/** The first node time whose conductor time has reached `t`: when a host
+ *  polling on its own clock can first see what happens at T = `t`. */
+int64_t firstNodeAt(int64_t t);
+
 /** Node time when the ether's welcome arrived, and whether it has. A host
  *  whose clock counts from its own boot counts from here. */
 int64_t nodeAtJoin();

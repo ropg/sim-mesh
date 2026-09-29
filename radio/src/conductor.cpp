@@ -328,6 +328,15 @@ const struct simradio_services* modelServices()
 int64_t nodeOf(int64_t t)       { return mapThrough(profile(), t, true); }
 int64_t conductorOf(int64_t n)  { return mapThrough(profile(), n, false); }
 
+int64_t firstNodeAt(int64_t t)
+{
+    /* nodeOf rounds down, so its answer can be a microsecond or two past the
+     * first node time that maps back to `t` or later; step back to it. */
+    int64_t n = nodeOf(t);
+    while (n > 0 && conductorOf(n - 1) >= t) n--;
+    return n;
+}
+
 int64_t nodeNowUs()
 {
     return isVirtual() ? nodeOf(s_T.load()) : B()->now_us();
