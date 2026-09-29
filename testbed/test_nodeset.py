@@ -127,6 +127,20 @@ def test_offsets_are_a_list_and_an_offsets_ends_a_list_of_nodes(tmp_path):
             nodeset.read(str(path))
 
 
+def test_an_offset_is_between_two_nodes(tmp_path):
+    """A third name, and any after it, was passed over without a word: the
+    offset held between the first two. A link's is refused, and so is this."""
+    head = ("nodes:\n  a: { id: 1, lat: 0, lon: 0 }\n  b: { id: 2, lat: 0, lon: 0.01 }\n"
+            "  c: { id: 3, lat: 0, lon: 0.02 }\noffsets:\n  - { between: %s, db: 3 }\n")
+    for ends in ("[a, b, c]", "[a, b, zz]", "[a]", "[]"):
+        path = tmp_path / "f.yaml"
+        path.write_text(head % ends)
+        with pytest.raises(store.StoreError, match="an offset is { between: \\[a, b\\]"):
+            nodeset.read(str(path))
+    path.write_text(head % "[c, a]")
+    assert nodeset.read(str(path))["offsets"] == [{"between": ["c", "a"], "db": 3.0}]
+
+
 def test_edits_mark_it_dirty_and_ids_are_the_lowest_free(nodesets_dir):
     ns = nodeset.create("new")
     assert ns.add_node("a", 0.0, 0.0)["id"] == 1
