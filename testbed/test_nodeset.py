@@ -99,6 +99,23 @@ def test_a_number_no_file_could_hold_is_refused_where_it_is_read(tmp_path):
             nodeset.read(str(path))
 
 
+def test_a_node_figure_that_is_no_number_is_refused_by_its_key(tmp_path):
+    """A word where a node's height goes raised float()'s ValueError, none a
+    TypeError, and an infinite id int()'s OverflowError, where every other
+    bad value is a StoreError."""
+    node = "nodes:\n  a: { id: %s, lat: %s, lon: 0%s }\n"
+    for text, match in (
+            (node % (1, 0, ", height_m: tall"), "node a: height_m is a finite number, not 'tall'"),
+            (node % (1, 0, ", height_m: null"), "node a: height_m is a finite number, not None"),
+            (node % (".inf", 0, ""), "node a needs id, lat and lon"),
+            (node % (1, "north", ""), "node a needs id, lat and lon"),
+            (node % (1, 0, ", max_dbm: [27]"), "node a: max_dbm is a number")):
+        path = tmp_path / "f.yaml"
+        path.write_text(text)
+        with pytest.raises(store.StoreError, match=match):
+            nodeset.read(str(path))
+
+
 def test_offsets_are_a_list_and_an_offsets_ends_a_list_of_nodes(tmp_path):
     # A string's letters were read as the ends: `ab` joined nodes a and b.
     head = "nodes:\n  a: { id: 1, lat: 0, lon: 0 }\n  b: { id: 2, lat: 0, lon: 0.01 }\n"

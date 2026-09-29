@@ -133,6 +133,19 @@ def check_tags(tags):
     return list(dict.fromkeys(tags))
 
 
+def finite(value, key, where):
+    """A nodeset's number as a float, or a StoreError naming its key when it
+    is none: a word, or a NaN or an infinity, which YAML and JSON read as
+    numbers but no file could be written with (store.scalar)."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        out = math.nan
+    if not math.isfinite(out):
+        raise store.StoreError("%s: %s is a finite number, not %r" % (where, key, value))
+    return out
+
+
 def parse(data, where):
     """A nodeset file's mapping, checked and filled out.
 
@@ -155,7 +168,7 @@ def parse(data, where):
         try:
             node_id = int(node["id"])
             lat, lon = float(node["lat"]), float(node["lon"])
-        except (KeyError, TypeError, ValueError) as err:
+        except (KeyError, TypeError, ValueError, OverflowError) as err:
             raise store.StoreError("%s: node %s needs id, lat and lon" % (where, name)) from err
         if node_id in ids:
             raise store.StoreError("%s: nodes %s and %s share id %d"
@@ -179,15 +192,11 @@ def parse(data, where):
         if "board" in node:
             raise store.StoreError("%s: a node has no board: every node is an SX1262, and "
                                    "`max_dbm` is its maximum power" % here)
-        record = node_record(
-            node_id, lat, lon, node.get("height_m", DEFAULT_HEIGHT_M), height_from,
+        out["nodes"][name] = node_record(
+            node_id, finite(lat, "lat", here), finite(lon, "lon", here),
+            finite(node.get("height_m", DEFAULT_HEIGHT_M), "height_m", here), height_from,
             antennas_module.check(node.get("antenna"), here), check_tags(node.get("tags")),
             boards_module.check(node.get("max_dbm"), here))
-        for key in ("lat", "lon", "height_m"):
-            if not math.isfinite(record[key]):
-                raise store.StoreError("%s: %s is a finite number, not %r"
-                                       % (here, key, record[key]))
-        out["nodes"][name] = record
     offsets = data.get("offsets") or []
     if not isinstance(offsets, list):
         raise store.StoreError("%s: offsets is a list, each { between: [a, b], db, note? }"
