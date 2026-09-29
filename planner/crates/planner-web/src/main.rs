@@ -2580,15 +2580,37 @@ struct LinkQuery {
 /// P.1812's own range (`p1812::lb_from_arrays` refuses anything outside
 /// 1..=99), else the model's default.
 ///
-/// Checked here rather than left to the model. A P.1812 call that fails is
-/// answered below with the near-field model, as if the path were inside the
-/// 0.25 km floor, so an out-of-range pL would come back as a confident
-/// free-space number instead of a 4xx.
+/// Checked here rather than left to the model, whose refusal is no 4xx: on a
+/// path P.1812 judges it is the server's error (`link_model`), and inside the
+/// 0.25 km floor the near-field model answers, which has no pL, so a bad one
+/// would pass unremarked.
 fn resolve_loc_pct(loc_pct: Option<f64>) -> Result<f64, String> {
     match loc_pct {
         None => Ok(planner_core::model::LinkParams::eu868_defaults().loc_pct),
         Some(p) if (1.0..=99.0).contains(&p) => Ok(p),
         Some(p) => Err(format!("loc_pct must be in [1, 99], not {p}")),
+    }
+}
+
+/// The loss a link reply gives, and the model it came from: P.1812's own
+/// answer, or on a path inside its 0.25 km floor the near-field model's.
+///
+/// Only that refusal is answered from the near field, the one
+/// `p1812::lb_from_arrays` gives a path shorter than 0.25 km (§1). Any other
+/// is P.1812 refusing a path it does judge, and answering it from the near
+/// field would give a free-space figure, labelled as a path inside the
+/// floor, for one that is not; it is an error, and the reply says so.
+fn link_model(
+    p1812: Result<f64, planner_core::model::ModelError>,
+    d_total_km: f64,
+    near_field: impl FnOnce() -> Option<f64>,
+) -> Result<(f64, &'static str), (StatusCode, String)> {
+    match p1812 {
+        Ok(lb) => Ok((lb, "ITU-R P.1812-8")),
+        Err(planner_core::model::ModelError::OutOfRange(_)) if d_total_km < 0.25 => near_field()
+            .map(|v| (v, "free space + P.526 diffraction (inside P.1812's 0.25 km floor)"))
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "path too short to evaluate".into())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 
@@ -3029,19 +3051,16 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     // opposite are, and a measure-link tool that returns an error there is
     // useless for exactly the neighbour-to-neighbour hop a mesh is built
     // from. Free space plus diffraction over the real roofs on the path.
-    let (lb_p1812, model_used) = match loss {
-        Ok(l) => (l.lb_db, "ITU-R P.1812-8"),
-        // Both ways here too, for the same reason.
-        Err(_) => match planner_propag::near_field::loss_db(
-            &planner_propag::near_field::NearFieldPath {
-                d_km: &md_km,
-                h_masl: &mh_masl,
-                g_masl: &mg_masl,
-                f_mhz: link.freq_mhz,
-                tx_h_agl_m: link.tx_h_agl_m,
-                rx_h_agl_m: link.rx_h_agl_m,
-            },
-        )
+    // Both ways here too, for the same reason.
+    let near_field = || {
+        planner_propag::near_field::loss_db(&planner_propag::near_field::NearFieldPath {
+            d_km: &md_km,
+            h_masl: &mh_masl,
+            g_masl: &mg_masl,
+            f_mhz: link.freq_mhz,
+            tx_h_agl_m: link.tx_h_agl_m,
+            rx_h_agl_m: link.rx_h_agl_m,
+        })
         .zip(planner_propag::near_field::loss_db(&planner_propag::near_field::NearFieldPath {
             d_km: &rd_km,
             h_masl: &rh_masl,
@@ -3051,12 +3070,10 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
             rx_h_agl_m: link_rev.rx_h_agl_m,
         }))
         .map(|(f, r)| (f + r) / 2.0)
-        {
-            Some(v) => (v, "free space + P.526 diffraction (inside P.1812's 0.25 km floor)"),
-            None => {
-                return (StatusCode::BAD_REQUEST, "path too short to evaluate").into_response()
-            }
-        },
+    };
+    let (lb_p1812, model_used) = match link_model(loss.map(|l| l.lb_db), d_total, near_field) {
+        Ok(answer) => answer,
+        Err(refused) => return refused.into_response(),
     };
     let lb = lb_p1812 + ah_tx + ah_rx;
 
@@ -4316,8 +4333,8 @@ mod tests {
         for good in [1.0, 50.0, 99.0] {
             assert_eq!(resolve_loc_pct(Some(good)), Ok(good));
         }
-        // Refused, not handed to the model, whose refusal would turn into a
-        // near-field answer.
+        // Refused here, not handed to the model, whose refusal is a server
+        // error, and inside the 0.25 km floor none at all.
         for bad in [0.0, 0.5, 99.5, 100.0, -50.0, f64::NAN, f64::INFINITY] {
             assert!(resolve_loc_pct(Some(bad)).is_err(), "loc_pct {bad} must be refused");
         }
@@ -4331,6 +4348,36 @@ mod tests {
         assert_eq!(parse("").unwrap(), None);
         assert_eq!(parse("&loc_pct=50").unwrap(), Some(50.0));
         assert!(parse("&loc=50").is_err());
+    }
+
+    /// The near-field model answers inside P.1812's 0.25 km floor and only
+    /// there. Every refusal used to be answered from it, as a free-space
+    /// figure labelled as a path inside the floor.
+    #[test]
+    fn only_the_distance_floor_is_answered_from_the_near_field() {
+        use planner_core::model::ModelError;
+        let near = || Some(71.5);
+        assert_eq!(link_model(Ok(120.0), 1.2, near), Ok((120.0, "ITU-R P.1812-8")));
+        let floor = || {
+            Err(ModelError::OutOfRange("path length 0.150 km outside P.1812's 0.25–3000 km".into()))
+        };
+        let (lb, model) = link_model(floor(), 0.15, near).unwrap();
+        assert!(lb == 71.5 && model.contains("inside P.1812's 0.25 km floor"), "{model}");
+        // A path the near-field model cannot take either is still the caller's.
+        assert_eq!(link_model(floor(), 0.15, || None).unwrap_err().0, StatusCode::BAD_REQUEST);
+        // Past the floor, whatever P.1812 refuses is its error, and the near
+        // field is never asked.
+        for (refusal, says) in [
+            (ModelError::BadProfile("profile spacing 5.00 m is below the 30 m floor".into()),
+             "spacing"),
+            (ModelError::OutOfRange("frequency 10000 MHz outside P.1812's 30 MHz–6 GHz".into()),
+             "frequency"),
+        ] {
+            let (status, text) =
+                link_model(Err(refusal), 1.2, || panic!("the near field was asked")).unwrap_err();
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(text.contains(says), "{text}");
+        }
     }
 
     use super::*;
