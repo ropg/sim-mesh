@@ -69,6 +69,9 @@ class Sergeyculum(Kind):
     # Its console is log lines out (a line at a time, as Rust's stdout
     # writes) and a line reader that answers with where the KISS door is.
     console_tty = False
+    # Configured through its host door, never its console: its log lines are
+    # read as they come.
+    console_acted_on = False
 
     def __init__(self, device):
         super().__init__(device)

@@ -413,7 +413,7 @@ class Station:
         os.set_blocking(reader, False)
         marks = self.clock.console_marks(reader) if self.clock is not None else None
         self.drain = Drain(self, reader, self.rpc, asyncio.get_running_loop(), marks)
-        if self.clock is not None:
+        if self.clock is not None and self.kind.console_acted_on:
             self.clock.watch(self.node_id, self.drain.marks)
         ptys().call(self.drain.attach)
         log("station %s (%d, %s) up as pid %d on %s" % (

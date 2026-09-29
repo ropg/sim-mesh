@@ -507,6 +507,45 @@ def test_roles_are_asked_only_for_a_page_that_draws_them(stores, monkeypatch):
     asyncio.run(watched_or_not())
 
 
+def test_a_console_nothing_acts_on_is_not_waited_for(tmp_path, monkeypatch):
+    """The drain before T moves reads only the consoles of kinds that act on
+    what their stations print (console_acted_on): Sergeyculum's, log lines
+    alone, are read as they come, and a barrier where only it printed waits
+    for nothing."""
+    import stations
+    import types
+
+    daemon = make_simd(tmp_path)
+    from kinds import reticulous, sergeyculum
+    assert reticulous.Reticulous.console_acted_on
+    assert not sergeyculum.Sergeyculum.console_acted_on
+
+    pipes = []
+
+    def printing(node_id, acted_on):
+        reader, writer = os.pipe()
+        pipes.extend((reader, writer))
+        marks = stations.Marks(reader)
+        marks.reading, marks.taken = True, 1         # handed on reads not caught up with
+        drain = types.SimpleNamespace(master=reader, marks=marks)
+        kind = types.SimpleNamespace(console_acted_on=acted_on)
+        return types.SimpleNamespace(node_id=node_id, drain=drain, kind=kind)
+    daemon.stations = {"ours": printing(1, False), "theirs": printing(2, True)}
+    waited = []
+    monkeypatch.setattr(stations.ptys(), "call",
+                        lambda fn, drains, loop, done: waited.extend(drains))
+
+    async def go():
+        assert daemon.drain_consoles([1], lambda: None) is False
+        assert daemon.drain_consoles([1, 2], lambda: None) is True
+    try:
+        asyncio.run(go())
+    finally:
+        for fd in pipes:
+            os.close(fd)
+    assert waited == [daemon.stations["theirs"].drain]
+
+
 @pytest.mark.parametrize("marks", ["testbed", "core"])
 def test_only_a_station_that_printed_is_read_through_the_pty_thread(marks):
     """stations.printed polls the ptys on the main thread: a station that
