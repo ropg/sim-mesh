@@ -602,10 +602,14 @@ class FakeSim:
     snapshot with the stations up, and commands and intents answered by the
     stations chosen, each answer carrying the asker's id."""
 
-    def __init__(self, names):
+    def __init__(self, names, failing_sequences=0):
         self.names = names
         self.got = []
         self.turns = []                 # drive and yield, as they came
+        # The first this many sequences (a message's route and send) fail on
+        # the way, answered as simd answers a request it could not do.
+        self.failing_sequences = failing_sequences
+        self.sequences = 0
 
     async def handle(self, request):
         from aiohttp import web
@@ -629,6 +633,16 @@ class FakeSim:
             if m["type"] in ("firmware", "first_boot"):
                 await ws.send_json({"type": "command_result", "id": m.get("id"), "results": {},
                                     "t": 2_000_000})
+            if m["type"] == "sequence":
+                self.sequences += 1
+                who = m.get("names") or self.names
+                if self.sequences <= self.failing_sequences:
+                    await ws.send_json({"type": "command_result", "id": m.get("id"), "results": {},
+                                        "error": "rncfg gave no answer in 10s", "t": 2_000_000})
+                else:
+                    await ws.send_json({"type": "command_result", "id": m.get("id"), "t": 2_000_000,
+                                        "results": [{n: "no route" for n in who},
+                                                    {n: "queued %032x" % 7 for n in who}]})
             if m["type"] in ("command", "meta"):
                 who = [m["name"]] if m.get("name") else m.get("names") or self.names
                 line = m.get("line") or m.get("verb")
@@ -701,6 +715,19 @@ def test_the_traffic_driver_runs_on_a_sim(tmp_path):
     assert json.loads(out.read_text())["phases"][-1][0] == "gathered"
     with pytest.raises(ValueError, match="no traffic option"):
         rtraffic.Options(colour="blue")
+
+
+def test_a_message_whose_send_fails_is_recorded_so_and_the_rest_go_on(tmp_path):
+    """simd answers a request it could not do with the error (a tool that
+    gave no answer, say): that message is recorded as failed, and the
+    traffic goes on. The driver had waited on the answer for ever."""
+    fake = FakeSim(["n01", "n02"], failing_sequences=1)
+    opts = {"warm_rounds": 0, "settle_every": 1, "traffic": 10, "every": 5, "drain": 0}
+    result = with_fake_sim(fake, lambda sim: rtraffic.run_on(sim, opts, str(tmp_path / "out.json")))
+    sends = result["sends"]
+    assert len(sends) == fake.sequences >= 2
+    assert sends[0]["error"] == "rncfg gave no answer in 10s" and "t_sent" not in sends[0]
+    assert all("error" not in s and s["mid"] == "%032x" % 7 for s in sends[1:])
 
 
 def test_a_script_says_it_synchronously(monkeypatch):

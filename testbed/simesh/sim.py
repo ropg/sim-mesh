@@ -217,7 +217,11 @@ class Sim:
                     self.has_floor = True
                     self.poke()
                     if not waiter.done():
-                        waiter.set_result(m)
+                        if m.get("error"):
+                            # Refused, or failed on the way: the request fails.
+                            waiter.set_exception(SimError(m["error"]))
+                        else:
+                            waiter.set_result(m)
             elif kind == "error":
                 self.errors.append(m.get("text"))
                 print("simd: %s" % m.get("text"), flush=True)

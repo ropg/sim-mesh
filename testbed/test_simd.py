@@ -358,6 +358,36 @@ def test_an_edit_with_a_number_no_file_could_hold_is_refused(stores):
     asyncio.run(go())
 
 
+def test_a_request_that_fails_is_answered_with_its_error(stores):
+    """A script waits on each request's answer, by its id. One that cannot be
+    done is answered with the error, and the page told as before; left
+    unanswered, the script waited for ever, and T went on without it."""
+    async def go():
+        daemon = make_simd(stores)
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three", **STUBS})
+        assert await until(lambda: len(daemon.stations) == 3 and all(
+            s.status == "up" for s in daemon.stations.values()))
+        for msg in ({"type": "meta", "verb": "message", "name": "a",
+                     "args": {"to": "nobody", "text": "yo"}, "id": "f1"},
+                    {"type": "sequence", "names": ["a"], "id": "f2",
+                     "steps": [{"type": "meta", "verb": "path", "args": {"to": "nobody"}}]},
+                    # Put off to an instant, it fails on a task of its own.
+                    {"type": "meta", "verb": "message", "name": "a", "after": 0.001,
+                     "args": {"to": "nobody", "text": "yo"}, "id": "f3"}):
+            said = len(daemon.said)
+            await daemon.handle(msg)
+            assert await until(lambda: any(m.get("id") == msg["id"] for m in daemon.said[said:]))
+            answers = [m for m in daemon.said[said:] if m["type"] == "command_result"]
+            errors = [m["text"] for m in daemon.said[said:] if m["type"] == "error"]
+            assert [a["id"] for a in answers] == [msg["id"]], msg
+            assert answers[0]["error"] == errors[0] and answers[0]["results"] == {}, msg
+            assert "nobody is not up" in errors[0], msg
+        await daemon.stop_all(flush=False)
+        daemon.ether.close()
+    asyncio.run(go())
+
+
 def test_commands_and_intents_go_to_the_stations_chosen(stores):
     async def go():
         daemon = make_simd(stores)
