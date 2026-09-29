@@ -1587,12 +1587,17 @@ change.
   `below_threshold`, lost lock, `crc` from interference, `left_rx`, with a
   summary per station and per pair. A protocol claim ("`settling` cannot
   happen here") and a departure policy are judged by these.
-- **A referee over `record.tsv`**: it reads the channel plan and the `state`,
-  `tx`, `rx_begin` and `rx_end` lines and names the line that breaks a rule:
-  more than 100 s of transmission in any hour per 500 kHz channel, less than
-  100 ms off-time before returning to a frequency, radiated power over a
-  channel's cap, a `tx` without the sense window of RX or CAD before it on
-  that carrier, a `tx` from a slot that is inside a reception.
+- **A referee over `record.tsv`**, in part. After a run, `compliance.py`
+  holds each node to EN 300 220's duty cycle, polite spectrum access and
+  e.r.p., and `referee.py` audits the air: every `tx` that began over a frame
+  on its carrier its sender could decode, whether and when the ether had told
+  the slot of that frame (a slot told by a lock sent from inside a
+  reception) and in which window of it; the frames nobody was told of; and
+  every `crc`, by whether the overlapping senders could hear each other.
+  Still to build: holding a station to any of it during a run, and
+  listen-before-talk itself. That a slot was in RX or CAD before a `tx` is
+  in the record; whether its firmware read the channel, and what it found
+  there, is not: an RSSI read or a CAD's result never reaches the ether.
 - **The CRC band**: in the `crc_margin_db` (3 dB) above the demodulation
   threshold, a locked frame ends as `crc` with a probability falling linearly
   from 1 to 0, drawn from the run's seeded generator.
