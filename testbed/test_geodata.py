@@ -375,3 +375,34 @@ def test_a_spread_is_the_number_a_copy_of_the_file_reads_back(tmp_path):
     gd = geodata.read(str(path))
     geodata.write_copy(gd, str(copy_path))
     assert geodata.read(str(copy_path)).shadowing_db == gd.shadowing_db == 6.123456789
+
+
+def test_loc_pct_is_a_packs_round_trips_and_is_part_of_the_ground(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
+    write_pack(tmp_path)
+    geodata.write(geodata.geodata_path("tiny"), {"pack": "../packs/tiny"})
+    geodata.write(geodata.geodata_path("median"),
+                  {"pack": "../packs/tiny", "loc_pct": 50, "shadowing_db": 7})
+    assert (tmp_path / "geodata" / "median.yaml").read_text() == \
+        'pack: "../packs/tiny"\nloc_pct: 50\nshadowing_db: 7\n'
+    at90, median = geodata.load("tiny"), geodata.load("median")
+    assert (at90.loc_pct, median.loc_pct) == (None, 50)
+    assert median.as_dict()["loc_pct"] == 50 and "loc_pct" not in at90.as_dict()
+    # The table's own, unlike the shadowing: another percentage, other tables.
+    assert median.content_hash != at90.content_hash
+    # It goes where the pack goes.
+    out = io.BytesIO()
+    geodata.export_zip(median, out)
+    zipped = tmp_path / "median.zip"
+    zipped.write_bytes(out.getvalue())
+    back = geodata.import_zip(str(zipped), "again", packs=str(tmp_path / "elsewhere"))
+    assert (back.loc_pct, back.shadowing_db) == (50, 7)
+    path = tmp_path / "g.yaml"
+    for text, match in (("pack: x\nloc_pct: 0\n", "1 to 99"),
+                        ("pack: x\nloc_pct: 99.5\n", "1 to 99"),
+                        ("pack: x\nloc_pct: most\n", "is a number"),
+                        ("pack: x\nloc_pc: 50\n", "did you mean loc_pct"),
+                        (PLAIN + "loc_pct: 50\n", "a pack's")):
+        path.write_text(text)
+        with pytest.raises(store.StoreError, match=match):
+            geodata.read(str(path))

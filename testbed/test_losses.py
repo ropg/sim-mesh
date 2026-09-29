@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 import pytest
+from aiohttp import web
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -342,6 +343,118 @@ def test_link_json_replies_become_cells():
     assert loss == pytest.approx(ether.fspl_1m_db(869.525e6) + 20)
     with pytest.raises(losses.LossError):
         losses.cell_from_reply((500, "boom"), 1, 1)
+
+
+# ---- a pack's percentage of locations, through a sidecar of the test's own --
+
+LINK_FIELDS = {"ax", "ay", "bx", "by", "tx_h", "rx_h", "budget_db", "tx_gain_dbi", "rx_gain_dbi",
+               "loc_pct"}
+SEA = {"name": "sea", "region": {"crs_epsg": 32631, "bbox": [2.9, 0.1, 3.1, 0.3]}, "layers": []}
+
+
+def fake_sidecar(asked):
+    """/api/pack and /link.json as planner-web answers them, for a pack out
+    at sea: every pair 120 dB at 90 % of locations and 113 dB at the median,
+    and a field link.json does not know refused, as its `deny_unknown_fields`
+    refuses one. Each link.json query is kept in `asked`."""
+    async def pack(request):
+        return web.json_response({"extent": {"minx": 300000, "miny": 0,
+                                             "maxx": 700000, "maxy": 100000}})
+
+    async def link(request):
+        query = dict(request.query)
+        asked.append(query)
+        loc = float(query.get("loc_pct", 90))
+        if set(query) - LINK_FIELDS or not 1 <= loc <= 99:
+            return web.Response(status=400, text="Failed to deserialize query string")
+        return web.json_response({"lb_db": 113 + 7 * (loc - 50) / 40,
+                                  "fresnel": {"verdict": "grazing"},
+                                  "profile_evidence": {"model": losses.P1812_MODEL,
+                                                       "buildings_index": "ready"}})
+
+    app = web.Application()
+    app.router.add_get("/api/pack", pack)
+    app.router.add_get("/link.json", link)
+    return app
+
+
+def serving(app, go):
+    """`go(url)` with `app` answering at url, on one loop."""
+    async def main():
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        try:
+            await go("http://127.0.0.1:%d" % site._server.sockets[0].getsockname()[1])
+        finally:
+            await runner.cleanup()
+    asyncio.run(main())
+
+
+def test_a_packs_loc_pct_goes_to_every_request_the_header_and_the_cache_key(stores, tmp_path):
+    pack = tmp_path / "packs" / "sea"
+    pack.mkdir(parents=True)
+    (pack / "manifest.json").write_text(json.dumps(SEA))
+    geodata.write(geodata.geodata_path("sea"), {"pack": str(pack)})
+    ns = nodeset.create("buoys")
+    for i in range(3):
+        ns.add_node("b%d" % i, 0.2, 3.0 + 0.01 * i, height_m=10)
+    moved = ns.copy()
+    moved.move_node("b2", 0.21, 3.02)
+    asked = []
+
+    async def go(url):
+        at90 = geodata.load("sea")
+        path90, _ = await losses.compute(at90, ns, "868", url)
+        # Without the key, every request is what it was before the key existed.
+        assert asked and all(set(q) == {"ax", "ay", "bx", "by", "tx_h", "rx_h"} for q in asked)
+        assert path90 == losses.cache_path("sea", ns.geometry_hash(), "868")
+        table = slt.Table.read(path90)
+        assert table.header["p_loc_pct"] == 90.0 and table.get("b0", "b1") == 120
+        # At the median every request says so, and neither the cache nor a
+        # donor offers the 90 % table, which would otherwise serve.
+        geodata.write(geodata.geodata_path("sea"), {"pack": str(pack), "loc_pct": 50})
+        median = geodata.load("sea")
+        assert losses.cached(median, ns, "868") is None
+        assert losses.nearest_cached(at90, moved, "868")[0] is not None
+        assert losses.nearest_cached(median, moved, "868") == (None, None)
+        del asked[:]
+        path50, hit = await losses.compute(median, ns, "868", url)
+        assert not hit and path50 != path90
+        assert asked and all(q["loc_pct"] == "50.0" for q in asked)
+        table = slt.Table.read(path50)
+        assert table.header["p_loc_pct"] == 50.0 and table.get("b0", "b1") == 113
+        # Side by side: back at 90 %, the cache still has its table, and a
+        # moved node's donor is the table at its own percentage.
+        assert losses.cached(at90, ns, "868") == path90
+        assert losses.cached(median, ns, "868") == path50
+        for gd, pct in ((at90, 90.0), (median, 50.0)):
+            donor, fresh = losses.nearest_cached(gd, moved, "868")
+            assert donor.header["p_loc_pct"] == pct and fresh == {"b2"}
+        # One node's row, as the page's links ask for it, is at the median too.
+        del asked[:]
+        row = await losses.row(median, ns, "b0", "868", url)
+        assert row["b1"][:2] == (113, 113) and all(q["loc_pct"] == "50.0" for q in asked)
+        # A table at one percentage is never carried into another.
+        with pytest.raises(losses.LossError, match="of locations"):
+            await losses.update_nodes(table, at90, moved, ["b2"], url)
+    serving(fake_sidecar(asked), go)
+
+
+def test_shadowing_over_a_pack_that_is_no_median_is_warned_about_not_refused(tmp_path):
+    (tmp_path / "manifest.json").write_text(json.dumps(SEA))
+
+    def sea(**keys):
+        return geodata.Geodata("sea", geodata.parse({"pack": str(tmp_path), **keys}, "sea"))
+    assert losses.shadowing_warning(sea()) is None
+    assert losses.shadowing_warning(sea(loc_pct=50)) is None
+    assert losses.shadowing_warning(sea(shadowing_db=7, loc_pct=50)) is None
+    said = losses.shadowing_warning(sea(shadowing_db=7))
+    assert "at 90 % of locations" in said and "loc_pct: 50" in said
+    assert "at 70 % of locations" in losses.shadowing_warning(sea(shadowing_db=7, loc_pct=70))
+    flat = geodata.Geodata("flat", geodata.parse({"synthetic": {}, "shadowing_db": 7}, "flat"))
+    assert losses.shadowing_warning(flat) is None
 
 
 # ---- a pack, through a real sidecar --------------------------------------
