@@ -15,6 +15,15 @@ library ── firmware | first_boot {rules, id} ──────────�
 seconds of it, so a real-time and a virtual-time run act at the same
 instants of the run.
 
+**Turns.** In a virtual-time run a driver and the run take turns with T:
+the driver says `drive` when it attaches, and simd holds T while the driver
+has the floor, from each answer it gives the driver until the driver says
+`yield`, which it does once it has nothing left to do but wait on simd (its
+loop has nothing to run, and `may_yield()` agrees: a script's thread is
+waiting on a call). So what a driver does about an answer, it does at the
+answer's T, and its waits (`until`, `sleep`, `all_up`, `ready`) are simd's,
+ending at an instant of the run. `sim.t` is the T of the last answer.
+
 **A selection** is some of the stations: `sim.nodes(tag=, firmware=, kind=,
 role=, names=)`, or `sim.node(name)` for one. What is done to a selection is
 done to each member that is up, spread over `spread` seconds and held back
@@ -162,6 +171,10 @@ class Sim:
         self.errors = collections.deque(maxlen=50)
         self.reader = None
         self.firmware_tasks = []         # firmware said and not yet awaited
+        self.has_floor = False           # simd holds T for us until we yield
+        self.may_yield = lambda: True    # a script's runtime: its thread is waiting on a call
+        self._settling = False
+        self._turns = 0
 
     # ---- the stream ------------------------------------------------------
 
@@ -180,7 +193,7 @@ class Sim:
                     self.t_zero = self.t
                     self.loaded.set_result(m)
             elif kind == "clock":
-                self.t = m["t"]
+                # A report on the wall clock's beat: kept, not taken for now.
                 self.result["clock"].append([round(time.time(), 3), m["t"], m.get("barriers"),
                                              m.get("observed"), m.get("slow_idles")])
             elif kind == "node":
@@ -194,8 +207,14 @@ class Sim:
                 self.stations.pop(m.get("name"), None)
             elif kind == "command_result":
                 waiter = self.waiting.pop(m.get("id"), None)
-                if waiter is not None and not waiter.done():
-                    waiter.set_result(m)
+                if waiter is not None:
+                    # Ours: simd gave us the floor with it, at its T.
+                    if isinstance(m.get("t"), int):
+                        self.t = max(self.t, m["t"])
+                    self.has_floor = True
+                    self.poke()
+                    if not waiter.done():
+                        waiter.set_result(m)
             elif kind == "error":
                 self.errors.append(m.get("text"))
                 print("simd: %s" % m.get("text"), flush=True)
@@ -205,6 +224,41 @@ class Sim:
 
     async def send(self, msg):
         await self.ws.send_str(json.dumps(msg))
+
+    # ---- turns -------------------------------------------------------------
+
+    async def drive(self):
+        """Take turns with T (see *Turns*): we have the floor from here."""
+        await self.send({"type": "drive"})
+        self.has_floor = True
+        self.poke()
+
+    def poke(self):
+        """Look, once the loop has settled, whether to yield."""
+        if not self._settling:
+            self._settling = True
+            self._turns = 0
+            asyncio.get_running_loop().call_soon(self._settle)
+
+    def _settle(self):
+        loop = asyncio.get_running_loop()
+        ready = getattr(loop, "_ready", None)
+        if ready and self._turns < 1000:
+            self._turns += 1
+            loop.call_soon(self._settle)
+            return
+        self._settling = False
+        if self.has_floor and self.may_yield():
+            self.has_floor = False
+            asyncio.ensure_future(self.send({"type": "yield"}))
+
+    async def _wait(self, msg):
+        """One of simd's waits: done at the instant it ends."""
+        ident = next(self.ids)
+        waiter = asyncio.get_running_loop().create_future()
+        self.waiting[ident] = waiter
+        await self.send(dict(msg, id=ident))
+        return await waiter
 
     @property
     def run_dir(self):
@@ -220,16 +274,16 @@ class Sim:
 
     async def until(self, run_s):
         """Until the run's clock reaches `run_s` seconds after attaching."""
-        while self.run_s < run_s:
-            await asyncio.sleep(0.2)
+        target = (self.t_zero or 0) + int(round(run_s * 1e6))
+        if self.t < target:
+            await self._wait({"type": "wait", "until": target})
 
     async def sleep(self, seconds):
         await self.until(self.run_s + seconds)
 
     async def all_up(self):
-        """Until every station is up."""
-        while not self.stations or any(s.status != "up" for s in self.stations.values()):
-            await asyncio.sleep(0.2)
+        """Until every station that has firmware is up."""
+        await self._wait({"type": "wait", "for": "up"})
 
     async def plan(self, *phases):
         """What is left of the run: (name, until) pairs, until in seconds of
@@ -307,13 +361,13 @@ class Sim:
             raise SimError("%s run%s no firmware: say firmware() for %s first"
                            % (", ".join(bare), "s" if len(bare) == 1 else "",
                               "it" if len(bare) == 1 else "them"))
-        loop = asyncio.get_running_loop()
-        deadline = None if timeout is None else loop.time() + timeout
-        while any(self.stations[n].status != "up" for n in names if n in self.stations):
-            if deadline is not None and loop.time() > deadline:
-                raise SimError("not up after %.0f s: %s" % (timeout, ", ".join(
-                    n for n in names if self.stations[n].status != "up")))
-            await asyncio.sleep(0.2)
+        try:
+            await asyncio.wait_for(self._wait({"type": "wait", "for": "up",
+                                               "names": [n for n in names if n in self.stations]}),
+                                   timeout)
+        except asyncio.TimeoutError:
+            raise SimError("not up after %.0f s: %s" % (timeout, ", ".join(
+                n for n in names if self.stations[n].status != "up"))) from None
         return [n for n in names if n in self.stations]
 
     def pairs(self, selection=None, sample=None, seed=None):
@@ -431,6 +485,7 @@ async def attach(name=None, port=None, session=None):
     sim = Sim(ws, session, name, port)
     sim.reader = asyncio.ensure_future(sim.read())
     await asyncio.wait_for(asyncio.shield(sim.loaded), 60)
+    await sim.drive()
     return sim
 
 

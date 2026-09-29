@@ -275,10 +275,17 @@ async def run_phases(opts, sim, result, phase, dump):
         jobs = [asyncio.ensure_future(one(*p)) for p in plan]
         print("scheduled %d messages over %.0f s" % (len(plan), opts.traffic), flush=True)
         t_end = start + opts.traffic
-        while sim.run_s < t_end:
-            await asyncio.sleep(5)
-            dump()
+
+        async def progress():
+            # What has been sent so far, on the wall clock's beat: it asks
+            # simd nothing, so it is no turn of ours.
+            while True:
+                await asyncio.sleep(5)
+                dump()
+        keeping = asyncio.ensure_future(progress())
+        await sim.until(t_end)
         await asyncio.gather(*jobs)
+        keeping.cancel()
         phase("traffic_end")
         await sim.until(t_end + opts.drain)
         phase("drain_end")

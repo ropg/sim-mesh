@@ -291,6 +291,13 @@ class Simd:
         self.consoles = {}                  # node name -> set of websockets
         self.poller = None
         self.role_wake = asyncio.Event()    # set when a page or a station comes or goes
+        # The driver (a script's socket that said `drive`) takes turns with T:
+        # T stands while it has the floor, from each answer simd gives it
+        # until it says `yield`, having nothing left to do but wait on simd.
+        self.driver = None
+        self.driver_floor = False
+        self.driver_ids = set()             # its requests not yet answered
+        self.status_changed = asyncio.Event()   # a station's status moved (`wait` for up)
         self.stopping = False
         self.control_port = None            # where the aiohttp app really listens
         self.front = None
@@ -605,6 +612,7 @@ class Simd:
         if self.stations.get(station.name) is station:
             self.broadcast(self.node_message(station.name))
         self.role_wake.set()
+        self.status_changed.set()
 
     def station_output(self, station, data):
         """Console bytes go to whoever has that station's terminal open."""
@@ -940,6 +948,11 @@ class Simd:
                 **store_lists()}
 
     def broadcast(self, message):
+        if message.get("type") == "command_result" and message.get("id") in self.driver_ids:
+            # An answer to the driver: it has the floor from this T until it
+            # yields, so what it does about the answer it does at this T.
+            self.driver_ids.discard(message["id"])
+            self.take_floor()
         text = json.dumps(message)
         loud = message.get("type") in LOUD
         for socket, quiet in list(self.pages.items()):
@@ -985,6 +998,45 @@ class Simd:
             self.error("%s: %s" % (kind, err))
         except (KeyError, TypeError, ValueError) as err:
             self.error("%s: malformed message (%s)" % (kind, err))
+
+    # ---- the driver's turns -------------------------------------------------
+
+    def take_floor(self):
+        """The driver has the floor: T stands until it yields."""
+        if self.driver is not None and not self.driver_floor and self.virtual:
+            self.driver_floor = True
+            self.ether.holds += 1
+
+    def give_floor(self):
+        """The driver yields, or has gone: T runs again."""
+        if self.driver_floor:
+            self.driver_floor = False
+            self.ether.release()
+
+    async def do_wait(self, msg):
+        """A driver's wait, answered at the instant it ends, so the driver
+        goes on at an instant of the run and not at whatever instant a look
+        at a clock report happened to catch: `until`, T in µs; or `for: up`,
+        until every station (or `names`) is up. A task of its own, as a
+        message put off with `after` is."""
+        async def wait():
+            if msg.get("until") is not None:
+                left = int(msg["until"]) - self.ether.now()
+                if left > 0:
+                    await self.sleep(left / 1e6)
+            elif msg.get("for") == "up":
+                names = msg.get("names")
+                while True:
+                    chosen = [s for n, s in self.stations.items()
+                              if names is None or n in names]
+                    wanted = set(names) if names is not None else set(self.firmware)
+                    if chosen and {s.name for s in chosen} >= wanted and all(
+                            s.status == stations_module.UP for s in chosen):
+                        break
+                    self.status_changed.clear()
+                    await self.status_changed.wait()
+            self.answered(msg, {})
+        asyncio.ensure_future(wait())
 
     def need_run(self):
         if self.run is None:
@@ -1621,6 +1673,18 @@ class Simd:
         self.pages[socket] = request.query.get("quiet", "") not in ("", "0")
         self.role_wake.set()
         await socket.send_str(json.dumps(self.snapshot()))
+        # A socket's messages are handled in the order they came, by a worker
+        # of its own, so that its `yield` is taken at once even while
+        # something it asked for is still being done (which may need T).
+        work = asyncio.Queue()
+
+        async def worker():
+            while True:
+                msg = await work.get()
+                if msg is None:
+                    return
+                await self.handle(msg)
+        handling = asyncio.ensure_future(worker())
         try:
             async for message in socket:
                 if message.type is WSMsgType.TEXT:
@@ -1628,10 +1692,34 @@ class Simd:
                         msg = json.loads(message.data)
                     except ValueError:
                         continue
-                    if isinstance(msg, dict):
-                        await self.handle(msg)
+                    if not isinstance(msg, dict):
+                        continue
+                    kind = msg.get("type")
+                    if kind == "drive":
+                        if self.driver is not None and self.driver is not socket:
+                            self.give_floor()
+                        self.driver = socket
+                        self.driver_ids.clear()
+                        self.take_floor()
+                        continue
+                    if kind == "yield":
+                        if socket is self.driver:
+                            self.give_floor()
+                        continue
+                    if socket is self.driver and msg.get("id") is not None:
+                        self.driver_ids.add(msg["id"])
+                    work.put_nowait(msg)
         finally:
             self.pages.pop(socket, None)
+            if socket is self.driver:
+                self.give_floor()
+                self.driver = None
+                self.driver_ids.clear()
+            work.put_nowait(None)
+            try:
+                await handling
+            except Exception:           # noqa: BLE001 - a handler's own error, logged there
+                pass
         return socket
 
     async def ws_console(self, request):

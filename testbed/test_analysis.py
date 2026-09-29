@@ -605,6 +605,7 @@ class FakeSim:
     def __init__(self, names):
         self.names = names
         self.got = []
+        self.turns = []                 # drive and yield, as they came
 
     async def handle(self, request):
         from aiohttp import web
@@ -618,7 +619,13 @@ class FakeSim:
                                       for i, n in enumerate(self.names)]})
         async for msg in ws:
             m = json.loads(msg.data)
+            if m["type"] in ("drive", "yield"):
+                self.turns.append(m["type"])
+                continue
             self.got.append(m)
+            if m["type"] == "wait":
+                await ws.send_json({"type": "command_result", "id": m.get("id"), "results": {},
+                                    "t": max(2_000_000, int(m.get("until") or 0))})
             if m["type"] in ("firmware", "first_boot"):
                 await ws.send_json({"type": "command_result", "id": m.get("id"), "results": {},
                                     "t": 2_000_000})
@@ -671,6 +678,7 @@ def test_a_driver_chooses_stations_and_asks_them(tmp_path):
         await sim.plan(("warm", 10))
 
     with_fake_sim(fake, drive)
+    assert fake.turns[0] == "drive"
     meta = [m for m in fake.got if m["type"] == "meta"][0]
     assert meta["verb"] == "announce" and meta["names"] == ["n02"] and meta["stagger"] == 30
     command = [m for m in fake.got if m["type"] == "command"][0]

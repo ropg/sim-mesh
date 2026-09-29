@@ -584,6 +584,51 @@ def test_a_console_that_need_not_be_a_terminal_is_a_pipe_each_way(tmp_path):
     asyncio.run(go())
 
 
+def test_a_driver_takes_turns_with_t(stores):
+    """A socket that says `drive` holds T while it has the floor: from then,
+    and from each answer to it, until it yields. Its waits are answered at
+    the instant they end, with the floor."""
+    import aiohttp
+    from aiohttp import web
+
+    async def go():
+        daemon = make_simd(stores, "--time", "max")
+        daemon.broadcast = simd.Simd.broadcast.__get__(daemon)     # the sockets hear it
+        await daemon.start_ether()
+        runner = web.AppRunner(daemon.app(), access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three"})
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect("http://127.0.0.1:%d/ws?quiet=1" % port) as ws:
+                await ws.receive()                          # the snapshot
+                daemon.ether.call_at(5_000_000, lambda: None)
+                await ws.send_json({"type": "drive"})
+                await asyncio.sleep(0.2)
+                assert daemon.ether.now() == 0              # the driver has the floor
+                await ws.send_json({"type": "wait", "until": 3_000_000, "id": "w1"})
+                await asyncio.sleep(0.2)
+                assert daemon.ether.now() == 0              # still: it has not yielded
+                await ws.send_json({"type": "yield"})
+                while True:
+                    msg = json.loads((await ws.receive()).data)
+                    if msg.get("type") == "command_result" and msg.get("id") == "w1":
+                        break
+                assert msg["t"] == 3_000_000
+                await asyncio.sleep(0.2)
+                assert daemon.ether.now() == 3_000_000      # answered: the floor is back
+                await ws.send_json({"type": "yield"})
+                await asyncio.sleep(0.2)
+                assert daemon.ether.now() == 5_000_000
+        await asyncio.sleep(0.1)
+        assert daemon.driver is None and not daemon.driver_floor
+        await runner.cleanup()
+        daemon.ether.close()
+    asyncio.run(go())
+
+
 def test_a_role_the_station_forgets_is_said_again_after_a_reset(stores, monkeypatch):
     monkeypatch.setattr(Stub, "role_volatile", True)
 
