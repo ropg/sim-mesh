@@ -110,6 +110,9 @@ def check(antenna, where):
             out["elevation_deg"] = max(-90.0, min(90.0, float(antenna.get("elevation_deg") or 0.0)))
         except (TypeError, ValueError) as err:
             raise store.StoreError("%s: an antenna's aim is in degrees" % where) from err
+        if not math.isfinite(out["azimuth_deg"]):
+            raise store.StoreError("%s: an antenna's azimuth_deg is a finite number of degrees, "
+                                   "not %r" % (where, antenna.get("azimuth_deg")))
     return out
 
 

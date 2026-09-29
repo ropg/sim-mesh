@@ -80,6 +80,25 @@ def test_names_ids_and_heights_are_checked_and_nodes_declare_nothing(tmp_path):
             nodeset.read(str(path))
 
 
+def test_a_number_no_file_could_hold_is_refused_where_it_is_read(tmp_path):
+    """NaN and infinity read as numbers, and store.scalar cannot write them:
+    a nodeset holding one loaded, and could then not be saved."""
+    node = ("nodes:\n  a: { id: 1, lat: %s, lon: %s, height_m: %s%s }\n"
+            "  b: { id: 2, lat: 0, lon: 1 }\n")
+    aimed = ", antenna: { type: panel_directional, azimuth_deg: .inf }"
+    for text, match in (
+            (node % (".nan", 0, 2, ""), "node a: lat is a finite number, not nan"),
+            (node % (0, "-.inf", 2, ""), "node a: lon is a finite number, not -inf"),
+            (node % (0, 0, ".inf", ""), "node a: height_m is a finite number, not inf"),
+            (node % (0, 0, 2, aimed), "node a: an antenna's azimuth_deg is a finite number"),
+            (node % (0, 0, 2, "") + "offsets:\n  - { between: [a, b], db: .nan }\n",
+             "offset between a and b states db nan")):
+        path = tmp_path / "f.yaml"
+        path.write_text(text)
+        with pytest.raises(store.StoreError, match=match):
+            nodeset.read(str(path))
+
+
 def test_edits_mark_it_dirty_and_ids_are_the_lowest_free(nodesets_dir):
     ns = nodeset.create("new")
     assert ns.add_node("a", 0.0, 0.0)["id"] == 1
