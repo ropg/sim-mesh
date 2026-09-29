@@ -950,6 +950,7 @@ class Ether(asyncio.DatagramProtocol):
         batch = sorted(self.pending, key=lambda p: (p[0], p[1]))
         self.pending = []
         for sid, _, addr, msg in batch:
+            self.write_record("in", sid, msg)
             if sid not in self.stations:
                 continue
             kind = msg.get("type")
@@ -1405,7 +1406,12 @@ class Ether(asyncio.DatagramProtocol):
             return
         sid = msg.get("sid")
         kind = msg.get("type")
-        if kind not in ("idle", "wrote", "read", "floor"):
+        # What is held for the barrier (a virtual run's state and tx) goes into
+        # the record when it is taken, in station order (flush_pending): two
+        # stations saying something at one instant arrive in whichever order
+        # the host ran them.
+        held = self.clock.virtual and kind in ("state", "tx")
+        if kind not in ("idle", "wrote", "read", "floor") and not held:
             self.write_record("in", sid, msg)
         if not isinstance(sid, int):
             return
