@@ -259,7 +259,13 @@ def test_main_reads_what_is_written_and_prices_every_pair_as_the_old_ether(tmp_p
     assert "\nWarnings: " in (out / "conversion.txt").read_text()
     # Every pair without a stated link, priced by main's table with the
     # antennas and offsets on it, is what the old ether priced it at:
-    # FSPL(1 m) + 10·n·log10(d) + wall - G_a - G_b.
+    # FSPL(1 m) + 10·n·log10(d) + wall - G_a - G_b. Shadowing is left out:
+    # the old ether drew it by station id and main draws it by node name
+    # (losses.with_shadowing), so one seed is other ground of the same spread.
+    plain = tmp_path / "plain.yaml"
+    plain.write_text("".join(line for line in (out / "geodata" / "mixed.yaml").read_text()
+                             .splitlines(keepends=True) if not line.startswith("shadowing_")))
+    gd = geodata.read(str(plain))
     table = losses.medium_tables({"868": losses.synthetic_table(gd, ns, "868")}, gd, ns)["868"]
     linked = {frozenset(l["between"]) for l in raw["links"]}
     walls = {frozenset(w["between"]): w["db"] for w in MIXED["obstructions"]}
