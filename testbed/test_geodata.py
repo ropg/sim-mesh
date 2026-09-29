@@ -123,6 +123,19 @@ def test_a_ground_figure_no_file_could_hold_is_refused(tmp_path):
             geodata.read(str(path))
 
 
+def test_a_ground_figure_that_is_no_number_is_refused_by_its_key(tmp_path):
+    # float() of a word raised a ValueError, and of nothing a TypeError,
+    # where every other bad value is a StoreError naming its key.
+    path = tmp_path / "g.yaml"
+    for ground, match in (("{ extent_m: wide }", "extent_m is a number, not 'wide'"),
+                          ("{ exponent: steep }", "exponent is a number, not 'steep'"),
+                          ("{ extent_m: null }", "extent_m is a number, not None"),
+                          ("{ exponent: [2, 3] }", r"exponent is a number, not \[2, 3\]")):
+        path.write_text("synthetic: %s\n" % ground)
+        with pytest.raises(store.StoreError, match=match):
+            geodata.read(str(path))
+
+
 def test_a_copied_pack_still_names_its_pack(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
     pack = write_pack(tmp_path)
