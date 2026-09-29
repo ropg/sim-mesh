@@ -1316,8 +1316,9 @@ tick drift a loaded host adds makes it unreproducible for reasons that have
 nothing to do with the protocol.
 
 In real time `esp_timer` is `CLOCK_MONOTONIC` in microseconds from the first
-reading, and every timed event in the model — the instant a preamble ends, a
-header lands, a frame finishes — is a one-shot on the backend's timer. The
+reading, and every timed event in the model — the instant a preamble is found,
+a sync word ends, a header lands, a frame finishes — is a one-shot on the
+backend's timer. The
 FreeRTOS tick is 100 Hz while a task runs and stops while every task is
 blocked, so nothing is accurate below ten milliseconds; the
 frames the driver sends take tens to hundreds of milliseconds, which is why
