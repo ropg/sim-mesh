@@ -269,6 +269,8 @@ enum ProgressiveSweep {
     Idle,
     Running {
         key: CoverageKey,
+        /// Bands in this sweep: the ladder's, or one for a `whole` sweep.
+        bands: usize,
         /// Bands finished so far, and the radius of the last one.
         done: usize,
         band_radius_m: f64,
@@ -2029,6 +2031,13 @@ struct LossQuery {
     radius_km: f64,
     #[serde(default = "d_budget")]
     budget_db: f32,
+    /// Sweep the whole radius in one band, without the inner bands a map
+    /// paints while it waits. Every band is a complete sweep of its own
+    /// radius, computed afresh, so the last one is the same raster either
+    /// way: a caller that keeps only that one, as SIMesh's coverage does,
+    /// asks this and is spared the rest of the ladder.
+    #[serde(default)]
+    whole: bool,
     /// Radials to sweep. Omit for the resolution-matched count.
     ///
     /// Exposed because the right value is a MEASUREMENT, not a constant: the
@@ -2441,10 +2450,12 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
     // the instant the caller is told the sweep began.
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started = std::time::Instant::now();
+    let bands: &'static [f64] = if q.whole { &[1.0] } else { SWEEP_BANDS };
     {
         let mut g = st.sweep.lock().await;
         *g = ProgressiveSweep::Running {
             key,
+            bands: bands.len(),
             done: 0,
             band_radius_m: 0.0,
             started: Some(started),
@@ -2475,7 +2486,7 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        for (i, frac) in SWEEP_BANDS.iter().enumerate() {
+        for (i, frac) in bands.iter().enumerate() {
             let band_m = (radius_m * frac).max(cell_m * 8.0);
             let t0 = std::time::Instant::now();
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2498,6 +2509,7 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
                     if matches!(&*g, ProgressiveSweep::Running { key: k, .. } if *k == key) {
                         *g = ProgressiveSweep::Running {
                             key,
+                            bands: bands.len(),
                             done: i + 1,
                             band_radius_m: band_m,
                             started: Some(started),
@@ -2535,7 +2547,7 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
         }
     });
     axum::Json(serde_json::json!({
-        "state": "running", "bands": SWEEP_BANDS.len(), "done": 0
+        "state": "running", "bands": bands.len(), "done": 0
     }))
     .into_response()
 }
@@ -2556,10 +2568,10 @@ fn sweep_status(
             "state": "idle", "band_km": band_km, "bands": SWEEP_BANDS.len(),
             "done": if band_km > 0.0 { SWEEP_BANDS.len() } else { 0 }
         }),
-        ProgressiveSweep::Running { done, band_radius_m, started, .. } => serde_json::json!({
+        ProgressiveSweep::Running { bands, done, band_radius_m, started, .. } => serde_json::json!({
             "state": "running",
             "done": done,
-            "bands": SWEEP_BANDS.len(),
+            "bands": bands,
             "band_km": band_radius_m / 1000.0,
             "ready_km": band_km,
             "elapsed_s": started.map(|t| t.elapsed().as_secs()).unwrap_or(0),
@@ -4045,6 +4057,8 @@ async fn pack_info(State(st): State<Arc<AppState>>) -> Response {
         // asks for it only of a sidecar that has it: the query refuses a name
         // it does not know.
         "link_options": ["lean"],
+        // And what `/loss/start` takes beyond the page's.
+        "loss_options": ["whole"],
         "licenses": st.manifest.licenses.iter()
             .map(|l| serde_json::json!({"source": l.source, "notice": l.notice}))
             .collect::<Vec<_>>(),
