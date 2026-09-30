@@ -1243,6 +1243,15 @@ carries, which in a virtual-time run also keys every station's randomness,
 and the wall clock T 0 stands for; two runs of one network given both draw the
 same random bytes and the same timestamps).
 
+simd places each station on one CPU, in turn over the CPUs it may use, and
+every station talks to the ether hundreds of thousands of times a run. On a
+machine whose cores do not all share one last-level cache (an AMD EPYC or a
+Ryzen with several core complexes), starting simd under `taskset` to CPUs that
+share one keeps that talk inside the cache: a 173-station run took a fifth
+less time and a seventh less CPU so, record for record the same. Whether a
+run's load fits in those CPUs is the operator's to judge, so simd does not
+choose them.
+
 A simd started beside the front, or beside another, needs its own port,
 ether, station addresses and run directory, because every station binds its
 own address, two stations on one address are one port taken twice, and two
