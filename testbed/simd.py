@@ -398,7 +398,8 @@ class Simd:
             os.makedirs(record_dir, exist_ok=True)
             record = os.path.join(record_dir, "record.tsv")
         bind = ether_module.parse_bind(self.ether_addr)
-        physics = ether_module.Physics(self.args.noise_figure, self.args.crc_margin_db)
+        physics = ether_module.Physics(self.args.noise_figure, self.args.crc_margin_db,
+                                       interference=not self.args.no_interference)
         self.ether_transport, self.ether = await ether_module.open_ether(
             bind, record, physics=physics, time_mode=self.args.time,
             pairwise=self.args.pairwise, seed=self.args.seed, epoch=self.args.epoch,
@@ -1982,6 +1983,11 @@ def parse_args(argv):
                     help="the CRC band: how far above its threshold a frame may still "
                          "fail its CRC, the chance falling linearly to nothing "
                          "(default %g: none)" % ether_module.DEFAULT_CRC_MARGIN_DB)
+    ap.add_argument("--no-interference", action="store_true",
+                    help="an oracle: the ether judges every frame against noise alone "
+                         "and never takes a receiver off the frame it follows; what "
+                         "overlapping frames cost a run is its delivery with this less "
+                         "without")
     ap.add_argument("--seed", type=int,
                     help="the ether's seed, which its welcome hands every station "
                          "(default: drawn at random)")
