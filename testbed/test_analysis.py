@@ -886,3 +886,55 @@ def test_the_schedule_is_the_seed_s():
     one = rtraffic.schedule(["a", "b", "c"], 17, 30, 5, "G")
     assert one == rtraffic.schedule(["c", "b", "a"], 17, 30, 5, "G")
     assert [s[0] for s in one] == [1, 2, 3, 4, 5, 6] and all(s[2] != s[3] for s in one)
+
+
+def the_schedule_as_it_was(names, seed, duration, every, marker):
+    """traffic.schedule before its variants, word for word."""
+    import random
+    rng = random.Random(seed)
+    names = sorted(names)
+    out = []
+    n = 0
+    while n * every < duration:
+        src = rng.choice(names)
+        dst = rng.choice([s for s in names if s != src])
+        cls = rng.choice(rtraffic.CLASSES)
+        out.append((n + 1, n * every, src, dst, cls,
+                    rtraffic.body(rng, cls, "%s%04d" % (marker, n + 1))))
+        n += 1
+    return out
+
+
+def test_the_default_schedule_is_the_one_it_always_was():
+    names = ["n%02d" % i for i in range(1, 28)]
+    for seed in (17, 101, 102, 103):
+        assert rtraffic.schedule(names, seed, 1800, 5.0, "G") == \
+            the_schedule_as_it_was(names, seed, 1800, 5.0, "G")
+
+
+def test_the_variants_keep_the_messages_and_change_when_and_between_whom():
+    names = ["n%02d" % i for i in range(1, 11)]
+    even = rtraffic.schedule(names, 7, 3600, 5.0, "G")
+    texts = [(s[4], s[5]) for s in even]
+
+    poisson = rtraffic.schedule(names, 7, 3600, 5.0, "G", arrivals="poisson")
+    ats = [s[1] for s in poisson]
+    assert ats[0] == 0 and ats == sorted(ats) and ats[-1] < 3600
+    assert 600 < len(poisson) < 840                 # 720 expected, a rate of one per 5 s
+    k = min(len(poisson), len(texts))
+    assert [(s[4], s[5]) for s in poisson][:k] == texts[:k]
+    assert poisson == rtraffic.schedule(names, 7, 3600, 5.0, "G", arrivals="poisson")
+
+    paired = rtraffic.schedule(names, 7, 3600, 5.0, "G", pairs=3)
+    assert len({(s[2], s[3]) for s in paired}) <= 3 and all(s[2] != s[3] for s in paired)
+    assert [(s[4], s[5]) for s in paired] == texts and [s[1] for s in paired] == [s[1] for s in even]
+
+    hubbed = rtraffic.schedule(names, 7, 3600, 5.0, "G", hub="n01", hub_share=0.5)
+    others = [s for s in hubbed if s[2] != "n01"]
+    share = sum(1 for s in others if s[3] == "n01") / len(others)
+    assert 0.45 < share < 0.62 and all(s[2] != s[3] for s in hubbed)
+    assert [(s[4], s[5]) for s in hubbed] == texts
+
+    for bad in ({"arrivals": "bursty"}, {"hub": "nobody"}, {"hub_share": 2}, {"pairs": -1}):
+        with pytest.raises(ValueError):
+            rtraffic.schedule(names, 7, 60, 5.0, "G", **bad)

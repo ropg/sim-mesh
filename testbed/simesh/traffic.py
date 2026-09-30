@@ -27,7 +27,10 @@ Phases, each skipped when its option says so:
             `message` meta command, `send_msg`), the sender, recipient,
             size class and text all drawn from `seed`, so two runs with one
             seed and one set of station names send the same messages at the
-            same instants after the traffic starts. Each send is preceded
+            same instants after the traffic starts. `arrivals`
+            "poisson", `pairs` and `hub` vary when the messages go and
+            between whom, keeping the messages themselves (`schedule`).
+            Each send is preceded
             by the `path` meta command at the sender, the route length at
             send time where the kind can say it. Size classes: short 20-55
             characters, two-frame 115-300, and 420-650 (over 500 B on the
@@ -60,7 +63,9 @@ from simesh.sim import SimError
 OPTIONS = {"warm_rounds": 3, "warm_spread": 300.0, "warm_gap": 120.0,
            "settle_every": 180.0, "settle_max": 3600.0, "warm_snapshot": None,
            "traffic": 3600.0, "every": 5.0, "seed": 17, "marker": "G", "drain": 600.0,
-           "gather": None, "end_snapshot": None}
+           "gather": None, "end_snapshot": None,
+           "arrivals": "even", "hub": None, "hub_share": 0.5, "pairs": 0}
+ARRIVALS = ("even", "poisson")
 
 WORDS = ("mesh relay gateway lora packet announce proof link path hop station "
          "field city river bridge north south east west signal").split()
@@ -82,17 +87,58 @@ def body(rng, cls, marker):
     return text[:n]
 
 
-def schedule(names, seed, duration, every, marker):
-    """The traffic: (n, at, src, dst, cls, text), at in seconds after its start."""
-    rng = random.Random(seed)
+def schedule(names, seed, duration, every, marker, arrivals="even", hub=None,
+             hub_share=0.5, pairs=0):
+    """The traffic: (n, at, src, dst, cls, text), at in seconds after its start.
+
+    By default one message every `every` seconds, its sender, recipient, size
+    class and text drawn from `seed`, in that order, from one stream. The
+    variants draw from streams of their own, so the messages stay the ones
+    the default draws, the same texts of the same classes in the same order,
+    and only when they go and between whom changes:
+
+    - arrivals "poisson": the gaps between sends drawn exponential with mean
+      `every`, the first at the start, as many as fall within `duration`;
+    - pairs > 0: every message between one of `pairs` sender-recipient pairs
+      drawn once, taken in turn, like that many conversations at once;
+    - hub: a share `hub_share` of the messages whose sender is not `hub` go to
+      it instead, as to a gateway or a dispatcher.
+    """
+    if arrivals not in ARRIVALS:
+        raise ValueError("arrivals are %s, not %r" % (" or ".join(ARRIVALS), arrivals))
     names = sorted(names)
+    if hub is not None and hub not in names:
+        raise ValueError("the hub %r is not one of the senders" % hub)
+    if not 0.0 <= float(hub_share) <= 1.0:
+        raise ValueError("a hub share is between 0 and 1, not %r" % hub_share)
+    if int(pairs) < 0:
+        raise ValueError("pairs is a count, not %r" % pairs)
+    rng = random.Random(seed)
+    times = random.Random("%s:arrivals" % seed)
+    ends = random.Random("%s:endpoints" % seed)
+    fixed = []
+    for _ in range(int(pairs)):
+        src = ends.choice(names)
+        fixed.append((src, ends.choice([s for s in names if s != src])))
     out = []
     n = 0
-    while n * every < duration:
+    at = 0.0
+    while True:
+        if arrivals == "even":
+            at = n * every
+        elif n:
+            at += times.expovariate(1.0 / every)
+        if at >= duration:
+            break
         src = rng.choice(names)
         dst = rng.choice([s for s in names if s != src])
         cls = rng.choice(CLASSES)
-        out.append((n + 1, n * every, src, dst, cls, body(rng, cls, "%s%04d" % (marker, n + 1))))
+        text = body(rng, cls, "%s%04d" % (marker, n + 1))
+        if fixed:
+            src, dst = fixed[n % len(fixed)]
+        if hub is not None and src != hub and ends.random() < float(hub_share):
+            dst = hub
+        out.append((n + 1, at, src, dst, cls, text))
         n += 1
     return out
 
@@ -241,7 +287,8 @@ async def run_phases(opts, sim, result, phase, dump):
         phase("warm_snapshot")
 
     if opts.traffic > 0:
-        plan = schedule(senders, opts.seed, opts.traffic, opts.every, opts.marker)
+        plan = schedule(senders, opts.seed, opts.traffic, opts.every, opts.marker,
+                        opts.arrivals, opts.hub, opts.hub_share, opts.pairs)
         start = sim.run_s + 1.0
         result["traffic_start_run_s"] = start
         await send_plan(start - 1.0)
