@@ -289,7 +289,7 @@ def check_id(node_id):
 def read(path):
     try:
         with open(path, encoding="utf-8") as handle:
-            data = yaml.safe_load(handle) or {}
+            data = store.load_yaml(handle) or {}
     except (OSError, yaml.YAMLError) as err:
         raise store.StoreError("%s: %s" % (path, err)) from err
     return parse(data, path)
