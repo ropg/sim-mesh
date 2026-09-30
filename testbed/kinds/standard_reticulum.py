@@ -4,9 +4,9 @@ reference implementation and an LXMF router behind it
 
 Its device's `elf` is station.py, and it names the RNode among its tools,
 `tools: { rnode: <path> }`: microReticulum_Firmware's Linux daemon built with
-`[env:simesh-rnode]`, whose own stack is never started, so the radio is the
+`[env:sim-mesh-rnode]`, whose own stack is never started, so the radio is the
 host's alone, as on the standard RNode firmware. The station needs a
-python3 with Reticulum (`rns`) and LXMF (`lxmf`), which SIMesh's image has.
+python3 with Reticulum (`rns`) and LXMF (`lxmf`), which sim-mesh's image has.
 
 Two processes of a station join a virtual-time run: the RNode as the node's
 own id, which is the radio the loss tables know, and station.py as a station
@@ -70,8 +70,8 @@ class StandardReticulum(Kind):
         if station.clock is not None:
             # Plain processes: the time shim says each is idle when all its
             # threads are blocked.
-            env["SIMESH_IDLE"] = "threads"
-        env.update(SIMESH_NODE_ID=str(station.node_id + COMPANION),
+            env["SIM_MESH_IDLE"] = "threads"
+        env.update(SIM_MESH_NODE_ID=str(station.node_id + COMPANION),
                    SR_RNODE_ID=str(station.node_id),
                    SR_RNODE=self.tools.get("rnode") or "",
                    SR_SIMRADIO=SIMRADIO,

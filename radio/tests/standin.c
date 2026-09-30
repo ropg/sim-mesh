@@ -22,7 +22,7 @@
  *                              thing, before the chip library is opened
  *     tcp <text>               what came back over TCP for a console line,
  *                              given a second argument (relay, below)
- *     listening <port>         the port it listens on at SIMESH_BIND_ADDR,
+ *     listening <port>         the port it listens on at SIM_MESH_BIND_ADDR,
  *                              given a second argument
  */
 /* sem_clockwait is a GNU extension: without this <semaphore.h> does not
@@ -235,7 +235,7 @@ int main(int argc, char** argv)
     if (argc > 2) {
         pthread_t r;
         pthread_create(&r, NULL, relay, argv[2]);
-        const char* own = getenv("SIMESH_BIND_ADDR");
+        const char* own = getenv("SIM_MESH_BIND_ADDR");
         int l = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in at = { 0 };
         at.sin_family = AF_INET;

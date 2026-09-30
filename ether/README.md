@@ -163,12 +163,12 @@ Each call swaps what it changes in whole, between two events, so no frame is
 ruled on half a table; until it is made the old figures stand. The tables
 handed in are never written to.
 
-The gains are one figure per station, the same in every direction. SIMesh's
+The gains are one figure per station, the same in every direction. sim-mesh's
 testbed gives none: its antennas have patterns, so it takes each pair's gains
 off that pair's loss before it hands the tables over (`losses.with_antennas`).
 
 Run alone, `--nodeset` names the nodes, their ids and `antenna.gain_dbi` (a
-file of the ether's own: a SIMesh nodeset's antenna is a type, and gives 0),
+file of the ether's own: a sim-mesh nodeset's antenna is a type, and gives 0),
 and `--losses` is the directory holding `<band>.bin` for each band computed.
 `--geodata` is named in the log and read for nothing else: the tables already
 belong to it. The tables are handed over as they are: whatever links and
@@ -327,14 +327,14 @@ sends — a `state`, a `tx`, a second `hello` — means it is not idle.
 
 The conductor is the barrier above, and most of what the ether does in a
 virtual-time run: a few microseconds of work at every one of hundreds of
-thousands of instants. [`core/`](core/) does it in Rust (`simesh build
+thousands of instants. [`core/`](core/) does it in Rust (`sim-mesh build
 ether`, into `build/`), in the event loop's thread, on the ether's socket:
 T, the stations' numbering and idles, the resend buffer, the barrier itself,
 and whether the stations that just ran printed anything. Everything else —
 the medium, the ether's timers, hello, the channels, the testbed's holds —
 stays in `ether.py`, called at the same points as before, so the run is the
 same: `Ether`'s own conductor is the reference, and the two give the same
-record. `SIMESH_ETHER_CORE=python` runs `Ether`'s, `rust` the core (an error
+record. `SIM_MESH_ETHER_CORE=python` runs `Ether`'s, `rust` the core (an error
 when it is not built); unset, the core runs when it is built.
 
 A station that stays busy cannot stop T for good: its own side reports idle

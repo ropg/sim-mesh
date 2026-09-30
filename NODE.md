@@ -5,8 +5,8 @@ architecture: an executable, whatever else it needs, and a `node.yaml` that
 says what they are.
 
 ```
-catalogue/index.html ── <a href="<slug>_hw-simesh-<arch>_<stamp>.zip"> ──► reader
-reader ── GET <slug>_hw-simesh-<arch>_<stamp>.zip ──► catalogue
+catalogue/index.html ── <a href="<slug>_hw-sim-mesh-<arch>_<stamp>.zip"> ──► reader
+reader ── GET <slug>_hw-sim-mesh-<arch>_<stamp>.zip ──► catalogue
 reader: unzip, read node.yaml, check arch and stamp, run <elf> as its kind says
 ```
 
@@ -21,7 +21,7 @@ A zip archive. In a catalogue it is named in the catalogue image format:
 - `<slug>` is the project's name, lower case, with every run of characters
   other than `a`–`z` and `0`–`9` made one `-` and a leading or trailing `-`
   dropped (`builds` when nothing is left). It holds no `_`.
-- `<entry>` is `hw-simesh-<arch>`, where `<arch>` is the architecture as
+- `<entry>` is `hw-sim-mesh-<arch>`, where `<arch>` is the architecture as
   `uname -m` names it on Linux: `aarch64` or `x86_64`.
 - `<stamp>` is the build stamp: the UTC time of the build as
   `YYYYMMDDhhmmss`, digits only. A later stamp is a later build, compared as
@@ -86,7 +86,7 @@ virtual_hardware: ESP32-S3
 virtual_radio: SX1262
 project: Reticulous
 catalogue: dev
-entry: hw-simesh-aarch64
+entry: hw-sim-mesh-aarch64
 libc: "2.39"
 ```
 
@@ -111,7 +111,7 @@ A catalogue lists its images in `index.html`, one `<a href>` per image, the
 href relative to the listing. A device file is listed like any other image,
 its anchor carrying `data-target="linux"` where a chip image's carries its
 chip, so a reader that flashes chips leaves it out without fetching it. A
-reader of device files finds them by the `hw-simesh-` prefix of the entry
+reader of device files finds them by the `hw-sim-mesh-` prefix of the entry
 and takes the highest stamps per entry.
 
 ## Expanded

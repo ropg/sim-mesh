@@ -405,7 +405,7 @@ async def estimated_heights(gd, points, base_url, session=None, notice=None):
                 async with session.get(car.base + "/height.json", params=params) as resp:
                     if resp.status == 404:
                         raise LossError("the planner sidecar at %s has no height estimate: "
-                                        "simesh build planner" % base_url)
+                                        "sim-mesh build planner" % base_url)
                     if resp.status != 200:
                         raise LossError("height.json answered %d: %s"
                                         % (resp.status, (await resp.text()).strip()[:200]))

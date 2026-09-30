@@ -838,10 +838,10 @@ mod tests {
         assert_eq!(small_uint(f64::NAN), None);
     }
 
-    /// A saved copy of the advert map: `SIMESH_MESHCORE_SNAPSHOT` when set,
+    /// A saved copy of the advert map: `SIM_MESH_MESHCORE_SNAPSHOT` when set,
     /// else the front's download cache.
     fn snapshot_path() -> std::path::PathBuf {
-        std::env::var_os("SIMESH_MESHCORE_SNAPSHOT").map(Into::into).unwrap_or_else(|| {
+        std::env::var_os("SIM_MESH_MESHCORE_SNAPSHOT").map(Into::into).unwrap_or_else(|| {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../testbed/geodata/.cache/meshcore/nodes.json")
         })

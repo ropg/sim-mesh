@@ -44,7 +44,7 @@ let socket: WebSocket | null = null
 let observer: ResizeObserver | null = null
 
 const BASE_FONT = 10
-const ZOOM_KEY = 'simesh.console.zoom'
+const ZOOM_KEY = 'sim-mesh.console.zoom'
 function storedZoom() {
   try { return Number(localStorage.getItem(ZOOM_KEY)) || 0 } catch { return 0 }
 }

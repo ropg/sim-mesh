@@ -218,7 +218,7 @@ def test_a_bare_planner_pack_loses_its_nodes_on_the_way_in(tmp_path, monkeypatch
     assert [n["source"] for n in gd.manifest["licenses"]] == ["Copernicus GLO-30 DSM"]
 
 
-def test_geodata_goes_out_and_comes_back_as_a_simesh_geodata_pack(tmp_path, monkeypatch):
+def test_geodata_goes_out_and_comes_back_as_a_sim_mesh_geodata_pack(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
     pack = tmp_path / "geodata" / "city"
     (pack / "sub").mkdir(parents=True)

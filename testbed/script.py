@@ -1,9 +1,9 @@
-"""Scripts: plain Python against the simesh library, run from top to end.
+"""Scripts: plain Python against the sim-mesh library, run from top to end.
 
     testbed/scripts/<name>.py
 
     '''What this script is for, in its first line.'''
-    from simesh import *
+    from sim_mesh import *
 
     time("real")
     firmware("all", "reticulous_dev_latest")
@@ -13,9 +13,9 @@
     announce(nodes(tag="lora"), spread=300)
 
 A script says what its simulation runs and what is done to it, in order
-(simesh.library is the whole of it): declarations first, then whatever it
+(sim_mesh.library is the whole of it): declarations first, then whatever it
 does, the first of which starts its simulation. It is run by the runner
-(simesh.runner), a process of its own, never inside simd: what a station
+(sim_mesh.runner), a process of its own, never inside simd: what a station
 is given at its first boot travels to simd as data, `on_first_boot()`'s
 rules, not as the script's code. A script may define `report(run_dir)`,
 which returns the run's report as Markdown once the script has run to its
@@ -46,7 +46,7 @@ import store
 
 REPORT = "report"
 DEFAULT_TEXT = '''"""A new script."""
-from simesh import *
+from sim_mesh import *
 
 time("real")
 firmware("all", "reticulous_dev_latest")
@@ -60,7 +60,7 @@ GLOBALS = "globals"
 # coverage and links, the loss tables' band and the analysis take as given.
 SHARED = (("FREQ_MHZ", float), ("SF", int), ("BW_KHZ", float), ("CR", int))
 NODESET_SETUP_TEXT = '''"""{name}'s own setup: what only this nodeset's nodes need."""
-from simesh import *
+from sim_mesh import *
 '''
 
 
@@ -147,9 +147,9 @@ def has_report(tree):
 
 
 def references(tree, seen=None):
-    """The files a script imports or includes that are SIMesh's own, and
+    """The files a script imports or includes that are sim-mesh's own, and
     those they import or include in turn: other scripts of the store, and
-    the simesh library's modules, as [{name, path, library}], `name` as the
+    the sim-mesh library's modules, as [{name, path, library}], `name` as the
     script spells it. An include whose path is not written out (one per
     nodeset, say) is not followed: nothing but running it says which."""
     wanted = []
@@ -184,12 +184,12 @@ def references(tree, seen=None):
 
 
 def module_file(name):
-    """The file of a module a script imports, when it is one of SIMesh's
+    """The file of a module a script imports, when it is one of sim-mesh's
     own (the library or another script), else None."""
     parts = name.split(".")
-    if parts == ["simesh"]:
-        parts = ["simesh", "library"]       # what `from simesh import *` is
-    if parts[0] == "simesh":
+    if parts == ["sim_mesh"]:
+        parts = ["sim_mesh", "library"]       # what `from sim_mesh import *` is
+    if parts[0] == "sim_mesh":
         base = os.path.join(store.SIM_DIR, *parts)
     elif len(parts) == 1:
         base = os.path.join(os.path.abspath(store.SCRIPTS_DIR), parts[0])
@@ -243,7 +243,7 @@ def read(name):
 def read_reference(relpath):
     """A file a script refers to, by its path under testbed/: its text."""
     path = os.path.abspath(os.path.join(store.SIM_DIR, relpath))
-    lib = os.path.join(os.path.abspath(store.SIM_DIR), "simesh") + os.sep
+    lib = os.path.join(os.path.abspath(store.SIM_DIR), "sim_mesh") + os.sep
     scripts = os.path.abspath(store.SCRIPTS_DIR) + os.sep
     if not path.endswith(".py") or not (path.startswith(lib) or path.startswith(scripts)):
         raise store.StoreError("%s is not the library's or a script" % relpath)
@@ -268,7 +268,7 @@ def _module(path, name):
         if where not in sys.path:
             sys.path.insert(0, where)
     spec = importlib.util.spec_from_file_location(
-        "simesh_script_%s" % name.replace("-", "_"), path)
+        "sim_mesh_script_%s" % name.replace("-", "_"), path)
     return spec, importlib.util.module_from_spec(spec)
 
 

@@ -59,7 +59,7 @@ export interface NodesetRow {
   error?: string
 }
 
-/** A file a script imports that is SIMesh's own: the library's (read-only
+/** A file a script imports that is sim-mesh's own: the library's (read-only
  *  here) or another script's. */
 export interface ScriptReference { name: string; path: string; library: boolean }
 

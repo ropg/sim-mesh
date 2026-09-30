@@ -276,16 +276,16 @@ def pairwise(tmp_path):
 
 
 # The conductors a virtual-time run can have: Ether's own, and ether_core's
-# when it is built (`simesh build ether`); every virtual-time test runs on each.
+# when it is built (`sim-mesh build ether`); every virtual-time test runs on each.
 CORE_BUILT = os.path.exists(ether_module.CORE_PATH)
 CONDUCTORS = ["python", pytest.param("rust", marks=pytest.mark.skipif(
-    not CORE_BUILT, reason="no ether core built (simesh build ether)"))]
+    not CORE_BUILT, reason="no ether core built (sim-mesh build ether)"))]
 
 
 @pytest.fixture(params=CONDUCTORS)
 def conductor(tmp_path, request, monkeypatch):
     """The ether in virtual time, as fast as its stations let it go."""
-    monkeypatch.setenv("SIMESH_ETHER_CORE", request.param)
+    monkeypatch.setenv("SIM_MESH_ETHER_CORE", request.param)
     bed = Bench(tmp_path, "max")
     try:
         yield bed
@@ -1714,8 +1714,8 @@ def in_process(test, conductors=None):
     """Run `test` on an in-process ether, once for each conductor built (or
     each of `conductors`)."""
     for conductor in conductors or (("python", "rust") if CORE_BUILT else ("python",)):
-        before = os.environ.get("SIMESH_ETHER_CORE")
-        os.environ["SIMESH_ETHER_CORE"] = conductor
+        before = os.environ.get("SIM_MESH_ETHER_CORE")
+        os.environ["SIM_MESH_ETHER_CORE"] = conductor
         loop = asyncio.new_event_loop()
         try:
             bed = InProcess(loop)
@@ -1728,9 +1728,9 @@ def in_process(test, conductors=None):
         finally:
             loop.close()
             if before is None:
-                os.environ.pop("SIMESH_ETHER_CORE", None)
+                os.environ.pop("SIM_MESH_ETHER_CORE", None)
             else:
-                os.environ["SIMESH_ETHER_CORE"] = before
+                os.environ["SIM_MESH_ETHER_CORE"] = before
 
 
 def test_a_station_that_takes_lines_is_told_an_instant_in_one_datagram():
@@ -1974,7 +1974,7 @@ def test_a_watched_console_holds_t_only_once_it_has_printed():
     in_process(test)
 
 
-@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (simesh build ether)")
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim-mesh build ether)")
 def test_a_burst_the_kernel_could_not_hold_is_heard_whole_by_the_core():
     """The core's reader thread takes datagrams off the socket as they come,
     whatever the loop's thread is doing: a burst far past the kernel's receive
@@ -2004,7 +2004,7 @@ def test_a_burst_the_kernel_could_not_hold_is_heard_whole_by_the_core():
     in_process(test, conductors=("rust",))
 
 
-@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (simesh build ether)")
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim-mesh build ether)")
 def test_datagrams_that_come_while_the_core_is_handling_others_are_all_heard():
     """Datagrams keep coming from another thread while the loop handles the
     ones before them: every one is heard, none left queued with nothing to
@@ -2035,7 +2035,7 @@ def test_datagrams_that_come_while_the_core_is_handling_others_are_all_heard():
     in_process(test, conductors=("rust",))
 
 
-@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (simesh build ether)")
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim-mesh build ether)")
 def test_the_core_counts_what_the_kernel_dropped_on_its_socket():
     """Datagrams the kernel could not hold before anyone read them are
     counted, from what it says with the next one (SO_RXQ_OVFL), and simd
@@ -2064,15 +2064,15 @@ def test_the_core_counts_what_the_kernel_dropped_on_its_socket():
         finally:
             sender.close()
 
-    before = os.environ.get("SIMESH_ETHER_CORE")
-    os.environ["SIMESH_ETHER_CORE"] = "rust"
+    before = os.environ.get("SIM_MESH_ETHER_CORE")
+    os.environ["SIM_MESH_ETHER_CORE"] = "rust"
     try:
         asyncio.run(test())
     finally:
         if before is None:
-            os.environ.pop("SIMESH_ETHER_CORE", None)
+            os.environ.pop("SIM_MESH_ETHER_CORE", None)
         else:
-            os.environ["SIMESH_ETHER_CORE"] = before
+            os.environ["SIM_MESH_ETHER_CORE"] = before
 
 
 def test_what_stations_printed_is_read_before_t_moves():

@@ -1006,7 +1006,7 @@ mod tests {
         // actual scraped population rather than against a remembered figure.
         // Skipped rather than failed when the cache is absent, the same rule
         // the importer's real-data tests already use.
-        let path = std::env::var_os("SIMESH_MESHCORE_SNAPSHOT").map(std::path::PathBuf::from).unwrap_or_else(|| {
+        let path = std::env::var_os("SIM_MESH_MESHCORE_SNAPSHOT").map(std::path::PathBuf::from).unwrap_or_else(|| {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../testbed/geodata/.cache/meshcore/nodes.json")
         });

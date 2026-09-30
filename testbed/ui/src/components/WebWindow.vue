@@ -37,7 +37,7 @@ defineEmits<{ 'update:visible': [value: boolean] }>()
 
 const STEPS = [0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2]
 const DEFAULT_STEP = STEPS.indexOf(0.75)
-const ZOOM_KEY = 'simesh.web.zoom'
+const ZOOM_KEY = 'sim-mesh.web.zoom'
 
 function storedStep() {
   try {

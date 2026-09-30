@@ -1,7 +1,7 @@
 /**
  * libsimclock.so — the C library's time, answered in node time.
  *
- * Preloaded into a station started for a virtual-time run (SIMESH_TIME=
+ * Preloaded into a station started for a virtual-time run (SIM_MESH_TIME=
  * virtual). The station's chip library owns the clock; when it starts it finds
  * simclock_attach here and hands over what this needs (simclock.h). From then
  * on:
@@ -33,7 +33,7 @@
  * the way it ends a real one — which a host whose threads are switched by
  * signals depends on.
  *
- * With SIMESH_IDLE=threads the shim also keeps a census of the process's
+ * With SIM_MESH_IDLE=threads the shim also keeps a census of the process's
  * threads: every thread created through pthread_create, and the first. A
  * thread is blocked while it is inside one of the waits above, an untimed
  * pthread_cond_wait or sem_wait, or a read, recv or accept on a blocking
@@ -52,10 +52,10 @@
  * never opens a chip. A Python host behind a radio in another process of its
  * station is one (testbed/kinds/standard_reticulum.py).
  *
- * With SIMESH_SEED in the environment as well, the shim is also the station's
+ * With SIM_MESH_SEED in the environment as well, the shim is also the station's
  * randomness: getentropy, getrandom and syscall(SYS_getrandom) — what ESP-IDF's
  * host esp_random and mbedtls's platform entropy call — draw from a generator
- * keyed by the seed and SIMESH_NODE_ID, so a run given the same seed gives
+ * keyed by the seed and SIM_MESH_NODE_ID, so a run given the same seed gives
  * every station the same bytes in the same order, and two stations of one run
  * different ones. This needs nothing from the chip library and holds from the
  * process's first instruction.
@@ -73,7 +73,7 @@
  *                                             the TCP connection from A to B
  *                                             ("addr:port"): asked before the
  *                                             call, on the writing thread's
- *                                             own socket to SIMESH_ETHER, and
+ *                                             own socket to SIM_MESH_ETHER, and
  *                                             the call waits for {"go":k};
  *                                             after it, without "go", minus
  *                                             what the call did not take
@@ -87,13 +87,13 @@
  * lets a TCP write go when its reader is in step (ether/INTERNALS.md). A
  * report travels on the same socket as the idle that follows it, so it is
  * always ahead of it; a TCP write is asked for before its bytes exist. A TCP
- * connection to a loopback address leaves from SIMESH_BIND_ADDR, so both of
+ * connection to a loopback address leaves from SIM_MESH_BIND_ADDR, so both of
  * its ends name a station. And while the station computes, the chip
  * library's busy watchdog is held back (below).
  *
- * Without SIMESH_TIME=virtual, and before the chip library attaches, every
- * clock and wait is the C library's own; without SIMESH_TIME=virtual or
- * without SIMESH_SEED, so is the randomness.
+ * Without SIM_MESH_TIME=virtual, and before the chip library attaches, every
+ * clock and wait is the C library's own; without SIM_MESH_TIME=virtual or
+ * without SIM_MESH_SEED, so is the randomness.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -189,8 +189,8 @@ static ssize_t (*r_getrandom)(void*, size_t, unsigned);
 static long (*r_syscall)(long, ...);
 
 static int s_seeded;                /* the randomness is ours */
-static uint64_t s_randKey;          /* from SIMESH_SEED and SIMESH_NODE_ID */
-static int s_sid;                   /* SIMESH_NODE_ID */
+static uint64_t s_randKey;          /* from SIM_MESH_SEED and SIM_MESH_NODE_ID */
+static int s_sid;                   /* SIM_MESH_NODE_ID */
 
 static uint64_t fnv(uint64_t h, const char* s)
 {
@@ -201,11 +201,11 @@ static uint64_t fnv(uint64_t h, const char* s)
 static void load_mode(void)
 {
     if (s_virtual >= 0) return;
-    const char* v = getenv("SIMESH_TIME");
-    const char* i = getenv("SIMESH_IDLE");
-    const char* e = getenv("SIMESH_EPOCH_US");
-    const char* seed = getenv("SIMESH_SEED");
-    const char* id = getenv("SIMESH_NODE_ID");
+    const char* v = getenv("SIM_MESH_TIME");
+    const char* i = getenv("SIM_MESH_IDLE");
+    const char* e = getenv("SIM_MESH_EPOCH_US");
+    const char* seed = getenv("SIM_MESH_SEED");
+    const char* id = getenv("SIM_MESH_NODE_ID");
     int virt = v && strcmp(v, "virtual") == 0;
     s_census = i && strcmp(i, "threads") == 0;
     s_epochEnv = e && *e ? strtoll(e, NULL, 10) : 0;
@@ -1229,7 +1229,7 @@ static __thread int t_goFd = -1;
 static int go_socket(void)
 {
     if (t_goFd >= 0) return t_goFd;
-    const char* e = getenv("SIMESH_ETHER");
+    const char* e = getenv("SIM_MESH_ETHER");
     const char* colon = e ? strrchr(e, ':') : NULL;
     char host[INET_ADDRSTRLEN];
     if (!colon || (size_t)(colon - e) >= sizeof host) return -1;
@@ -1526,13 +1526,13 @@ int listen(int fd, int backlog)
 }
 
 /* A TCP connection a station opens to a loopback address leaves from the
- * station's own (SIMESH_BIND_ADDR) when it has not been given one: every end
+ * station's own (SIM_MESH_BIND_ADDR) when it has not been given one: every end
  * of a connection between two stations is then an address that says which
  * station it is, to the peer and to the ether. */
 int connect(int fd, const struct sockaddr* a, socklen_t al)
 {
     load_mode();
-    const char* own = s_virtual ? getenv("SIMESH_BIND_ADDR") : NULL;
+    const char* own = s_virtual ? getenv("SIM_MESH_BIND_ADDR") : NULL;
     if (own && *own && a && a->sa_family == AF_INET && al >= (socklen_t)sizeof(struct sockaddr_in)
         && (ntohl(((const struct sockaddr_in*)a)->sin_addr.s_addr) >> 24) == 127) {
         int type = 0;

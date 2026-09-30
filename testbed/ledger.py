@@ -12,7 +12,7 @@ packet relayed, or answered by many, is therefore one packet however many
 stations put it on the air. Seconds are T in a virtual-time run, and the
 wall clock since the record's first line in a real one.
 
-- by kind (`simesh.reticulum.frames.kind_of`): packets, transmissions and
+- by kind (`sim_mesh.reticulum.frames.kind_of`): packets, transmissions and
   their airtime, each transmission counted as the packet's first on the
   air, as another station's (a relay, or a second answer), or as a station
   sending again what it has sent already (`repeat`);
@@ -35,9 +35,9 @@ import json
 import sys
 
 import referee
-from simesh import record as record_module
-from simesh.reticulum import frames as rframes
-from simesh.view import RunView
+from sim_mesh import record as record_module
+from sim_mesh.reticulum import frames as rframes
+from sim_mesh.view import RunView
 
 TRUNC = rframes.TRUNC_HASH
 WINDOW_S = 60.0

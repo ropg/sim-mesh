@@ -3,7 +3,7 @@
 The simulation runs on the wall clock and keeps running when this script
 ends, for the page, the consoles and the stations' web UIs.
 """
-from simesh import *
+from sim_mesh import *
 
 time("real")
 firmware("all", "reticulous_dev_latest")

@@ -21,8 +21,8 @@ import losses  # noqa: E402
 import nodeset  # noqa: E402
 import script  # noqa: E402
 import store  # noqa: E402
-from simesh import library  # noqa: E402
-from simesh.select import Nodes  # noqa: E402
+from sim_mesh import library  # noqa: E402
+from sim_mesh.select import Nodes  # noqa: E402
 
 R = cs.EARTH_RADIUS_M
 # The latitude where a degree of longitude is half a degree of latitude.
@@ -78,7 +78,7 @@ MIXED = old({
             "shadowing_seed": 3, "capture_model": "bench", "sf_orthogonality": "croce",
             "crc_band_db": 1.5},
     kinds={"reticulous": {"elf": "../x/reticulous.elf"},
-           "berlinmesh": {"elf": "../y/simesh",
+           "berlinmesh": {"elf": "../y/sim-mesh",
                           "setup": ["name set {name}",
                                     "set --freq-hz 869525000 --sf 8 --bw-hz 125000 --cr 5 "
                                     "--txpower-dbm 20"]}},
@@ -352,5 +352,5 @@ def runtime(monkeypatch):
     """A fresh library runtime, with no simulation to reach."""
     fresh = library.Runtime()
     monkeypatch.setattr(library, "runtime", fresh)
-    monkeypatch.delenv("SIMESH_SIM", raising=False)
+    monkeypatch.delenv("SIM_MESH_SIM", raising=False)
     return fresh

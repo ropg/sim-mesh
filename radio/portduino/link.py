@@ -1,5 +1,5 @@
 # The chip library's headers for this library's source, and the library
-# itself (build/libsimradio.a, from `simesh build radio`) for the program.
+# itself (build/libsimradio.a, from `sim-mesh build radio`) for the program.
 import inspect
 import os
 

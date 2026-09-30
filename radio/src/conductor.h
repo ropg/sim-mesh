@@ -23,7 +23,7 @@ namespace conductor {
 
 constexpr int64_t kNever = INT64_MAX;
 
-/** True in a virtual-time run. Read from SIMESH_TIME at the first call, and
+/** True in a virtual-time run. Read from SIM_MESH_TIME at the first call, and
  *  confirmed by the ether's welcome. */
 bool isVirtual();
 

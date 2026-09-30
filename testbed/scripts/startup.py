@@ -5,7 +5,7 @@ declarations: all of this is said to a station at its first boot, in the
 order written, in the station's own kind's lines. A script's own first-boot
 lines after the include come after the radio is up.
 """
-from simesh import *
+from sim_mesh import *
 from globals import FREQ_MHZ, SF, BW_KHZ, CR, SYNC
 
 RADIOS = ~nodes(tag="no-radio")

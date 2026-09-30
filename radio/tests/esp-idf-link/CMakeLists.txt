@@ -3,12 +3,12 @@
 # esp_timer. Not a firmware; nothing here ships.
 #
 #     . $IDF_PATH/export.sh
-#     idf.py -C SIMesh/radio/tests/esp-idf-link -B SIMesh/radio/build/esp-idf-link \
-#            -D SDKCONFIG=SIMesh/radio/build/esp-idf-link/sdkconfig set-target linux build
-#     SIMesh/radio/build/esp-idf-link/simradio_link.elf
+#     idf.py -C sim-mesh/radio/tests/esp-idf-link -B sim-mesh/radio/build/esp-idf-link \
+#            -D SDKCONFIG=sim-mesh/radio/build/esp-idf-link/sdkconfig set-target linux build
+#     sim-mesh/radio/build/esp-idf-link/simradio_link.elf
 #
 # esp_timer on the host target is hw-linux's (the IDF registers only headers
-# there), so that component comes from the workspace beside SIMesh.
+# there), so that component comes from the workspace beside sim-mesh.
 cmake_minimum_required(VERSION 3.16)
 set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_LIST_DIR}/../../backend/esp-idf"

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* Refresh vendor/planner-wasm from SIMesh's built planner-wasm.
+/* Refresh vendor/planner-wasm from sim-mesh's built planner-wasm.
  *
  *     node vendor/update-planner-wasm.mjs [<planner workspace>]
  *
@@ -11,14 +11,14 @@
  * wasm-pack's output is four files, which planner-web embeds from
  * crates/planner-web/static. That directory has no package.json, so this
  * script copies the four files and writes one beside them. The workspace is
- * the argument, else SIMesh's own planner/. */
+ * the argument, else sim-mesh's own planner/. */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const SIMESH = resolve(HERE, '..', '..', '..')
-const planner = resolve(process.argv[2] || join(SIMESH, 'planner'))
+const SIM_MESH = resolve(HERE, '..', '..', '..')
+const planner = resolve(process.argv[2] || join(SIM_MESH, 'planner'))
 const source = join(planner, 'crates', 'planner-web', 'static')
 const target = join(HERE, 'planner-wasm')
 const FILES = ['planner_wasm.js', 'planner_wasm_bg.wasm',
@@ -26,7 +26,7 @@ const FILES = ['planner_wasm.js', 'planner_wasm_bg.wasm',
 
 for (const file of FILES) {
   if (!existsSync(join(source, file))) {
-    console.error(`update-planner-wasm: no ${file} in ${source} (build the planner first: simesh build planner)`)
+    console.error(`update-planner-wasm: no ${file} in ${source} (build the planner first: sim-mesh build planner)`)
     process.exit(1)
   }
 }

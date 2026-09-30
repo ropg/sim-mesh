@@ -1,6 +1,6 @@
 # simradio for a Portduino firmware
 
-A PlatformIO library that puts SIMesh's simulated SX1262 (`radio/`) under a
+A PlatformIO library that puts sim-mesh's simulated SX1262 (`radio/`) under a
 firmware built on Portduino, Meshtastic's Arduino API for Linux, in place of
 `/dev/spidev` and libgpiod. The firmware's radio driver is unchanged: it
 talks SPI and pins as on a board, and each transfer reaches the chip model
@@ -20,9 +20,9 @@ definition is here:
 
 - `void native_radio_backend_init()`, once, after the firmware knows its
   pins and before its `SPI.begin()` and its first touch of the radio. It
-  opens the station's link to the ether (`SIMESH_NODE_ID`,
-  `SIMESH_BIND_ADDR`, `SIMESH_ETHER`) and chip slot 0, installs its `SPIChip`
-  into the global `SPI`, and binds the chip's lines with `gpioBind`.
+  opens the station's link to the ether (`SIM_MESH_NODE_ID`,
+  `SIM_MESH_BIND_ADDR`, `SIM_MESH_ETHER`) and chip slot 0, installs its
+  `SPIChip` into the global `SPI`, and binds the chip's lines with `gpioBind`.
 - `void rnode_idle(uint32_t max_ms)`, where the firmware has nothing to do
   for up to `max_ms`. It waits on a condition variable until then or until
   DIO1 rises; in a virtual-time run the time shim answers the wait in node
@@ -43,7 +43,7 @@ each frame is already one transfer.
 
 ## Building with it
 
-`simesh build radio` builds `radio/build/libsimradio.a`, which `link.py`
+`sim-mesh build radio` builds `radio/build/libsimradio.a`, which `link.py`
 links into the program by path. A firmware's environment lists the library
 with a `symlink://` entry in `lib_deps`. `casefold.py`, as a `pre:` extra
 script, lets Portduino build on a case-insensitive filesystem, where its
@@ -51,5 +51,5 @@ script, lets Portduino build on a case-insensitive filesystem, where its
 linked as objects, not as an archive, so its strong definitions win over the
 firmware's weak ones.
 
-attermann's microReticulum_Firmware is built with it as `[env:simesh]`
+attermann's microReticulum_Firmware is built with it as `[env:sim-mesh]`
 (the `microreticulum` kind).

@@ -35,11 +35,11 @@ import runs  # noqa: E402
 import seq  # noqa: E402
 import slt  # noqa: E402
 
-import simesh  # noqa: E402
-from simesh import reticulum  # noqa: E402
-from simesh.reticulum import frames  # noqa: E402
-from simesh import traffic as rtraffic  # noqa: E402
-from simesh.view import RunView  # noqa: E402
+import sim_mesh  # noqa: E402
+from sim_mesh import reticulum  # noqa: E402
+from sim_mesh.reticulum import frames  # noqa: E402
+from sim_mesh import traffic as rtraffic  # noqa: E402
+from sim_mesh.view import RunView  # noqa: E402
 
 CALLING = 869_525_000
 GLOBALS = "FREQ_MHZ = 869.525\nSF = 8\nBW_KHZ = 125\nCR = 5\n"
@@ -211,7 +211,7 @@ def test_a_run_with_no_reticulous_station_reads_no_protocol(tmp_path):
     assert set(view.roles().values()) == {"client"} and view.forwarders() == set()
     assert view.protocols() == []
     assert view.radio("n01")["sf"] == 8                  # the run's globals.py
-    assert simesh.protocol_for("sergeyculum") is None
+    assert sim_mesh.protocol_for("sergeyculum") is None
     code, text = call(airtime.main, [other.dir, "--roles"])
     out = json.loads(text)
     assert out["roles"]["client"]["stations"] == 4
@@ -505,7 +505,7 @@ def test_delivery_counts_each_sender_by_its_own_stations_logs(tmp_path):
     with open(os.path.join(run.dir, "record.tsv"), "a", encoding="utf-8") as handle:
         handle.write("30.000000\tin\t4\t%s\n" % json.dumps(
             {"type": "hello", "sid": 4, "slots": [0], "t": 0}, separators=(",", ":")))
-    boot = "  0.000000 [INFO] simesh 0.1: station %d in d, bound to a, ether e"
+    boot = "  0.000000 [INFO] sim-mesh 0.1: station %d in d, bound to a, ether e"
     logs = {
         "n01": [boot % 1,
                 "  5.100000 [INFO] [lxmf] sent 42 B to 02020202 iface0 — waiting for its proof",
@@ -557,7 +557,7 @@ def test_a_send_is_its_own_outcome_however_late_and_a_refused_one_takes_none(tmp
     goes out long after it was due and is still that send's; a send the tool
     refused takes nothing, so the next one keeps its own outcome."""
     run = lay_out(tmp_path, kind="sergeyculum")
-    boot = "  0.000000 [INFO] simesh 0.1: station %d in d, bound to a, ether e"
+    boot = "  0.000000 [INFO] sim-mesh 0.1: station %d in d, bound to a, ether e"
     os.makedirs(run.node_dir("n01"), exist_ok=True)
     with open(os.path.join(run.node_dir("n01"), "log"), "w") as handle:
         handle.write("\n".join([
@@ -587,7 +587,7 @@ def test_a_send_is_its_own_outcome_however_late_and_a_refused_one_takes_none(tmp
 def test_a_real_time_record_is_not_counted_for_rncfg_stations(tmp_path):
     """Their logs are placed in T at the hellos, which a real-time record
     stamps with the wall clock: refused rather than miscounted."""
-    from simesh.reticulum import rncfg_delivery
+    from sim_mesh.reticulum import rncfg_delivery
     path = tmp_path / "record.tsv"
     path.write_text("# 2026-09-29T00:00:00+00:00\tether record: stamp\tdir\tsid\tjson\n"
                     "2026-09-29T23:59:59.000000+00:00\tin\t1\t"
@@ -601,7 +601,7 @@ def test_a_record_read_for_some_types_is_those_lines_of_it_read_whole(tmp_path):
     what it gives is exactly what reading every line gives, of those types,
     whatever the spacing, with a nested `type` of theirs not enough, and
     the malformed lines skipped alike."""
-    from simesh import record as record_module
+    from sim_mesh import record as record_module
     path = tmp_path / "record.tsv"
     path.write_text("\n".join([
         "# 2026-09-29T00:00:00+00:00\tether record: stamp\tdir\tsid\tjson",
@@ -760,7 +760,7 @@ def with_fake_sim(fake, drive):
         site = web.TCPSite(runner, "127.0.0.1", 0)
         await site.start()
         port = site._server.sockets[0].getsockname()[1]
-        sim = await simesh.attach("fake", port)
+        sim = await sim_mesh.attach("fake", port)
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 return await drive(sim)
@@ -783,7 +783,7 @@ def test_a_driver_chooses_stations_and_asks_them(tmp_path):
         assert await sim.node("n01").run("x", after=2) == {"n01": "3 paths total"}
         assert sim.pairs(sample=2, seed=1) == sim.pairs(sample=2, seed=1)
         assert len(sim.pairs()) == 6
-        with pytest.raises(simesh.SimError):
+        with pytest.raises(sim_mesh.SimError):
             sim.node("nobody")
         await sim.plan(("warm", 10))
 
@@ -831,7 +831,7 @@ def test_a_script_says_it_synchronously(monkeypatch):
     on a loop of its own, its rules said once it is attached."""
     from aiohttp import web
 
-    from simesh import library
+    from sim_mesh import library
 
     fake = FakeSim(["n01", "n02", "n03"])
     loop = asyncio.new_event_loop()

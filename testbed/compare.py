@@ -11,7 +11,7 @@ the same network only if the same things happen in both. Frame for frame
 they cannot agree — the firmware draws its own random numbers — so this
 compares what a run achieves and when. What a frame is (an announce, its
 destination and hop count) is Reticulum's reading of it
-(`simesh.reticulum.frames`):
+(`sim_mesh.reticulum.frames`):
 
 - per station: when it joined the ether, when its radio first listened, the
   announces it originated and forwarded, its frames by type, and how many of
@@ -26,7 +26,7 @@ destination and hop count) is Reticulum's reading of it
 With `--cli A.json B.json`, each run's final `rnpath` answers (a JSON object,
 station name to what it printed) are compared too: paths known by hop count.
 With `--logs`, the LXMF messages each run's senders logged as delivered
-(`simesh.reticulum.delivery.log_deliveries`) are counted as well. `--until S`
+(`sim_mesh.reticulum.delivery.log_deliveries`) are counted as well. `--until S`
 keeps the first S seconds of each run, so a record that ran on while its run
 was being stopped does not count the extra.
 """
@@ -40,10 +40,10 @@ import sys
 import time
 
 import referee
-from simesh import record as record_module
-from simesh.reticulum import delivery
-from simesh.reticulum import frames as rframes
-from simesh.view import RunView
+from sim_mesh import record as record_module
+from sim_mesh.reticulum import delivery
+from sim_mesh.reticulum import frames as rframes
+from sim_mesh.view import RunView
 
 KINDS = ("ANNOUNCE", "DATA", "LINKREQUEST", "PROOF")
 

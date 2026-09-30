@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""A standard Reticulum node on SIMesh: the RNode firmware as a Linux process,
+"""A standard Reticulum node on sim-mesh: the RNode firmware as a Linux process,
 and Reticulum's Python reference implementation with an LXMF router behind
 it, as a person runs rnsd and an LXMF client on a computer with an RNode on
 its USB port.
 
     station.py ── spawns ──► rnode        the RNode firmware, its KISS host port at
-                                          SIMESH_BIND_ADDR:7633, the chip model below
-    station.py ── RNodeInterface, tcp://SIMESH_BIND_ADDR ──► rnode
+                                          SIM_MESH_BIND_ADDR:7633, the chip model below
+    station.py ── RNodeInterface, tcp://SIM_MESH_BIND_ADDR ──► rnode
     testbed ── framed RPC on the console ──► station.py
 
 Both processes join a virtual-time run, each as a station of the ether's:
 the RNode as the node's own id (SR_RNODE_ID), which is the radio the loss
-tables know, and this process as its own id (SIMESH_NODE_ID), a station with
+tables know, and this process as its own id (SIM_MESH_NODE_ID), a station with
 no radio that reads the console. The ether then holds T for the KISS bytes
 between them as for any TCP between two stations.
 
@@ -19,7 +19,7 @@ Settings live in `state/settings.json`, and Reticulum and the router read
 them when this process starts: a `set` that changes one says so in `status`
 (`pending: yes`), and the kind's flush restarts the station to apply it.
 
-The console speaks framed RPC (SIMesh's testbed/rpc.py) and, for a person,
+The console speaks framed RPC (sim-mesh's testbed/rpc.py) and, for a person,
 one command per line:
 
     show s.net.hostname    the name, as `<key> = <value>`
@@ -112,14 +112,14 @@ def save_settings(settings):
 # ---- the RNode ---------------------------------------------------------------
 
 def rnode_conf(addr, node_id):
-    """rnoded.conf for the RNode: the chip on SIMesh's pins, its KISS host
+    """rnoded.conf for the RNode: the chip on sim-mesh's pins, its KISS host
     port on this station's address, and an exit for a reboot."""
     lines = [("data_dir", "./state/rnode"), ("modem", "SX1262"),
              ("pin_cs", 1), ("pin_reset", 2), ("pin_busy", 3), ("pin_dio", 4)]
     lines += [(key, -1) for key in ("pin_rxen", "pin_txen", "pin_tcxo_enable",
                                     "pin_led_rx", "pin_led_tx")]
     lines += [("kiss_tcp_port", KISS_PORT), ("kiss_tcp_bind", addr),
-              ("reboot_mode", "exit"), ("device_id", "simesh-%s" % node_id)]
+              ("reboot_mode", "exit"), ("device_id", "sim-mesh-%s" % node_id)]
     return "".join("%s = %s\n" % kv for kv in lines)
 
 
@@ -133,7 +133,7 @@ def start_rnode(addr):
     with open(conf, "w") as f:
         f.write(rnode_conf(addr, node_id))
     os.makedirs(os.path.join(STATE, "rnode"), exist_ok=True)
-    env = dict(os.environ, SIMESH_NODE_ID=node_id, MR_CONFIG=conf,
+    env = dict(os.environ, SIM_MESH_NODE_ID=node_id, MR_CONFIG=conf,
                MR_DATA_DIR=os.path.join(STATE, "rnode"),
                SIMRADIO_PIN_NSS="1", SIMRADIO_PIN_RESET="2",
                SIMRADIO_PIN_BUSY="3", SIMRADIO_PIN_DIO1="4")
@@ -382,15 +382,15 @@ def restart():
 
 
 def main():
-    addr = os.environ["SIMESH_BIND_ADDR"]
+    addr = os.environ["SIM_MESH_BIND_ADDR"]
     if not os.environ.get("SR_RNODE"):
         sys.exit("station: no RNode: the device names none under its tools as rnode")
     rnode = start_rnode(addr)
-    if os.environ.get("SIMESH_TIME") == "virtual":
+    if os.environ.get("SIM_MESH_TIME") == "virtual":
         lib = ctypes.CDLL(os.environ["SR_SIMRADIO"])
         lib.simradio_station_open.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p)
-        if lib.simradio_station_open(int(os.environ["SIMESH_NODE_ID"]), addr.encode(),
-                                     os.environ.get("SIMESH_ETHER", "").encode()) != 0:
+        if lib.simradio_station_open(int(os.environ["SIM_MESH_NODE_ID"]), addr.encode(),
+                                     os.environ.get("SIM_MESH_ETHER", "").encode()) != 0:
             sys.exit("station: no link to the ether")
     settings = load_settings()
     node = Node(dict(settings))

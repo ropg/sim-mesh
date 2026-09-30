@@ -87,11 +87,11 @@ fn potatomesh_nodes_import_from_the_saved_fixture() {
     assert_eq!(nodes.iter().find(|n| n["kind"] == "client").unwrap()["position"], "gps");
 }
 
-/// The saved MeshCore map: `SIMESH_MESHCORE_SNAPSHOT`, else the front's
+/// The saved MeshCore map: `SIM_MESH_MESHCORE_SNAPSHOT`, else the front's
 /// download cache. Skips when neither is there.
 #[test]
 fn meshcore_nodes_import_from_the_saved_map() {
-    let file = std::env::var_os("SIMESH_MESHCORE_SNAPSHOT")
+    let file = std::env::var_os("SIM_MESH_MESHCORE_SNAPSHOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| cache().join("meshcore/nodes.json"));
     if !file.exists() {

@@ -50,7 +50,7 @@ export const useSocket = defineStore('socket', {
         const page = typeof msg.page === 'string' ? msg.page : null
         if (mine && page && mine !== page) {
           let tried = false
-          try { tried = sessionStorage.getItem('simesh.reloaded') === page; sessionStorage.setItem('simesh.reloaded', page) } catch { /* private window */ }
+          try { tried = sessionStorage.getItem('sim-mesh.reloaded') === page; sessionStorage.setItem('sim-mesh.reloaded', page) } catch { /* private window */ }
           if (!tried) { location.reload(); return }
         }
         // Only the front has the editors: a simd on its own answers none of them.
