@@ -580,12 +580,21 @@ front ── GET /loss/start, /loss/status, /loss.bin, one node at a time ──
   builds with no planner beside it.
 - **Every cell is one `link.json`**, the same request the pair inspector
   makes, so a cell of the table is what the inspector shows for the same two
-  nodes, near-field pairs included. `link.json` already composes
+  nodes, near-field pairs included. The table asks it `lean`, of a sidecar
+  that lists the option: the same reply without the profile the inspector
+  draws. `link.json` already composes
   everything a cell needs: the profile, the P.1812 call, a near-field model
   where the two are too close for P.1812, which model it used, and the
   Fresnel verdict. The planner's own pairwise sweep is not used: it drops
   every pair beyond a link budget and every pair under 250 m, and both are
   pairs the medium needs (below).
+- **Pairs are asked in parallel**, as many at once as the sidecar has
+  render slots, and the sidecar computes them in parallel: it reads the
+  layers a pair needs without their locks wherever the pack's layout allows
+  (an uncompressed strip TIFF, as the pack builder writes them), with the
+  same rows and the same decoder as through the lock, so the numbers are the
+  same. Both sides size themselves by the process's CPU affinity mask, as
+  simd places stations, so `taskset` bounds a table build too.
 - **What the sidecar decides, and what it does not.** `link.json` takes no
   carrier and judges at the planner's EU868 parameters, 869.525 MHz, 50 % of
   time and 90 % of locations; a pack therefore has an 868 table only,

@@ -58,10 +58,16 @@ is never heard with the matching flag; "path too short for a §3.2 profile",
 which the sidecar says of pairs a few tens of metres apart whose profile
 decimates to fewer than three points, is free space at that distance,
 FLAG_NEAR_FIELD, as under 20 m; "renderer busy" (429) is retried after a
-growing pause. Requests run concurrently up to a bound near the sidecar's
-render slots, though the sidecar holds its raster locks for the whole of a
-`link.json`, so requests are answered one at a time whatever the bound:
-about 2.5 ms a request, two requests a pair.
+growing pause. Requests run concurrently, as many as the sidecar has render
+slots: both are sized by the process's CPU affinity mask, so `taskset`
+bounds a table as it bounds the stations. The sidecar answers them in
+parallel, reading its layers without their locks where the pack's layout
+allows (an uncompressed strip TIFF, which is what the pack builder writes),
+and each pair is asked both ways. A sidecar that lists `lean` among its
+`link_options` is asked for the reply without the profile drawn for the
+page, which a cell does not keep. 173 Berlin nodes, 14,878 pairs within
+the radius, took 200 s on 8 slots when the layers were read under their
+locks, and take 22-26 s.
 
 A sidecar indexes its pack's buildings in the background after it starts
 (a second for the berlin-city pack, half a minute for all of Berlin), and
@@ -441,12 +447,18 @@ class Sidecar:
         self.loc_pct = loc_pct
         self.indexed = False
         self.index_lock = asyncio.Lock()
+        # Whether /link.json may be asked `lean`, without the profile drawn
+        # for the page (~40 KB a reply, of which a cell keeps nothing). Only
+        # a sidecar that lists the option is asked it: the query refuses a
+        # name it does not know.
+        self.lean = False
 
     async def pack(self):
         async with self.session.get(self.base + "/api/pack") as resp:
             if resp.status != 200:
                 raise LossError("sidecar %s: /api/pack answered %d" % (self.base, resp.status))
             info = await resp.json(content_type=None)
+        self.lean = "lean" in (info.get("link_options") or ())
         ext = info["extent"]
         self.extent = (ext["minx"], ext["miny"], ext["maxx"], ext["maxy"])
         return info
@@ -462,6 +474,8 @@ class Sidecar:
                   "tx_h": "%g" % tx_h, "rx_h": "%g" % rx_h}
         if self.loc_pct is not None:
             params["loc_pct"] = repr(float(self.loc_pct))     # the header's figure, exactly
+        if self.lean:
+            params["lean"] = "true"
         pause = RETRY_FIRST_S
         while True:
             async with self.gate:
@@ -551,13 +565,25 @@ def cell_from_reply(reply, f0_hz, d_m):
     return float(reply["lb_db"]), flags
 
 
+def usable_cpus():
+    """The CPUs this process may run on: its affinity mask, by which simd
+    places stations and the planner sidecar sizes its render slots, so that
+    under `taskset` the table asks as many pairs at once as the sidecar will
+    take. `os.cpu_count()` is the machine's, whatever the mask: on a shared
+    host that asked hundreds at once of a sidecar holding a dozen slots."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:          # no affinity masks on this platform
+        return os.cpu_count() or 4
+
+
 async def _fill_pack(table, gd, ns, pairs, base_url, progress=None,
                      radius_m=DEFAULT_RADIUS_M, concurrency=None, session=None, notice=None):
     import aiohttp
 
     xy = _xy(gd, ns)
     f0 = table.f0_hz
-    concurrency = concurrency or max(4, (os.cpu_count() or 4) - 2)
+    concurrency = concurrency or max(4, usable_cpus() - 2)
     own = session is None
     if own:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
