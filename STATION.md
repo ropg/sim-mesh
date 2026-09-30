@@ -122,7 +122,12 @@ four promises:
   time after every message once none of its threads is on the CPU, which
   runs but crawls. A host whose own clock is
   counted from node time, as a kernel tick is, learns of every move of it
-  from `simradio_on_advance()`. The link is UDP, and a datagram lost either
+  from `simradio_on_advance()`. Nothing the ether says reaches the host
+  piecemeal. A datagram is applied whole (the chip's own timers running as
+  T moves) before the host is told of any of it: its waits that fall due,
+  the advance hook and DIO1 come after, so a thread woken at T finds all of
+  T. A station whose hello says `"lines": 1` is sent every message the
+  barrier has for it at one go in one datagram. The link is UDP, and a datagram lost either
   way would leave the ether and the station each waiting on the other, so
   `radio/` applies the ether's messages strictly in their numbers' order,
   never twice, and says its idle again every 250 ms of wall time until it
