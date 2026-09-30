@@ -420,3 +420,23 @@ def test_a_delete_takes_the_nodesets_own_setup_with_it(nodesets_dir):
     assert nodeset.names() == [] and not (nodesets_dir / "ex.py").exists()
     with pytest.raises(store.StoreError, match="no nodeset"):
         nodeset.delete("ex")
+
+
+def test_an_estimate_replaces_only_an_assumed_height_and_says_what_it_rested_on():
+    data = nodeset.blank()
+    for i, source in enumerate(("assumed", "assumed", "assumed", "measured", "roof", "assumed")):
+        data["nodes"]["n%d" % i] = nodeset.node_record(i + 1, 52.5, 13.4 + i / 1000, 15.0, source)
+    reply = {"h_agl_m": 24.04, "low_m": 22.0, "high_m": 26.0}
+    estimates = {"n0": dict(reply, basis="lod2-building"),
+                 "n1": dict(reply, basis="clutter-neighbourhood"),
+                 "n2": dict(reply, basis="no-evidence"),
+                 "n3": dict(reply, basis="lod2-building"),
+                 "n4": dict(reply, basis="class-typical")}
+    assert nodeset.with_estimated_heights(data, estimates) == ["n0", "n1"]
+    nodes = data["nodes"]
+    assert (nodes["n0"]["height_m"], nodes["n0"]["height_from"]) == (24.0, "roof")
+    assert (nodes["n1"]["height_m"], nodes["n1"]["height_from"]) == (24.0, "raster")
+    # Nothing to go on, a measured or a roof height, and no estimate at all:
+    # each keeps its own.
+    for name, source in (("n2", "assumed"), ("n3", "measured"), ("n4", "roof"), ("n5", "assumed")):
+        assert (nodes[name]["height_m"], nodes[name]["height_from"]) == (15.0, source)

@@ -458,6 +458,37 @@ def test_a_packs_loc_pct_goes_to_every_request_the_header_and_the_cache_key(stor
     serving(fake_sidecar(asked), go)
 
 
+def test_a_packs_heights_are_asked_of_its_sidecar_once_its_buildings_are_in(stores, tmp_path):
+    pack = tmp_path / "packs" / "sea"
+    pack.mkdir(parents=True)
+    (pack / "manifest.json").write_text(json.dumps(SEA))
+    geodata.write(geodata.geodata_path("sea"), {"pack": str(pack)})
+    gd = geodata.load("sea")
+    asked, heights = [], []
+    app = fake_sidecar(asked)
+
+    async def height(request):
+        heights.append(dict(request.query))
+        return web.json_response({"h_agl_m": 24.0, "low_m": 22.0, "high_m": 26.0,
+                                  "basis": "lod2-building", "detail": {}, "clamped_from_m": None,
+                                  "buildings_index": "ready"})
+    app.router.add_get("/height.json", height)
+
+    async def go(url):
+        got = await losses.estimated_heights(gd, {"b0": (0.2, 3.0), "far": (0.2, 9.0)}, url)
+        # The index was asked about before any height, and a point off the
+        # pack is not asked at all.
+        assert asked and set(got) == {"b0"} and got["b0"]["basis"] == "lod2-building"
+        x, y = gd.to_xy(0.2, 3.0)
+        assert heights == [{"x": "%.3f" % x, "y": "%.3f" % y}]
+    serving(app, go)
+
+    async def old(url):
+        with pytest.raises(losses.LossError, match="no height estimate"):
+            await losses.estimated_heights(gd, {"b0": (0.2, 3.0)}, url)
+    serving(fake_sidecar([]), old)
+
+
 def test_shadowing_over_a_pack_that_is_no_median_is_warned_about_not_refused(tmp_path):
     (tmp_path / "manifest.json").write_text(json.dumps(SEA))
 

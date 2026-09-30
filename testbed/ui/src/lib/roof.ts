@@ -7,7 +7,7 @@
  * Without a footprint under the click the pack's raster stands in, its
  * clutter height at the point, and the height is marked `raster` rather than
  * `roof` so nobody mistakes it for a building's. */
-import { buildings, inside, sample } from './planner'
+import { buildings, getWithBackoff, inside, sample } from './planner'
 import type { GroundPoint } from './marks'
 import type { HeightFrom } from '../stores/nodes'
 
@@ -54,4 +54,34 @@ export async function roofAt(sidecar: string, at: GroundPoint): Promise<{ height
   const s = await sample(sidecar, at.x, at.y)
   if (s.clutter === null || !Number.isFinite(s.clutter) || s.clutter <= 0) return null
   return { height_m: Math.round(s.clutter * 10) / 10, height_from: 'raster' }
+}
+
+/** planner's estimate of an antenna's height at (x, y) on a pack, for a node
+ *  whose height nobody measured (the sidecar's /height.json): a roof within
+ *  reach of an imprecise position with a mast on it, `roof`, else the
+ *  clutter or the land class around it, `raster`, each with the band it
+ *  believes. null for an estimate on no evidence, no better than a height
+ *  assumed, and from a sidecar without the estimator. */
+export interface Estimate {
+  height_m: number
+  height_from: HeightFrom
+  low_m: number
+  high_m: number
+}
+
+const FROM_BASIS: Record<string, HeightFrom> = {
+  'lod2-building': 'roof', 'clutter-neighbourhood': 'raster', 'class-typical': 'raster',
+}
+
+export async function estimateAt(sidecar: string, x: number, y: number): Promise<Estimate | null> {
+  const res = await getWithBackoff(`${sidecar}/height.json?x=${x.toFixed(3)}&y=${y.toFixed(3)}`)
+  if (res.status === 404) return null
+  if (!res.ok) throw new Error(`height ${res.status}: ${(await res.text()).slice(0, 200)}`)
+  const e = await res.json() as { h_agl_m: number; low_m: number; high_m: number; basis: string; buildings_index: string }
+  /* Until the index is in, no roof is asked: an answer then is the rasters'
+   * alone, which is not what the pack would say. */
+  if (e.buildings_index === 'loading') throw new Error('the pack\'s buildings are still being indexed: try again in a moment')
+  const from = FROM_BASIS[e.basis]
+  if (!from) return null
+  return { height_m: Math.round(e.h_agl_m * 10) / 10, height_from: from, low_m: e.low_m, high_m: e.high_m }
 }

@@ -780,6 +780,33 @@ def from_imported(rows, source, height_m=15.0):
     return data
 
 
+# What planner's height estimate rested on (`/height.json`'s `basis`), as a
+# node's `height_from`: a roof under it, or the rasters around it. An estimate
+# on no evidence is no better than the height already assumed.
+HEIGHT_FROM_BASIS = {"lod2-building": "roof", "clutter-neighbourhood": "raster",
+                     "class-typical": "raster"}
+
+
+def with_estimated_heights(data, estimates):
+    """In a nodeset file mapping, every node whose height is assumed given the
+    height planner's estimator found for it (`estimates`: {name: a
+    `/height.json` reply}), to the decimetre, and `roof` or `raster` for what
+    it rested on. A measured, roof or raster height is kept, and so is a node
+    with no estimate or one on no evidence. Returns the names changed."""
+    changed = []
+    for name, node in data["nodes"].items():
+        got = estimates.get(name)
+        if node.get("height_from", "assumed") != "assumed" or not got:
+            continue
+        source = HEIGHT_FROM_BASIS.get(got.get("basis"))
+        if source is None:
+            continue
+        node["height_m"] = round(float(got["h_agl_m"]), 1)
+        node["height_from"] = source
+        changed.append(name)
+    return changed
+
+
 def import_nodes_csv(path, height_m=15.0):
     """The deployed-network CSV `planner nodes import` writes, as a nodeset.
 

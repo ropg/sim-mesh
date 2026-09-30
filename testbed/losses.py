@@ -378,6 +378,46 @@ async def grounds(gd, ns, sidecar, names=None, session=None):
     return out
 
 
+async def estimated_heights(gd, points, base_url, session=None, notice=None):
+    """planner's estimate of an antenna's height at each point on the pack
+    `gd`, through the sidecar at `base_url`: {key: reply} for `points` ({key:
+    (lat, lon)}), a reply being `/height.json`'s (`h_agl_m`, `low_m`,
+    `high_m`, `basis`, `detail`). A point off the pack is left out. The
+    building index is waited for first, as a table waits for it, since until
+    it is in no roof is asked. A sidecar without the estimator is refused."""
+    import aiohttp
+
+    own = session is None
+    if own:
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+    try:
+        car = Sidecar(base_url, session, 1, notice)
+        out = {}
+        try:
+            await car.pack()
+            if points:
+                await car.wait_indexed()
+            for key, (lat, lon) in points.items():
+                x, y = gd.to_xy(lat, lon)
+                if not car.inside(x, y):
+                    continue
+                params = {"x": "%.3f" % x, "y": "%.3f" % y}
+                async with session.get(car.base + "/height.json", params=params) as resp:
+                    if resp.status == 404:
+                        raise LossError("the planner sidecar at %s has no height estimate: "
+                                        "simesh build planner" % base_url)
+                    if resp.status != 200:
+                        raise LossError("height.json answered %d: %s"
+                                        % (resp.status, (await resp.text()).strip()[:200]))
+                    out[key] = await resp.json(content_type=None)
+        except aiohttp.ClientError as err:
+            raise LossError("planner sidecar at %s: %s" % (base_url, err)) from err
+        return out
+    finally:
+        if own:
+            await session.close()
+
+
 def terrain_of_tile(data):
     """The first cell's terrain, in metres, of a sidecar `tile.bin` ("PTL2",
     u32 w, u32 h, six f64, u8 flags, then i16 decimetres per cell), or None."""

@@ -1060,8 +1060,13 @@ one node's editor shows its status, live role and radio and who hears it at
 what level, with **Console**, **Web UI**, **Reset** and **Factory reset**.
 
 **Right-click** on a node: attached, **Console**, **Web UI**, **Reset**,
-**Factory reset**, **Announce** and **Run command…**; and **Remove this
-node…** (or these). On the ground: **New node here**, **New node on this roof**,
+**Factory reset**, **Announce** and **Run command…**; on a pack, **Estimate
+heights from the pack**; and **Remove this node…** (or these). The estimate
+is the planner's for a node whose height nobody measured, such as an
+imported map's: a roof within reach of an imprecise position with a mast on
+it (`roof`), else the clutter or land class around it (`raster`); it
+replaces only an `assumed` height, and a node it finds nothing for keeps its
+own. On the ground: **New node here**, **New node on this roof**,
 select all or none, and fit the view to the nodes. A new node takes the
 lowest free id, the default antenna (a quarter-wave SMA whip) and the
 default radio (869.525 MHz, SF8, 125 kHz, 14 dBm); attached, it runs what
