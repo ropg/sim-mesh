@@ -195,11 +195,12 @@ def report(frames, window, busy, args, names, roles=None):
         if not fs:
             return None
         air = sum(f["span"] for f in fs)
+        top = max(g["power"] for g in fs)
         return {"frames": len(fs),
                 "mean_by_frame": sum(f["power"] for f in fs) / len(fs),
                 "mean_by_airtime": sum(f["power"] * f["span"] for f in fs) / air if air else None,
                 "min_q1_median_q3_max": quartiles([f["power"] for f in fs]),
-                "below_max_frames": sum(1 for f in fs if f["power"] < max(g["power"] for g in fs))}
+                "below_max_frames": sum(1 for f in fs if f["power"] < top)}
     out["power_calling"] = power(on_call)
     out["power_traffic_channels"] = power(lambda f: not on_call(f))
 
