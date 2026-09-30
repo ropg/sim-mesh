@@ -30,6 +30,7 @@ station is given them (`expand`).
 """
 
 import asyncio
+import contextlib
 import os
 import re
 
@@ -307,7 +308,10 @@ async def run_tool(argv, timeout, env=None):
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
     except asyncio.TimeoutError as err:
-        proc.kill()
+        # It may have ended in the same instant the wait did: there is then
+        # nothing to kill, and it is still a tool that gave no answer in time.
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
         await proc.wait()
         raise CommandError("%s gave no answer in %.0fs" % (os.path.basename(argv[0]),
                                                           timeout)) from err

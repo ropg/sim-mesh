@@ -746,3 +746,28 @@ def test_a_snapshot_reloads_what_the_run_had(stores):
         await daemon.stop_all(flush=False)
         daemon.ether.close()
     asyncio.run(go())
+
+
+def test_a_tool_that_ends_as_its_wait_times_out_is_a_tool_that_gave_no_answer(monkeypatch):
+    """A tool's answer is waited for on the wall clock; when the wait times out
+    in the instant the tool itself ends, there is no process left to kill, and
+    that is the same failure as any other late answer, not another one."""
+    class Late:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(10)
+
+        def kill(self):
+            raise ProcessLookupError()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+    async def spawn(*argv, **kw):
+        return Late()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(kinds.CommandError, match="gave no answer"):
+        asyncio.run(kinds.run_tool(["/bin/true"], 0.05))
