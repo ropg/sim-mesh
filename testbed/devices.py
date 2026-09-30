@@ -2,16 +2,16 @@
 """Devices: the station builds a node can run.
 
 ```
-simesh ── GET <base>/index.html ────────────────────────────────► site     which catalogues there are
-simesh ── GET <catalogue>/index.html ───────────────────────────► site or builds/<catalogue>/
-simesh: the newest <project>_hw-simesh-<arch>_<stamp>.zip per project, this machine's arch only,
-        into devices/latest/index.yaml; a fetched one older than that is removed
-simesh ── its node.yaml, read from the zip (a range request on the web) ► site or builds/
-        once per new build: what it plays and its kind, before it is fetched
+sim-mesh ── GET <base>/index.html ────────────────────────────────► site     which catalogues there are
+sim-mesh ── GET <catalogue>/index.html ───────────────────────────► site or builds/<catalogue>/
+sim-mesh: the newest <project>_hw-sim-mesh-<arch>_<stamp>.zip per project, this machine's arch only,
+          into devices/latest/index.yaml; a fetched one older than that is removed
+sim-mesh ── its node.yaml, read from the zip (a range request on the web) ► site or builds/
+          once per new build: what it plays and its kind, before it is fetched
 script  firmware("all", "reticulous_dev_latest") ──► ensure() ──► resolve()
-simesh ── GET <catalogue>/<project>_hw-simesh-<arch>_<stamp>.zip ► site    only when used
-simesh: unzip to devices/latest/.part-…, check node.yaml, rename to
-        devices/latest/<project>_<catalogue>_<stamp>/
+sim-mesh ── GET <catalogue>/<project>_hw-sim-mesh-<arch>_<stamp>.zip ► site    only when used
+sim-mesh: unzip to devices/latest/.part-…, check node.yaml, rename to
+          devices/latest/<project>_<catalogue>_<stamp>/
 page ── Save ──► devices/saved/<project>_<catalogue>_<stamp>/      a copy that stays
 page ── POST /api/devices/import?name=<zip name> (the zip) ──► devices/saved/<project>_imported_<stamp>/
 ```
@@ -20,7 +20,7 @@ A **device file** is one station build ready to run: a zip holding an
 executable, whatever it needs beside it, and a `node.yaml` saying what those
 are (NODE.md is the spec). It is published in a build catalogue exactly as a
 board image is, named `<project>_<entry>_<stamp>.zip` with
-`hw-simesh-<arch>` as the entry, and listed in that catalogue's `index.html`.
+`hw-sim-mesh-<arch>` as the entry, and listed in that catalogue's `index.html`.
 The executable is native code dynamically linked against the builder's C
 library, so a device runs only on a machine of the architecture its
 `node.yaml` names.
@@ -38,9 +38,9 @@ devices this way (`firmware(which, name)`), and two more forms:
 **Latest.** A survey reads every catalogue's listing, fetching nothing, and
 keeps the newest build per project and catalogue for this machine in
 `devices/latest/index.yaml`. The catalogues are the ones the web's
-`SIMESH_CATALOGUES` index lists (by default `https://reticulous.net/builds/`)
+`SIM_MESH_CATALOGUES` index lists (by default `https://reticulous.net/builds/`)
 and every catalogue directory (one holding an `index.html`) in `builds/`
-beside SIMesh, a local one joining the web's of its name, so `builds/local`
+beside sim-mesh, a local one joining the web's of its name, so `builds/local`
 is the catalogue `local` (`reticulous_local_latest`); one called `imported`
 is `builds-imported`. Each new build's `node.yaml` is read from its zip as
 it is surveyed (on the web by HTTP range requests: the zip's directory and
@@ -50,12 +50,12 @@ into `devices/latest/<name>/`, and a fetched one is removed as soon as a
 survey sees a newer one for its project and catalogue, fetched or not. So
 `devices/latest/` holds at most one build per project and catalogue.
 
-**Compiled builds** are for a project that publishes no simesh build yet:
+**Compiled builds** are for a project that publishes no sim-mesh build yet:
 `devices/local/<project>_<catalogue>.yaml`, a `node.yaml` that is not in a
 package, its `elf`, `fixed` and `tools` paths relative to the file and free
 to point anywhere, run in place from wherever it was last compiled. Each is
 the latest of its catalogue, `sergeyculum_local_latest` for Sergeyculum's
-`fw/simesh`, its stamp its executable's modification time.
+`fw/sim-mesh`, its stamp its executable's modification time.
 
 **Saved** builds are copies that stay: `devices/saved/<name>/`, a package
 directory like any other, made by Save from a latest build (fetching it first
@@ -67,7 +67,7 @@ A directory is whole or absent: a package is unzipped or copied under a
 
 Fetching is aiohttp in the caller's loop, and unzipping and copying run in a
 worker thread, so nothing here blocks an event loop. Run as a script it is
-the CLI behind `simesh devices`.
+the CLI behind `sim-mesh devices`.
 """
 
 import argparse
@@ -98,9 +98,9 @@ COMPILED = "compiled"           # a latest row's source: a compiled build, run i
 NOT_BUILT = "no firmware"       # a compiled build whose executable is not there
 PEEK_TAIL = 1 << 16             # a zip's end read for its directory, by range request
 INDEX_YAML = "index.yaml"
-DEFAULT_BASE = os.environ.get("SIMESH_CATALOGUES", "https://reticulous.net/builds/")
+DEFAULT_BASE = os.environ.get("SIM_MESH_CATALOGUES", "https://reticulous.net/builds/")
 WEB_FALLBACK = ("stable", "dev")    # the web's catalogues when its index cannot be read
-ENTRY_PREFIX = "hw-simesh-"
+ENTRY_PREFIX = "hw-sim-mesh-"
 NODE_YAML = "node.yaml"
 ORIGIN_YAML = "origin.yaml"
 PART_PREFIX = ".part-"
@@ -165,7 +165,7 @@ def slug_of(project):
 
 
 def entry_arch(entry):
-    """The architecture a `hw-simesh-<arch>` entry is for, or None for any
+    """The architecture a `hw-sim-mesh-<arch>` entry is for, or None for any
     other entry."""
     if entry.startswith(ENTRY_PREFIX) and len(entry) > len(ENTRY_PREFIX):
         return entry[len(ENTRY_PREFIX):]
@@ -538,7 +538,7 @@ def resolve(ref, base_dir=None, devices_dir=None, arch=None):
         have = fetched(key, devices_dir)
         if not have:
             raise DeviceError("device %s: not fetched yet (it is fetched when a simulation "
-                              "uses it, or by simesh devices fetch %s)" % (ref, ref))
+                              "uses it, or by sim-mesh devices fetch %s)" % (ref, ref))
         return _package_here(have[0][1], ref, arch)
     for where in (SAVED, LATEST):
         path = os.path.join(devices_dir, where, ref)
@@ -644,7 +644,7 @@ def catalogue_names(links):
 
 
 def builds_sources(builds_dir=None):
-    """The catalogue directories in `builds/` beside SIMesh: each one holding
+    """The catalogue directories in `builds/` beside sim-mesh: each one holding
     an `index.html`."""
     base = builds_dir or BUILDS_DIR
     try:
@@ -1088,7 +1088,7 @@ def delete_saved(ref, devices_dir=None):
 # ---- the CLI -----------------------------------------------------------------
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="simesh devices",
+    ap = argparse.ArgumentParser(prog="sim-mesh devices",
                                  description="the station builds a node can run")
     sub = ap.add_subparsers(dest="verb", required=True)
     p = sub.add_parser("refresh", help="survey the catalogues for their newest builds "
@@ -1141,7 +1141,7 @@ def main(argv=None):
         else:
             got = resolve(args.device, args.base_dir)
     except DeviceError as err:
-        print("simesh devices: %s" % err, file=sys.stderr)
+        print("sim-mesh devices: %s" % err, file=sys.stderr)
         return 1
     print(json.dumps(got, indent=2, default=str))
     return 0

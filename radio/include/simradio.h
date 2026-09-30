@@ -6,7 +6,7 @@
  * frame to `simradio_transfer` exactly as it would put it on a bus, and reads
  * the reply the datasheet describes; the model times every frame on the air,
  * raises the IRQ bits a real chip raises, and tells the ether what it is doing.
- * The ether (SIMesh/ether) decides who hears what and hands the frames that
+ * The ether (sim-mesh/ether) decides who hears what and hands the frames that
  * reach this antenna back.
  *
  * Thread-safe throughout. Nothing here blocks the caller beyond the model's
@@ -60,7 +60,7 @@ void simradio_close(simradio_t*);
 /* ---- The station's clock ----
  *
  * A run keeps real or virtual time, for every station alike; the ether says
- * which in its welcome, and SIMESH_TIME=virtual in the environment says it
+ * which in its welcome, and SIM_MESH_TIME=virtual in the environment says it
  * before the station can reach the ether. In virtual time the ether owns
  * conductor time T and moves it only when every station is idle. The host
  * reads node time, f(T) — its own crystal — and tells the library when it

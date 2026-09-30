@@ -5,7 +5,7 @@
         <div class="dp-heading">Latest builds</div>
         <q-space />
         <q-btn flat dense no-caps label="Refresh" :loading="refreshing" @click="refresh">
-          <q-tooltip>Look for newer builds in the web's catalogues and in builds/ beside SIMesh</q-tooltip>
+          <q-tooltip>Look for newer builds in the web's catalogues and in builds/ beside sim-mesh</q-tooltip>
         </q-btn>
         <q-btn unelevated dense no-caps color="primary" label="Import…" @click="importing = true" />
       </div>
@@ -133,7 +133,7 @@ function when(stamp?: string) {
 
 function whence(d: DeviceRow) {
   if (d.source === 'compiled') return 'as last compiled in its own tree, run in place'
-  const from = d.source === 'builds' ? 'builds/ beside SIMesh' : 'the web'
+  const from = d.source === 'builds' ? 'builds/ beside sim-mesh' : 'the web'
   return `${from}, ${d.fetched ? 'fetched' : 'fetched when used'}`
 }
 

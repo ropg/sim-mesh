@@ -1,5 +1,5 @@
 """Delivery of LXMF messages sent from stations configured with rncfg: the
-reticulum project's station, fw/simesh (the kind SIMesh calls `sergeyculum`).
+reticulum project's station, fw/sim-mesh (the kind sim-mesh calls `sergeyculum`).
 
 Such a station logs its LXMF sends under the `lxmf` tag
 (crates/reticulum-node/src/engine.rs in the reticulum project):
@@ -24,7 +24,7 @@ tool that waits for the proof is long after the message went out; latency
 runs from it too.
 
 A station's log is stamped with seconds since its process started, one boot
-section per start (its `simesh …: station N in` line at 0). Each section is
+section per start (its `sim-mesh …: station N in` line at 0). Each section is
 placed in T at the station's `hello` in the run's record, the k-th last
 section at the k-th last hello, which is where the station started to within
 the milliseconds between its start and its hello.
@@ -34,15 +34,15 @@ import collections
 import os
 import re
 
-from simesh import record
+from sim_mesh import record
 
-# SIMesh's kind for the reticulum project's station.
+# sim-mesh's kind for the reticulum project's station.
 KIND_TYPES = ("sergeyculum",)
 EARLY_S = 2.0       # how early a send's outcome may be: the schedule is the driver's, to a second or so
 REFUSED = re.compile(r"(^|\s|!\s*)error:")      # what the tool answers when it took nothing
 
 
-BOOT = re.compile(r"^\s*0\.0+ \[\w+\] simesh .*: station \d+ in ")
+BOOT = re.compile(r"^\s*0\.0+ \[\w+\] sim-mesh .*: station \d+ in ")
 LINE = re.compile(r"^\s*(\d+\.\d+) \[\w+\] \[(\w+)\] (.*)$")
 EVENTS = (
     ("sent", re.compile(r"^sent \d+ B to ([0-9a-f]{8})")),

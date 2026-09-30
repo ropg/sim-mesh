@@ -655,7 +655,7 @@ def setup_of(name, old, devices, used, left):
     old first-boot lines nothing else here says, to the same nodes."""
     out = ['"""%s\'s own setup: each node on its old kind\'s device, with its old lines."""'
            % name,
-           "from simesh import *",
+           "from sim_mesh import *",
            "",
            "# Converted from an old scenario by convert_scenario.py. A script says its",
            "# firmware() before it includes scripts/startup.py, which includes this, so",

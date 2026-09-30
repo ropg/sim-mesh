@@ -1,7 +1,7 @@
 """Station kinds: what the testbed must know about one kind of firmware.
 
 A station is a process that keeps the station contract (STATION.md): it reads
-its identity, directory, address and ether from `SIMESH_*` in its
+its identity, directory, address and ether from `SIM_MESH_*` in its
 environment, runs in its directory, and treats stdin/stdout as its console.
 Everything beyond that differs by firmware — how to tell it is up, how to
 type a line at it, what role it plays in the mesh, whether it has a web UI,
@@ -120,20 +120,20 @@ class Kind:
 
     def env(self, station):
         """The station's environment: the contract, then the device's own."""
-        env = {"SIMESH_NODE_ID": str(station.node_id),
-               "SIMESH_NODE_DIR": station.dir,
-               "SIMESH_BIND_ADDR": station.addr,
-               "SIMESH_ETHER": station.ether_addr}
+        env = {"SIM_MESH_NODE_ID": str(station.node_id),
+               "SIM_MESH_NODE_DIR": station.dir,
+               "SIM_MESH_BIND_ADDR": station.addr,
+               "SIM_MESH_ETHER": station.ether_addr}
         if station.clock is not None:
-            env.update(SIMESH_TIME="virtual",
-                       SIMESH_EPOCH_US=str(station.clock.epoch),
-                       SIMESH_SEED=str(station.clock.seed),
+            env.update(SIM_MESH_TIME="virtual",
+                       SIM_MESH_EPOCH_US=str(station.clock.epoch),
+                       SIM_MESH_SEED=str(station.clock.seed),
                        LD_PRELOAD=SHIM)
         if getattr(station, "board", None):
-            env["SIMESH_BOARD"] = station.board
+            env["SIM_MESH_BOARD"] = station.board
         profile = getattr(station, "clock_profile", None)
         if station.clock is not None and profile:
-            env["SIMESH_CLOCK_PROFILE"] = profile
+            env["SIM_MESH_CLOCK_PROFILE"] = profile
         env.update(self.extra_env)
         return env
 

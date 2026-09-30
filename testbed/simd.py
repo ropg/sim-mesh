@@ -36,7 +36,7 @@ Several of these run at once as the children of front.py, each on its own
 ports, network and run directory, with the front in front of all of them.
 
 **Firmware.** What each node runs is said by firmware rules, `{which,
-firmware}`: a selection of nodes (simesh.select) and a device name. A run
+firmware}`: a selection of nodes (sim_mesh.select) and a device name. A run
 is made with its script's rules (`sim_load`'s `firmware_rules`, which the
 front has from the script's runner) and takes more from a `firmware`
 message; they are kept in the run (`firmware_rules`), and each node runs
@@ -168,7 +168,7 @@ import script as script_module     # noqa: E402
 import stations as stations_module  # noqa: E402
 import store                       # noqa: E402
 import webrtc as webrtc_module     # noqa: E402
-from simesh import select as select_module  # noqa: E402
+from sim_mesh import select as select_module  # noqa: E402
 
 UI_DIST = os.path.join(SIM_DIR, "ui", "dist", "spa")
 DEFAULT_RUN = os.path.join(store.RUNS_DIR, "simd")
@@ -264,7 +264,7 @@ async def serve_page(request):
         return web.FileResponse(page)
     return web.Response(
         text="The control page has not been built.\n\n"
-             "In SIMesh/testbed/ui run `npm install && npx quasar build`.\n",
+             "In sim-mesh/testbed/ui run `npm install && npx quasar build`.\n",
         content_type="text/plain")
 
 
@@ -417,7 +417,7 @@ class Simd:
                 ether_module.rule_name(self.args.pairwise, self.args.bench_capture)))
         if self.ether.clock.virtual and not os.path.exists(kinds_module.SHIM):
             log("error: no time shim at %s: a virtual-time run needs it "
-                "(see SIMesh/README.md)" % kinds_module.SHIM)
+                "(see sim-mesh/README.md)" % kinds_module.SHIM)
 
     @property
     def virtual(self):
@@ -629,7 +629,7 @@ class Simd:
     def clock_profile(self, name):
         """A station's crystal, off by a draw uniform within ±`--clock-ppm`
         parts per million, from the seed and its name: its node time as a
-        function of T (STATION.md, `SIMESH_CLOCK_PROFILE`), or None for a
+        function of T (STATION.md, `SIM_MESH_CLOCK_PROFILE`), or None for a
         true clock. A kind's own profile in its `env:` still wins."""
         if not self.args.clock_ppm or not self.virtual:
             return None
@@ -894,7 +894,7 @@ class Simd:
         """Whether a live role has anyone to go to: a page that draws the map
         is open, and a station is up to be asked. A quiet socket is a
         driver's, and a script goes by a node's role tag until a role is
-        reported (simesh.sim)."""
+        reported (sim_mesh.sim)."""
         return (any(not quiet for quiet in self.pages.values())
                 and any(s.status == stations_module.UP for s in self.stations.values()))
 
@@ -1130,7 +1130,7 @@ class Simd:
     # ---- firmware --------------------------------------------------------
 
     def facts(self, name):
-        """What a firmware rule's selection (simesh.select) asks of a node."""
+        """What a firmware rule's selection (sim_mesh.select) asks of a node."""
         node = self.nodeset.nodes[name]
         station = self.stations.get(name)
         kind = self.kind_of(name)
@@ -1944,7 +1944,7 @@ CLOCK_HORIZON_US = 30 * 86_400 * 1_000_000
 
 
 def drift_profile(ppm, horizon_us=CLOCK_HORIZON_US):
-    """A `SIMESH_CLOCK_PROFILE` for a crystal `ppm` parts per million fast (or
+    """A `SIM_MESH_CLOCK_PROFILE` for a crystal `ppm` parts per million fast (or
     slow, below zero): node time running that much ahead of T from T 0."""
     return "0:0,%d:%d" % (horizon_us, horizon_us + round(horizon_us * ppm * 1e-6))
 

@@ -1,12 +1,12 @@
-# SIMesh's image: the tools to build and run SIMesh on a machine that is not
-# Linux. `simesh` builds it on first use and runs itself inside it, with the
-# directory holding SIMesh mounted at its own path; nothing of SIMesh is copied
+# sim-mesh's image: the tools to build and run sim-mesh on a machine that is not
+# Linux. `sim-mesh` builds it on first use and runs itself inside it, with the
+# directory holding sim-mesh mounted at its own path; nothing of sim-mesh is copied
 # in or built here.
 #
 # Ubuntu 24.04 because a device package's ELF is dynamically linked against that
 # release's libc, libstdc++, zlib and libbsd, and a package runs only on the
 # architecture it was built for: the image is pulled for the host's own
-# architecture, which is the one `simesh devices refresh` fetches for.
+# architecture, which is the one `sim-mesh devices refresh` fetches for.
 #
 # Holds:
 #   - python3 with aiohttp and pyyaml (the front, simd, the ether, devices.py)
@@ -45,7 +45,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends nodejs; \
     rm -rf /var/lib/apt/lists/*
 
-# Rust in a shared location, writable by whatever uid `simesh` runs the
+# Rust in a shared location, writable by whatever uid `sim-mesh` runs the
 # container as (the host user's, so what it builds in the mounted tree is
 # theirs), so cargo can fetch crates at build time.
 ENV RUSTUP_HOME=/usr/local/rustup \
@@ -56,8 +56,8 @@ RUN set -eux; \
     rustup target add wasm32-unknown-unknown; \
     chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
 
-# The home `simesh` mounts a named volume on, for npm's and cargo's caches
+# The home `sim-mesh` mounts a named volume on, for npm's and cargo's caches
 # between runs; any uid may write it.
-RUN mkdir -p /home/simesh && chmod 1777 /home/simesh
+RUN mkdir -p /home/sim-mesh && chmod 1777 /home/sim-mesh
 
 EXPOSE 8800/tcp 8800/udp

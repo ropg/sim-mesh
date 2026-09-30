@@ -247,7 +247,7 @@ def test_the_tables_are_computed_before_the_run_is_laid_out(tmp_path, monkeypatc
     shutil.copy(FOUR, str(tmp_path / "nodesets" / "four.yaml"))
     (tmp_path / "geodata" / "plain-27").mkdir()
     shutil.copy(PLAIN, str(tmp_path / "geodata" / "plain-27" / "geodata.yaml"))
-    (tmp_path / "scripts" / "four.py").write_text("from simesh import *\n")
+    (tmp_path / "scripts" / "four.py").write_text("from sim_mesh import *\n")
     (tmp_path / "scripts" / "globals.py").write_text("FREQ_MHZ = 869.525\nSF = 8\n"
                                                      "BW_KHZ = 125\nCR = 5\n")
     build = tmp_path / "build.linux"
@@ -400,8 +400,8 @@ def test_the_editors_list_open_and_save(stores):
         assert not reply["ok"] and "firmware()" in reply["error"]
         reply = await ask(ws, "script_new", name="drive")
         assert reply["ok"] and 'firmware("all"' in reply["text"]
-        assert reply["script"]["references"][0]["path"] == "simesh/library.py"
-        reply = await ask(ws, "module_open", path="simesh/library.py")
+        assert reply["script"]["references"][0]["path"] == "sim_mesh/library.py"
+        reply = await ask(ws, "module_open", path="sim_mesh/library.py")
         assert reply["ok"] and "def on_first_boot" in reply["text"]
         reply = await ask(ws, "script_save", name="drive", text="def (:\n")
         assert not reply["ok"] and "line 1" in reply["error"]

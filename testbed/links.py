@@ -44,8 +44,8 @@ import math
 import sys
 
 import referee
-from simesh import record as record_module
-from simesh.view import RunView
+from sim_mesh import record as record_module
+from sim_mesh.view import RunView
 
 BIN_M = 200
 

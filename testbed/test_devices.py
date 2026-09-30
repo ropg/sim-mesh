@@ -23,7 +23,7 @@ def package_zip(path, arch=ARCH, stamp="20260925035045", kind="reticulous",
     doc = node if node is not None else {
         "kind": kind, "arch": arch, "stamp": stamp, "elf": "reticulous.elf",
         "fixed": "fixed", "project": "Reticulous", "catalogue": "dev",
-        "entry": "hw-simesh-%s" % arch}
+        "entry": "hw-sim-mesh-%s" % arch}
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("node.yaml", yaml.safe_dump(doc))
         info = zipfile.ZipInfo("reticulous.elf")
@@ -54,7 +54,7 @@ def catalogue(directory, images, attrs=""):
 
 
 def image(stamp, arch=ARCH, slug="reticulous"):
-    return ("%s_hw-simesh-%s_%s.zip" % (slug, arch, stamp), arch, stamp)
+    return ("%s_hw-sim-mesh-%s_%s.zip" % (slug, arch, stamp), arch, stamp)
 
 
 def quiet(lines):
@@ -68,13 +68,13 @@ def survey(sources, dd, said=None):
 # ---- names ---------------------------------------------------------------------
 
 def test_an_image_name_splits_from_the_right():
-    assert devices.split_image_name("reticulous_hw-simesh-aarch64_20260925035045.zip") == \
-        ("reticulous", "hw-simesh-aarch64", "20260925035045")
+    assert devices.split_image_name("reticulous_hw-sim-mesh-aarch64_20260925035045.zip") == \
+        ("reticulous", "hw-sim-mesh-aarch64", "20260925035045")
     assert devices.split_image_name("reticulous_odd_entry_name_1.zip") == \
         ("reticulous", "odd_entry_name", "1")
     assert devices.split_image_name("reticulous_generic_abc.zip") is None
     assert devices.split_image_name("index.html") is None
-    assert devices.entry_arch("hw-simesh-x86_64") == "x86_64"
+    assert devices.entry_arch("hw-sim-mesh-x86_64") == "x86_64"
     assert devices.entry_arch("hw-heltecv4") is None
 
 
@@ -90,11 +90,11 @@ def test_a_device_name_is_project_catalogue_and_stamp_or_latest():
 
 def test_the_newest_package_per_project_for_this_arch_is_picked():
     links = devices.parse_listing(
-        '<a href="r_hw-simesh-aarch64_2.zip" data-target="linux">a</a>'
-        '<a href="r_hw-simesh-aarch64_4.zip">b</a>'
-        '<a href="r_hw-simesh-aarch64_1.zip">b</a>'
-        '<a href="s_hw-simesh-aarch64_3.zip">b</a>'
-        '<a href="r_hw-simesh-x86_64_9.zip">c</a>'
+        '<a href="r_hw-sim-mesh-aarch64_2.zip" data-target="linux">a</a>'
+        '<a href="r_hw-sim-mesh-aarch64_4.zip">b</a>'
+        '<a href="r_hw-sim-mesh-aarch64_1.zip">b</a>'
+        '<a href="s_hw-sim-mesh-aarch64_3.zip">b</a>'
+        '<a href="r_hw-sim-mesh-x86_64_9.zip">c</a>'
         '<a href="r_hw-heltecv4_9.zip">d</a><a name="x">no href</a>')
     newest = devices.newest_packages(links, ARCH)
     assert {k: v["stamp"] for k, v in newest.items()} == {"r": "4", "s": "3"}
@@ -124,7 +124,7 @@ def test_a_source_is_a_name_a_url_or_a_directory(tmp_path):
     assert devices.Source(catalogue(str(tmp_path / "imported"), [])).name == "builds-imported"
 
 
-def test_the_builds_beside_simesh_are_sources(tmp_path):
+def test_the_builds_beside_sim_mesh_are_sources(tmp_path):
     catalogue(str(tmp_path / "builds" / "dev"), [])
     os.makedirs(str(tmp_path / "builds" / "elf"))
     assert devices.builds_sources(str(tmp_path / "builds")) == [str(tmp_path / "builds" / "dev")]
@@ -272,7 +272,7 @@ def test_the_survey_and_the_fetch_over_http(tmp_path):
     index, got, said = asyncio.run(go())
     assert list(index) == ["reticulous_dev"]
     assert any(line.startswith("stable:") for line in said)
-    assert got["source"].endswith("/builds/dev/reticulous_hw-simesh-aarch64_7.zip")
+    assert got["source"].endswith("/builds/dev/reticulous_hw-sim-mesh-aarch64_7.zip")
     # Its node.yaml was read by range requests, before the fetch.
     assert index["reticulous_dev"]["node"] == {"kind": "reticulous", "project": "Reticulous",
                                                "arch": ARCH}
@@ -329,12 +329,12 @@ def compiled(tmp_path):
     dd = tmp_path / "devices"
     build = tmp_path / "ws" / "fw" / "target"
     build.mkdir(parents=True)
-    (build / "simesh").write_text("elf")
+    (build / "sim-mesh").write_text("elf")
     (build / "rncfg").write_text("tool")
     (dd / "local").mkdir(parents=True)
     (dd / "local" / "sergeyculum_local.yaml").write_text(
         "kind: sergeyculum\nproject: Sergeyculum\nvirtual_hardware: nRF52840\n"
-        "elf: ../../ws/fw/target/simesh\ntools: { rncfg: ../../ws/fw/target/rncfg }\n")
+        "elf: ../../ws/fw/target/sim-mesh\ntools: { rncfg: ../../ws/fw/target/rncfg }\n")
     (dd / "local" / "broken_local.yaml").write_text("kind: sergeyculum\nelf: ../../nowhere\n")
     (dd / "local" / "oddly-named.yaml").write_text("kind: sergeyculum\nelf: x\n")
     return str(dd), build
@@ -343,7 +343,7 @@ def compiled(tmp_path):
 def test_a_compiled_build_is_the_latest_of_its_catalogue_run_in_place(tmp_path):
     dd, build = compiled(tmp_path)
     got = devices.resolve("sergeyculum_local_latest", devices_dir=dd, arch=ARCH)
-    assert got["elf"] == str(build / "simesh")
+    assert got["elf"] == str(build / "sim-mesh")
     assert got["tools"] == {"rncfg": str(build / "rncfg")}
     assert (got["project"], got["catalogue"], got["virtual_hardware"]) == \
         ("sergeyculum", "local", "nRF52840")
@@ -374,7 +374,7 @@ def test_a_path_resolves_to_a_package_or_a_workspace_build(tmp_path):
     build = tmp_path / "ws" / "reticulous" / "esp-idf" / "build.linux"
     (build / "data_merged").mkdir(parents=True)
     (build / "reticulous.elf").write_text("elf")
-    base = tmp_path / "ws" / "SIMesh" / "testbed"
+    base = tmp_path / "ws" / "sim-mesh" / "testbed"
     base.mkdir(parents=True)
     got = devices.resolve("../../reticulous/esp-idf/build.linux", base_dir=str(base), arch=ARCH)
     assert got["elf"] == str(build / "reticulous.elf")

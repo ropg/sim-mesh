@@ -57,8 +57,8 @@ import sys
 from datetime import datetime
 
 import store
-from simesh import record as record_module
-from simesh.view import RunView
+from sim_mesh import record as record_module
+from sim_mesh.view import RunView
 
 sys.path.insert(0, os.path.join(store.SIM_DIR, "..", "ether"))
 import ether as ether_module  # noqa: E402 - the path is set just above

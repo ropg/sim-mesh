@@ -3,14 +3,14 @@
 Every station runs Reticulous's dev build, is set up by the startup script
 (its role, its radio, its nodeset's own setup), and gets an LXMF identity at
 its first boot; its messages go out as the `send_msg`
-meta command (simesh.traffic), so the driver runs on any firmware that has
-one. `OPTIONS` below are the phases' settings, over simesh.traffic's
+meta command (sim_mesh.traffic), so the driver runs on any firmware that has
+one. `OPTIONS` below are the phases' settings, over sim_mesh.traffic's
 defaults; the result, every send with its route and reply, lands in the run
 directory as `traffic.json`, the simulation is paused, and the report is the
 delivery `delivery.py traffic.json <run>` counts.
 """
-from simesh import *
-from simesh import traffic
+from sim_mesh import *
+from sim_mesh import traffic
 
 OPTIONS = {
     "warm_rounds": 3,

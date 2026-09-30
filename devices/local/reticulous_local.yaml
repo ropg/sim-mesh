@@ -1,8 +1,8 @@
-# Reticulous as last built for the host target in the workspace beside SIMesh —
+# Reticulous as last built for the host target in the workspace beside sim-mesh —
 # `spangap build reticulous/reticulous --with spangap/hw-linux …`, which leaves
 # the executable and the merged /fixed tree in the target's own build dir:
 # reticulous_local_latest, run in place, until the catalogues carry a
-# hw-simesh-<arch> build of their own.
+# hw-sim-mesh-<arch> build of their own.
 project: Reticulous
 kind: reticulous
 virtual_hardware: ESP32-S3

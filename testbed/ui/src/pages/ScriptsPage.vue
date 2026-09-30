@@ -72,10 +72,10 @@
         </div>
       </template>
       <div v-else class="sp-intro">
-        <div class="sp-heading">Scripts are Python against the simesh library</div>
+        <div class="sp-heading">Scripts are Python against the sim_mesh library</div>
         <p>
           A script runs from its top to its end, each call doing what it says:
-          <code>from simesh import *</code>, then its declarations,
+          <code>from sim_mesh import *</code>, then its declarations,
           <code>time("real")</code> (or <code>"max"</code>, or a pace such as
           <code>10</code>), <code>firmware(which, "reticulous_dev_latest")</code> and
           <code>on_first_boot(which, lines)</code>, then what it does:

@@ -2075,7 +2075,7 @@ struct LossQuery {
     /// Sweep the whole radius in one band, without the inner bands a map
     /// paints while it waits. Every band is a complete sweep of its own
     /// radius, computed afresh, so the last one is the same raster either
-    /// way: a caller that keeps only that one, as SIMesh's coverage does,
+    /// way: a caller that keeps only that one, as sim-mesh's coverage does,
     /// asks this and is spared the rest of the ladder.
     #[serde(default)]
     whole: bool,
@@ -2705,11 +2705,11 @@ struct LinkQuery {
     /// §4.7 eq. (69), both ways of the both-way mean. Left unset, the model's
     /// own (`LinkParams::eu868_defaults`, 90), so every URL that worked before
     /// returns the number it did. A caller that lays its own location spread
-    /// over the answer, as SIMesh's shadowing does, asks for the median: at
+    /// over the answer, as sim-mesh's shadowing does, asks for the median: at
     /// 90 the spread is counted twice.
     loc_pct: Option<f64>,
     /// Leave out the profile drawn for the page (240 points, ~40 KB): a
-    /// caller that keeps only the loss and its verdicts, such as SIMesh's
+    /// caller that keeps only the loss and its verdicts, such as sim-mesh's
     /// loss tables asking every pair, has no use for it. Everything else in
     /// the reply is the same.
     #[serde(default)]

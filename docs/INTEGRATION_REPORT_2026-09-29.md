@@ -1,7 +1,9 @@
 # Integration report, 29 September 2026
 
+Names follow the rename of 30 September (SIMesh to sim-mesh): a path or name cited at an older commit carried the old one there.
+
 What this fork's `integration/main` takes from our own simulators and tools
-into SIMesh, why, how it was checked, and what was left out. The capability
+into sim-mesh, why, how it was checked, and what was left out. The capability
 matrix it follows is `docs/CAPABILITY_MATRIX_2026-09-29.md`. The sweep behind
 its results ran on 29 and 30 September.
 
@@ -27,11 +29,11 @@ its results ran on 29 and 30 September.
 
 ## Sources
 
-- **SIMesh**: upstream main `50e2c31`, which this fork's `main` is.
+- **sim-mesh**: upstream main `50e2c31`, which this fork's `main` is.
 - **Our upstream PR branches**: ten branches on `01d9b1f`.
 - **mesh**: `c2ff69d`.
 - **planner**: `bd1019d`. Its crates are those of `830f221`. The survey's `f3d897a` became `06ff759` in planner's rewrite of 29 September.
-- **reticulum**: the reticulum project's `tools/rnscale`, `tools/rncapture`, `tools/simether` and `fw/simesh`, at `feat/supe` `b2b4302`. The station of step 4's grids is `fw/simesh` on `perf/sim-quiet` `882c8cc`.
+- **reticulum**: the reticulum project's `tools/rnscale`, `tools/rncapture`, `tools/simether` and `fw/sim-mesh`, at `feat/supe` `b2b4302`. The station of step 4's grids is `fw/sim-mesh` on `perf/sim-quiet` `882c8cc`.
 
 ## What went in
 
@@ -65,12 +67,12 @@ written byte for byte as before.
 
 | Commit | Key or flag | What | From |
 |---|---|---|---|
-| 147d65e | `--crc-margin-db` | The CRC band: a frame m dB over its threshold, m under the band, fails with probability 1 − m/band, one seeded draw per frame and receiver. SIMesh's INTERNALS planned it. | PR #7 |
+| 147d65e | `--crc-margin-db` | The CRC band: a frame m dB over its threshold, m under the band, fails with probability 1 − m/band, one seeded draw per frame and receiver. sim-mesh's INTERNALS planned it. | PR #7 |
 | 4362f8e | `--bench-capture` | Same-SF collisions as a bench measured them (289 collisions, SF7/125 kHz), over main's summed interference. The lock and both verdicts read one seeded draw. | PR #4 |
 | ee375a0 | `--clock-ppm` | Each station's crystal off by a draw within ±ppm, hashed from the seed and its name, through the conductor's clock profile. Virtual time only. | rnscale's ±20 ppm |
 | 1e9ab0c | geodata `shadowing_db`, `shadowing_seed` | One static log-normal draw per pair laid over the tables, by node name. | PR #2 |
 | bf81004 | nodeset `links:` | A pair's loss stated outright; antennas and offsets still apply. | PR #5 |
-| e630c8a, fa256fe | pack geodata `loc_pct` | Tables at a chosen percentage of locations through SIMesh's planner copy, so a median can carry shadowing. | planner's `loc_pct` |
+| e630c8a, fa256fe | pack geodata `loc_pct` | Tables at a chosen percentage of locations through sim-mesh's planner copy, so a median can carry shadowing. | planner's `loc_pct` |
 
 ### Tools
 
@@ -108,14 +110,14 @@ pairs before the grids, and closed; the grids found an eighth (below):
 end at one instant, and the ether's socket buffer (the kernel's, capped by
 `net.core.rmem_max`, 208 KB here) cannot hold them all. What does not fit is
 dropped: an idle is said again, but a lost `state` or `tx` is one the medium
-never heard, and the run with it is not the run. SIMesh's ether heard 444 of
+never heard, and the run with it is not the run. sim-mesh's ether heard 444 of
 1500 hellos sent while its loop was busy. The fork's conductor takes datagrams
 off the socket on a thread of its own (55a013a, 98828d3), and simd reports
 any datagram the kernel drops on the ether's socket all the same; every run
 of the fork's arms in step 4's grids reported none.
 
 **Fast.** The conductor of a virtual-time run (every idle, T, every `run`) is
-in Rust (78d81d7, `simesh build ether`), in simd's own thread, with the
+in Rust (78d81d7, `sim-mesh build ether`), in simd's own thread, with the
 medium and everything else still in `ether.py` and called at the same points:
 its records are those of the Python conductor, which stays, line for line. A
 barrier reads only the consoles something was printed on (8282f49, 6abf297),
@@ -123,7 +125,7 @@ roles are asked only while a page shows them (3394b2d), and a console need not
 be a pty (d4744cc). The stations of our own stack sleep through the engine's
 polls that cannot act, woken at the first that can, by a frame or by their
 host, with their records unchanged line for line (the reticulum project's
-`perf/sim-quiet`, `SIMESH_POLL_SKIP`).
+`perf/sim-quiet`, `SIM_MESH_POLL_SKIP`).
 
 On 28 stations and 34 minutes of run time, one seed, a run took 101.7 s of
 wall before any of this and 9.6 s after it; a Berlin run of an hour of run time, about
@@ -149,8 +151,8 @@ A few more are fixes found on the way:
 
 The fix has two halves. Each datagram is now applied whole before the host is told of any of it: its due waits, the advance hook and DIO1 all wait (68150ff). And everything the barrier has for a station at one go is sent as one datagram, a message a line, to a station that says in its hello that it takes them (27cb922). On the stack of the grids, five runs each of two elev seeds, and two runs of a Berlin seed (1,231,947 record lines), are each one record.
 
-**Found by the grids: a host's turn given back too early.** The fault was in our station, not in SIMesh.
-- The station told SIMesh it was answering its host (the floor, above) before every frame it wrote to the host, including mail pushed to the host as it landed.
+**Found by the grids: a host's turn given back too early.** The fault was in our station, not in sim-mesh.
+- The station told sim-mesh it was answering its host (the floor, above) before every frame it wrote to the host, including mail pushed to the host as it landed.
 - When mail landed while a tool's line still waited for the station's poll, the floor went back to the tool first. T then stood, and the line went unread, until the tool gave up after 8 s of wall.
 - Where two such waits ran past the testbed's 10 s, the send failed, the script waited for an answer (f41ea81 above), and T ran away.
 
@@ -319,13 +321,13 @@ The seed of the table above is one of those three. Its upstream runs span 87.5 t
 - **PR #5 as written**: SLT1 tables supersede it. What main lacked, a loss stated outright, came back as the nodeset key.
 - **PR #8's duty section**: `compliance.py` holds each node to EN 300 220-2 Annex B, e.r.p. and polite spectrum access. Ours put 863–865 MHz at 1 % and checked no power.
 - **`wip/virtual-time`** (simd_remote and the external simether): it talks to the geometric ether main removed. simether would need loss tables first.
-- **iface-lora's PRs #2–#5**: since iface-lora e651bca its host build links SIMesh's chip library, so the chip fixes above reach reticulous stations built against this fork. Three `integration/medium` commit messages (1106a99, b4c2c7a, 0f051d6) wrongly say iface-lora needs the same change.
+- **iface-lora's PRs #2–#5**: since iface-lora e651bca its host build links sim-mesh's chip library, so the chip fixes above reach reticulous stations built against this fork. Three `integration/medium` commit messages (1106a99, b4c2c7a, 0f051d6) wrongly say iface-lora needs the same change.
 - **From mesh**:
   - its capture (+1 dB, no timing rule, per interferer);
   - its SNR without a noise figure;
   - its 100 ms polling grid.
 
-  SIMesh's are better. Its energy model and outside interferer are candidates (below).
+  sim-mesh's are better. Its energy model and outside interferer are candidates (below).
 - **From planner**:
   - The multi-wall law as a whole-path model: planner's own file warns against using it for a region it has not seen.
   - Its interior increment (1.26 dB per metre of building, capped at 25 m) is a candidate for indoor ends on packs. No pack was at hand to test it.
@@ -333,9 +335,9 @@ The seed of the table above is one of those three. Its upstream runs span 87.5 t
 ## Candidates for a next round
 
 1. Planner's interior increment for an indoor antenna on a pack, in place of the P.2109 median, behind a key.
-2. Planner's `site_pair_loss` as SIMesh's pair-table path: both directions, `loc_pct`, `time_pct` and frequency as inputs, and no two HTTP requests per pair.
+2. Planner's `site_pair_loss` as sim-mesh's pair-table path: both directions, `loc_pct`, `time_pct` and frequency as inputs, and no two HTTP requests per pair.
 3. Per-node power from the sub-band's e.r.p. cap (planner's `conducted_dbm_for_erp`), so a run is compliant by construction.
-4. An energy tool over the record, after mesh's model but charged by mode (RX, CAD, standby, TX by power), which only SIMesh's record allows.
+4. An energy tool over the record, after mesh's model but charged by mode (RX, CAD, standby, TX by power), which only sim-mesh's record allows.
 5. An outside interferer: a foreign station on the shared band, heard through the tables like any node.
 6. mesh's analytic reachability as a ceiling a protocol's delivery can be held against.
 7. Fast per-frame fading, a key of its own on top of the static shadowing.
@@ -388,7 +390,7 @@ Drafted here, not sent; whether and how to send them is the fork owner's call.
 
 - A loss-matrix export: every pair both ways, whatever its budget, with the near field under 250 m and P.2108 at both ends, and `loc_pct`, `time_pct` and frequency as inputs. `site_pair_loss` is the start: one direction, no near field, no P.2108.
 - `/link.json` exposing `loc_pct` and `time_pct`.
-- Reconciling with SIMesh's copy, which averages both directions and charges P.2109 at an indoor end.
+- Reconciling with sim-mesh's copy, which averages both directions and charges P.2109 at an indoor end.
 - `sensitivity.db_per_m_*` compares a loss including A_h against a P.1812-only probe.
 - `README.md:20` quotes void coverage figures.
 

@@ -120,7 +120,7 @@ def stores(tmp_path, monkeypatch):
         "  a: { id: 1, lat: 0, lon: 0, tags: [transport] }\n"
         "  b: { id: 2, lat: 0, lon: 0.006, tags: [no-radio] }\n"
         "  c: { id: 3, lat: 0.006, lon: 0, tags: [far] }\n")
-    (tmp_path / "scripts_dir" / "far.py").write_text('"""far"""\nfrom simesh import *\n')
+    (tmp_path / "scripts_dir" / "far.py").write_text('"""far"""\nfrom sim_mesh import *\n')
     (tmp_path / "scripts_dir" / "globals.py").write_text(
         "FREQ_MHZ = 869.525\nSF = 8\nBW_KHZ = 125\nCR = 5\n")
     return tmp_path
@@ -213,7 +213,7 @@ def test_a_run_records_the_medium_it_was_started_on(stores):
         run = daemon.run
         assert run.meta["physics"] == {"noise_figure_db": 4.5, "pairwise": False}
         assert run.meta["seed"] == 77
-        from simesh import view
+        from sim_mesh import view
         assert view.RunView(run.dir).medium().physics.noise_figure_db == 4.5
         await daemon.stop_all(flush=False)
         daemon.ether.close()
@@ -243,13 +243,13 @@ def test_each_station_keeps_its_own_clock_within_the_ppm_given(stores):
     station = types.SimpleNamespace(node_id=1, dir="d", addr="a", ether_addr="e",
                                     clock=daemon.ether, board=None,
                                     clock_profile=daemon.clock_profile("a"))
-    assert Stub({}).env(station)["SIMESH_CLOCK_PROFILE"] == daemon.clock_profile("a")
-    own = Stub({"env": {"SIMESH_CLOCK_PROFILE": "0:0,1:2"}}).env(station)
-    assert own["SIMESH_CLOCK_PROFILE"] == "0:0,1:2"
+    assert Stub({}).env(station)["SIM_MESH_CLOCK_PROFILE"] == daemon.clock_profile("a")
+    own = Stub({"env": {"SIM_MESH_CLOCK_PROFILE": "0:0,1:2"}}).env(station)
+    assert own["SIM_MESH_CLOCK_PROFILE"] == "0:0,1:2"
     daemon.args.clock_ppm = 0
     assert daemon.clock_profile("a") is None
     station.clock_profile = None
-    assert "SIMESH_CLOCK_PROFILE" not in Stub({}).env(station)
+    assert "SIM_MESH_CLOCK_PROFILE" not in Stub({}).env(station)
 
 
 def test_a_drifting_clock_needs_virtual_time():
@@ -590,7 +590,7 @@ def test_only_a_station_that_printed_is_read_through_the_pty_thread(marks):
     if marks == "core":
         module = simd.ether_module.core_module()
         if module is None:
-            pytest.skip("no ether core built (simesh build ether)")
+            pytest.skip("no ether core built (sim-mesh build ether)")
 
     async def go():
         main = asyncio.get_running_loop()

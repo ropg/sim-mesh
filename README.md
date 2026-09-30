@@ -1,4 +1,4 @@
-# SIMesh
+# sim-mesh
 
 A LoRa testbed, run in real time or in virtual time. Stations are real
 firmware, built as Linux processes, each on its own loopback address; below
@@ -13,7 +13,7 @@ browser ── localhost:8800 ──► front.py ─┬─► simd (lora) ─┬
                                         │                ├─ stations     (firmware processes, one pty each)
                                         │                └─ proxy        <station>.lora.sim.localhost ─► the station's :80
                                         ├─► simd (supe)  …
-                                        ├─► simesh.runner   a script's main, driving one simulation
+                                        ├─► sim_mesh.runner  a script's main, driving one simulation
                                         ├─► planner-web  one per ground-data pack in use
                                         └─► planner-job  a pack built from its sources, a node map imported
 ```
@@ -22,7 +22,7 @@ One simulation is one simd; the front runs several behind port 8800, keeps
 their registry, computes their loss tables, runs scripts against them,
 starts the planner that supplies real ground and builds that ground from
 public sources. Around them are the things
-SIMesh keeps, each on its own because each changes on its own:
+sim-mesh keeps, each on its own because each changes on its own:
 
 | | What it is | Where |
 |---|---|---|
@@ -31,13 +31,13 @@ SIMesh keeps, each on its own because each changes on its own:
 | **geodata** | the ground: a pack built from public sources, or synthetic ground at 0°, 0° | `testbed/geodata/<name>/`: `geodata.yaml`, and the pack's files beside it |
 | a **nodeset** | which nodes stand where with what maximum power and antenna, their tags, the offsets and any stated links; its own setup script beside it | `testbed/nodesets/<name>.yaml`, `<name>.py` |
 | a **loss table** | every ordered pair's path loss, derived from geodata and a nodeset | `testbed/losses/…`, a cache |
-| a **script** | plain Python against the simesh library, top to end: the time, what each node runs and is given at first boot, and what is done | `testbed/scripts/<name>.py` |
+| a **script** | plain Python against the sim-mesh library, top to end: the time, what each node runs and is given at first boot, and what is done | `testbed/scripts/<name>.py` |
 | a **run** | one simulation's output: its record, logs and state | `testbed/runs/<name>/` |
 | a **snapshot** | a moment of a run, state and all, to start another from | `testbed/snapshots/<name>/` |
 
 | Piece | Where |
 |---|---|
-| the launcher | `simesh`, and its image, `Dockerfile` |
+| the launcher | `sim-mesh`, and its image, `Dockerfile` |
 | the medium | [`ether/`](ether/README.md) |
 | the chip model, as a C library a station links | `radio/` |
 | the front, simd, the stores, the library, the page, the analysis tools | `testbed/` |
@@ -50,43 +50,43 @@ It is the firmware under test, built for a different target — not an emulator.
 
 ## Getting started
 
-SIMesh needs no firmware tree: it runs prebuilt stations it fetches itself.
+sim-mesh needs no firmware tree: it runs prebuilt stations it fetches itself.
 
 On **Linux** it runs natively, and needs `python3` with `aiohttp` and
 `pyyaml` (Debian and Ubuntu: `python3-aiohttp python3-yaml`), `node` and
 `npm` for the page, and `cmake` with a C and C++ compiler for the chip
 library; `cargo` too for real ground (below), and Reticulum and LXMF
 (`pip install rns lxmf`) for `standard_reticulum` stations. On a fresh
-Debian, Ubuntu or Fedora, `simesh install` puts all of it in place, as
-SIMesh's image holds it (step 2). **Anywhere else** it needs
-only `docker`: `simesh` builds its own small image on first use (a few
+Debian, Ubuntu or Fedora, `sim-mesh install` puts all of it in place, as
+sim-mesh's image holds it (step 2). **Anywhere else** it needs
+only `docker`: `sim-mesh` builds its own small image on first use (a few
 minutes, once) and runs itself inside it, with port 8800 published; `podman`
-does as well where there is no `docker` (`SIMESH_RUNTIME` chooses).
+does as well where there is no `docker` (`SIM_MESH_RUNTIME` chooses).
 
-**1. Clone it.** The directory you clone into is the one `simesh` mounts
-into its image, so a workspace put beside SIMesh later is where a local
+**1. Clone it.** The directory you clone into is the one `sim-mesh` mounts
+into its image, so a workspace put beside sim-mesh later is where a local
 device expects it:
 
 ```sh
 mkdir mesh && cd mesh
-git clone https://github.com/reticulous/SIMesh.git
+git clone https://github.com/sim-mesh/sim-mesh.git
 ```
 
 **2. Build** the page, the chip library, the ether's conductor and the
-planner (SIMesh's own, in `planner/`; without cargo the last two are left
-out, SIMesh says so, synthetic ground works and the ether's Python conductor
+planner (sim-mesh's own, in `planner/`; without cargo the last two are left
+out, sim-mesh says so, synthetic ground works and the ether's Python conductor
 runs virtual time):
 
 ```sh
-SIMesh/simesh build
+sim-mesh/sim-mesh build
 ```
 
-On a fresh Linux, `SIMesh/simesh install` does this step with what it needs
+On a fresh Linux, `sim-mesh/sim-mesh install` does this step with what it needs
 first: the system's packages through apt or dnf (with sudo); a Node the
 page's build takes (22.22 or later) where the system's is older, NodeSource's
 22 on Debian and Ubuntu, which ship 18, and on Fedora, whose default is 22.21,
 its own nodejs24; Rust through rustup; and Reticulum and LXMF in a Python
-environment beside the clone, `SIMesh/.venv`, which `simesh` puts first on
+environment beside the clone, `sim-mesh/.venv`, which `sim-mesh` puts first on
 the path for itself and every station it starts (Fedora's Node 24 is given
 its plain names there). A step whose result is there already is left out;
 `--dry-run` says what it would do. It is tried from a fresh clone on Debian
@@ -95,23 +95,25 @@ its plain names there). A step whose result is there already is left out;
 **3. Start it:**
 
 ```sh
-SIMesh/simesh
+sim-mesh/sim-mesh
 ```
 
 It builds whichever of the page, the chip library and the planner is not
-built yet, so a fresh clone may skip step 2, then starts the front and opens
+built yet or is older than a file of its sources (hidden directories and
+`__pycache__` aside), so a fresh clone or a pull may skip step 2, then
+starts the front and opens
 `http://localhost:8800/`. The terminal is the
 testbed's: Ctrl-C there stops every simulation and everything they started.
 
 **4. Stations.** A station is a device file: the firmware built for Linux
 and a `node.yaml` saying how to run it, published in a build catalogue beside
 the board images. On start the front looks through the web's catalogues and
-every catalogue in a `builds/` directory beside SIMesh for the newest build
+every catalogue in a `builds/` directory beside sim-mesh for the newest build
 of each project for this machine's architecture (`aarch64` or `x86_64`); the
 Firmware tab lists them as `reticulous_dev_latest` and so on, and one is
 fetched when a simulation first uses it.
 
-**5. A first simulation.** No geodata and no nodesets come with SIMesh:
+**5. A first simulation.** No geodata and no nodesets come with sim-mesh:
 both are your own, kept in `testbed/geodata/` and `testbed/nodesets/` and
 never committed. Make ground on the **Geodata** tab, **Build from
 sources…** over a rectangle of the map or **New synthetic…**, and click
@@ -127,7 +129,7 @@ the next minute; rings on the map are frames on the air. For a simulation
 to work with by hand, run `realtime`: every node on the dev build, on the
 wall clock, set up by the startup script and left running.
 
-**While `dev` has no `hw-simesh` build** for your architecture, the
+**While `dev` has no `hw-sim-mesh` build** for your architecture, the
 simulation says it cannot fetch one and its stations run nothing. Change the
 script's `firmware()` line to a build the Firmware tab lists (or one of your
 own, [The developer loop](#the-developer-loop-with-a-workspace)) and start
@@ -167,9 +169,9 @@ a **kind**: how the testbed talks to it (`testbed/kinds/`). A device's
 | Kind | The firmware | Up when | A line is | Web UI |
 |---|---|---|---|---|
 | `reticulous` | Reticulous, built for `spangap/hw-linux` | it answers a framed RPC (remote procedure call) frame on its console (after printing the marker, or to one blind probe), and `s.sys.reset_reason` reads, which its boot writes once every service has initialised | a CLI (command line) command, one framed RPC frame over its console pty (pseudo-terminal) | port 80 |
-| `sergeyculum` | "Sergeyculum", the Rust Reticulum stack at [git.emcomm.cc/berlinmesh/reticulum](https://git.emcomm.cc/berlinmesh/reticulum), as its `fw/simesh` target | its `kiss` pty answers `rncfg detect` | `rncfg` without program and port: `name set {name}` runs `rncfg name <dir>/kiss set <name>` | none |
-| `microreticulum` | attermann's [microReticulum_Firmware](https://github.com/attermann/microReticulum_Firmware), the RNode firmware with the microReticulum stack in it, as its Portduino Linux daemon built with `[env:simesh]`: a LoRa transport node and nothing else | its log shows `RNS Transport is READY!` since its latest start | an edit to its `rnoded.conf`, `set <key> <value>`, `unset <key>` or `txp <dBm at the connector>`; a flush restarts it when a line changed the file | none |
-| `standard_reticulum` | a standard Reticulum node: the RNode firmware with Reticulum's Python reference implementation and an LXMF router behind it, as rnsd runs on a computer with an RNode on its USB port (`stations/standard_reticulum/station.py`, over microReticulum_Firmware's Linux daemon built with `[env:simesh-rnode]`, whose own stack is never started) | it answers a framed RPC frame, and its `status` says `state: up` | one of `station.py`'s commands, one framed RPC frame; a flush restarts it when a setting is pending | none |
+| `sergeyculum` | "Sergeyculum", the Rust Reticulum stack at [git.emcomm.cc/berlinmesh/reticulum](https://git.emcomm.cc/berlinmesh/reticulum), as its `fw/sim-mesh` target | its `kiss` pty answers `rncfg detect` | `rncfg` without program and port: `name set {name}` runs `rncfg name <dir>/kiss set <name>` | none |
+| `microreticulum` | attermann's [microReticulum_Firmware](https://github.com/attermann/microReticulum_Firmware), the RNode firmware with the microReticulum stack in it, as its Portduino Linux daemon built with `[env:sim-mesh]`: a LoRa transport node and nothing else | its log shows `RNS Transport is READY!` since its latest start | an edit to its `rnoded.conf`, `set <key> <value>`, `unset <key>` or `txp <dBm at the connector>`; a flush restarts it when a line changed the file | none |
+| `standard_reticulum` | a standard Reticulum node: the RNode firmware with Reticulum's Python reference implementation and an LXMF router behind it, as rnsd runs on a computer with an RNode on its USB port (`stations/standard_reticulum/station.py`, over microReticulum_Firmware's Linux daemon built with `[env:sim-mesh-rnode]`, whose own stack is never started) | it answers a framed RPC frame, and its `status` says `state: up` | one of `station.py`'s commands, one framed RPC frame; a flush restarts it when a setting is pending | none |
 
 Sergeyculum is a working name; the project calls itself `reticulum` and the
 kind is named after its repository.
@@ -223,7 +225,7 @@ testbed ── framed RPC on the console ──► station.py     the node's id 
 ```
 
 `station.py` is Reticulum (`rns`) and LXMF (`lxmf`) in a python3 that has
-them, which SIMesh's image does; natively, install both. The RNode is
+them, which sim-mesh's image does; natively, install both. The RNode is
 attermann's firmware with its own stack compiled in but never started
 (`STANDARD_RNODE`) and its EEPROM provisioned with no radio configuration,
 so it stays out of TNC mode and Reticulum sets its radio over KISS, as it
@@ -236,8 +238,8 @@ then hands LXMF a DIRECT message; the station logs `lxmf: queued mid=…`
 and then `lxmf: DIRECT delivered mid=…` (`DIRECT resource delivered`) or
 `lxmf: failed mid=…`, which is what the traffic report counts. Its device
 is the compiled build `standard-reticulum_local_latest`: the RNode as last
-compiled with `pio run -e simesh-rnode` in the clone under `competition/`
-beside SIMesh.
+compiled with `pio run -e sim-mesh-rnode` in the clone under `competition/`
+beside sim-mesh.
 
 ## Firmware
 
@@ -247,20 +249,20 @@ whatever else it needs, and a `node.yaml` saying what those are, what the
 page calls it (`name`), what hardware it plays (`virtual_hardware`, shown
 as "virtual ESP32-S3") and what radio chip it drives (`virtual_radio`, shown beneath as
 "virtual SX1262"). Build catalogues publish them beside the board images as
-`<project>_hw-simesh-<arch>_<stamp>.zip`.
+`<project>_hw-sim-mesh-<arch>_<stamp>.zip`.
 
 **A device is called** `<project>_<catalogue>_<stamp>`, one name for one
 build (`reticulous_dev_20260927140352`), or `<project>_<catalogue>_latest`
 for whichever is newest in that catalogue when it is used. The project is
 the catalogue filename's, the catalogue where it was published. A script
-names devices this way ([Scripts](#scripts)), and so do `simesh new
+names devices this way ([Scripts](#scripts)), and so do `sim-mesh new
 --build` and `simd --build`, which also take a package directory or a
 workspace's `build.linux`.
 
 **Latest builds.** The front surveys the catalogues when it starts, fetching
-nothing: the ones the web's index lists (`$SIMESH_CATALOGUES`, by default
+nothing: the ones the web's index lists (`$SIM_MESH_CATALOGUES`, by default
 `https://reticulous.net/builds/`), then every catalogue directory (one
-holding an `index.html`) in `builds/` beside SIMesh, which is where a
+holding an `index.html`) in `builds/` beside sim-mesh, which is where a
 workspace's `make-builds` leaves them. A local catalogue joins the web's of
 its name, the newer build winning, so a fresh local `dev` build is
 `reticulous_dev_latest` and one in `builds/local` is `reticulous_local_latest`.
@@ -275,16 +277,16 @@ and **Refresh** there does the web too.
 
 **Saved builds** stay until deleted: **Save** on a latest build copies it
 (fetching it first) into `devices/saved/<project>_<catalogue>_<stamp>/`.
-**Import** on the Firmware tab, or `simesh devices import`, takes a zip of
+**Import** on the Firmware tab, or `sim-mesh devices import`, takes a zip of
 any name into the saved builds as `<project>_imported_<stamp>`, named from
 its `node.yaml`; it must be built for this machine.
 
-**Compiled builds** stand in for a project that publishes no simesh build
+**Compiled builds** stand in for a project that publishes no sim-mesh build
 yet: `devices/local/<project>_<catalogue>.yaml`, a `node.yaml` that is not
 in an archive, its `elf`, `fixed` and `tools` paths relative to the file and
 free to point anywhere, run in place from wherever it was last compiled, and
-the latest of its catalogue. These come with SIMesh:
-`sergeyculum_local_latest`, Sergeyculum's `fw/simesh` with its `rncfg` as
+the latest of its catalogue. These come with sim-mesh:
+`sergeyculum_local_latest`, Sergeyculum's `fw/sim-mesh` with its `rncfg` as
 last compiled in `sergey/reticulum`; `microreticulum_local_latest` and
 `microreticulum-jrl290_local_latest`, attermann's firmware and a stand-in
 for jrl290's as last compiled under `competition/`; and
@@ -295,19 +297,19 @@ like any other.
 From a shell:
 
 ```sh
-simesh devices refresh                          # survey the web's catalogues, then builds/
-simesh devices refresh ../builds/rop            # one catalogue: a name, a URL or a directory
-simesh devices list                             # the latest and the saved builds
-simesh devices fetch reticulous_dev_latest      # download it now
-simesh devices save reticulous_dev_latest       # keep the one there is now
-simesh devices delete reticulous_dev_20260927140352
-simesh devices import mine.zip                  # any device zip, saved
-simesh devices resolve reticulous_dev_latest    # what a name runs, as JSON
+sim-mesh devices refresh                          # survey the web's catalogues, then builds/
+sim-mesh devices refresh ../builds/rop            # one catalogue: a name, a URL or a directory
+sim-mesh devices list                             # the latest and the saved builds
+sim-mesh devices fetch reticulous_dev_latest      # download it now
+sim-mesh devices save reticulous_dev_latest       # keep the one there is now
+sim-mesh devices delete reticulous_dev_20260927140352
+sim-mesh devices import mine.zip                  # any device zip, saved
+sim-mesh devices resolve reticulous_dev_latest    # what a name runs, as JSON
 ```
 
 A device's executable is native code linked against its builder's C
 library, C++ runtime, zlib and libbsd, so it runs on a machine of its
-architecture with those present; SIMesh's image is Ubuntu 24.04 of the
+architecture with those present; sim-mesh's image is Ubuntu 24.04 of the
 host's own architecture for that reason.
 
 A build given to a simulation runs in place of every firmware of that
@@ -377,7 +379,7 @@ A pack's files sit beside its `geodata.yaml` (not committed), which says
 nothing the pack does not: its extent, projection and layers come from the
 pack's `manifest.json`. On a pack, a pair's loss is ITU-R (International
 Telecommunication Union, radio sector) Recommendation P.1812-8 over the real
-profile, as SIMesh's planner computes it, and the map draws the pack's
+profile, as sim-mesh's planner computes it, and the map draws the pack's
 ground, roads and buildings, with the notices of the sources it was built
 from in its bottom corner, as OpenStreetMap's Open Database Licence (ODbL)
 and Copernicus's terms ask.
@@ -417,7 +419,7 @@ There are three ways of getting ground, one button each on the Geodata tab:
 **New synthetic…**, **Build from sources…** and **Import zip…**. Nothing else
 makes or moves geodata.
 
-### A SIMesh geodata pack
+### A sim-mesh geodata pack
 
 How geodata goes from one machine to another: a zip holding `geodata.yaml`
 at the top, its first line `# geodata <name>`, and for a pack the pack itself
@@ -521,15 +523,15 @@ OSM defaults, or GLO-30 alone.
 A node's height is always above the ground under it, so the same nodes on
 other ground rise and fall with it.
 
-**The planner.** A pack needs `planner-web`, SIMesh's own ground and
-propagation server, built from the Rust workspace in `SIMesh/planner/` (the
-crates came from Sergey's planner, and keep their names). SIMesh runs it as
+**The planner.** A pack needs `planner-web`, sim-mesh's own ground and
+propagation server, built from the Rust workspace in `sim-mesh/planner/` (the
+crates came from Sergey's planner, and keep their names). sim-mesh runs it as
 a **sidecar**: one per pack in use, started by the front on a free loopback
 port when the first simulation or page opens geodata on that pack, and
 stopped when the last one lets go. The page reaches it as
 `/planner/<geodata>/…` on port 8800. Beside it, `planner-job` is the
-compiler and the node-map importer, run once per job. `simesh build planner`
-builds both with cargo (in SIMesh's image on a machine that is not Linux).
+compiler and the node-map importer, run once per job. `sim-mesh build planner`
+builds both with cargo (in sim-mesh's image on a machine that is not Linux).
 Not built, a pack is refused with the sentence saying so, and synthetic
 ground works.
 
@@ -582,7 +584,7 @@ names no board: a nodeset whose node has a `board:` key is refused.
 It is what a node sends at: coverage and links draw it there, and the
 startup script's radio sets it (`tx_dbm="max"`); a script can still
 change it with `max_tx_pwr(which)` or `{max_dbm}` in its lines. A station
-is told its board at start (`SIMESH_BOARD` in its environment,
+is told its board at start (`SIM_MESH_BOARD` in its environment,
 STATION.md).
 
 **A nodeset's own setup**, `testbed/nodesets/<name>.py` beside its YAML,
@@ -633,7 +635,7 @@ from one of four sources:
 
 - **the MeshCore map**, the node list at `map.meshcore.io/api/v1/nodes`,
   fetched by the front at most once a week into the cache under a user agent
-  naming SIMesh; repeaters and room servers, and companions when asked. An
+  naming sim-mesh; repeaters and room servers, and companions when asked. An
   advert older than a year, or dated more than a week ahead, is left out:
   both are clocks never set;
 - **a PotatoMesh instance**'s `/api/nodes`, by its address: Meshtastic and
@@ -653,12 +655,12 @@ nodes, and are not imported.
 
 ## Scripts
 
-A script is plain Python against SIMesh's own library, run from its top to
+A script is plain Python against sim-mesh's own library, run from its top to
 its end, each call doing what it says and returning when it has:
 
 ```python
 """A study: the dev build everywhere, Sergeyculum where tagged."""
-from simesh import *
+from sim_mesh import *
 
 time("max")                                               # declarations first
 firmware("all", "reticulous_dev_latest")
@@ -789,13 +791,13 @@ nothing is added behind your back.
 script's own on the Nodes tab's geodata and shown nodesets (several merged
 as **Save visible as** merges them), and goes over to its live map; or
 runs it on a simulation already running, which then takes its rules. The
-script is a process of its own (`python3 -m simesh.runner`) whose output is
+script is a process of its own (`python3 -m sim_mesh.runner`) whose output is
 kept and shown beside the editor; from a shell:
 
 ```sh
-simesh run lxmf-traffic --geodata berlin-city --nodeset mitte7
-simesh run ./my-study.py --geodata stralsund --nodeset fachhochschule --nodeset more
-simesh run lxmf-traffic --sim mitte7
+sim-mesh run lxmf-traffic --geodata berlin-city --nodeset mitte7
+sim-mesh run ./my-study.py --geodata stralsund --nodeset fachhochschule --nodeset more
+sim-mesh run lxmf-traffic --sim mitte7
 ```
 
 A simulation keeps a copy of a script of `scripts/` (a file from elsewhere
@@ -808,7 +810,7 @@ to its end, and returns the run's report as Markdown. The runner writes it
 to the run as `report.md` with an **ETSI compliance** section after it
 (`compliance.py`, [Reading a run](#reading-a-run)), and the page's
 **Report** buttons, on the script run and on the simulation's row, show it.
-`simesh run SCRIPT --report RUN_DIR` writes it again for a run that has
+`sim-mesh run SCRIPT --report RUN_DIR` writes it again for a run that has
 ended, reading the script's definitions without running it.
 
 **The editor** has a tab for the script and one for every file it imports:
@@ -816,7 +818,7 @@ another script, edited as the script is, or the library's own module, to
 read.
 
 `scripts/lxmf-traffic.py` is a whole LXMF (Lightweight Extensible Message
-Format) run, on virtual time, through `simesh.traffic`: announce warm-up
+Format) run, on virtual time, through `sim_mesh.traffic`: announce warm-up
 until paths stop growing, a seeded hour of messages, a drain, a gather, with
 its record written to the run as `traffic.json`, and the simulation paused.
 Its messages are the `send_msg` meta command, its identities the `address`
@@ -922,7 +924,7 @@ project's newest in each catalogue, by the name a script gives it
 when it was built, and whether it has been fetched; **Save** keeps it.
 **Saved builds**: the ones kept, by their stamped names, each with a trash
 can. **Import…** takes a device zip into the saved ones; **Refresh** surveys
-the web's catalogues and `builds/` beside SIMesh again.
+the web's catalogues and `builds/` beside sim-mesh again.
 
 **Antennas** lists the antenna catalogue, each with its picture and what it
 is; clicking one shows its figures and its radiation pattern in the
@@ -942,7 +944,7 @@ renames its geodata or deletes it, its pack included; neither is allowed
 while a run or a snapshot stands on its pack, whose copy of the geodata
 names the pack's directory, and the page says which. **New synthetic…**
 makes flat synthetic ground at an exponent and an extent, **Build from
-sources…** opens the build view, and **Import zip…** takes a SIMesh geodata
+sources…** opens the build view, and **Import zip…** takes a sim-mesh geodata
 pack or a bare planner pack ([Geodata](#geodata)).
 
 **Scripts** lists the scripts with their first docstring line, edits one
@@ -1166,7 +1168,7 @@ Nodes tab's shown nodesets on its geodata, the script's `firmware()` rules
 saying what the nodes run, so even working with the stations by hand starts
 from a script of a line, `firmware("all", "reticulous_dev_latest")`. A
 simulation runs the nodeset's file, so the nodeset the Nodes tab is editing
-has its unsaved changes saved first. `simesh new` from a shell picks
+has its unsaved changes saved first. `sim-mesh new` from a shell picks
 geodata, a nodeset and a script, or a snapshot, then a time mode and a
 build. The front checks them, computes or reuses the loss tables, lays out
 the run directory and starts a simd on it, which settles each node's
@@ -1218,13 +1220,13 @@ browser ── alpha.lora.sim.localhost:8800 ──────►           ├
 driver  ── localhost:8800/ws?sim=lora ─────────►           └─► …
 ```
 
-`simesh` runs the front, `testbed/front.py`, on the published port 8800. It
+`sim-mesh` runs the front, `testbed/front.py`, on the published port 8800. It
 starts one simd per simulation behind it, each with its own loopback control
 port (from 9100), ether port (from 7100), station network (a /22 from
 `127.16.0.0` that no socket on the host is bound in and no other front holds
 the lock of, so two fronts on one host never share one) and run directory
 (`testbed/runs/<name>/`, with the simd's own log in `simd.log`). Arguments
-after `--` go to every simd as they stand: `simesh -- --pairwise --stagger
+after `--` go to every simd as they stand: `sim-mesh -- --pairwise --stagger
 30`.
 
 **Simulations** lists each one: its nodeset, geodata and script, its pace
@@ -1250,29 +1252,29 @@ registry, across a restart of the front too, until it is resumed or deleted.
 snapshot load would, and starts it: the same network as it ended, booting
 again, with T from 0 on a new ether; the paused run is then listed as ended.
 Its trash can deletes the run directory, and with it the pause. A script's run pauses the simulation it started when
-`main` ends; **⋯ ▸ Pause**, `simesh pause`, and `sim.pause()` pause any running
+`main` ends; **⋯ ▸ Pause**, `sim-mesh pause`, and `sim.pause()` pause any running
 one.
 
-From a shell, `simesh`'s simulation verbs do the same (`simesh help` lists
+From a shell, `sim-mesh`'s simulation verbs do the same (`sim-mesh help` lists
 every verb); `new` starts the front in the background (logging to
 `testbed/runs/front.log`) when nothing answers on the port. Under Docker
-they run inside the front's container, `simesh-front`, so the front is
-started first with `simesh`.
+they run inside the front's container, `sim-mesh-front`, so the front is
+started first with `sim-mesh`.
 
 ```sh
-simesh run lxmf-traffic --geodata berlin-city --nodeset mitte7 --name lora
-                                                  # a script's own simulation (Scripts)
-simesh new pw --geodata berlin-city --nodeset mitte7 --time max --pairwise
-                                                  # a bare one, its ether on the pairwise rule;
-                                                  # prints its control address, ether, network and run as JSON
-simesh new --snapshot mitte7-warm --time 2x --build reticulous_dev_latest
-                                                  # named after what it loads: mitte7-warm
-simesh list
-simesh plan lora warm-up=+600 traffic=+4200       # T each phase ends at; +N is N s from now
-simesh pause lora                                 # stopped, its state kept; listed as paused
-simesh resume lora                                # started again as it ended, in a new run
-simesh stop lora
-simesh run lxmf-traffic --sim lora                # a script's main: one of scripts/ by name, or a path
+sim-mesh run lxmf-traffic --geodata berlin-city --nodeset mitte7 --name lora
+                                                    # a script's own simulation (Scripts)
+sim-mesh new pw --geodata berlin-city --nodeset mitte7 --time max --pairwise
+                                                    # a bare one, its ether on the pairwise rule;
+                                                    # prints its control address, ether, network and run as JSON
+sim-mesh new --snapshot mitte7-warm --time 2x --build reticulous_dev_latest
+                                                    # named after what it loads: mitte7-warm
+sim-mesh list
+sim-mesh plan lora warm-up=+600 traffic=+4200       # T each phase ends at; +N is N s from now
+sim-mesh pause lora                                 # stopped, its state kept; listed as paused
+sim-mesh resume lora                                # started again as it ended, in a new run
+sim-mesh stop lora
+sim-mesh run lxmf-traffic --sim lora                # a script's main: one of scripts/ by name, or a path
 ```
 
 A driver never picks a port or a network for a simulation: it asks the front
@@ -1280,10 +1282,10 @@ for one and drives it through `ws://127.0.0.1:8800/ws?sim=<name>`.
 
 ### One simd by hand
 
-On Linux or in SIMesh's image, one simulation is one process:
+On Linux or in sim-mesh's image, one simulation is one process:
 
 ```sh
-cd SIMesh/testbed && python3 simd.py
+cd sim-mesh/testbed && python3 simd.py
 ```
 
 That starts the ether, the stations, the proxy and the control page, on
@@ -1361,7 +1363,7 @@ the simulation's row (or `snapshot_save_as` on the control websocket, or
 | `nodes/<name>/state/` | every station's store |
 
 A simulation given a snapshot (**⋯ ▸ Load snapshot into it…** on its row, or
-started from one with `simesh new --snapshot`) gets its nodeset, script and tables
+started from one with `sim-mesh new --snapshot`) gets its nodeset, script and tables
 back exactly as they were, without a recompute and without the planner, and
 every station its store: identities, keys, paths and message history, as the
 firmware keeps them. The snapshot keeps its script and its firmware and
@@ -1517,7 +1519,7 @@ node's role, none a `client`, and `no-radio`), the run's copy of
 `globals.py` (every other node's radio, at its maximum power), its geodata, the firmware each
 node ran and its own loss tables with the links, shadowing, antennas and offsets on them —
 never the files as they stand now. What a frame means is a protocol's, under
-`testbed/simesh/<protocol>/`, found by each node's firmware kind; the roles are
+`testbed/sim_mesh/<protocol>/`, found by each node's firmware kind; the roles are
 what `airtime.py --roles` and the hop counts through forwarding stations use.
 
 | Tool | Says |
@@ -1554,7 +1556,7 @@ Reticulous station, a frame reads as its length and carrier.
 ## A station's own doors
 
 A `reticulous` station serves its web UI on port 80 of its own loopback
-address, which is invisible outside the machine or image SIMesh runs in; the
+address, which is invisible outside the machine or image sim-mesh runs in; the
 proxy on port 8800 routes by hostname, the simulation being the second
 label (a station of a kind with no web UI is refused with a sentence saying
 so, and has no **Web UI** button):
@@ -1569,7 +1571,7 @@ not, and needs entries in `/etc/hosts` on the Mac:
 
     127.0.0.1  alpha.lora.sim.localhost bravo.lora.sim.localhost
 
-Port 8800 is the testbed's own: where `simesh` runs SIMesh in its image, the
+Port 8800 is the testbed's own: where `sim-mesh` runs sim-mesh in its image, the
 container publishes it at the same number on the host. It is clear of the
 ports spangap holds (9000–9011), the planner's 8787, and the per-simulation
 control and ether ports the front counts up from 9100 and 7100, so a testbed,
@@ -1664,7 +1666,7 @@ the same directory.
 
 ## The developer loop, with a workspace
 
-To run firmware of your own, put SIMesh in a [spangap](https://github.com/spangap/spangap)
+To run firmware of your own, put sim-mesh in a [spangap](https://github.com/spangap/spangap)
 workspace — the directory it was cloned into, made one with `spangap init` —
 and build the station there, for the `hw-linux` board, a Linux process
 rather than a chip image:
@@ -1686,7 +1688,7 @@ what carries each node's gateway distance. The result is
 `data_merged/`. Every target builds in its own `build.<target>/`, so a chip
 build and this one never touch each other's files.
 
-That directory can be run as it is, by path (`simesh new … --build
+That directory can be run as it is, by path (`sim-mesh new … --build
 reticulous/esp-idf/build.linux`), but what was last built there is anyone's
 guess. The way to run a build of one's own is to make it a device file in
 the catalogue it will be published in (below): `make-builds` into
@@ -1697,16 +1699,16 @@ whether it was published since or not.
 
 A `sergeyculum` station and its tool are built in the Sergeyculum tree
 (`sergey/reticulum` in the workspace), with Rust. Sergeyculum publishes no
-simesh build yet, so whatever was last compiled there is the compiled build
+sim-mesh build yet, so whatever was last compiled there is the compiled build
 `sergeyculum_local_latest`:
 
 ```sh
-cd sergey/reticulum/fw/simesh && cargo build --release    # fw/simesh/target/release/simesh
-cd sergey/reticulum && cargo build --release -p rncfg     # target/release/rncfg
+cd sergey/reticulum/fw/sim-mesh && cargo build --release    # fw/sim-mesh/target/release/sim-mesh
+cd sergey/reticulum && cargo build --release -p rncfg       # target/release/rncfg
 ```
 
 A `microreticulum` station is attermann's firmware in its clone under
-`competition/`, built with PlatformIO after `simesh build radio`, since it
+`competition/`, built with PlatformIO after `sim-mesh build radio`, since it
 links `radio/build/libsimradio.a` through the Portduino backend
 (`radio/portduino/`). Portduino's core needs libuv's and i2c-tools'
 headers (`libuv1-dev`, `libi2c-dev` on Debian). Two builds of it are
@@ -1719,12 +1721,12 @@ full mode:
 
 ```sh
 cd competition/attermann_microReticulum_Firmware
-pio run -e simesh             # .pio/build/simesh/rnode_firmware_native
-pio run -e simesh-jrl290      # .pio/build/simesh-jrl290/rnode_firmware_native
+pio run -e sim-mesh           # .pio/build/sim-mesh/rnode_firmware_native
+pio run -e sim-mesh-jrl290    # .pio/build/sim-mesh-jrl290/rnode_firmware_native
 ```
 
 Device files are produced by the catalogue build: a `builds.yaml` entry with
-`target: linux`, `arch:`, `virtual_hardware:` and `virtual_radio:` becomes `hw-simesh-<arch>` in its
+`target: linux`, `arch:`, `virtual_hardware:` and `virtual_radio:` becomes `hw-sim-mesh-<arch>` in its
 catalogue when `spangap make-builds` runs on a machine of that architecture.
 The front sees it in the workspace's `builds/<catalogue>/` by itself, as that
 catalogue's latest, and fetches it when a simulation uses it
@@ -1732,12 +1734,12 @@ catalogue's latest, and fetches it when a simulation uses it
 
 ## After a restart
 
-Stations are processes, not a service: stopping `simesh` stops them. Their
+Stations are processes, not a service: stopping `sim-mesh` stops them. Their
 state is not in the process though — `runs/`, `snapshots/`, `devices/` and a
-workspace's build are all in the directory SIMesh was cloned into, which the
+workspace's build are all in the directory sim-mesh was cloned into, which the
 image mounts from the host. A simulation's stations keep their state in its
 run directory, but a new simulation starts factory-fresh; to carry a network
-across a restart, save a snapshot before stopping, then after `simesh` load
+across a restart, save a snapshot before stopping, then after `sim-mesh` load
 it into a new simulation (⋯ ▸ Load snapshot into it…), and it comes back with its names, radio
 settings, identities and message history as they were.
 
@@ -1784,7 +1786,7 @@ recursive lock, a UDP socket, a reader, a log — and two backends supply them:
 | `radio/backend/posix/` | a plain process: `std::thread`, `CLOCK_MONOTONIC`, a `std::recursive_mutex` |
 | `radio/backend/esp-idf/` | an ESP-IDF (Espressif's development framework) firmware built for the Linux host target: esp_timer, a FreeRTOS critical section and task; an IDF component |
 
-`simesh build radio` builds it (`radio/build/`: `libsimradio.a`,
+`sim-mesh build radio` builds it (`radio/build/`: `libsimradio.a`,
 `libsimradio.so`, `libsimclock.so`); a virtual run preloads the shim from
 there. The ESP-IDF backend is proved by a throwaway project that links it
 against the IDF host port and sends one frame (`radio/tests/esp-idf-link/`;
@@ -1795,10 +1797,10 @@ the commands are at the top of its `CMakeLists.txt`).
 None needs firmware, a planner or a network:
 
 ```sh
-cd SIMesh/testbed && python3 -m pytest -q      # the stores, the devices, the front, simd, the kinds, the library, the tools
-cd SIMesh/ether   && python3 -m pytest -q      # the medium and both conductors, over real UDP and in-process
-cd SIMesh/radio   && python3 -m pytest -q tests  # the chip model, the conductor, the time shim
-cd SIMesh/testbed/ui && npx vue-tsc --noEmit && npx quasar build
+cd sim-mesh/testbed && python3 -m pytest -q      # the stores, the devices, the front, simd, the kinds, the library, the tools
+cd sim-mesh/ether   && python3 -m pytest -q      # the medium and both conductors, over real UDP and in-process
+cd sim-mesh/radio   && python3 -m pytest -q tests  # the chip model, the conductor, the time shim
+cd sim-mesh/testbed/ui && npx vue-tsc --noEmit && npx quasar build
 ```
 
 The model's tests load `libsimradio.so` with ctypes, drive it frame by frame
@@ -1813,10 +1815,10 @@ download cache, `testbed/geodata/.cache/`, and skip what is not there, and two r
 of a few square kilometres of Berlin run through the binary with
 
 ```sh
-cd SIMesh/planner && cargo test --release -p planner-job -- --ignored
+cd sim-mesh/planner && cargo test --release -p planner-job -- --ignored
 ```
 
-`SIMESH_MESHCORE_SNAPSHOT` names a saved MeshCore node list for the importer's
+`SIM_MESH_MESHCORE_SNAPSHOT` names a saved MeshCore node list for the importer's
 tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 
 ## Where the code lives
@@ -1845,8 +1847,8 @@ code lives in that component's `src/host/`.
 
 | Where | What |
 |---|---|
-| `simesh` | the one command: the front natively or in SIMesh's image, `new`, `stop`, `list`, `plan`, `run`, `devices`, `build` |
-| `Dockerfile` | SIMesh's image, for a machine that is not Linux |
+| `sim-mesh` | the one command: the front natively or in sim-mesh's image, `new`, `stop`, `list`, `plan`, `run`, `devices`, `build` |
+| `Dockerfile` | sim-mesh's image, for a machine that is not Linux |
 | `devices/local/` | the compiled builds, run in place, named `<project>_<catalogue>` |
 | `stations/standard_reticulum/` | a standard Reticulum node's station program: the RNode started, Reticulum and LXMF behind it, its console |
 | `radio/` | the chip and the station's UDP link to the ether, as a C library |
@@ -1857,17 +1859,17 @@ code lives in that component's `src/host/`.
 | [`ether/`](ether/README.md) | the medium: the loss tables, who hears a frame and how it comes out; `slt.py` reads and writes a table |
 | `testbed/front.py` | several simulations behind one port: the registry, the editors' verbs, the imports, the planner sidecars, the loss tables before a start, one simd per simulation, script runs, coverage, station hostnames by simulation, the WebRTC relay one level up, the finish estimate |
 | `testbed/simd.py` | one simulation: the ether, the stations and their setup, the proxy, the control server, commands and intents on chosen stations, a moved node's row |
-| `testbed/simctl.py` | behind `simesh new`, `stop`, `list` and `plan`: the front from a shell; starts the front when none answers |
+| `testbed/simctl.py` | behind `sim-mesh new`, `stop`, `list` and `plan`: the front from a shell; starts the front when none answers |
 | `testbed/store.py` | where geodata, nodesets, scripts, tables, coverage, runs and snapshots live, and what a name may be |
 | `testbed/devices.py` | devices: the survey of the catalogues, a latest build fetched when used, saving, importing, compiled builds, and what a device name runs |
 | `testbed/antennas.py`, `testbed/antennas/` | the antenna catalogue and pictures, a pattern's gain by direction, a pair's gain in three dimensions |
-| `testbed/geodata.py` | geodata: packs and synthetic ground, the projections, the extent, a SIMesh geodata pack's export and import |
+| `testbed/geodata.py` | geodata: packs and synthetic ground, the projections, the extent, a sim-mesh geodata pack's export and import |
 | `testbed/sources.py` | a build's sources: what a rectangle needs of each, the download cache and its fetches |
 | `testbed/packbuild.py` | one pack built from its sources: fetch, `planner-job pack-build`, the pack into place |
 | `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, links, edits, the geometry hash, the merge of shown layers, the imports |
 | `planner/` | the Rust workspace: `planner-web` (the sidecar), `planner-job` (a pack's build, a node map's import), `planner-pack` (the compiler, OpenStreetMap from a PBF extract), `planner-buildings`, `planner-import`, and the ground, propagation and coverage crates |
 | `testbed/script.py` | scripts: listing, checking, loading, the `firmware()` rules at a script's top |
-| `testbed/simesh/library.py`, `testbed/simesh/select.py` | the script library, `firmware`, `exec`, `max_tx_pwr`, `send_msg`, and `nodes()` selections |
+| `testbed/sim_mesh/library.py`, `testbed/sim_mesh/select.py` | the script library, `firmware`, `exec`, `max_tx_pwr`, `send_msg`, and `nodes()` selections |
 | `testbed/losses.py` | a loss table, on synthetic ground or through the sidecar; the cache; links, shadowing, antennas and offsets as layers, the ground under each node; one node's row |
 | `testbed/coverage.py` | a node's coverage raster on a pack, through the sidecar, cached |
 | `testbed/runs.py` | a run directory, and snapshots taken from and loaded into one |
@@ -1878,7 +1880,7 @@ code lives in that component's `src/host/`.
 | `testbed/webrtc.py` | the WebRTC relay: the signalling rewritten, and one UDP port in front of every station's DataChannel |
 | `testbed/ui/` | the page (Quasar 2 on Vue 3; Pinia stores `catalog`, `geodata`, `nodes`, `sim`, `coverage`, `display`, `socket`); `vendor/planner-wasm` is the planner's built planner-wasm, copied in by `vendor/update-planner-wasm.mjs` so the page builds with no planner beside it |
 | `testbed/seq.py`, `compare.py`, `airtime.py`, `links.py`, `delivery.py`, `compliance.py`, `referee.py` | the analysis tools ([Reading a run](#reading-a-run)) |
-| `testbed/simesh/` | the library: `library` (what a script says, synchronously), `select` (`nodes()`), `traffic` (the LXMF traffic driver), `sim` (the async hold on a simulation the library runs on), `runner` (a script run, its simulation started, its report), `view` (a run opened for analysis), `record`; `simesh/reticulum/` holds Reticulum's parts: frame reading (Reticulum packets, SUPE), delivery analysis |
+| `testbed/sim_mesh/` | the library: `library` (what a script says, synchronously), `select` (`nodes()`), `traffic` (the LXMF traffic driver), `sim` (the async hold on a simulation the library runs on), `runner` (a script run, its simulation started, its report), `view` (a run opened for analysis), `record`; `sim_mesh/reticulum/` holds Reticulum's parts: frame reading (Reticulum packets, SUPE), delivery analysis |
 | `testbed/boards.py` | the one board, an SX1262 with a GC1109 front end above 22 dBm; a node's maximum power; what a station is told of it |
 | `testbed/scripts/` | the scripts: `realtime.py`, `lxmf-traffic.py`; `startup.py`, which every script includes; `globals.py`, the settings they share and the page reads |
 | `testbed/geodata/`, `testbed/nodesets/` | your geodata and nodesets (not committed) |
@@ -1889,3 +1891,7 @@ airtime accounting, Reticulum, LXMF and the web UI are the same code that runs
 on a board. The same holds for a `sergeyculum` station: its SX1262 driver,
 `LoRaIface` and engine are Sergeyculum's own, unchanged, over an embedded-hal
 bus that ends in `radio/`.
+
+## License
+
+sim-mesh is released under the Apache License, Version 2.0; see [LICENSE](LICENSE).

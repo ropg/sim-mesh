@@ -16,7 +16,7 @@ the wall clock since the record's first line in a real one.
   alone `by_kind_calling`), so the announce share can be read off. What a
   frame is belongs to the protocol: in a run with Reticulous stations,
   Reticulum packet type and context or SUPE frame type
-  (`simesh.reticulum.frames.kind_of`); otherwise every frame is `frame`;
+  (`sim_mesh.reticulum.frames.kind_of`); otherwise every frame is `frame`;
 - transmit power: `power_dbm` of each frame, on the calling channel and on
   the other carriers, weighted by frame and by airtime, with its minimum,
   quartiles and maximum; and exchanges on the other carriers, where an
@@ -53,10 +53,10 @@ import json
 import sys
 
 import referee
-from simesh import record as record_module
-from simesh import reticulum
-from simesh.reticulum import frames as rframes
-from simesh.view import RunView
+from sim_mesh import record as record_module
+from sim_mesh import reticulum
+from sim_mesh.reticulum import frames as rframes
+from sim_mesh.view import RunView
 
 TOLERANCE_HZ = 125_000 // 4
 

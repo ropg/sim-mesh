@@ -23,7 +23,7 @@ import losses  # noqa: E402
 import nodeset  # noqa: E402
 import referee  # noqa: E402
 import runs  # noqa: E402
-from simesh.view import RunView  # noqa: E402
+from sim_mesh.view import RunView  # noqa: E402
 
 CALLING = 869_525_000
 GLOBALS = "FREQ_MHZ = 869.525\nSF = 8\nBW_KHZ = 125\nCR = 5\n"

@@ -187,9 +187,9 @@ def analyse_run(traffic_path, run_dir):
     epoch (a run not in virtual time)."""
     import json
 
-    from simesh import record
-    from simesh.reticulum import rncfg_delivery
-    from simesh.view import RunView
+    from sim_mesh import record
+    from sim_mesh.reticulum import rncfg_delivery
+    from sim_mesh.view import RunView
 
     with open(traffic_path, encoding="utf-8") as handle:
         drive = json.load(handle)

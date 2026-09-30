@@ -1,5 +1,5 @@
 """The hold on one running simulation that the script library runs on
-(simesh.library, which a script uses; this is async, on the library's own
+(sim_mesh.library, which a script uses; this is async, on the library's own
 loop): the stations, the clock, and what to do with them.
 
 ```
@@ -52,7 +52,7 @@ import time
 
 import aiohttp
 
-DEFAULT_PORT = int(os.environ.get("SIMESH_PORT") or 8800)
+DEFAULT_PORT = int(os.environ.get("SIM_MESH_PORT") or 8800)
 
 
 class SimError(Exception):
@@ -81,7 +81,7 @@ class Station:
         self.status = msg.get("status")
 
     def facts(self):
-        """What a selection (simesh.select) can ask of it."""
+        """What a selection (sim_mesh.select) can ask of it."""
         return {"name": self.name, "id": self.id, "tags": self.tags, "firmware": self.firmware,
                 "kind": self.kind, "role": self.role, "antenna": self.antenna,
                 "max_dbm": self.max_dbm, "lat": self.lat,
@@ -325,7 +325,7 @@ class Sim:
         return Selection(self, [name])
 
     def facts(self):
-        """Every station's facts, for a selection (simesh.select): {name: facts}."""
+        """Every station's facts, for a selection (sim_mesh.select): {name: facts}."""
         return {name: s.facts() for name, s in self.stations.items()}
 
     # ---- firmware --------------------------------------------------------
@@ -481,8 +481,8 @@ async def front_verb(session, port, msg, timeout=None):
 
 
 async def attach(name=None, port=None, session=None):
-    """Hold a running simulation: `name`, else `$SIMESH_SIM`."""
-    name = name or os.environ.get("SIMESH_SIM")
+    """Hold a running simulation: `name`, else `$SIM_MESH_SIM`."""
+    name = name or os.environ.get("SIM_MESH_SIM")
     if not name:
         raise SimError("attach to which simulation? name one, or run under the front")
     port = port or DEFAULT_PORT

@@ -83,11 +83,11 @@ def test_a_station_is_two_processes_of_the_run_and_the_second_reads_the_console(
     assert sr.sids(st) == (3, 3 + standard_reticulum.COMPANION)
     assert sr.console_sid(st) == 3 + standard_reticulum.COMPANION
     env = sr.env(st)
-    assert env["SIMESH_NODE_ID"] == str(3 + standard_reticulum.COMPANION)
+    assert env["SIM_MESH_NODE_ID"] == str(3 + standard_reticulum.COMPANION)
     assert env["SR_RNODE_ID"] == "3"
     assert env["SR_RNODE"] == "/rnode"
     assert env["SR_SIMRADIO"].endswith(os.path.join("radio", "build", "libsimradio.so"))
-    assert env["SIMESH_IDLE"] == "threads"
+    assert env["SIM_MESH_IDLE"] == "threads"
 
 
 def test_the_ether_expects_and_forgets_both_processes(tmp_path):

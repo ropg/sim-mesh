@@ -12,7 +12,7 @@
  * in its hello, every message of an instant in one datagram, a line each,
  * which the station applies as one (ether_link.cpp, handleDatagram). A
  * station ignores a message it does not understand.
- * SIMesh/ether/README.md is the wire.
+ * sim-mesh/ether/README.md is the wire.
  */
 #pragma once
 

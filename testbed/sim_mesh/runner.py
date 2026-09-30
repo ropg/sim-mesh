@@ -1,15 +1,15 @@
 """A script, run: its top to its end, against its simulation.
 
-    simesh run SCRIPT --geodata G --nodeset N [--nodeset N2 …] [--name S] [--port P]
-    simesh run SCRIPT --sim NAME [--port P]
-    simesh run SCRIPT --report RUN_DIR
+    sim-mesh run SCRIPT --geodata G --nodeset N [--nodeset N2 …] [--name S] [--port P]
+    sim-mesh run SCRIPT --sim NAME [--port P]
+    sim-mesh run SCRIPT --report RUN_DIR
 
-The front runs a script as `python3 -m simesh.runner` when the Scripts tab
+The front runs a script as `python3 -m sim_mesh.runner` when the Scripts tab
 says Run, on the Nodes tab's geodata and nodesets, with its output streamed
-to the page; `simesh run` from a shell is the same. SCRIPT is a path, or the
+to the page; `sim-mesh run` from a shell is the same. SCRIPT is a path, or the
 name of one of the store's.
 
-The script is plain Python run from its top (simesh.library): its
+The script is plain Python run from its top (sim_mesh.library): its
 declarations (`time`, `firmware`, `on_first_boot`) are collected until the
 first thing it does, which starts its simulation with them on `--geodata`
 and `--nodeset` (several are merged), or attaches to `--sim` and says its
@@ -37,8 +37,8 @@ import compliance                   # noqa: E402 - the path is set just above
 import runs as runs_module          # noqa: E402
 import script as script_module      # noqa: E402
 import store                        # noqa: E402
-from simesh import library          # noqa: E402
-from simesh import sim as sim_module  # noqa: E402
+from sim_mesh import library        # noqa: E402
+from sim_mesh import sim as sim_module  # noqa: E402
 
 
 def script_file(given):
@@ -96,7 +96,7 @@ def run(args):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="simesh run", description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(prog="sim-mesh run", description=__doc__.split("\n")[0])
     ap.add_argument("script")
     ap.add_argument("--sim", help="the running simulation to run it on")
     ap.add_argument("--geodata")

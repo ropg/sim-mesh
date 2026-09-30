@@ -13,7 +13,7 @@ every node at it, the startup script's radio sets it (`tx_dbm="max"`), a
 power a rule asks above it is held to it, a script's `max_tx_pwr(which)`
 sets it, and a station's first-boot lines have it as `{max_dbm}`.
 
-A station is told its board at start, `SIMESH_BOARD` in its environment (one
+A station is told its board at start, `SIM_MESH_BOARD` in its environment (one
 flat JSON object: the chip, the node's maximum, and the front end's figures
 when it has one). The chip model applies the front end's curve and receive
 gain from it, and firmware that models a front end at run time takes the
@@ -62,7 +62,7 @@ def has_fem(own):
 
 
 def environment(own):
-    """What a station of this `max_dbm` is told of its board: SIMESH_BOARD's
+    """What a station of this `max_dbm` is told of its board: SIM_MESH_BOARD's
     JSON, one flat object (the chip model and hw-linux read it with a flat
     reader): chip, max_dbm, and fem_part, fem_tx_cal, fem_gain_db and
     fem_rx_gain_db when it has the front end."""
@@ -76,7 +76,7 @@ def environment(own):
 # ---- transmit power through the front end ------------------------------------
 
 def _curve(env):
-    """The front end's transmit curve from SIMESH_BOARD's JSON, as the chip
+    """The front end's transmit curve from SIM_MESH_BOARD's JSON, as the chip
     model reads it: [(chip, connector), …] for the entry naming `fem_part`,
     or None for none."""
     part = env.get("fem_part") or ""
@@ -100,7 +100,7 @@ def _curve(env):
 
 
 def connector_dbm(board_env, chip_dbm):
-    """What reaches the connector for a chip power on the board SIMESH_BOARD
+    """What reaches the connector for a chip power on the board SIM_MESH_BOARD
     describes (`board_env`, its JSON): the front end's curve, straight lines
     between its points and flat outside them, rounded as the chip model
     rounds; else its flat gain; else the chip's own."""

@@ -9,7 +9,7 @@ import stat
 import subprocess
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LAUNCHER = os.path.join(ROOT, "simesh")
+LAUNCHER = os.path.join(ROOT, "sim-mesh")
 
 STANDIN = """#!/bin/sh
 echo "$@" >> "%(log)s"
@@ -48,8 +48,8 @@ def standin(tmp_path, name, says):
 
 
 def launch(args, bin_dir, cwd, **env):
-    environ = dict(os.environ, SIMESH_DOCKER="1", PATH=str(bin_dir))
-    environ.pop("SIMESH_RUNTIME", None)
+    environ = dict(os.environ, SIM_MESH_DOCKER="1", PATH=str(bin_dir))
+    environ.pop("SIM_MESH_RUNTIME", None)
     environ.update(env)
     return subprocess.run([LAUNCHER, *args], cwd=cwd, env=environ, capture_output=True,
                           text=True, timeout=60)
@@ -61,7 +61,7 @@ def calls(log, verb):
 
 def test_podman_keeps_the_callers_id_and_lets_a_station_have_port_80(tmp_path):
     bin_dir, log = standin(tmp_path, "podman", "podman version 4.9.4")
-    done = launch(["build", "page"], bin_dir, tmp_path, SIMESH_RUNTIME="podman")
+    done = launch(["build", "page"], bin_dir, tmp_path, SIM_MESH_RUNTIME="podman")
     assert done.returncode == 0, done.stderr
     [run] = calls(log, "run")
     assert "--sysctl" in run and "net.ipv4.ip_unprivileged_port_start=0" in run
@@ -72,7 +72,7 @@ def test_podman_keeps_the_callers_id_and_lets_a_station_have_port_80(tmp_path):
 def test_a_verb_runs_the_launcher_by_its_path_from_the_directory_above(tmp_path):
     bin_dir, log = standin(tmp_path, "podman", "podman version 4.9.4")
     above = os.path.dirname(ROOT)
-    done = launch(["list"], bin_dir, above, SIMESH_RUNTIME="podman")
+    done = launch(["list"], bin_dir, above, SIM_MESH_RUNTIME="podman")
     assert done.returncode == 0, done.stderr
     [run] = calls(log, "exec")
     assert run[run.index("-w") + 1] == above

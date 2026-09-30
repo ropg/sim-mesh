@@ -113,7 +113,7 @@ const MIN_ZOOM = 2
 const MAX_ZOOM = 19
 const TILES_KEPT = 400
 const ASK_AFTER_MS = 400
-const VIEW_KEY = 'simesh.buildview'
+const VIEW_KEY = 'sim-mesh.buildview'
 
 /* ── the side panel ── */
 const rect = ref<[number, number, number, number] | null>(null)

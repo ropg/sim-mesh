@@ -1,4 +1,4 @@
-# SIMesh's planner: the ground, propagation and coverage code behind a pack.
+# sim-mesh's planner: the ground, propagation and coverage code behind a pack.
 #
 #   planner-web       the sidecar the front runs per pack in use
 #   planner-job       the front's batch jobs: pack-build, nodes-import

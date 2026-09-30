@@ -1,4 +1,4 @@
-"""`simesh install` puts on a Linux machine what SIMesh's image holds: the
+"""`sim-mesh install` puts on a Linux machine what sim-mesh's image holds: the
 same system packages, the same Node major, the same Reticulum and LXMF. The
 two are written separately, the launcher's lists and the Dockerfile's
 RUN lines, so this keeps them from drifting apart."""
@@ -16,8 +16,8 @@ def read(name):
 
 def launcher_list(name):
     """A bash array from the launcher, `NAME=(a b …)`, over several lines."""
-    got = re.search(r"^%s=\(([^)]*)\)" % name, read("simesh"), re.M)
-    assert got, "no %s in simesh" % name
+    got = re.search(r"^%s=\(([^)]*)\)" % name, read("sim-mesh"), re.M)
+    assert got, "no %s in sim-mesh" % name
     return got.group(1).split()
 
 
@@ -47,7 +47,7 @@ def test_the_launcher_pins_what_the_image_pins():
 
 def test_the_launcher_takes_node_from_where_the_image_does():
     major = re.search(r"deb\.nodesource\.com/node_(\d+)\.x", read("Dockerfile")).group(1)
-    assert re.search(r"^NODE_MAJOR=%s\b" % major, read("simesh"), re.M)
+    assert re.search(r"^NODE_MAJOR=%s\b" % major, read("sim-mesh"), re.M)
 
 
 def test_a_fedora_install_names_the_same_things():

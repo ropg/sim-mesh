@@ -8,7 +8,7 @@
       <div v-if="!sim.sims.length" class="sims-none">
         No simulation runs yet. A script's Run on the Scripts tab starts one, on
         the Nodes tab's geodata and nodeset, running what the script's
-        <code>firmware()</code> says; so does <code>simesh run &lt;script&gt;
+        <code>firmware()</code> says; so does <code>sim-mesh run &lt;script&gt;
         --geodata &lt;g&gt; --nodeset &lt;n&gt;</code> from a shell.
       </div>
 

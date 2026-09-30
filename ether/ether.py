@@ -1983,10 +1983,10 @@ class Ether(asyncio.DatagramProtocol):
 #
 # In a virtual-time run most of the ether's work is the barrier: an idle in, T
 # moved, the stations due sent a `run`. ether_core, built from ether/core
-# (`simesh build ether`), does that in Rust on the ether's socket, in the
+# (`sim-mesh build ether`), does that in Rust on the ether's socket, in the
 # event loop's thread; CoreEther is Ether with that conductor and everything
 # else as Ether has it, called at the same points. Ether's own conductor stays
-# the reference, and SIMESH_ETHER_CORE picks: `python` for it, `rust` for the
+# the reference, and SIM_MESH_ETHER_CORE picks: `python` for it, `rust` for the
 # core (an error when it is not built), unset for the core when it is built.
 
 CORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1997,16 +1997,16 @@ _core_module = None
 def core_module():
     """ether_core, or None when the Python conductor is to run."""
     global _core_module
-    wanted = os.environ.get("SIMESH_ETHER_CORE", "")
+    wanted = os.environ.get("SIM_MESH_ETHER_CORE", "")
     if wanted not in ("", "rust", "python"):
-        raise ValueError("SIMESH_ETHER_CORE is rust or python, not %r" % wanted)
+        raise ValueError("SIM_MESH_ETHER_CORE is rust or python, not %r" % wanted)
     if wanted == "python":
         return None
     if _core_module is None:
         if not os.path.exists(CORE_PATH):
             if wanted == "rust":
-                raise RuntimeError("SIMESH_ETHER_CORE=rust, and there is no %s "
-                                   "(simesh build ether)" % CORE_PATH)
+                raise RuntimeError("SIM_MESH_ETHER_CORE=rust, and there is no %s "
+                                   "(sim-mesh build ether)" % CORE_PATH)
             return None
         import importlib.util
         spec = importlib.util.spec_from_file_location("ether_core", CORE_PATH)

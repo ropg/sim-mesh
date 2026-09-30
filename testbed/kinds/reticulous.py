@@ -64,8 +64,8 @@ class Reticulous(Kind):
                    SPANGAP_ETHER=station.ether_addr)
         if self.fixed:
             env["SPANGAP_FIXED_DIR"] = self.fixed
-        if env.get("SIMESH_BOARD"):
-            env["SPANGAP_BOARD"] = env["SIMESH_BOARD"]
+        if env.get("SIM_MESH_BOARD"):
+            env["SPANGAP_BOARD"] = env["SIM_MESH_BOARD"]
         return env
 
     def client(self, station):
