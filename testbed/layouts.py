@@ -135,8 +135,9 @@ def generate(shape, seed=1, spacing_m=500.0, radius_m=3000.0, jitter_m=0.0, n=50
 
 
 def describe(args):
-    common = "seed %d, %g m high, %g of them transport" % (
-        args.seed, args.height_m, args.transport_share)
+    share = ("all" if args.transport_share == 1 else "none" if args.transport_share == 0
+             else "%g %%" % (100 * args.transport_share))
+    common = "seed %d, %g m high, %s of them transport" % (args.seed, args.height_m, share)
     if args.shape == "hex":
         shape = "hex, %g m apart within %g m, jitter %g m" % (
             args.spacing_m, args.radius_m, args.jitter_m)
