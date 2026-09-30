@@ -5,6 +5,8 @@ import hashlib
 import io
 import json
 import os
+import pathlib
+import shutil
 import sys
 import zipfile
 
@@ -51,17 +53,21 @@ def manifest(name="tiny", epsg=32633):
             "layers": ["TerrainDtm", {"kind": "Roads"}]}
 
 
-def write_pack(tmp_path, epsg=32633):
-    pack = tmp_path / "packs" / "tiny"
-    pack.mkdir(parents=True)
-    (pack / "manifest.json").write_text(json.dumps(manifest(epsg=epsg)))
-    return pack
+def write_pack(name="tiny", epsg=32633, comment=None):
+    """Pack geodata in the store: its directory, the manifest and the
+    geodata file that says the pack is the directory."""
+    pack = geodata.geodata_dir(name)
+    os.makedirs(pack)
+    with open(os.path.join(pack, "manifest.json"), "w") as handle:
+        handle.write(json.dumps(manifest(epsg=epsg)))
+    geodata.write(geodata.geodata_path(name), {"pack": "."}, comment)
+    return pathlib.Path(pack)
 
 
-def test_a_pack_reads_its_manifest_relative_to_the_geodata_file(tmp_path, monkeypatch):
+def test_a_pack_is_the_geodata_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
-    pack = write_pack(tmp_path)
-    geodata.write(geodata.geodata_path("tiny"), {"pack": "../packs/tiny"})
+    pack = write_pack()
+    assert geodata.names() == ["tiny"]
     gd = geodata.load("tiny")
     assert gd.is_pack and gd.crs_epsg == 32633
     assert gd.pack_dir == str(pack)
@@ -138,13 +144,12 @@ def test_a_ground_figure_that_is_no_number_is_refused_by_its_key(tmp_path):
 
 def test_a_copied_pack_still_names_its_pack(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
-    pack = write_pack(tmp_path)
-    geodata.write(geodata.geodata_path("tiny"), {"pack": "../packs/tiny"})
+    pack = write_pack()
     target = tmp_path / "runs" / "a" / "geodata.yaml"
     geodata.write_copy(geodata.load("tiny"), str(target))
     assert geodata.read(str(target), "tiny").pack_dir == str(pack)
     text = geodata.rebase_text(target.read_text(), str(target.parent), str(tmp_path / "elsewhere"))
-    assert "packs/tiny" in text
+    assert text == 'pack: "../geodata/tiny"\n'
 
 
 def make_zip(path, members):
@@ -153,43 +158,42 @@ def make_zip(path, members):
             zf.writestr(name, text)
 
 
-def test_a_pack_zip_is_imported_into_the_packs_and_named(tmp_path, monkeypatch):
+def test_a_pack_zip_is_imported_into_its_own_directory_and_named(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
-    packs = tmp_path / "planner" / "packs"
     zipped = tmp_path / "up.zip"
     make_zip(zipped, {"berlin/manifest.json": json.dumps(manifest("berlin")),
                       "berlin/terrain/a.bin": "x"})
-    gd = geodata.import_zip(str(zipped), "berlin", str(packs))
-    assert gd.is_pack and gd.pack_dir == str(packs / "berlin")
-    assert (packs / "berlin" / "terrain" / "a.bin").read_text() == "x"
+    gd = geodata.import_zip(str(zipped), "berlin")
+    here = tmp_path / "geodata" / "berlin"
+    assert gd.is_pack and gd.pack_dir == str(here)
+    assert (here / "terrain" / "a.bin").read_text() == "x"
+    assert (here / "geodata.yaml").read_text() == '# imported pack berlin\npack: "."\n'
     with pytest.raises(store.StoreError, match="already"):
-        geodata.import_zip(str(zipped), "berlin", str(packs))
+        geodata.import_zip(str(zipped), "berlin")
     # With no name given, the manifest's.
     make_zip(zipped, {"manifest.json": json.dumps(manifest("Other Place"))})
-    assert geodata.import_zip(str(zipped), packs=str(packs)).name == "other-place"
+    assert geodata.import_zip(str(zipped)).name == "other-place"
 
 
 def test_a_pack_zip_without_a_usable_manifest_leaves_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
-    packs = tmp_path / "packs"
     zipped = tmp_path / "up.zip"
     make_zip(zipped, {"a/b.bin": "x"})
     with pytest.raises(store.StoreError, match="manifest"):
-        geodata.import_zip(str(zipped), "nothing", str(packs))
+        geodata.import_zip(str(zipped), "nothing")
     make_zip(zipped, {"manifest.json": json.dumps({"region": {"crs_epsg": 4326, "bbox": [0, 0, 1, 1]}})})
     with pytest.raises(store.StoreError, match="not usable"):
-        geodata.import_zip(str(zipped), "nothing", str(packs))
+        geodata.import_zip(str(zipped), "nothing")
     make_zip(zipped, {"manifest.json": "{}", "../escape": "x"})
     with pytest.raises(store.StoreError):
-        geodata.import_zip(str(zipped), "nothing", str(packs))
+        geodata.import_zip(str(zipped), "nothing")
     make_zip(zipped, {"geodata.yaml": "pack: ../out\n", "manifest.json": "{}"})
     with pytest.raises(store.StoreError, match="leaves"):
-        geodata.import_zip(str(zipped), "nothing", str(packs))
+        geodata.import_zip(str(zipped), "nothing")
     make_zip(zipped, {"manifest.json": "{}"})
     with pytest.raises(store.StoreError, match="usable geodata name"):
-        geodata.import_zip(str(zipped), packs=str(packs))
-    assert os.listdir(packs) == []
-    assert not os.path.exists(geodata.geodata_path("nothing"))
+        geodata.import_zip(str(zipped))
+    assert os.listdir(tmp_path / "geodata") == []
 
 
 def nodes_manifest(name="city"):
@@ -203,27 +207,27 @@ def nodes_manifest(name="city"):
 
 def test_a_bare_planner_pack_loses_its_nodes_on_the_way_in(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
-    packs = tmp_path / "packs"
     zipped = tmp_path / "up.zip"
     make_zip(zipped, {"city/manifest.json": json.dumps(nodes_manifest()),
                       "city/dtm.tif": "t", "city/nodes.bin": "n"})
-    gd = geodata.import_zip(str(zipped), packs=str(packs))
+    gd = geodata.import_zip(str(zipped))
     assert gd.name == "city"
-    assert sorted(os.listdir(packs / "city")) == ["dtm.tif", "manifest.json"]
+    assert sorted(os.listdir(tmp_path / "geodata" / "city")) == ["dtm.tif", "geodata.yaml",
+                                                                 "manifest.json"]
     assert [layer["kind"] for layer in gd.manifest["layers"]] == ["TerrainDtm"]
     assert [n["source"] for n in gd.manifest["licenses"]] == ["Copernicus GLO-30 DSM"]
 
 
 def test_geodata_goes_out_and_comes_back_as_a_simesh_geodata_pack(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
-    pack = tmp_path / "packs" / "city"
+    pack = tmp_path / "geodata" / "city"
     (pack / "sub").mkdir(parents=True)
     (pack / "manifest.json").write_text(json.dumps(nodes_manifest()))
     (pack / "dtm.tif").write_text("t")
     (pack / "nodes.bin").write_text("n")
     (pack / "sub" / "x.bin").write_text("x")
     (pack / ".hidden").write_text("h")
-    geodata.write(geodata.geodata_path("city"), {"pack": "../packs/city"})
+    geodata.write(geodata.geodata_path("city"), {"pack": "."})
     gd = geodata.load("city")
     assert gd.as_dict()["layers"] == ["TerrainDtm"]
     assert gd.as_dict()["licences"] == [{"source": "Copernicus GLO-30 DSM", "notice": "(c) DLR"}]
@@ -250,10 +254,10 @@ def test_geodata_goes_out_and_comes_back_as_a_simesh_geodata_pack(tmp_path, monk
         assert "Nodes" not in zf.read("pack/manifest.json").decode()
 
     with pytest.raises(store.StoreError, match="already"):
-        geodata.import_zip(str(zipped), packs=str(tmp_path / "elsewhere"))
-    back = geodata.import_zip(str(zipped), "city-two", packs=str(tmp_path / "elsewhere"))
-    assert back.is_pack and back.pack_dir == str(tmp_path / "elsewhere" / "city-two")
-    assert (tmp_path / "elsewhere" / "city-two" / "sub" / "x.bin").read_text() == "x"
+        geodata.import_zip(str(zipped))
+    back = geodata.import_zip(str(zipped), "city-two")
+    assert back.is_pack and back.pack_dir == str(tmp_path / "geodata" / "city-two")
+    assert (tmp_path / "geodata" / "city-two" / "sub" / "x.bin").read_text() == "x"
     assert back.bbox == gd.bbox and back.crs_epsg == gd.crs_epsg
 
     geodata.write(geodata.geodata_path("flat"), {"synthetic": {"exponent": 3.5}})
@@ -273,38 +277,35 @@ def own_store(tmp_path, monkeypatch):
     for attr, sub in (("GEODATA_DIR", "geodata"), ("RUNS_DIR", "runs"),
                       ("SNAPSHOTS_DIR", "snapshots")):
         monkeypatch.setattr(store, attr, str(tmp_path / sub))
-    monkeypatch.setattr(geodata, "PACKS_DIR", str(tmp_path / "packs"))
 
 
-def test_a_rename_takes_its_own_pack_along_and_keeps_the_comment(tmp_path, monkeypatch):
+def test_a_rename_moves_the_directory_pack_and_comment_with_it(tmp_path, monkeypatch):
     own_store(tmp_path, monkeypatch)
-    write_pack(tmp_path)
-    geodata.write(geodata.geodata_path("tiny"), {"pack": "../packs/tiny"}, "built from sources")
+    write_pack(comment="built from sources")
     geodata.rename("tiny", "small")
     assert geodata.names() == ["small"]
-    assert not (tmp_path / "packs" / "tiny").exists()
-    assert geodata.load("small").pack_dir == str(tmp_path / "packs" / "small")
-    assert (tmp_path / "geodata" / "small.yaml").read_text().startswith("# built from sources\n")
+    assert not (tmp_path / "geodata" / "tiny").exists()
+    assert geodata.load("small").pack_dir == str(tmp_path / "geodata" / "small")
+    assert (tmp_path / "geodata" / "small" / "geodata.yaml").read_text() \
+        .startswith("# built from sources\n")
     with pytest.raises(store.StoreError, match="no geodata"):
         geodata.rename("tiny", "other")
+    write_pack("other")
+    with pytest.raises(store.StoreError, match="already"):
+        geodata.rename("small", "other")
 
 
-def test_a_pack_something_else_names_stays_where_it_is(tmp_path, monkeypatch):
+def test_geodata_a_snapshot_stands_on_is_neither_renamed_nor_deleted(tmp_path, monkeypatch):
     own_store(tmp_path, monkeypatch)
-    pack = write_pack(tmp_path)
-    geodata.write(geodata.geodata_path("tiny"), {"pack": "../packs/tiny"})
+    pack = write_pack()
     geodata.write_copy(geodata.load("tiny"), str(tmp_path / "snapshots" / "s1" / "geodata.yaml"))
-    geodata.rename("tiny", "small")
-    assert pack.is_dir() and geodata.load("small").pack_dir == str(pack)
-    assert geodata.delete("small") == ["snapshot s1"]
-    assert pack.is_dir() and geodata.names() == []
-
-
-def test_a_delete_takes_its_own_pack_with_it(tmp_path, monkeypatch):
-    own_store(tmp_path, monkeypatch)
-    pack = write_pack(tmp_path)
-    geodata.write(geodata.geodata_path("tiny"), {"pack": "../packs/tiny"})
-    assert geodata.delete("tiny") == []
+    with pytest.raises(store.StoreError, match="ground of snapshot s1: delete it before renaming"):
+        geodata.rename("tiny", "small")
+    with pytest.raises(store.StoreError, match="ground of snapshot s1: delete it before deleting"):
+        geodata.delete("tiny")
+    assert geodata.names() == ["tiny"] and pack.is_dir()
+    shutil.rmtree(str(tmp_path / "snapshots" / "s1"))
+    geodata.delete("tiny")
     assert not pack.exists() and geodata.names() == []
 
 
@@ -321,14 +322,20 @@ def hash_before_the_keys(gd):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def hand_written(name, text):
+    """A geodata file written by hand, in the geodata's own directory."""
+    path = pathlib.Path(geodata.geodata_path(name))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
 def test_geodata_without_the_keys_is_what_it_was_and_is_written_back_byte_for_byte(
         tmp_path, monkeypatch):
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
-    write_pack(tmp_path)
-    (tmp_path / "geodata").mkdir()
-    for name, text in (("flat", PLAIN), ("tiny", 'pack: "../packs/tiny"\n')):
-        path = tmp_path / "geodata" / ("%s.yaml" % name)
-        path.write_text(text)
+    write_pack()
+    for name, text in (("flat", PLAIN), ("tiny", 'pack: "."\n')):
+        path = hand_written(name, text)
         gd = geodata.load(name)
         assert not set(geodata.STATED) & (set(gd.data) | set(gd.as_dict()))
         assert gd.content_hash == hash_before_the_keys(gd)
@@ -339,9 +346,8 @@ def test_geodata_without_the_keys_is_what_it_was_and_is_written_back_byte_for_by
 
 def test_shadowing_round_trips_and_is_no_part_of_the_ground(tmp_path, monkeypatch):
     own_store(tmp_path, monkeypatch)
-    (tmp_path / "geodata").mkdir()
-    (tmp_path / "geodata" / "rough.yaml").write_text(ROUGH)
-    (tmp_path / "geodata" / "flat.yaml").write_text(PLAIN)
+    rough_path = hand_written("rough", ROUGH)
+    hand_written("flat", PLAIN)
     rough, flat = geodata.load("rough"), geodata.load("flat")
     assert (rough.shadowing_db, rough.shadowing_seed) == (6.5, 3)
     assert (rough.as_dict()["shadowing_db"], rough.as_dict()["shadowing_seed"]) == (6.5, 3)
@@ -349,7 +355,7 @@ def test_shadowing_round_trips_and_is_no_part_of_the_ground(tmp_path, monkeypatc
     # serves the other.
     assert rough.content_hash == flat.content_hash
     geodata.write(geodata.geodata_path("rough"), rough.data)
-    assert (tmp_path / "geodata" / "rough.yaml").read_text() == ROUGH
+    assert rough_path.read_text() == ROUGH
     # And through everything else that writes a geodata file anew.
     copy_path = tmp_path / "runs" / "r" / "geodata.yaml"
     geodata.write_copy(rough, str(copy_path))
@@ -361,11 +367,11 @@ def test_shadowing_round_trips_and_is_no_part_of_the_ground(tmp_path, monkeypatc
 
 def test_a_packs_keys_go_where_its_pack_goes(tmp_path, monkeypatch):
     own_store(tmp_path, monkeypatch)
-    write_pack(tmp_path)
-    geodata.write(geodata.geodata_path("tiny"), {"pack": "../packs/tiny", "shadowing_db": 7})
-    geodata.rename("tiny", "small")                 # its own pack is renamed with it
+    write_pack()
+    geodata.write(geodata.geodata_path("tiny"), {"pack": ".", "shadowing_db": 7})
+    geodata.rename("tiny", "small")                 # the directory, its pack and keys with it
     small = geodata.load("small")
-    assert small.pack_dir == str(tmp_path / "packs" / "small") and small.shadowing_db == 7
+    assert small.pack_dir == str(tmp_path / "geodata" / "small") and small.shadowing_db == 7
     out = io.BytesIO()
     geodata.export_zip(small, out)
     with zipfile.ZipFile(io.BytesIO(out.getvalue())) as zf:
@@ -405,12 +411,12 @@ def test_a_spread_is_the_number_a_copy_of_the_file_reads_back(tmp_path):
 
 def test_loc_pct_is_a_packs_round_trips_and_is_part_of_the_ground(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
-    write_pack(tmp_path)
-    geodata.write(geodata.geodata_path("tiny"), {"pack": "../packs/tiny"})
-    geodata.write(geodata.geodata_path("median"),
-                  {"pack": "../packs/tiny", "loc_pct": 50, "shadowing_db": 7})
-    assert (tmp_path / "geodata" / "median.yaml").read_text() == \
-        'pack: "../packs/tiny"\nloc_pct: 50\nshadowing_db: 7\n'
+    # Two geodata on one pack's contents, at 90 % and at the median.
+    write_pack("tiny")
+    write_pack("median")
+    geodata.write(geodata.geodata_path("median"), {"pack": ".", "loc_pct": 50, "shadowing_db": 7})
+    assert (tmp_path / "geodata" / "median" / "geodata.yaml").read_text() == \
+        'pack: "."\nloc_pct: 50\nshadowing_db: 7\n'
     at90, median = geodata.load("tiny"), geodata.load("median")
     assert (at90.loc_pct, median.loc_pct) == (None, 50)
     assert median.as_dict()["loc_pct"] == 50 and "loc_pct" not in at90.as_dict()
@@ -421,7 +427,7 @@ def test_loc_pct_is_a_packs_round_trips_and_is_part_of_the_ground(tmp_path, monk
     geodata.export_zip(median, out)
     zipped = tmp_path / "median.zip"
     zipped.write_bytes(out.getvalue())
-    back = geodata.import_zip(str(zipped), "again", packs=str(tmp_path / "elsewhere"))
+    back = geodata.import_zip(str(zipped), "again")
     assert (back.loc_pct, back.shadowing_db) == (50, 7)
     path = tmp_path / "g.yaml"
     for text, match in (("pack: x\nloc_pct: 0\n", "1 to 99"),
@@ -432,3 +438,11 @@ def test_loc_pct_is_a_packs_round_trips_and_is_part_of_the_ground(tmp_path, monk
         path.write_text(text)
         with pytest.raises(store.StoreError, match=match):
             geodata.read(str(path))
+
+
+def test_synthetic_ground_goes_whatever_stands_on_it(tmp_path, monkeypatch):
+    own_store(tmp_path, monkeypatch)
+    geodata.write(geodata.geodata_path("flat"), {"synthetic": {"exponent": 3.0}})
+    geodata.write_copy(geodata.load("flat"), str(tmp_path / "runs" / "r1" / "geodata.yaml"))
+    geodata.delete("flat")
+    assert geodata.names() == [] and not (tmp_path / "geodata" / "flat").exists()
