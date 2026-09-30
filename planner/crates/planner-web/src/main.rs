@@ -24,6 +24,8 @@ use planner_core::geo::Xy;
 use planner_pack::{LayerKind, PackManifest};
 use planner_render::{BaseLayer, RenderOpts, ViewRect};
 use planner_terrain::cog::CogReader;
+#[cfg(unix)]
+use planner_terrain::cog::SharedRows;
 use rayon::prelude::*;
 use serde::Deserialize;
 use std::fs::File;
@@ -63,6 +65,11 @@ struct Cli {
     /// 2 GB VPS.
     #[arg(long, default_value_t = 1)]
     sweep_slots: usize,
+    /// Threads a propagation sweep runs on. Default: cores minus two, never
+    /// below one. On a host shared with others, or one running several
+    /// sidecars, the caller says how many are its to use.
+    #[arg(long)]
+    sweep_threads: Option<usize>,
 }
 
 struct Layers {
@@ -88,6 +95,56 @@ struct Layers {
     /// is the right input for an area sweep that treats every cell as a
     /// receiver; this is the right input for one specific path.
     building_top: Option<Mutex<CogReader<BufReader<File>>>>,
+    /// The four layers `/link.json` reads, readable without their locks.
+    ///
+    /// Every request used to queue on `terrain`'s lock for its windows, so a
+    /// pack table's pairs were read one at a time however many render slots
+    /// there were: at 8 slots, 173 nodes, ~15 k pairs, the reads were 58 s of
+    /// a 61 s build. A layer whose rows are directly readable is read here
+    /// by positioned reads instead (see `SharedRows`); the grid is the one
+    /// `CogReader::window` returns. `None` where a layer's layout allows no
+    /// such read, and that layer is read through its lock as before.
+    #[cfg(unix)]
+    unlocked: Unlocked,
+}
+
+#[cfg(unix)]
+struct Unlocked {
+    terrain: Option<SharedRows>,
+    clutter: Option<SharedRows>,
+    building_top: Option<SharedRows>,
+    built_fraction: Option<SharedRows>,
+}
+
+/// `/link.json`'s four windows — terrain, clutter, building top, built
+/// fraction — read without the locks where the layers allow it, all four at
+/// once. `None` for a layer with no lock-free reader, or whose reader could
+/// not read this box; the caller reads that one through its lock.
+#[cfg(unix)]
+fn link_windows_unlocked(layers: &Layers, lo: Xy, hi: Xy) -> [Option<planner_terrain::Grid>; 4] {
+    let u = &layers.unlocked;
+    let read = |s: &Option<SharedRows>| s.as_ref().and_then(|s| s.window(lo, hi).ok().flatten());
+    let ((t, c), (bt, bf)) = rayon::join(
+        || rayon::join(|| read(&u.terrain), || read(&u.clutter)),
+        || rayon::join(|| read(&u.building_top), || read(&u.built_fraction)),
+    );
+    [t, c, bt, bf]
+}
+
+#[cfg(not(unix))]
+fn link_windows_unlocked(_: &Layers, _: Xy, _: Xy) -> [Option<planner_terrain::Grid>; 4] {
+    [None, None, None, None]
+}
+
+/// One layer's window through its lock: the read every request made before
+/// the lock-free readers, and still the one for a layer without one.
+async fn locked_window(
+    layer: &Mutex<CogReader<BufReader<File>>>,
+    lo: Xy,
+    hi: Xy,
+) -> Result<planner_terrain::Grid, planner_terrain::TerrainError> {
+    let mut guard = layer.lock().await;
+    tokio::task::block_in_place(|| guard.window(lo, hi))
 }
 
 struct AppState {
@@ -2574,6 +2631,12 @@ struct LinkQuery {
     /// over the answer, as SIMesh's shadowing does, asks for the median: at
     /// 90 the spread is counted twice.
     loc_pct: Option<f64>,
+    /// Leave out the profile drawn for the page (240 points, ~40 KB): a
+    /// caller that keeps only the loss and its verdicts, such as SIMesh's
+    /// loss tables asking every pair, has no use for it. Everything else in
+    /// the reply is the same.
+    #[serde(default)]
+    lean: bool,
 }
 
 /// The location percentage a link is judged at: the caller's, held to
@@ -2722,35 +2785,36 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     let lo = st.clamp(Xy { x: a.x.min(b.x) - res * 4.0, y: a.y.min(b.y) - res * 4.0 });
     let hi = st.clamp(Xy { x: a.x.max(b.x) + res * 4.0, y: a.y.max(b.y) + res * 4.0 });
 
-    let mut t_guard = st.layers.terrain.lock().await;
-    let mut h_guard = match st.layers.clutter.as_ref() {
-        Some(m) => Some(m.lock().await),
-        None => None,
-    };
     // The two unblended layers. `building_top` is the obstacle a path
     // crossing a building actually meets; `built_fraction` says how much of
     // the cell that building covers, which is what separates "this sample is
     // inside a Vorderhaus" from "this sample is on the street beside one".
-    let mut bt_guard = match st.layers.building_top.as_ref() {
-        Some(m) => Some(m.lock().await),
-        None => None,
+    //
+    // No lock is held past its own read. Held to the end of the request, as
+    // they once were, the locks made every other request wait out this one's
+    // profile, both P.1812 runs and the Fresnel trace, so however many render
+    // slots there were, one pair was computed at a time.
+    let [terrain, clutter, building_top, built_fraction] =
+        tokio::task::block_in_place(|| link_windows_unlocked(&st.layers, lo, hi));
+    let terrain = match terrain {
+        Some(g) => Ok(g),
+        None => locked_window(&st.layers.terrain, lo, hi).await,
     };
-    let mut bf_guard = match st.layers.built_fraction.as_ref() {
-        Some(m) => Some(m.lock().await),
-        None => None,
+    let clutter = match (clutter, st.layers.clutter.as_ref()) {
+        (Some(g), _) => Some(g),
+        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
+        (None, None) => None,
     };
-    let (terrain, clutter) = tokio::task::block_in_place(|| {
-        rayon::join(
-            || t_guard.window(lo, hi),
-            || h_guard.as_mut().and_then(|g| g.window(lo, hi).ok()),
-        )
-    });
-    let (building_top, built_fraction) = tokio::task::block_in_place(|| {
-        rayon::join(
-            || bt_guard.as_mut().and_then(|g| g.window(lo, hi).ok()),
-            || bf_guard.as_mut().and_then(|g| g.window(lo, hi).ok()),
-        )
-    });
+    let building_top = match (building_top, st.layers.building_top.as_ref()) {
+        (Some(g), _) => Some(g),
+        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
+        (None, None) => None,
+    };
+    let built_fraction = match (built_fraction, st.layers.built_fraction.as_ref()) {
+        (Some(g), _) => Some(g),
+        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
+        (None, None) => None,
+    };
     let terrain = match terrain {
         Ok(g) => g,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -3303,7 +3367,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     // Downsample the profile for display. The Fresnel block above used every
     // fine sample; P.1812 used the §3.2.1-spaced decimation, and
     // `profile_evidence` reports both so the two are not confused.
-    let want = 240usize.min(d_km.len());
+    let want = if q.lean { 0 } else { 240usize.min(d_km.len()) };
     let denom = want.max(2) - 1;
     let profile: Vec<serde_json::Value> = (0..want)
         .map(|i| {
@@ -3323,7 +3387,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
         })
         .collect();
 
-    axum::Json(serde_json::json!({
+    let mut reply = serde_json::json!({
         "distance_km": d_total,
         "lb_db": lb,
         "budget_db": budget_db,
@@ -3438,8 +3502,13 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
             "verdict": verdict,
         },
         "profile": profile,
-    }))
-    .into_response()
+    });
+    if q.lean {
+        if let Some(map) = reply.as_object_mut() {
+            map.remove("profile");
+        }
+    }
+    axum::Json(reply).into_response()
 }
 
 #[derive(Deserialize)]
@@ -3948,6 +4017,10 @@ async fn pack_info(State(st): State<Arc<AppState>>) -> Response {
         // 3 km view, where the held tile already covered it at 5 m.
         "res_m": terrain_res_hint(&st),
         "layers": st.manifest.layers.iter().map(|l| format!("{:?}", l.kind)).collect::<Vec<_>>(),
+        // What `/link.json` takes beyond the page's own query, so a caller
+        // asks for it only of a sidecar that has it: the query refuses a name
+        // it does not know.
+        "link_options": ["lean"],
         "licenses": st.manifest.licenses.iter()
             .map(|l| serde_json::json!({"source": l.source, "notice": l.notice}))
             .collect::<Vec<_>>(),
@@ -4063,7 +4136,7 @@ async fn main() {
     } else {
         BuildingsIndexState::Absent
     }));
-    let open = |p: PathBuf| CogReader::open(&p).map(Mutex::new).ok();
+    let open = |p: PathBuf| CogReader::open(&p).ok();
     let terrain = CogReader::open(&terrain_path).expect("open terrain");
     let m = *terrain.meta();
     let extent = ViewRect {
@@ -4203,13 +4276,27 @@ async fn main() {
         centre_lat: c.1.to_degrees(),
         centre_lon: c.0.to_degrees(),
         manifest,
-        layers: Layers {
-            terrain: Mutex::new(terrain),
-            clutter: clutter_path.and_then(open),
-            population: population_path.and_then(open),
-            classes: classes_path.and_then(open),
-            built_fraction: built_fraction_path.and_then(open),
-            building_top: building_top_path.and_then(open),
+        layers: {
+            let clutter = clutter_path.and_then(open);
+            let built_fraction = built_fraction_path.and_then(open);
+            let building_top = building_top_path.and_then(open);
+            #[cfg(unix)]
+            let unlocked = Unlocked {
+                terrain: terrain.shared_rows(),
+                clutter: clutter.as_ref().and_then(CogReader::shared_rows),
+                building_top: building_top.as_ref().and_then(CogReader::shared_rows),
+                built_fraction: built_fraction.as_ref().and_then(CogReader::shared_rows),
+            };
+            Layers {
+                terrain: Mutex::new(terrain),
+                clutter: clutter.map(Mutex::new),
+                population: population_path.and_then(open).map(Mutex::new),
+                classes: classes_path.and_then(open).map(Mutex::new),
+                built_fraction: built_fraction.map(Mutex::new),
+                building_top: building_top.map(Mutex::new),
+                #[cfg(unix)]
+                unlocked,
+            }
         },
         roads,
         places,
@@ -4227,7 +4314,7 @@ async fn main() {
             let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             // Two threads held back for interactive work. On a 2-core VPS
             // that would leave nothing, so never go below one.
-            let n = cores.saturating_sub(2).max(1);
+            let n = cli.sweep_threads.unwrap_or_else(|| cores.saturating_sub(2)).max(1);
             eprintln!(
                 "sweeps run on {n} of {cores} thread(s); the rest stay free for tiles"
             );

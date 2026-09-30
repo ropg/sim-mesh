@@ -96,25 +96,32 @@ impl RawRows {
     }
 
     fn decode_into(&self, bytes: &[u8], out: &mut [f32]) -> Result<(), TerrainError> {
-        let bps = self.bytes_per_sample as usize;
-        for (i, v) in out.iter_mut().enumerate() {
-            let b = &bytes[i * bps..(i + 1) * bps];
-            *v = match (self.sample_format, bps) {
-                (3, 4) => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-                (3, 8) => f64::from_le_bytes([
-                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                ]) as f32,
-                (2, 2) => i16::from_le_bytes([b[0], b[1]]) as f32,
-                (2, 4) => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32,
-                (1, 1) => b[0] as f32,
-                (1, 2) => u16::from_le_bytes([b[0], b[1]]) as f32,
-                (1, 4) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32,
-                (f, n) => {
-                    return Err(TerrainError::Cog(format!(
-                        "direct row read: unsupported sample format {f} at {n} byte(s)"
-                    )))
-                }
-            };
+        // The layout is matched once a row, not once a sample: every cell of
+        // every window passes through here, and matching per sample kept the
+        // loop from being the plain conversion it is. Each arm converts a
+        // sample exactly as the per-sample match did.
+        fn each<const N: usize>(bytes: &[u8], out: &mut [f32], f: impl Fn([u8; N]) -> f32) {
+            assert!(bytes.len() >= out.len() * N, "a row's bytes for every sample");
+            for (v, b) in out.iter_mut().zip(bytes.chunks_exact(N)) {
+                *v = f(b.try_into().expect("N bytes"));
+            }
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        match (self.sample_format, self.bytes_per_sample as usize) {
+            (3, 4) => each(bytes, out, f32::from_le_bytes),
+            (3, 8) => each(bytes, out, |b| f64::from_le_bytes(b) as f32),
+            (2, 2) => each(bytes, out, |b| i16::from_le_bytes(b) as f32),
+            (2, 4) => each(bytes, out, |b| i32::from_le_bytes(b) as f32),
+            (1, 1) => each(bytes, out, |b: [u8; 1]| b[0] as f32),
+            (1, 2) => each(bytes, out, |b| u16::from_le_bytes(b) as f32),
+            (1, 4) => each(bytes, out, |b| u32::from_le_bytes(b) as f32),
+            (f, n) => {
+                return Err(TerrainError::Cog(format!(
+                    "direct row read: unsupported sample format {f} at {n} byte(s)"
+                )))
+            }
         }
         Ok(())
     }
@@ -664,6 +671,83 @@ impl<R: Read + Seek> CogReader<R> {
     }
 }
 
+/// A layer whose rows are read directly (an uncompressed single-band strip
+/// image, [`RawRows`]), read by any number of threads at once.
+///
+/// `CogReader` seeks one shared file handle, so it is `&mut` and a server
+/// holds it behind a lock; every request that reads a window then waits for
+/// the one before it. Here each row is a positioned read of its own
+/// (`pread`), which needs no cursor: the same rows, decoded by the same
+/// code, into the same box as [`CogReader::window`] computes, with no lock.
+#[cfg(unix)]
+pub struct SharedRows {
+    meta: CogMeta,
+    raw: RawRows,
+}
+
+#[cfg(unix)]
+impl<R: Read + Seek> CogReader<R> {
+    /// A [`SharedRows`] on this layer's file, when its rows are directly
+    /// readable; `None` for any other layout, which keeps `window`.
+    pub fn shared_rows(&self) -> Option<SharedRows> {
+        let raw = self.raw_rows.as_ref()?;
+        Some(SharedRows {
+            meta: self.meta,
+            raw: RawRows {
+                file: raw.file.try_clone().ok()?,
+                offsets: raw.offsets.clone(),
+                rows_per_strip: raw.rows_per_strip,
+                bytes_per_sample: raw.bytes_per_sample,
+                sample_format: raw.sample_format,
+            },
+        })
+    }
+}
+
+#[cfg(unix)]
+impl SharedRows {
+    pub fn meta(&self) -> &CogMeta {
+        &self.meta
+    }
+
+    /// [`CogReader::window`] of this layer: the same box, rounded the same
+    /// way, read row by row. `Ok(None)` when the strip table does not cover a
+    /// row of it, where `CogReader` falls back to its decoder: the caller
+    /// asks `CogReader` then.
+    pub fn window(&self, min: Xy, max: Xy) -> Result<Option<Grid>, TerrainError> {
+        use std::os::unix::fs::FileExt as _;
+        // The box exactly as `CogReader::window` computes it.
+        let to_col = |x: f64| ((x - self.meta.origin.x) / self.meta.dx).round();
+        let to_row = |y: f64| ((y - self.meta.origin.y) / self.meta.dy).round();
+        let (ca, cb) = (to_col(min.x), to_col(max.x));
+        let (ra, rb) = (to_row(min.y), to_row(max.y));
+        let (c0, c1) = (ca.min(cb).max(0.0) as u32, ca.max(cb) as u32);
+        let (r0, r1) = (ra.min(rb).max(0.0) as u32, ra.max(rb) as u32);
+        if c1 >= self.meta.width || r1 >= self.meta.height {
+            return Err(TerrainError::OutOfBounds(max.x, max.y));
+        }
+        let (w, h) = ((c1 - c0 + 1) as usize, (r1 - r0 + 1) as usize);
+        let mut data = vec![0f32; w * h];
+        let bps = self.raw.bytes_per_sample as usize;
+        let mut bytes = vec![0u8; w * bps];
+        for r in 0..h {
+            let Some(off) = self.raw.offset_of(r0 + r as u32, c0, self.meta.width) else {
+                return Ok(None);
+            };
+            self.raw
+                .file
+                .read_exact_at(&mut bytes, off)
+                .map_err(|e| TerrainError::Cog(format!("row {}: {e}", r0 + r as u32)))?;
+            self.raw.decode_into(&bytes, &mut data[r * w..(r + 1) * w])?;
+        }
+        let origin = Xy {
+            x: self.meta.origin.x + c0 as f64 * self.meta.dx,
+            y: self.meta.origin.y + r0 as f64 * self.meta.dy,
+        };
+        Grid::with_axes(origin, self.meta.dx, self.meta.dy, w, h, data).map(Some)
+    }
+}
+
 /// Write a `Grid` as a minimal striped, uncompressed Float32 GeoTIFF
 /// (little-endian classic TIFF, RasterType=Point, tiepoint = center of pixel
 /// (0,0)). Round-trips through `CogReader`; the pack compiler's v0 layer
@@ -1106,5 +1190,101 @@ mod tests {
         assert_eq!(s.dx_m, full.dx_m);
         assert_eq!(s.dy_m, full.dy_m);
         assert_eq!(s.data, full.data);
+    }
+
+    /// The row decoder converts every layout it takes exactly as the
+    /// per-sample match it replaced did, bit for bit, NaNs included.
+    #[test]
+    fn decode_into_converts_as_the_per_sample_match_did() {
+        fn per_sample(format: u16, bps: usize, bytes: &[u8], out: &mut [f32]) {
+            for (i, v) in out.iter_mut().enumerate() {
+                let b = &bytes[i * bps..(i + 1) * bps];
+                *v = match (format, bps) {
+                    (3, 4) => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                    (3, 8) => f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+                        as f32,
+                    (2, 2) => i16::from_le_bytes([b[0], b[1]]) as f32,
+                    (2, 4) => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32,
+                    (1, 1) => b[0] as f32,
+                    (1, 2) => u16::from_le_bytes([b[0], b[1]]) as f32,
+                    (1, 4) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32,
+                    _ => unreachable!(),
+                };
+            }
+        }
+        // Every byte value in every position, and patterns that make NaNs,
+        // infinities and subnormals in the float layouts.
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for (format, bps) in [(3, 4), (3, 8), (2, 2), (2, 4), (1, 1), (1, 2), (1, 4)] {
+            let raw = RawRows {
+                file: File::open(std::env::current_exe().unwrap()).unwrap(),
+                offsets: vec![0],
+                rows_per_strip: 1,
+                bytes_per_sample: bps as u32,
+                sample_format: format,
+            };
+            let n = bytes.len() / bps;
+            let (mut want, mut got) = (vec![0f32; n], vec![0f32; n]);
+            per_sample(format, bps, &bytes, &mut want);
+            raw.decode_into(&bytes, &mut got).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&want), "format {format} at {bps} byte(s)");
+        }
+        let odd = RawRows {
+            file: File::open(std::env::current_exe().unwrap()).unwrap(),
+            offsets: vec![0],
+            rows_per_strip: 1,
+            bytes_per_sample: 3,
+            sample_format: 1,
+        };
+        assert!(odd.decode_into(&bytes, &mut [0f32; 4]).is_err());
+    }
+
+    /// The shared reader gives `window`'s grid, cell for cell, box for box,
+    /// strip boundaries included: a server may read without the lock only if
+    /// what it reads is what it read with it.
+    #[cfg(unix)]
+    #[test]
+    fn shared_rows_read_what_window_reads() {
+        // 300 rows, so a box can span the writer's 256-row strips.
+        let g = Grid::with_axes(
+            Xy { x: 399_000.0, y: 5_800_000.0 },
+            5.0,
+            -5.0,
+            97,
+            300,
+            (0..97 * 300).map(|i| (i as f32).sin() * 50.0 + 30.0).collect(),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join("planner_cog_sharedrows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sr.tif");
+        write_geotiff_f32(&path, &g).unwrap();
+
+        let mut locked = CogReader::open(&path).unwrap();
+        let shared = locked.shared_rows().expect("a strip TIFF is directly readable");
+        let mut slow = CogReader::open(&path).unwrap();
+        slow.raw_rows = None;
+        let m = *locked.meta();
+        assert_eq!(*shared.meta(), m);
+        let at = |c: f64, r: f64| Xy { x: m.origin.x + c * m.dx, y: m.origin.y + r * m.dy };
+        for (c0, r0, c1, r1) in [
+            (0.0, 0.0, 96.0, 299.0),
+            (13.2, 5.7, 61.4, 122.1),
+            (40.0, 250.0, 70.0, 262.0), // across the strip boundary at row 256
+            (96.0, 299.0, 96.0, 299.0),
+            (61.4, 122.1, 13.2, 5.7), // corners given the other way round
+        ] {
+            let want = locked.window(at(c0, r0), at(c1, r1)).unwrap();
+            let got = shared.window(at(c0, r0), at(c1, r1)).unwrap().expect("covered");
+            let reference = slow.window(at(c0, r0), at(c1, r1)).unwrap();
+            for other in [&got, &reference] {
+                assert_eq!((other.width, other.height), (want.width, want.height));
+                assert_eq!((other.origin, other.dx_m, other.dy_m), (want.origin, want.dx_m, want.dy_m));
+                assert_eq!(other.data, want.data);
+            }
+        }
+        assert!(shared.window(at(0.0, 0.0), at(97.0, 10.0)).is_err(), "past the edge, as window");
+        assert!(locked.window(at(0.0, 0.0), at(97.0, 10.0)).is_err());
     }
 }
