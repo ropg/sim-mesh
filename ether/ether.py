@@ -59,7 +59,6 @@ a virtual one), direction, station id, JSON.
 
 import argparse
 import asyncio
-import atexit
 import contextlib
 import hashlib
 import heapq
@@ -69,7 +68,6 @@ import os
 import random
 import socket
 import sys
-import threading
 import time
 from array import array
 from datetime import datetime, timezone
@@ -346,46 +344,10 @@ def parse_time_mode(text):
     raise ValueError("--time takes real, max or <k>x, not %r" % text)
 
 
-_log_lines = []                     # lines of this turn of the loop, not yet written
-_log_lock = threading.Lock()        # other threads log too
-
-
 def log(msg):
-    """One line of human-readable running commentary.
-
-    Written with the other lines of the event loop's turn, before the loop
-    next waits, rather than a write each: a city run logs some 900,000 lines,
-    and writing each at once was 6 % of simd's busy time. The log lags by at
-    most the turn; its lines keep their order and their stamps. A line
-    logged where no loop runs is written at once, after any still waiting.
-    The record is not written this way: a message's line is in the record
-    before the message is sent."""
-    line = "%s  %s\n" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], msg)
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    with _log_lock:
-        _log_lines.append(line)
-        first = len(_log_lines) == 1
-    if first:
-        if loop is None:
-            write_log()
-        else:
-            loop.call_soon(write_log)
-
-
-def write_log():
-    """The lines logged so far, written."""
-    with _log_lock:
-        text = "".join(_log_lines)
-        _log_lines.clear()
-    if text:
-        sys.stderr.write(text)
-        sys.stderr.flush()
-
-
-atexit.register(write_log)
+    """One line of human-readable running commentary."""
+    sys.stderr.write("%s  %s\n" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], msg))
+    sys.stderr.flush()
 
 
 def seeded_draw(seed, *parts):
