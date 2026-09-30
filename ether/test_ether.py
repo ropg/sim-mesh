@@ -1038,6 +1038,61 @@ def test_the_pairwise_rule_takes_each_interferer_alone(pairwise):
     assert ends[b"signal"]["verdict"] == "clean"
 
 
+@pytest.fixture
+def oracle(tmp_path):
+    """The ether without interference (`--no-interference`)."""
+    bed = Bench(tmp_path, "real", False, "--no-interference")
+    try:
+        yield bed
+    finally:
+        bed.close()
+
+
+def test_without_interference_a_frame_is_judged_against_noise_alone(oracle):
+    ends = summed_interference(oracle)
+    assert ends[b"signal"]["verdict"] == "clean"
+
+
+def test_without_interference_a_louder_frame_does_not_take_the_receiver(oracle):
+    """The louder frame arriving 8 dB up would take the receiver; without
+    interference the receiver keeps the frame it follows, which ends clean,
+    and the louder one is energy to it."""
+    oracle.link(1, 2, 118.0)
+    oracle.link(3, 2, 110.0)
+    quiet, b, loud = oracle(1), oracle(2), oracle(3)
+    listen(quiet, b, loud)
+
+    quiet.tx(1, payload=b"quiet")
+    assert "cad" not in b.expect("rx_begin")
+    time.sleep(0.03)
+    loud.tx(2, payload=b"loud")
+    assert b.expect("rx_begin")["cad"] is True, "one frame at a time, the first kept"
+
+    ends = b.ends(2)
+    assert ends[b"quiet"]["verdict"] == "clean"
+    assert ends[b"loud"]["verdict"] == "crc"
+
+
+def test_without_interference_a_receiver_still_cannot_hear_while_it_sends(oracle):
+    oracle.link(1, 2, 110.0)
+    a, b = oracle(1), oracle(2)
+    listen(a, b)
+    a.tx(1, payload=b"from a")
+    assert "cad" not in b.expect("rx_begin")
+    b.tx(2, payload=b"from b")
+    end = b.expect("rx_end")
+    assert end["verdict"] == "crc", "half duplex is the radio's, not interference"
+
+
+def test_without_interference_is_said_and_kept_with_the_run():
+    physics = ether_module.Physics(interference=False)
+    assert "no interference" in physics.describe()
+    assert physics.as_dict()["interference"] is False
+    assert ether_module.Physics.from_dict(physics.as_dict()).interference is False
+    assert "interference" not in ether_module.Physics().as_dict()
+    assert ether_module.Physics.from_dict({}).interference is True
+
+
 # ---------------------------------------------------------------------------
 # The hand-built case: two hidden senders, one receiver
 # ---------------------------------------------------------------------------

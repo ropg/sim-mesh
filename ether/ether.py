@@ -424,33 +424,47 @@ def fspl_1m_db(freq_hz):
 
 class Physics:
     """The medium's own settings beyond path loss: the receivers' noise
-    figure, and the CRC band above the demodulation threshold (off unless
-    given). A setting at its default is left out of `as_dict`, so what a run
-    records says only what was asked for."""
+    figure, the CRC band above the demodulation threshold (off unless given),
+    and whether frames on the air interfere with one another at all.
+
+    Without interference (`--no-interference`, an oracle, never so unless
+    asked) a frame is judged against noise alone, as though nothing else were
+    on the air, and a receiver is never taken off the frame it follows; a
+    receiver still follows one frame at a time, cannot hear while it
+    transmits, and senses the channel as before. What a run delivers with it
+    less what it delivers without is what overlapping frames cost it. A
+    setting at its default is left out of `as_dict`, so what a run records
+    says only what was asked for."""
 
     def __init__(self, noise_figure_db=DEFAULT_NOISE_FIGURE_DB,
-                 crc_margin_db=DEFAULT_CRC_MARGIN_DB):
+                 crc_margin_db=DEFAULT_CRC_MARGIN_DB, interference=True):
         self.noise_figure_db = float(noise_figure_db)
         self.crc_margin_db = float(crc_margin_db)
         if self.crc_margin_db < 0:
             raise ValueError("the CRC band is a width in dB, not %g" % self.crc_margin_db)
+        self.interference = bool(interference)
 
     def describe(self):
         text = "noise figure %.1f dB" % self.noise_figure_db
         if self.crc_margin_db:
             text += ", a %.1f dB CRC band" % self.crc_margin_db
+        if not self.interference:
+            text += ", no interference (an oracle)"
         return text
 
     @classmethod
     def from_dict(cls, data):
         data = data or {}
         return cls(data.get("noise_figure_db", DEFAULT_NOISE_FIGURE_DB),
-                   data.get("crc_margin_db", DEFAULT_CRC_MARGIN_DB))
+                   data.get("crc_margin_db", DEFAULT_CRC_MARGIN_DB),
+                   data.get("interference", True))
 
     def as_dict(self):
         out = {"noise_figure_db": self.noise_figure_db}
         if self.crc_margin_db != DEFAULT_CRC_MARGIN_DB:
             out["crc_margin_db"] = self.crc_margin_db
+        if not self.interference:
+            out["interference"] = False
         return out
 
 
@@ -1770,7 +1784,10 @@ class Ether(asyncio.DatagramProtocol):
         following: by leading it by the same-SF figure, or with bench capture
         as the bench saw two frames meet — never once the receiver is past
         the first one's preamble, and otherwise when the pair's outcome says
-        the new one survives, the same outcome its verdict will read."""
+        the new one survives, the same outcome its verdict will read. Never
+        without interference (`Physics`)."""
+        if not self.physics.interference:
+            return False
         if not self.bench_capture:
             return level - held.level >= SAME_SF_REJECTION_DB
         if now >= held.frame.pre_us:
@@ -1797,7 +1814,8 @@ class Ether(asyncio.DatagramProtocol):
             self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             return
         held = self.current_lock(rstation, slot, now)
-        if held is not None and round(level) < round(held.level) + PAIRWISE_CAPTURE_DB:
+        if held is not None and (not self.physics.interference
+                                 or round(level) < round(held.level) + PAIRWISE_CAPTURE_DB):
             self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
             self.open_reception(frame, rstation, slot, level, lost=True)
             return
@@ -1842,6 +1860,8 @@ class Ether(asyncio.DatagramProtocol):
             return "crc"
         if level - self.noise(frame.bw) < self.sensitivity(frame.sf):
             return "crc"
+        if not self.physics.interference:
+            return "clean"
         others = []
         for other in frame.interferers:
             against = self.level_of(other, rsid)
@@ -1898,6 +1918,8 @@ class Ether(asyncio.DatagramProtocol):
         frame, rsid, level = reception.frame, reception.rsid, reception.level
         if reception.lost or self.talked_over(reception):
             return "crc"
+        if not self.physics.interference:
+            return "clean"
         for other in frame.interferers:
             if not same_carrier(frame.freq, other.freq, max(frame.bw or 0, other.bw or 0)):
                 continue
@@ -2423,6 +2445,10 @@ def main(argv=None):
                     help="the CRC band: how far above its threshold a frame may still "
                          "fail its CRC, the chance falling linearly to nothing "
                          "(default %g: none)" % DEFAULT_CRC_MARGIN_DB)
+    ap.add_argument("--no-interference", action="store_true",
+                    help="an oracle: judge every frame against noise alone and never take "
+                         "a receiver off the frame it follows; what overlapping frames "
+                         "cost a run is its delivery with this less without")
     ap.add_argument("--seed", type=int,
                     help="the seed of the medium's draws, handed every station in its "
                          "welcome (default: drawn at random)")
@@ -2446,7 +2472,9 @@ def main(argv=None):
             log("geodata: %s" % args.geodata)
     try:
         asyncio.run(serve(parse_bind(args.bind), args.record,
-                          Physics(args.noise_figure, args.crc_margin_db), (tables, sids, gains),
+                          Physics(args.noise_figure, args.crc_margin_db,
+                                  interference=not args.no_interference),
+                          (tables, sids, gains),
                           args.time, args.pairwise, args.seed, args.bench_capture))
     except KeyboardInterrupt:
         log("ether stopping")
