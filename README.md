@@ -1235,8 +1235,9 @@ foreground: Ctrl-C stops it, and everything it started. It takes `--bind`
 run directory, default `testbed/runs/simd/`; a run loaded later that would
 land on one there goes beside it as `-2`, `-3`…), `--build`, `--sidecar` (the
 planner-web a pack's moved rows are recomputed through), `--stagger`,
-`--net`, `--time`, `--noise-figure`, `--pairwise` or `--bench-capture`, and
-`--crc-margin-db` (the ether's receivers, its rule and its CRC band),
+`--net`, `--time`, `--noise-figure`, `--pairwise` or `--bench-capture`,
+`--crc-margin-db` (the ether's receivers, its rule and its CRC band), and
+`--no-interference` (an oracle: every frame judged against noise alone),
 `--clock-ppm` (in virtual time, each station's crystal off by a draw within
 that many parts per million), and `--seed` and `--epoch` (the seed the ether's welcome
 carries, which in a virtual-time run also keys every station's randomness,
