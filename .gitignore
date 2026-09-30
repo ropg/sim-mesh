@@ -16,3 +16,4 @@ planner/target/
 __pycache__/
 .pytest_cache/
 ether/build/
+.venv/
