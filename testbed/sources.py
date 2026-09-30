@@ -40,7 +40,7 @@ offers no choice: Berlin's own data where the rectangle touches Berlin,
 GLO-30 and OpenStreetMap's buildings on the rest, the Zensus grid where it
 touches Germany (`plan` says which, and what each is used for).
 
-Every request names SIMesh in its User-Agent, a 429 or 5xx is retried after
+Every request names sim-mesh in its User-Agent, a 429 or 5xx is retried after
 the Retry-After the host gives (or a growing pause), and nothing is fetched
 that a build does not need.
 """
@@ -61,7 +61,7 @@ import geodata
 import store
 
 CACHE_DIR = os.path.join(store.GEODATA_DIR, ".cache")
-USER_AGENT = "SIMesh (+https://github.com/reticulous/SIMesh)"
+USER_AGENT = "sim-mesh (+https://github.com/sim-mesh/sim-mesh)"
 CHUNK = 1 << 16
 TRIES = 4
 BACKOFF_S = 5.0

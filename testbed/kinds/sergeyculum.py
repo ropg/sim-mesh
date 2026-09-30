@@ -1,5 +1,5 @@
 """Sergeyculum, the Rust Reticulum stack at git.emcomm.cc/berlinmesh/reticulum,
-as its Linux station `fw/simesh`.
+as its Linux station `fw/sim-mesh`.
 
 Its device names its configuration tool among its tools, `tools: { rncfg:
 <path> }`; `rncfg` on PATH when it names none.
@@ -74,7 +74,7 @@ class Sergeyculum(Kind):
         if station.clock is not None:
             # A plain process: the time shim says it is idle when all its
             # threads are blocked.
-            env["SIMESH_IDLE"] = "threads"
+            env["SIM_MESH_IDLE"] = "threads"
         return env
 
     def kiss(self, station):

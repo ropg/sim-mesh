@@ -60,16 +60,16 @@ int64_t rawWallUs()
 
 /* ---- f: the node's clock as a function of T ----
  *
- * SIMESH_CLOCK_PROFILE, when set, is "T:node,T:node,…" in microseconds, both
- * columns increasing: a monotone piecewise-linear map, slope 1 outside the
- * points. Absent, f is the identity. */
+ * SIM_MESH_CLOCK_PROFILE, when set, is "T:node,T:node,…" in microseconds,
+ * both columns increasing: a monotone piecewise-linear map, slope 1 outside
+ * the points. Absent, f is the identity. */
 struct Point { int64_t t, n; };
 
 const std::vector<Point>& profile()
 {
     static const std::vector<Point> points = [] {
         std::vector<Point> out;
-        const char* v = getenv("SIMESH_CLOCK_PROFILE");
+        const char* v = getenv("SIM_MESH_CLOCK_PROFILE");
         while (v && *v) {
             char* end = nullptr;
             long long t = strtoll(v, &end, 10);
@@ -289,12 +289,12 @@ bool isVirtual()
 {
     int m = s_mode.load();
     if (m < 0) {
-        const char* v = getenv("SIMESH_TIME");
+        const char* v = getenv("SIM_MESH_TIME");
         m = (v && strcmp(v, "virtual") == 0) ? 1 : 0;
         int expected = -1;
         if (!s_mode.compare_exchange_strong(expected, m)) m = expected;
         else if (m) {
-            const char* e = getenv("SIMESH_EPOCH_US");
+            const char* e = getenv("SIM_MESH_EPOCH_US");
             s_epoch.store(e && *e ? strtoll(e, nullptr, 10) : rawWallUs());
         }
     }

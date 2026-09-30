@@ -36,7 +36,7 @@ Several of these run at once as the children of front.py, each on its own
 ports, network and run directory, with the front in front of all of them.
 
 **Firmware.** What each node runs is said by firmware rules, `{which,
-firmware}`: a selection of nodes (simesh.select) and a device name. A run
+firmware}`: a selection of nodes (sim_mesh.select) and a device name. A run
 is made with its script's rules (`sim_load`'s `firmware_rules`, which the
 front has from the script's runner) and takes more from a `firmware`
 message; they are kept in the run (`firmware_rules`), and each node runs
@@ -167,7 +167,7 @@ import script as script_module     # noqa: E402
 import stations as stations_module  # noqa: E402
 import store                       # noqa: E402
 import webrtc as webrtc_module     # noqa: E402
-from simesh import select as select_module  # noqa: E402
+from sim_mesh import select as select_module  # noqa: E402
 
 UI_DIST = os.path.join(SIM_DIR, "ui", "dist", "spa")
 DEFAULT_RUN = os.path.join(store.RUNS_DIR, "simd")
@@ -254,7 +254,7 @@ async def serve_page(request):
         return web.FileResponse(page)
     return web.Response(
         text="The control page has not been built.\n\n"
-             "In SIMesh/testbed/ui run `npm install && npx quasar build`.\n",
+             "In sim-mesh/testbed/ui run `npm install && npx quasar build`.\n",
         content_type="text/plain")
 
 
@@ -397,7 +397,7 @@ class Simd:
                 physics.describe(), "pairwise" if self.args.pairwise else "receiver-centred"))
         if self.ether.clock.virtual and not os.path.exists(kinds_module.SHIM):
             log("error: no time shim at %s: a virtual-time run needs it "
-                "(see SIMesh/README.md)" % kinds_module.SHIM)
+                "(see sim-mesh/README.md)" % kinds_module.SHIM)
 
     @property
     def virtual(self):
@@ -969,7 +969,7 @@ class Simd:
     # ---- firmware --------------------------------------------------------
 
     def facts(self, name):
-        """What a firmware rule's selection (simesh.select) asks of a node."""
+        """What a firmware rule's selection (sim_mesh.select) asks of a node."""
         node = self.nodeset.nodes[name]
         station = self.stations.get(name)
         kind = self.kind_of(name)

@@ -15,7 +15,7 @@ Lifelines are named from the run's nodeset. The record is the ether's own
 account: it knows a frame's carrier, its air time and its bytes, and nothing
 about what the bytes mean. The reading on the right is the protocol's: in a
 run with Reticulous stations (or a record read on its own) it is done the way
-the firmware's receive path does it (`simesh.reticulum.frames.read_frame`);
+the firmware's receive path does it (`sim_mesh.reticulum.frames.read_frame`);
 in a run with none, a frame is its length and carrier.
 """
 
@@ -23,10 +23,10 @@ import argparse
 import base64
 import sys
 
-from simesh import record as record_module
-from simesh import reticulum
-from simesh.reticulum import frames as rframes
-from simesh.view import RunView
+from sim_mesh import record as record_module
+from sim_mesh import reticulum
+from sim_mesh.reticulum import frames as rframes
+from sim_mesh.view import RunView
 
 COL_W = 9               # characters between two lifelines
 GUTTER = 3              # room to the left of the first lifeline for its name

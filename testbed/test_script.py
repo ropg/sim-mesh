@@ -16,7 +16,7 @@ import nodeset  # noqa: E402
 import script  # noqa: E402
 import stations  # noqa: E402
 import store  # noqa: E402
-from simesh import library  # noqa: E402
+from sim_mesh import library  # noqa: E402
 
 RETICULOUS = {"ref": "stable", "kind_type": "reticulous", "elf": "/x", "name": "Reticulous",
               "virtual_hardware": "ESP32-S3"}
@@ -36,23 +36,23 @@ def runtime(monkeypatch):
     """A fresh library runtime, with no simulation to reach."""
     fresh = library.Runtime()
     monkeypatch.setattr(library, "runtime", fresh)
-    monkeypatch.delenv("SIMESH_SIM", raising=False)
+    monkeypatch.delenv("SIM_MESH_SIM", raising=False)
     return fresh
 
 
 def test_a_script_is_described_without_being_run(scripts_dir):
     (scripts_dir / "told.py").write_text(
-        '"""Sets up, then reports.\n\nMore."""\nfrom simesh import *\nfrom simesh import traffic\n'
+        '"""Sets up, then reports.\n\nMore."""\nfrom sim_mesh import *\nfrom sim_mesh import traffic\n'
         'raise SystemExit("never run")\n'
         "def report(run_dir):\n    return '# done'\n")
     (scripts_dir / "broken.py").write_text("firmware('all',\n")
     assert script.names() == ["broken", "told"]
     got = script.describe(script.script_path("told"), "told")
     assert got["doc"] == "Sets up, then reports." and got["report"] is True
-    assert [r["path"] for r in got["references"]] == ["simesh/library.py", "simesh/traffic.py"]
+    assert [r["path"] for r in got["references"]] == ["sim_mesh/library.py", "sim_mesh/traffic.py"]
     assert all(r["library"] for r in got["references"])
     assert "line 1" in script.describe(script.script_path("broken"))["error"]
-    assert script.read_reference("simesh/traffic.py").startswith('"""The LXMF traffic driver')
+    assert script.read_reference("sim_mesh/traffic.py").startswith('"""The LXMF traffic driver')
     with pytest.raises(store.StoreError):
         script.read_reference("../front.py")
 
@@ -70,7 +70,7 @@ def test_a_script_is_written_only_when_it_parses(scripts_dir):
 
 def test_a_scripts_definitions_are_read_without_running_it(scripts_dir, runtime):
     (scripts_dir / "one.py").write_text(
-        "from simesh import *\nWHO = 'one'\nfirmware('all', 'x_y_latest')\nup('all')\n"
+        "from sim_mesh import *\nWHO = 'one'\nfirmware('all', 'x_y_latest')\nup('all')\n"
         "def report(run_dir):\n    return WHO + run_dir\n")
     module = script.module_of(script.script_path("one"), "one")
     assert module.report("/r") == "one/r"
@@ -79,7 +79,7 @@ def test_a_scripts_definitions_are_read_without_running_it(scripts_dir, runtime)
 
 def test_declarations_are_collected_until_the_script_does_something(scripts_dir, runtime):
     (scripts_dir / "fw.py").write_text(
-        "from simesh import *\n"
+        "from sim_mesh import *\n"
         "time(10)\n"
         "firmware('all', 'reticulous_dev_latest')\n"
         "firmware(nodes(tag='sergeyculum'), 'sergeyculum_local_latest')\n"
@@ -112,7 +112,7 @@ def test_the_repositorys_scripts_all_parse_and_declare_what_they_run(runtime, mo
     shutil.copytree(store.SCRIPTS_DIR, str(tmp_path / "scripts"))
     (tmp_path / "nodesets").mkdir()
     (tmp_path / "nodesets" / "gw.py").write_text(
-        "from simesh import *\n"
+        "from sim_mesh import *\n"
         "on_first_boot(nodes(tag=\"tcp-peer\"), \"tcp peer add {addr:internet}:4965\")\n")
     monkeypatch.setattr(library, "TESTBED_DIR", str(tmp_path))
     names = script.names()
@@ -243,8 +243,8 @@ FACTS = {
 
 
 def test_a_selection_is_set_algebra_over_the_nodes_facts():
-    from simesh import nodes
-    from simesh.select import Nodes, which
+    from sim_mesh import nodes
+    from sim_mesh.select import Nodes, which
 
     assert nodes().pick(FACTS) == ["gw", "n2", "sg"]
     assert nodes(tag="lora").pick(FACTS) == ["gw", "n2"]

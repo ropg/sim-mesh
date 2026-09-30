@@ -58,7 +58,7 @@ const geom = reactive<Geom>({ ...props.defaultGeom })
 const z = ref(++zCounter)
 const size = reactive({ w: 0, h: 0 })
 const moving = ref(false)
-const KEY = `simesh.window.${props.id}`
+const KEY = `sim-mesh.window.${props.id}`
 
 const style = computed(() => ({
   left: `${geom.x}%`, top: `${geom.y}%`, width: `${geom.w}%`, height: `${geom.h}%`, zIndex: z.value,

@@ -9,7 +9,7 @@
  * The messages are JSON, one per datagram, payloads base64, times in
  * microseconds on the sender's own clock and meaningful only against each
  * other. A station ignores a message it does not understand.
- * SIMesh/ether/README.md is the wire.
+ * sim-mesh/ether/README.md is the wire.
  */
 #pragma once
 

@@ -222,7 +222,7 @@ function posOf(name: string): [number, number] | null {
  * Maps with the same viewKey share it (the Geodata and Nodes tabs do): each
  * keeps the last one in the geodata store as it moves, and one coming on
  * show, or on show when the other moved, takes it up. */
-function storageKey() { return `simesh.view.${ground.current?.name ?? '-'}.${props.viewKey}` }
+function storageKey() { return `sim-mesh.view.${ground.current?.name ?? '-'}.${props.viewKey}` }
 function saveView() {
   ground.views[storageKey()] = { ...view.value }
   try { localStorage.setItem(storageKey(), JSON.stringify(view.value)) } catch { /* private window */ }

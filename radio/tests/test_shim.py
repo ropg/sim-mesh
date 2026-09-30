@@ -45,9 +45,9 @@ class Station:
     takes a variable out."""
 
     def __init__(self, port, *args, **extra):
-        env = dict(os.environ, SIMESH_TIME="virtual", SIMESH_IDLE="threads",
-                   SIMESH_EPOCH_US=str(EPOCH), LD_PRELOAD=SHIM)
-        for key in ("SIMESH_SEED", "SIMESH_NODE_ID"):
+        env = dict(os.environ, SIM_MESH_TIME="virtual", SIM_MESH_IDLE="threads",
+                   SIM_MESH_EPOCH_US=str(EPOCH), LD_PRELOAD=SHIM)
+        for key in ("SIM_MESH_SEED", "SIM_MESH_NODE_ID"):
             env.pop(key, None)
         for key, value in extra.items():
             if value is None:
@@ -168,18 +168,18 @@ def entropy_of(**extra):
 
 
 def test_a_seeded_virtual_run_gives_each_station_its_own_repeatable_bytes():
-    a = entropy_of(SIMESH_SEED="17", SIMESH_NODE_ID="3")
-    assert entropy_of(SIMESH_SEED="17", SIMESH_NODE_ID="3") == a
+    a = entropy_of(SIM_MESH_SEED="17", SIM_MESH_NODE_ID="3")
+    assert entropy_of(SIM_MESH_SEED="17", SIM_MESH_NODE_ID="3") == a
     assert len(a) == 3 and len(set(a)) == 3        # three calls, three draws
-    assert entropy_of(SIMESH_SEED="17", SIMESH_NODE_ID="4") != a
-    assert entropy_of(SIMESH_SEED="18", SIMESH_NODE_ID="3") != a
+    assert entropy_of(SIM_MESH_SEED="17", SIM_MESH_NODE_ID="4") != a
+    assert entropy_of(SIM_MESH_SEED="18", SIM_MESH_NODE_ID="3") != a
 
 
 def test_without_a_seed_or_virtual_time_the_bytes_are_the_hosts():
-    unseeded = entropy_of(SIMESH_NODE_ID="3")
-    assert entropy_of(SIMESH_NODE_ID="3") != unseeded
-    real = entropy_of(SIMESH_TIME=None, SIMESH_SEED="17", SIMESH_NODE_ID="3")
-    assert entropy_of(SIMESH_TIME=None, SIMESH_SEED="17", SIMESH_NODE_ID="3") != real
+    unseeded = entropy_of(SIM_MESH_NODE_ID="3")
+    assert entropy_of(SIM_MESH_NODE_ID="3") != unseeded
+    real = entropy_of(SIM_MESH_TIME=None, SIM_MESH_SEED="17", SIM_MESH_NODE_ID="3")
+    assert entropy_of(SIM_MESH_TIME=None, SIM_MESH_SEED="17", SIM_MESH_NODE_ID="3") != real
 
 
 def test_the_shim_counts_console_and_tcp_bytes_and_waits_to_write():
@@ -196,8 +196,8 @@ def test_the_shim_counts_console_and_tcp_bytes_and_waits_to_write():
     peer.listen(1)
     host, port = peer.getsockname()
     station = Station(ether.getsockname()[1], "%s:%d" % (host, port),
-                      SIMESH_NODE_ID="3", SIMESH_BIND_ADDR="127.0.0.3",
-                      SIMESH_ETHER="127.0.0.1:%d" % ether.getsockname()[1])
+                      SIM_MESH_NODE_ID="3", SIM_MESH_BIND_ADDR="127.0.0.3",
+                      SIM_MESH_ETHER="127.0.0.1:%d" % ether.getsockname()[1])
     conn = None
     try:
         data, addr = ether.recvfrom(65535)

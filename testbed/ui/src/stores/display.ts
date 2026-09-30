@@ -29,7 +29,7 @@ const DEFAULTS: Display = {
 }
 const BASES: Display['base'][] = ['terrain', 'clutter']
 
-function key(view: View) { return `simesh.display.${view}` }
+function key(view: View) { return `sim-mesh.display.${view}` }
 
 function load(view: View): Display {
   const out = { ...DEFAULTS }

@@ -32,7 +32,7 @@ front ── simd.py --run runs/<sim> --sidecar URL ───► child
 front ── sim_new {ok, name, control, run, …} ─► asker
 
 page ── script_run {name, geodata, nodesets} ──► front: a name for its simulation, <sim>
-front ── python -m simesh.runner <script> --geodata G --nodeset N… --name <sim> ──► runner
+front ── python -m sim_mesh.runner <script> --geodata G --nodeset N… --name <sim> ──► runner
 front ── script_run {run, simulation: <sim>} ──► page          which goes over to <sim>
 runner: the script from its top; time(), firmware(), on_first_boot() collected
 runner ── sim_new {name: <sim>, …, time, firmware_rules, first_boot_rules} ──► front
@@ -62,14 +62,14 @@ from its script's `firmware()` declarations and fetching what they name.
 
 **The planner sidecar.** One `planner-web` per pack in use, on
 `127.0.0.1:<free>`: started when the first simulation or page socket opens
-geodata on that pack, stopped when the last one lets go. It is SIMesh's own,
-built from `planner/` (`simesh build planner`) to
+geodata on that pack, stopped when the last one lets go. It is sim-mesh's own,
+built from `planner/` (`sim-mesh build planner`) to
 `planner/target/release/planner-web`; not built, a pack is refused with
 NO_PLANNER and synthetic ground works. The page reaches it as `/planner/<geodata>/…`, passed through with
 the prefix stripped; a child is given its URL directly, for recomputing a
 moved node's row.
 
-**Script runs.** A script runs as a process of its own (`simesh.runner`),
+**Script runs.** A script runs as a process of its own (`sim_mesh.runner`),
 its output kept (the last `SCRIPT_LINES` lines) and sent to every page as it
 comes. On a new simulation it starts that itself, through `sim_new` on this
 same port, with its time and its firmware and first-boot rules, under the
@@ -239,7 +239,7 @@ SIGNAL_PATH = simd_module.SIGNAL_PATH
 LOSSES_PY = os.path.join(SIM_DIR, "losses.py")
 PLANNER_WEB = os.path.join("target", "release", "planner-web")
 PLANNER_JOB = os.path.join("target", "release", "planner-job")
-NO_PLANNER = ("geodata %s is a pack, and planner-web is not built: simesh build planner")
+NO_PLANNER = ("geodata %s is a pack, and planner-web is not built: sim-mesh build planner")
 OSM_TILES = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 OSM_TILES_DIR = os.path.join(SIM_DIR, "osmtiles")
 OSM_TILE_MAX_AGE_S = 7 * 86400      # the tile usage policy's floor for keeping one
@@ -254,7 +254,7 @@ POTATOMESH_NODES = "/api/nodes?limit=1000"
 CONTROL_PORTS = range(9100, 9200)   # a child's page, proxy and relay (TCP and UDP)
 ETHER_PORTS = range(7100, 7200)     # a child's ether
 NETS = range(4, 64)                 # 127.<4k>.0.0/22; below 127.16 is left for simd by hand
-NET_LOCK_DIR = os.path.join(tempfile.gettempdir(), "simesh-nets")   # one lock per /22, host-wide
+NET_LOCK_DIR = os.path.join(tempfile.gettempdir(), "sim-mesh-nets")   # one lock per /22, host-wide
 READY_TIMEOUT_S = 30.0              # how long a child has to open its port
 STOP_TIMEOUT_S = 15.0               # how long a child has to stop before it is killed
 SIDECAR_READY_S = 60.0              # how long a planner-web has to answer /api/pack
@@ -778,7 +778,7 @@ class Child:
 # ---------------------------------------------------------------------------
 
 class ScriptRun:
-    """A script, running as `simesh.runner` (and then its `report`, when it
+    """A script, running as `sim_mesh.runner` (and then its `report`, when it
     has one, on its simulation's run). It starts its own simulation, under
     the name the front chose for it, on `world` (geodata, nodesets, build),
     or runs on the one named, `world` then None."""
@@ -803,7 +803,7 @@ class ScriptRun:
         return child.run_dir if child is not None else None
 
     async def start(self, port):
-        argv = [sys.executable, "-u", "-m", "simesh.runner", script_module.script_path(self.name),
+        argv = [sys.executable, "-u", "-m", "sim_mesh.runner", script_module.script_path(self.name),
                 "--port", str(port)]
         if self.world is None:
             argv += ["--sim", self.sim]
@@ -813,10 +813,10 @@ class ScriptRun:
                 argv += ["--nodeset", layer]
             if self.world.get("build"):
                 argv += ["--build", self.world["build"]]
-        env = dict(os.environ, SIMESH_PORT=str(port),
+        env = dict(os.environ, SIM_MESH_PORT=str(port),
                    PYTHONPATH=os.pathsep.join(p for p in (SIM_DIR, os.environ.get("PYTHONPATH"))
                                               if p))
-        env.pop("SIMESH_SIM", None)
+        env.pop("SIM_MESH_SIM", None)
         self.process = await asyncio.create_subprocess_exec(
             *argv, cwd=SIM_DIR, env=env, stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -1568,7 +1568,7 @@ class Front:
         path = self.new_path(nodeset_module.nodeset_path(name), "nodeset", name)
         gd = geodata_module.load(msg.get("geodata") or "")
         if planner_job() is None:
-            raise store.StoreError("planner-job is not built: simesh build planner")
+            raise store.StoreError("planner-job is not built: sim-mesh build planner")
         if source == "meshcore":
             fetched = await self.cache.meta_file(MESHCORE_META, MESHCORE_NODES)
         elif source == "potatomesh":
@@ -1847,7 +1847,7 @@ class Front:
             name = msg.pop("sim", None) or conn.selected
             if name is None:
                 await conn.send({"type": "error",
-                                 "text": "the page asked for %s, which this SIMesh does not "
+                                 "text": "the page asked for %s, which this sim-mesh does not "
                                          "know" % kind})
                 return
             if kind in ("sim_load", "snapshot_load") and not msg.get("run"):
@@ -2126,7 +2126,7 @@ class Front:
         return web.json_response({"ok": True, "ref": got["ref"], "name": got["name"]})
 
     async def api_geodata_import(self, request):
-        """POST a SIMesh geodata pack or a bare planner pack, `?name=` the
+        """POST a sim-mesh geodata pack or a bare planner pack, `?name=` the
         geodata it becomes (empty: the one the zip gives), expanded into its
         own directory."""
         tmp = await self.upload(request)
@@ -2142,7 +2142,7 @@ class Front:
         return web.json_response({"ok": True, "geodata": gd.as_dict()})
 
     async def api_geodata_export(self, request):
-        """GET `?name=`: that geodata as a SIMesh geodata pack, a zip made
+        """GET `?name=`: that geodata as a sim-mesh geodata pack, a zip made
         while it is sent, never whole on disk or in memory: it is written on a
         worker thread into a short queue this handler drains into the
         response, and a reader that goes away stops the writer at its next
@@ -2238,7 +2238,7 @@ class Front:
         try:
             spec = self.build_spec(await request.json())
             if planner_job() is None:
-                raise store.StoreError("planner-job is not built: simesh build planner")
+                raise store.StoreError("planner-job is not built: sim-mesh build planner")
             if self.build is not None and self.build.running:
                 raise store.StoreError("%s is being built: one build at a time" % self.build.name)
             packbuild_module.refuse(spec)
@@ -2382,7 +2382,7 @@ class Front:
             "http://<station>.<simulation>.sim.localhost:%s/"
             % (self.args.public_port, self.args.public_port))
         if planner_web() is None:
-            log("planner-web is not built in %s (simesh build planner): packs are refused, "
+            log("planner-web is not built in %s (sim-mesh build planner): packs are refused, "
                 "synthetic ground works" % geodata_module.planner_repo())
 
     # ---- the run ---------------------------------------------------------

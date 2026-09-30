@@ -182,7 +182,7 @@ def test_nodes_csv_import(tmp_path):
 def test_the_planners_own_deployed_network_csv_imports():
     path = os.path.join(HERE, "..", "..", "sergey", "planner", ".cache", "nodes", "berlin.csv")
     if not os.path.isfile(path):
-        pytest.skip("no planner nodes CSV beside SIMesh")
+        pytest.skip("no planner nodes CSV beside sim-mesh")
     data = nodeset.import_nodes_csv(path)
     assert len(data["nodes"]) > 100
     nodeset.parse(data, "import")

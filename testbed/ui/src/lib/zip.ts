@@ -2,7 +2,7 @@
  * gives its geodata, so the import dialog can offer it.
  *
  * A zip's central directory is at its end, so only the tail and the one small
- * member asked for are read from the file, whatever its size. A SIMesh
+ * member asked for are read from the file, whatever its size. A sim-mesh
  * geodata pack gives its name in `geodata.yaml`'s first line, `# geodata
  * <name>`; a bare planner pack in its manifest's `name`, at the top or inside
  * one directory, made into a usable name as the front makes one. */

@@ -1,6 +1,6 @@
 # The station contract
 
-What SIMesh gives every station process, and what it expects back. A firmware
+What sim-mesh gives every station process, and what it expects back. A firmware
 that keeps this contract, and links `radio/` below its radio driver, runs on
 the testbed; what differs between firmwares beyond it is a **kind**
 (`testbed/kinds/`).
@@ -9,17 +9,17 @@ the testbed; what differs between firmwares beyond it is a **kind**
 
 | Variable | Meaning |
 |---|---|
-| `SIMESH_NODE_ID` | a small integer, unique on the host; the last byte of any MAC (media access control) address the station makes, and the `sid` it gives the ether |
-| `SIMESH_NODE_DIR` | the station's directory; its working directory; its state lives under `state/` |
-| `SIMESH_BIND_ADDR` | its own loopback address, fixed by its id in the testbed's network (`simd --net`, a /22 holding 1000 stations by default); every socket it opens binds here |
-| `SIMESH_ETHER` | `host:port` of the ether |
-| `SIMESH_BOARD` | the board its node is, as one flat JSON object: `chip` (`sx1262`), `max_dbm` (the node's maximum power at the antenna connector) and, when that is above 22 dBm and the node has a GC1109 front-end module, `fem_part`, `fem_tx_cal` (chip register → connector dBm, in the `LORAn_TX_CAL` form), `fem_gain_db` (its flat gain, when there is no curve) and `fem_rx_gain_db`, from `testbed/boards.py`. The chip model reads it too (below, The radio); a firmware that drives a front end takes its figures from here |
-| `SIMESH_TIME` | `virtual` in a virtual-time run, absent in a real-time one |
-| `SIMESH_EPOCH_US` | virtual time: the wall-clock microseconds T 0 stands for |
-| `SIMESH_SEED` | virtual time: the ether's seed, the one its `welcome` carries; the shim keys the station's `getentropy`/`getrandom` by it and `SIMESH_NODE_ID` |
+| `SIM_MESH_NODE_ID` | a small integer, unique on the host; the last byte of any MAC (media access control) address the station makes, and the `sid` it gives the ether |
+| `SIM_MESH_NODE_DIR` | the station's directory; its working directory; its state lives under `state/` |
+| `SIM_MESH_BIND_ADDR` | its own loopback address, fixed by its id in the testbed's network (`simd --net`, a /22 holding 1000 stations by default); every socket it opens binds here |
+| `SIM_MESH_ETHER` | `host:port` of the ether |
+| `SIM_MESH_BOARD` | the board its node is, as one flat JSON object: `chip` (`sx1262`), `max_dbm` (the node's maximum power at the antenna connector) and, when that is above 22 dBm and the node has a GC1109 front-end module, `fem_part`, `fem_tx_cal` (chip register → connector dBm, in the `LORAn_TX_CAL` form), `fem_gain_db` (its flat gain, when there is no curve) and `fem_rx_gain_db`, from `testbed/boards.py`. The chip model reads it too (below, The radio); a firmware that drives a front end takes its figures from here |
+| `SIM_MESH_TIME` | `virtual` in a virtual-time run, absent in a real-time one |
+| `SIM_MESH_EPOCH_US` | virtual time: the wall-clock microseconds T 0 stands for |
+| `SIM_MESH_SEED` | virtual time: the ether's seed, the one its `welcome` carries; the shim keys the station's `getentropy`/`getrandom` by it and `SIM_MESH_NODE_ID` |
 | `LD_PRELOAD` | virtual time: `radio/build/libsimclock.so`, the time shim |
-| `SIMESH_IDLE` | virtual time, set by a kind whose firmware does not call `simradio_idle()` itself: `threads`, and the shim says the station is idle when every thread is blocked (below) |
-| `SIMESH_CLOCK_PROFILE` | optional, from a kind's `env:`: node time as a function of T, `T:node,T:node,…` in microseconds, both columns increasing, slope 1 outside the points. Absent, node time is T |
+| `SIM_MESH_IDLE` | virtual time, set by a kind whose firmware does not call `simradio_idle()` itself: `threads`, and the shim says the station is idle when every thread is blocked (below) |
+| `SIM_MESH_CLOCK_PROFILE` | optional, from a kind's `env:`: node time as a function of T, `T:node,T:node,…` in microseconds, both columns increasing, slope 1 outside the points. Absent, node time is T |
 | the kind's `env:` | anything the binary needs beyond that |
 
 Nothing else is promised. A station reads its identity from these and from
@@ -46,16 +46,16 @@ nowhere else, so two stations on one host never collide.
 - **It may be several processes.** A process it starts that waits on time
   joins a virtual-time run as a station of its own, under the id its kind
   names for it (`sids`), with the same address, the time shim and
-  `SIMESH_IDLE=threads`: it opens its link (`simradio_station_open`) and,
+  `SIM_MESH_IDLE=threads`: it opens its link (`simradio_station_open`) and,
   with no radio, no chip. Whichever of them reads the console is the kind's
-  to name (`console_sid`); `SIMESH_NODE_ID` is that process's id, and the
+  to name (`console_sid`); `SIM_MESH_NODE_ID` is that process's id, and the
   radio's is the node's own. A `standard_reticulum` station is two: its
   RNode, and the Python behind it that reads the console.
 
 ## The radio
 
 The station links `radio/` (`simradio.h`) and calls
-`simradio_station_open(SIMESH_NODE_ID, SIMESH_BIND_ADDR, SIMESH_ETHER)` once,
+`simradio_station_open(SIM_MESH_NODE_ID, SIM_MESH_BIND_ADDR, SIM_MESH_ETHER)` once,
 then `simradio_open(slot, …)` per radio. Its driver talks to the chip model
 frame by frame, exactly as to an SX1262 on a bus. A firmware built on
 Portduino links [`radio/portduino/`](radio/portduino/README.md) instead,
@@ -77,7 +77,7 @@ transmission "succeeds" in no time.
 the loss table's alone; nothing in the environment or in setup tells it, so a
 firmware that reads a position behaves here as it would with none.
 
-**The model applies the board's front end** from `SIMESH_BOARD`: what the
+**The model applies the board's front end** from `SIM_MESH_BOARD`: what the
 chip radiates goes through `fem_tx_cal`'s curve for `fem_part` (or the flat
 `fem_gain_db`) before the ether is told its power, and every level the chip
 reads, instant or per packet, is `fem_rx_gain_db` above the connector's. A
@@ -116,7 +116,7 @@ four promises:
   attaches, and until the ether's welcome the monotonic clocks read 0 and the
   wall clocks the run's epoch. A monotonic clock that jumped backwards at
   attach would saturate Rust's `Instant` and hold a station's uptime at 0 for
-  the whole run. The mode itself comes in the environment (`SIMESH_TIME`)
+  the whole run. The mode itself comes in the environment (`SIM_MESH_TIME`)
   as well as in the welcome, because a FreeRTOS station calls `setitimer`
   before it can reach the ether; the two disagreeing is an error.
 - **It says when it is idle, and until when.** Idle is every thread
@@ -126,7 +126,7 @@ four promises:
   station from its tickless idle, with a wake at the tick its first task is
   due at and another at esp_timer's next expiry, so a station whose tasks
   sleep for a second is woken once in that second — or the kind sets
-  `SIMESH_IDLE=threads` and the shim keeps a census of the process's threads
+  `SIM_MESH_IDLE=threads` and the shim keeps a census of the process's threads
   and says so for it, each sleeping thread's deadline a wake. A station that
   says neither is reported idle by the library's watchdog, 20 ms of wall
   time after every message once none of its threads is on the CPU, which

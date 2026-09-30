@@ -1,7 +1,7 @@
 """What a script says to a simulation and its stations, whatever firmware they run.
 
     '''smoke: an LXMF identity everywhere, then an announce.'''
-    from simesh import *
+    from sim_mesh import *
 
     time("real")
     firmware("all", "reticulous_dev_latest")
@@ -15,7 +15,7 @@
     wait(600)
     send_msg("gw02", "internet", "hello")
 
-A script is plain Python, run from its top to its end (simesh.runner):
+A script is plain Python, run from its top to its end (sim_mesh.runner):
 every call below does what it says and returns when it has, so a script is
 read as it runs. Time is the run's own clock, so a real-time and a
 virtual-time run act at the same instants of the run.
@@ -77,7 +77,7 @@ done) and `wait=False`, which returns at once with a future whose
 `result()` is the answer: how a driver puts many things on the clock at once.
 
 **Which nodes** is `"all"`, a node's name, a list of names, or a selection,
-`nodes(field=value, …)` (simesh.select), combined with `&`, `|`, `-`, `~`.
+`nodes(field=value, …)` (sim_mesh.select), combined with `&`, `|`, `-`, `~`.
 """
 
 import asyncio
@@ -86,8 +86,8 @@ import os
 import textwrap
 import threading
 
-from simesh import sim as sim_module
-from simesh.select import Nodes, nodes, which  # noqa: F401 - the library's face
+from sim_mesh import sim as sim_module
+from sim_mesh.select import Nodes, nodes, which  # noqa: F401 - the library's face
 
 TIME_MODES = ("real", "max")
 TESTBED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -167,7 +167,7 @@ class Runtime:
         """Run `coro` on the loop: its result, or with `wait` false a future."""
         if self.loop is None:
             self.loop = asyncio.new_event_loop()
-            self.thread = threading.Thread(target=self.loop.run_forever, name="simesh-loop",
+            self.thread = threading.Thread(target=self.loop.run_forever, name="sim-mesh-loop",
                                            daemon=True)
             self.thread.start()
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
@@ -183,7 +183,7 @@ class Runtime:
     async def _begin(self):
         world = self.world
         port = world.get("port")
-        attach_to = world.get("sim") or (os.environ.get("SIMESH_SIM") if not world else None)
+        attach_to = world.get("sim") or (os.environ.get("SIM_MESH_SIM") if not world else None)
         if attach_to:
             if self.time is not None:
                 raise ScriptError("time() is a new simulation's: %s runs as it was started"
@@ -196,7 +196,7 @@ class Runtime:
             return sim
         if not world.get("geodata") or not world.get("nodesets"):
             raise ScriptError("this script has no simulation: run it from the Scripts tab, or "
-                              "with simesh run SCRIPT --geodata G --nodeset N (or --sim S)")
+                              "with sim-mesh run SCRIPT --geodata G --nodeset N (or --sim S)")
         if not self.firmware_rules:
             raise ScriptError("this script says no firmware(), so no node would run anything: "
                               "a script that is included by others (startup.py) is run "

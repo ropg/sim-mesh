@@ -36,10 +36,10 @@ Coordinates on a pack are its own CRS, absolute easting and northing in
 metres. Packs are UTM on WGS84 (EPSG 326zz north, 327zz south) or on ETRS89
 (258zz), and the transverse Mercator here is Krüger's series to sixth order
 in n (Karney 2011), good to well under a millimetre inside a zone, so what
-SIMesh sends the planner is the point the planner itself would compute. No
+sim-mesh sends the planner is the point the planner itself would compute. No
 projection library is needed.
 
-**A SIMesh geodata pack** is how geodata moves between machines: a zip
+**A sim-mesh geodata pack** is how geodata moves between machines: a zip
 holding `geodata.yaml` at the top and, for a pack, the pack under `pack/`,
 which the yaml's `pack:` names. Importing takes that, or a bare planner pack
 (its `manifest.json` at the zip's root, or inside one top-level directory),
@@ -69,13 +69,13 @@ TERRAINS = ("flat",)
 DEFAULT_EXPONENT = 2.7
 DEFAULT_EXTENT_M = 20000.0
 M_PER_DEGREE = 60 * 1852.0          # a nautical mile to the minute, on both axes
-SIMESH_ROOT = os.path.dirname(store.SIM_DIR)
-PLANNER_DIR = os.path.join(SIMESH_ROOT, "planner")
+SIM_MESH_ROOT = os.path.dirname(store.SIM_DIR)
+PLANNER_DIR = os.path.join(SIM_MESH_ROOT, "planner")
 GEODATA_FILE = "geodata.yaml"       # in a geodata's directory
 OWN_PACK = "."                      # a geodata file's `pack:` for its own directory
 PART_PREFIX = ".part-"
 CHUNK = 1 << 16
-GEODATA_MEMBER = "geodata.yaml"     # at the top of a SIMesh geodata pack
+GEODATA_MEMBER = "geodata.yaml"     # at the top of a sim-mesh geodata pack
 PACK_MEMBER = "pack"                # where an exported pack goes inside it
 EXPORT_LEVEL = 1                    # deflate's fastest: berlin-city, 450 MB, is 124 MB in 2 s
 NODES_LAYER = "Nodes"
@@ -83,7 +83,7 @@ NODES_NOTICE = "Deployed mesh nodes"   # how the Nodes layer's notice names its 
 
 
 def planner_repo():
-    """SIMesh's planner: the Rust workspace in `planner/`, whose planner-web
+    """sim-mesh's planner: the Rust workspace in `planner/`, whose planner-web
     serves a pack."""
     return PLANNER_DIR
 
@@ -479,7 +479,7 @@ def layer_kind(layer):
 def without_nodes(manifest):
     """A manifest with no `Nodes` layer and no notice for one, and the pack
     paths of the files those layers were. Nodes belong to nodesets, so a
-    pack SIMesh keeps, draws or exports never carries a planner's baked-in
+    pack sim-mesh keeps, draws or exports never carries a planner's baked-in
     deployed network."""
     out = copy.deepcopy(manifest)
     layers = out.get("layers") or []
@@ -492,10 +492,10 @@ def without_nodes(manifest):
     return out, [os.path.normpath(p) for p in dropped if p]
 
 
-# ---- a SIMesh geodata pack -----------------------------------------------
+# ---- a sim-mesh geodata pack ---------------------------------------------
 
 def export_zip(gd, out):
-    """Geodata as a SIMesh geodata pack, written to `out`, a binary stream
+    """Geodata as a sim-mesh geodata pack, written to `out`, a binary stream
     that need not seek (a response being sent).
 
     The zip holds `geodata.yaml` at the top, its first line `# geodata
@@ -554,7 +554,7 @@ def _named(text):
 
 
 def zip_name(zf):
-    """The name a zip gives its geodata: a SIMesh geodata pack's `# geodata`
+    """The name a zip gives its geodata: a sim-mesh geodata pack's `# geodata`
     line, or a bare planner pack's manifest `name` made usable; None when it
     gives none."""
     members = [info.filename for info in zf.infolist() if not info.is_dir()]
@@ -569,7 +569,7 @@ def zip_name(zf):
 
 
 def import_zip(zip_path, name=None):
-    """A zip as new geodata: a SIMesh geodata pack (`geodata.yaml` at the
+    """A zip as new geodata: a sim-mesh geodata pack (`geodata.yaml` at the
     top, and for a pack the pack directory its `pack:` names inside the zip),
     or a bare planner pack (a `manifest.json` at the top or inside one
     directory), which becomes pack geodata. `name` is the new geodata's; by

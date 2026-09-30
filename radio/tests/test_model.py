@@ -643,14 +643,14 @@ def transmit_at(chip, pa_duty, hp_max, reg):
 
 
 def test_without_a_board_the_connector_gets_what_the_chip_radiates(chip):
-    if os.environ.get("SIMESH_BOARD"):
+    if os.environ.get("SIM_MESH_BOARD"):
         pytest.skip("this process was given a board")
     assert transmit_at(chip, 4, 7, 22) == 22
     assert transmit_at(chip, 4, 7, 14) == 14
 
 
 def front_end_case(chip):
-    """Run in a child told it is a Heltec V4 (the model reads SIMESH_BOARD
+    """Run in a child told it is a Heltec V4 (the model reads SIM_MESH_BOARD
     once per process): the curve on transmit, the LNA on receive."""
     assert transmit_at(chip, 4, 7, 22) == 27     # the curve's own top point
     assert transmit_at(chip, 4, 7, 20) == 28     # it turns over near saturation
@@ -671,10 +671,10 @@ def front_end_case(chip):
 
 
 def test_a_front_end_shapes_what_goes_out_and_what_the_chip_reads(chip):
-    if os.environ.get("SIMESH_BOARD") == HELTEC_V4:
+    if os.environ.get("SIM_MESH_BOARD") == HELTEC_V4:
         front_end_case(chip)
         return
-    env = dict(os.environ, SIMESH_BOARD=HELTEC_V4)
+    env = dict(os.environ, SIM_MESH_BOARD=HELTEC_V4)
     done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
                            "%s::%s" % (os.path.abspath(__file__),
                                        "test_a_front_end_shapes_what_goes_out_and_what_the_chip_reads")],

@@ -32,11 +32,11 @@ import runs  # noqa: E402
 import seq  # noqa: E402
 import slt  # noqa: E402
 
-import simesh  # noqa: E402
-from simesh import reticulum  # noqa: E402
-from simesh.reticulum import frames  # noqa: E402
-from simesh import traffic as rtraffic  # noqa: E402
-from simesh.view import RunView  # noqa: E402
+import sim_mesh  # noqa: E402
+from sim_mesh import reticulum  # noqa: E402
+from sim_mesh.reticulum import frames  # noqa: E402
+from sim_mesh import traffic as rtraffic  # noqa: E402
+from sim_mesh.view import RunView  # noqa: E402
 
 CALLING = 869_525_000
 GLOBALS = "FREQ_MHZ = 869.525\nSF = 8\nBW_KHZ = 125\nCR = 5\n"
@@ -177,7 +177,7 @@ def test_a_run_with_no_reticulous_station_reads_no_protocol(tmp_path):
     assert set(view.roles().values()) == {"client"} and view.forwarders() == set()
     assert view.protocols() == []
     assert view.radio("n01")["sf"] == 8                  # the run's globals.py
-    assert simesh.protocol_for("sergeyculum") is None
+    assert sim_mesh.protocol_for("sergeyculum") is None
     code, text = call(airtime.main, [other.dir, "--roles"])
     out = json.loads(text)
     assert out["roles"]["client"]["stations"] == 4
@@ -353,7 +353,7 @@ def with_fake_sim(fake, drive):
         site = web.TCPSite(runner, "127.0.0.1", 0)
         await site.start()
         port = site._server.sockets[0].getsockname()[1]
-        sim = await simesh.attach("fake", port)
+        sim = await sim_mesh.attach("fake", port)
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 return await drive(sim)
@@ -376,7 +376,7 @@ def test_a_driver_chooses_stations_and_asks_them(tmp_path):
         assert await sim.node("n01").run("x", after=2) == {"n01": "3 paths total"}
         assert sim.pairs(sample=2, seed=1) == sim.pairs(sample=2, seed=1)
         assert len(sim.pairs()) == 6
-        with pytest.raises(simesh.SimError):
+        with pytest.raises(sim_mesh.SimError):
             sim.node("nobody")
         await sim.plan(("warm", 10))
 
@@ -410,7 +410,7 @@ def test_a_script_says_it_synchronously(monkeypatch):
     on a loop of its own, its rules said once it is attached."""
     from aiohttp import web
 
-    from simesh import library
+    from sim_mesh import library
 
     fake = FakeSim(["n01", "n02", "n03"])
     loop = asyncio.new_event_loop()

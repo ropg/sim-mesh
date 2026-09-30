@@ -1,8 +1,8 @@
 import { configure } from 'quasar/wrappers';
 
 // Where `quasar dev` sends /ws, /api and /planner: the front, run beside it
-// (`npm run dev` in this directory while `simesh` runs).
-const FRONT = process.env.SIMESH_FRONT || 'http://127.0.0.1:8800';
+// (`npm run dev` in this directory while `sim-mesh` runs).
+const FRONT = process.env.SIM_MESH_FRONT || 'http://127.0.0.1:8800';
 
 export default configure(() => {
   return {

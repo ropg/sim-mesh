@@ -1,9 +1,9 @@
 """microReticulum_Firmware (github.com/attermann/microReticulum_Firmware), the
 RNode firmware with the microReticulum stack embedded, as its Portduino
-Linux daemon built with `[env:simesh]`: a transport node on LoRa, and nothing
+Linux daemon built with `[env:sim-mesh]`: a transport node on LoRa, and nothing
 else.
 
-Its radio is SIMesh's chip through the Portduino backend library
+Its radio is sim-mesh's chip through the Portduino backend library
 (radio/portduino), which reads the pins it drives the chip on from
 SIMRADIO_PIN_*; the kind gives it the same pins it writes into the
 daemon's config.
@@ -139,12 +139,12 @@ class Microreticulum(Kind):
         if station.clock is not None:
             # A plain process: the time shim says it is idle when all its
             # threads are blocked.
-            env["SIMESH_IDLE"] = "threads"
+            env["SIM_MESH_IDLE"] = "threads"
         env.update(MR_CONFIG=conf_path(station),
                    MR_DATA_DIR=os.path.join(station.dir, "state"))
         env.update({var: str(pin) for _, var, pin in PINS})
         if not os.path.exists(conf_path(station)):
-            fixed = list(FIXED) + [("device_id", "simesh-%d" % station.node_id)]
+            fixed = list(FIXED) + [("device_id", "sim-mesh-%d" % station.node_id)]
             if self.extra_env.get(MODE_ENV):
                 fixed.append(("lora_interface_mode", self.extra_env[MODE_ENV]))
             with open(conf_path(station), "w") as f:

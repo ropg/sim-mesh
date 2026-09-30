@@ -71,7 +71,7 @@ def test_a_new_station_starts_from_the_fixed_file(tmp_path):
     text = conf(tmp_path)
     assert "pin_cs = 1\n" in text and "pin_dio = 4\n" in text and "pin_txen = -1\n" in text
     assert "kiss_tcp_port = 0\n" in text and "reboot_mode = exit\n" in text
-    assert "device_id = simesh-3\n" in text
+    assert "device_id = sim-mesh-3\n" in text
     assert text.endswith("lora_interface_mode = full\n")
     (tmp_path / "plain").mkdir()
     kind().env(station(tmp_path / "plain"))

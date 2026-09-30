@@ -1,8 +1,8 @@
 """The LXMF traffic driver: a whole run, on the run's own clock, on any
 firmware whose kind can say an address, an announce and a message.
 
-    from simesh import *
-    from simesh import traffic
+    from sim_mesh import *
+    from sim_mesh import traffic
 
     time("max")
     firmware("all", "reticulous_dev_latest")
@@ -45,7 +45,7 @@ be done. The result holds the phases (wall and T at each boundary), every
 clock message, the warm-up samples, every send with its route and reply,
 and the gathered output. How much of it was delivered is counted from the
 stations' logs afterwards, from the lines `reticulous` and
-`standard_reticulum` stations log (simesh.reticulum.delivery, `report`).
+`standard_reticulum` stations log (sim_mesh.reticulum.delivery, `report`).
 """
 
 import asyncio
@@ -55,7 +55,7 @@ import random
 import re
 import time
 
-from simesh import library
+from sim_mesh import library
 
 OPTIONS = {"warm_rounds": 3, "warm_spread": 300.0, "warm_gap": 120.0,
            "settle_every": 180.0, "settle_max": 3600.0, "warm_snapshot": None,
@@ -124,7 +124,7 @@ class Options:
 
 
 def run(opts=None, out_path=None):
-    """The whole run on the script's simulation (simesh.library): the
+    """The whole run on the script's simulation (sim_mesh.library): the
     result, written to `out_path` (the run directory's traffic.json by
     default) as it grows."""
     sim = library.runtime.held()
@@ -133,7 +133,7 @@ def run(opts=None, out_path=None):
 
 
 async def run_on(sim, opts, out_path):
-    """The whole run on a held `simesh.Sim`. `opts` is an Options (or a
+    """The whole run on a held `sim_mesh.Sim`. `opts` is an Options (or a
     mapping of them); the result is written to `out_path` as it grows, and
     returned."""
     if isinstance(opts, dict):
@@ -312,7 +312,7 @@ def t_text(us):
 def report(run_dir, traffic_path=None):
     """A traffic run's report, as Markdown: what ran, the phases, and the
     delivery counted from the run's own logs (`delivery.analyse_run`)."""
-    from simesh.reticulum import delivery
+    from sim_mesh.reticulum import delivery
 
     traffic_path = traffic_path or os.path.join(run_dir, RESULT_FILE)
     name = os.path.basename(os.path.normpath(run_dir))

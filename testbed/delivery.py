@@ -8,13 +8,13 @@ RUN_DIR is the run the traffic went through: its stations' logs, its
 record's epoch, and its radio graph, which is the run's own loss tables at
 the calling channel with each node's declared SF, bandwidth and power,
 forwarding through the stations whose role forwards. What is counted is
-`simesh.reticulum.delivery`'s.
+`sim_mesh.reticulum.delivery`'s.
 """
 import argparse
 import json
 import sys
 
-from simesh.reticulum import delivery
+from sim_mesh.reticulum import delivery
 
 
 def main(argv=None):

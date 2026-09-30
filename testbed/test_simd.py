@@ -119,7 +119,7 @@ def stores(tmp_path, monkeypatch):
         "  a: { id: 1, lat: 0, lon: 0, tags: [transport] }\n"
         "  b: { id: 2, lat: 0, lon: 0.006, tags: [no-radio] }\n"
         "  c: { id: 3, lat: 0.006, lon: 0, tags: [far] }\n")
-    (tmp_path / "scripts_dir" / "far.py").write_text('"""far"""\nfrom simesh import *\n')
+    (tmp_path / "scripts_dir" / "far.py").write_text('"""far"""\nfrom sim_mesh import *\n')
     (tmp_path / "scripts_dir" / "globals.py").write_text(
         "FREQ_MHZ = 869.525\nSF = 8\nBW_KHZ = 125\nCR = 5\n")
     return tmp_path

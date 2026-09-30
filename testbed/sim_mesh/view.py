@@ -15,7 +15,7 @@ resolved, and the loss tables the ether read.
   a node with none a `client`. What a script set beyond them is not seen
   here.
 - **Kind.** A node's kind is its firmware's, as the run resolved it; what its
-  frames mean belongs to that kind's protocol (`simesh.protocol_for`).
+  frames mean belongs to that kind's protocol (`sim_mesh.protocol_for`).
 - **Levels** are the medium's own: an `Ether` holding the run's tables with
   the nodeset's antennas (over the grounds the run kept) and offsets on
   them, the names, and the noise figure from
@@ -39,8 +39,8 @@ sys.path.insert(0, os.path.join(store.SIM_DIR, "..", "ether"))
 import ether as ether_module  # noqa: E402 - the path is set just above
 import slt  # noqa: E402
 
-import simesh  # noqa: E402
-from simesh import record as record_module  # noqa: E402
+import sim_mesh  # noqa: E402
+from sim_mesh import record as record_module  # noqa: E402
 
 
 class RunView:
@@ -90,7 +90,7 @@ class RunView:
         return (self.builds.get(ref) or {}).get("kind_type")
 
     def protocol(self, name):
-        return simesh.protocol_for(self.kind_type(name))
+        return sim_mesh.protocol_for(self.kind_type(name))
 
     def protocols(self):
         """The protocol modules any node of the run is read by."""
@@ -127,7 +127,7 @@ class RunView:
 
     def forwarders(self):
         """The station ids whose role forwards for others."""
-        return {sid for sid, role in self.roles().items() if role in simesh.FORWARDING}
+        return {sid for sid, role in self.roles().items() if role in sim_mesh.FORWARDING}
 
     def calling_hz(self):
         """The carrier globals.py sets: the calling channel."""

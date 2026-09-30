@@ -1,50 +1,51 @@
 #!/usr/bin/env bash
-# simesh — SIMesh, from a shell.
+# sim-mesh — the simulated testbed, from a shell.
 #
-#     simesh [front] [FRONT-ARGS…]   start the front on port 8800 and open the page,
-#                                    first building whichever of the page, the chip
-#                                    library and the planner is not built
-#     simesh new [NAME] (--geodata G --nodeset N | --snapshot S)
-#                [--time max|<k>x|real] [--stagger N] [--build B] [--pairwise]
-#                                    start a simulation (and the front, when none runs);
-#                                    prints its name, sockets and run directory as JSON
-#     simesh stop NAME               stop a simulation
-#     simesh pause NAME              stop one with its state kept, to be resumed
-#     simesh resume NAME             start a paused one again as it ended
-#     simesh list [--json]           the simulations, with their clocks and plans
-#     simesh plan NAME PHASE=UNTIL…  tell a simulation its phases (UNTIL in seconds
-#                                    of T; +N is N after now)
-#     simesh run SCRIPT (--sim NAME | --geodata G --nodeset N [--nodeset N2…] [--name S])
-#                                    a script, top to end, on a simulation of its own
-#                                    (several nodesets merged) or a running one, then
-#                                    its report. SCRIPT is a path or one of
-#                                    testbed/scripts/ by name
-#     simesh run SCRIPT --report RUN_DIR
-#                                    only the script's report of an ended run
-#     simesh devices refresh [SOURCE…]  survey the catalogues for their newest builds,
-#                                    fetching nothing (default: the web's, then every
-#                                    catalogue in builds/ beside SIMesh); a SOURCE is
-#                                    a catalogue name, URL or local directory
-#     simesh devices list            the latest and the saved builds
-#     simesh devices fetch DEVICE    download a <project>_<catalogue>_latest build now
-#     simesh devices save DEVICE     keep a <project>_<catalogue>_latest build as it is
-#     simesh devices delete DEVICE   remove a saved build
-#     simesh devices import ZIP      a device zip into the saved builds
-#     simesh devices resolve DEVICE  what a device name runs, as JSON
-#     simesh build [page|radio|planner]…
-#                                    build the page, the chip library and the planner
-#                                    (all three when none is named)
+#     sim-mesh [front] [FRONT-ARGS…]   start the front on port 8800 and open the page,
+#                                      first building whichever of the page, the chip
+#                                      library and the planner is missing or older
+#                                      than a file of its sources
+#     sim-mesh new [NAME] (--geodata G --nodeset N | --snapshot S)
+#                  [--time max|<k>x|real] [--stagger N] [--build B] [--pairwise]
+#                                      start a simulation (and the front, when none runs);
+#                                      prints its name, sockets and run directory as JSON
+#     sim-mesh stop NAME               stop a simulation
+#     sim-mesh pause NAME              stop one with its state kept, to be resumed
+#     sim-mesh resume NAME             start a paused one again as it ended
+#     sim-mesh list [--json]           the simulations, with their clocks and plans
+#     sim-mesh plan NAME PHASE=UNTIL…  tell a simulation its phases (UNTIL in seconds
+#                                      of T; +N is N after now)
+#     sim-mesh run SCRIPT (--sim NAME | --geodata G --nodeset N [--nodeset N2…] [--name S])
+#                                      a script, top to end, on a simulation of its own
+#                                      (several nodesets merged) or a running one, then
+#                                      its report. SCRIPT is a path or one of
+#                                      testbed/scripts/ by name
+#     sim-mesh run SCRIPT --report RUN_DIR
+#                                      only the script's report of an ended run
+#     sim-mesh devices refresh [SOURCE…]  survey the catalogues for their newest builds,
+#                                      fetching nothing (default: the web's, then every
+#                                      catalogue in builds/ beside sim-mesh); a SOURCE is
+#                                      a catalogue name, URL or local directory
+#     sim-mesh devices list            the latest and the saved builds
+#     sim-mesh devices fetch DEVICE    download a <project>_<catalogue>_latest build now
+#     sim-mesh devices save DEVICE     keep a <project>_<catalogue>_latest build as it is
+#     sim-mesh devices delete DEVICE   remove a saved build
+#     sim-mesh devices import ZIP      a device zip into the saved builds
+#     sim-mesh devices resolve DEVICE  what a device name runs, as JSON
+#     sim-mesh build [page|radio|planner]…
+#                                      build the page, the chip library and the planner
+#                                      (all three when none is named)
 #
 # The simulation verbs (new, stop, pause, resume, list, plan, run) take --port, the front's
 # (default 8800).
 #
 # Stations need Linux: each binds its own 127.x.y.z address and the virtual-time
 # shim is an LD_PRELOAD library. On Linux everything runs natively. Anywhere else,
-# or with SIMESH_DOCKER=1, the same command runs inside SIMesh's own image
+# or with SIM_MESH_DOCKER=1, the same command runs inside sim-mesh's own image
 # (Dockerfile beside this script), built on first use and again whenever the
-# Dockerfile changes, with the directory holding SIMesh mounted at its own path
+# Dockerfile changes, with the directory holding sim-mesh mounted at its own path
 # so a workspace beside it is where a workspace build expects it, and port 8800
-# published for TCP and UDP. That container is called simesh-front, and the
+# published for TCP and UDP. That container is called sim-mesh-front, and the
 # simulation verbs run inside it, so they need the front started first.
 #
 # Ctrl-C stops everything this started: the front is asked to stop (it stops its
@@ -52,11 +53,11 @@
 # script's process group when it exits is terminated.
 #
 # Environment:
-#     SIMESH_PYTHON      the python3 to run (default: the first of python3,
-#                        /usr/bin/python3 that has aiohttp and yaml)
-#     SIMESH_CATALOGUES  where bare catalogue names are fetched from
-#                        (default https://reticulous.net/builds/)
-#     SIMESH_DOCKER=1    use the container on Linux too
+#     SIM_MESH_PYTHON      the python3 to run (default: the first of python3,
+#                          /usr/bin/python3 that has aiohttp and yaml)
+#     SIM_MESH_CATALOGUES  where bare catalogue names are fetched from
+#                          (default https://reticulous.net/builds/)
+#     SIM_MESH_DOCKER=1    use the container on Linux too
 
 set -euo pipefail
 
@@ -64,9 +65,9 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PORT=8800
 URL="http://localhost:$PORT/"
 PLANNER=$ROOT/planner
-FRONT_CONTAINER=simesh-front
+FRONT_CONTAINER=sim-mesh-front
 
-say() { printf 'simesh: %s\n' "$*" >&2; }
+say() { printf 'sim-mesh: %s\n' "$*" >&2; }
 die() { say "$*"; exit 1; }
 
 usage() { sed -n '2,/^$/{s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
@@ -74,8 +75,8 @@ usage() { sed -n '2,/^$/{s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
 # ---- the container ------------------------------------------------------------
 
 want_container() {
-    [ -z "${SIMESH_IN_CONTAINER:-}" ] || return 1
-    [ "$(uname -s)" != Linux ] || [ -n "${SIMESH_DOCKER:-}" ]
+    [ -z "${SIM_MESH_IN_CONTAINER:-}" ] || return 1
+    [ "$(uname -s)" != Linux ] || [ -n "${SIM_MESH_DOCKER:-}" ]
 }
 
 # open_when_up URL: open the page in a browser once the front answers, from a
@@ -102,12 +103,12 @@ open_when_up() {
 
 in_container() {
     local publish=$1; shift
-    command -v docker >/dev/null || die "stations need Linux; on $(uname -s) SIMesh runs in Docker, which is not installed"
+    command -v docker >/dev/null || die "stations need Linux; on $(uname -s) sim-mesh runs in Docker, which is not installed"
     local tag image
     tag=$(cksum < "$ROOT/Dockerfile" | cut -d' ' -f1)
-    image="simesh:$tag"
+    image="sim-mesh:$tag"
     if ! docker image inspect "$image" >/dev/null 2>&1; then
-        say "building the SIMesh image ($image)…"
+        say "building the sim-mesh image ($image)…"
         docker build -t "$image" "$ROOT"
     fi
     local outer
@@ -115,10 +116,10 @@ in_container() {
     local args=(run --rm --init -i
                 --user "$(id -u):$(id -g)"
                 -v "$outer:$outer" -w "$ROOT"
-                -v simesh-home:/home/simesh -e HOME=/home/simesh
-                -e SIMESH_IN_CONTAINER=1)
+                -v sim-mesh-home:/home/sim-mesh -e HOME=/home/sim-mesh
+                -e SIM_MESH_IN_CONTAINER=1)
     [ -t 0 ] && [ -t 1 ] && args+=(-t)
-    [ -z "${SIMESH_CATALOGUES:-}" ] || args+=(-e "SIMESH_CATALOGUES=$SIMESH_CATALOGUES")
+    [ -z "${SIM_MESH_CATALOGUES:-}" ] || args+=(-e "SIM_MESH_CATALOGUES=$SIM_MESH_CATALOGUES")
     if [ "$publish" = 1 ]; then
         # One front at a time: a running one is said so, and one left behind
         # stopped (--rm did not get to it) is cleared out of the name's way.
@@ -132,36 +133,67 @@ in_container() {
         say "the page: $URL"
         open_when_up "$URL"
     fi
-    docker "${args[@]}" "$image" ./simesh "$@"
+    docker "${args[@]}" "$image" ./sim-mesh "$@"
 }
 
 # in_front VERB…: a simulation verb inside the running front's container,
 # where the front's port is its own.
 in_front() {
-    command -v docker >/dev/null || die "stations need Linux; on $(uname -s) SIMesh runs in Docker, which is not installed"
+    command -v docker >/dev/null || die "stations need Linux; on $(uname -s) sim-mesh runs in Docker, which is not installed"
     [ -n "$(docker ps -q -f "name=^${FRONT_CONTAINER}\$")" ] \
-        || die "no front running: start it with simesh"
+        || die "no front running: start it with sim-mesh"
     # The shell's directory when the container has it, so a path given is the same path.
     local outer here=$ROOT
     outer=$(cd "$ROOT/.." && pwd)
     case "$PWD/" in "$outer"/*) here=$PWD ;; esac
     local args=(exec -i -w "$here")
     [ -t 0 ] && [ -t 1 ] && args+=(-t)
-    docker "${args[@]}" "$FRONT_CONTAINER" ./simesh "$@"
+    docker "${args[@]}" "$FRONT_CONTAINER" ./sim-mesh "$@"
 }
 
 # ---- native -------------------------------------------------------------------
 
 pick_python() {
     local p
-    for p in "${SIMESH_PYTHON:-}" python3 /usr/bin/python3; do
+    for p in "${SIM_MESH_PYTHON:-}" python3 /usr/bin/python3; do
         [ -n "$p" ] && command -v "$p" >/dev/null || continue
         if "$p" -c 'import aiohttp, yaml' 2>/dev/null; then
             printf '%s\n' "$p"
             return 0
         fi
     done
-    die "no python3 with aiohttp and pyyaml (set SIMESH_PYTHON, or install python3-aiohttp python3-yaml)"
+    die "no python3 with aiohttp and pyyaml (set SIM_MESH_PYTHON, or install python3-aiohttp python3-yaml)"
+}
+
+# stale DIR OUT… [-- SKIP…]: true when an OUT is missing or a file under DIR,
+# outside the SKIP directories (relative to DIR), hidden directories and
+# __pycache__, is newer than it.
+stale() {
+    local dir=$1; shift
+    local outs=() prune=(-type d \( -name '.?*' -o -name __pycache__ \) -prune -o)
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do outs+=("$1"); shift; done
+    [ $# -eq 0 ] || shift
+    local s
+    for s in "$@"; do prune+=(-path "$dir/$s" -prune -o); done
+    local out
+    for out in "${outs[@]}"; do
+        [ -e "$out" ] || return 0
+        [ -z "$(find "$dir" "${prune[@]}" -type f -newer "$out" -print -quit)" ] || return 0
+    done
+    return 1
+}
+
+page_stale() {
+    stale "$ROOT/testbed/ui" "$ROOT/testbed/ui/dist/spa/index.html" -- node_modules dist
+}
+
+radio_stale() {
+    stale "$ROOT/radio" "$ROOT/radio/build/libsimclock.so" "$ROOT/radio/build/libsimradio.so" \
+          "$ROOT/radio/build/libsimradio.a" -- build tests portduino
+}
+
+planner_stale() {
+    stale "$PLANNER" "$PLANNER/target/release/planner-web" "$PLANNER/target/release/planner-job" -- target
 }
 
 build_page() {
@@ -176,8 +208,16 @@ build_page() {
 build_radio() {
     command -v cmake >/dev/null || die "the chip library needs cmake and a C compiler"
     say "the chip library and the time shim: cmake"
-    cmake -S "$ROOT/radio" -B "$ROOT/radio/build"
+    # A cache configured for the tree at another path (moved, or mounted
+    # elsewhere in the image) is configured again from scratch.
+    local cache="$ROOT/radio/build/CMakeCache.txt" fresh=()
+    if [ -f "$cache" ] && ! grep -qxF "CMAKE_HOME_DIRECTORY:INTERNAL=$ROOT/radio" "$cache"; then
+        fresh=(--fresh)
+    fi
+    cmake "${fresh[@]}" -S "$ROOT/radio" -B "$ROOT/radio/build"
     cmake --build "$ROOT/radio/build" -j "$(nproc 2>/dev/null || echo 2)"
+    # Up to date now, whichever sources the build found nothing to redo for.
+    touch "$ROOT/radio/build/libsimclock.so" "$ROOT/radio/build/libsimradio.so" "$ROOT/radio/build/libsimradio.a"
 }
 
 # planner-web embeds planner-wasm's output (crates/planner-web/static), so the
@@ -207,6 +247,7 @@ build_planner() {
     fi
     say "the planner: planner-web and planner-job (cargo build --release)"
     (cd "$PLANNER" && cargo build --release -p planner-web -p planner-job)
+    touch "$PLANNER/target/release/planner-web" "$PLANNER/target/release/planner-job"
 }
 
 cmd_build() {
@@ -238,14 +279,15 @@ sweep_group() {
 cmd_front() {
     local py
     py=$(pick_python)
-    [ -f "$ROOT/radio/build/libsimclock.so" ] || build_radio
-    [ -f "$ROOT/testbed/ui/dist/spa/index.html" ] || build_page \
-        || say "the page did not build; the front will say so when it is opened"
-    [ -x "$PLANNER/target/release/planner-web" ] && [ -x "$PLANNER/target/release/planner-job" ] \
-        || (build_planner) \
+    ! radio_stale || build_radio
+    # The planner first: its wasm lands in the page's vendor/, which the page
+    # then builds from.
+    ! planner_stale || (build_planner) \
         || say "the planner did not build; synthetic ground works, and a pack is refused saying so"
+    ! page_stale || build_page \
+        || say "the page did not build; the front will say so when it is opened"
     say "the page: $URL"
-    [ -n "${SIMESH_IN_CONTAINER:-}" ] || open_when_up "$URL"
+    [ -n "${SIM_MESH_IN_CONTAINER:-}" ] || open_when_up "$URL"
     "$py" "$ROOT/testbed/front.py" --bind "0.0.0.0:$PORT" "$@" &
     local front=$!
     trap 'kill -TERM "$front" 2>/dev/null || true' INT TERM
@@ -274,7 +316,7 @@ cmd_sims() {
 cmd_run() {
     local py
     py=$(pick_python)
-    PYTHONPATH="$ROOT/testbed${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m simesh.runner "$@"
+    PYTHONPATH="$ROOT/testbed${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m sim_mesh.runner "$@"
 }
 
 # ---- dispatch -------------------------------------------------------------------
@@ -283,7 +325,7 @@ verb=${1:-}
 case "$verb" in
     -h|--help|help) usage; exit 0 ;;
     ""|front|-*|build|devices|new|stop|pause|resume|list|plan|run) ;;
-    *) die "no verb '$verb' (simesh help lists them)" ;;
+    *) die "no verb '$verb' (sim-mesh help lists them)" ;;
 esac
 
 if want_container; then

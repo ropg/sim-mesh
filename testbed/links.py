@@ -45,7 +45,7 @@ import json
 import math
 import sys
 
-from simesh.view import RunView
+from sim_mesh.view import RunView
 
 BIN_M = 200
 

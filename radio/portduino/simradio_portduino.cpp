@@ -22,8 +22,8 @@
  * risen; the time shim answers the wait in node time, and Portduino's next
  * gpioIdle() runs the DIO1 interrupt handler.
  *
- * Environment: SIMESH_NODE_ID, SIMESH_BIND_ADDR and SIMESH_ETHER (the station
- * contract), and the pin numbers the firmware drives the chip on:
+ * Environment: SIM_MESH_NODE_ID, SIM_MESH_BIND_ADDR and SIM_MESH_ETHER (the
+ * station contract), and the pin numbers the firmware drives the chip on:
  * SIMRADIO_PIN_NSS, SIMRADIO_PIN_RESET, SIMRADIO_PIN_BUSY, SIMRADIO_PIN_DIO1
  * (1, 2, 3 and 4 when unset).
  */
@@ -141,9 +141,9 @@ private:
 
 void native_radio_backend_init()
 {
-    int sid = envInt("SIMESH_NODE_ID", 0);
-    const char* bind = getenv("SIMESH_BIND_ADDR");
-    const char* ether = getenv("SIMESH_ETHER");
+    int sid = envInt("SIM_MESH_NODE_ID", 0);
+    const char* bind = getenv("SIM_MESH_BIND_ADDR");
+    const char* ether = getenv("SIM_MESH_ETHER");
     if (simradio_station_open(sid, bind ? bind : "127.0.0.1", ether ? ether : "") != 0) {
         fprintf(stderr, "[simradio] could not open the link to the ether at %s\n",
                 ether ? ether : "(none)");

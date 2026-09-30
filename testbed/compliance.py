@@ -35,8 +35,8 @@ import os
 import sys
 
 import antennas as antennas_module
-from simesh import record as record_module
-from simesh.view import RunView
+from sim_mesh import record as record_module
+from sim_mesh.view import RunView
 
 HOUR_S = 3600.0
 DBI_TO_DBD = 2.15

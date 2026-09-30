@@ -1,4 +1,4 @@
-# SIMesh — internals
+# sim-mesh — internals
 
 Why the testbed is shaped the way it is, and the rules anything added to it
 has to obey. [README.md](README.md) is how to run it and where every file
@@ -22,7 +22,7 @@ Reticulum / LXMF / web UI                   Node, LoRaIface
         │                                           │
    iface-lora, RadioLib                        Sx1262Radio
         │  RadioLibHal                              │  embedded-hal
-   VirtualHal ── GPIO shim                     simesh-hal
+   VirtualHal ── GPIO shim                     sim-mesh-hal
         │                                           │
         └──────────── the chip model (radio/), linked by each
                             │  UDP, JSON
@@ -50,17 +50,17 @@ virtual time.
 
 ## Its own launcher, and its own container
 
-SIMesh simulates whatever firmware has a station kind. Reticulous is one;
+sim-mesh simulates whatever firmware has a station kind. Reticulous is one;
 Sergeyculum is another, and a Meshtastic or MeshCore node would be as much
 its business. So it is not a verb of the tool that builds one of those
-firmwares: it has its own launcher (`simesh`), its own image and its own
+firmwares: it has its own launcher (`sim-mesh`), its own image and its own
 supply of prebuilt stations, and a clone runs with no firmware tree beside
 it. A workspace is for building a station of one's own, into a catalogue of
-its `builds/` like any other build; everything else about SIMesh is the same
+its `builds/` like any other build; everything else about sim-mesh is the same
 without one.
 
 **A build is a stamped device file, not a build tree.** What was last
-compiled in a tree is anyone's guess, so a firmware that publishes simesh
+compiled in a tree is anyone's guess, so a firmware that publishes sim-mesh
 builds is only run from a catalogue, where each build has a stamp and a
 name. A compiled build (`devices/local/<project>_<catalogue>.yaml`, run in
 place from its tree) stands in only for a project that publishes none yet,
@@ -68,7 +68,7 @@ Sergeyculum today, until it does.
 
 **Stations need Linux.** Each binds a `127.x.y.z` address of its own and
 the virtual-time shim is an `LD_PRELOAD` library, and neither exists on
-another kernel. On Linux `simesh` runs natively; anywhere else it runs
+another kernel. On Linux `sim-mesh` runs natively; anywhere else it runs
 itself inside its own image. That image is small on purpose and is not the
 firmware build container: Ubuntu 24.04, because a device package's ELF
 (executable and linkable format) binary is
@@ -76,19 +76,19 @@ dynamically linked against that release's C library, C++ runtime, zlib and
 libbsd; the host's own architecture, because a package runs only on the one
 it was built for; python3 with aiohttp and pyyaml, Node for the page, a C
 toolchain and cmake for the chip library, cargo for the planner and the
-`sergeyculum` kind. It copies nothing from the tree. `simesh` mounts the
-directory holding SIMesh at its own path, so a compiled build's `../../../sergey`
+`sergeyculum` kind. It copies nothing from the tree. `sim-mesh` mounts the
+directory holding sim-mesh at its own path, so a compiled build's `../../../sergey`
 resolves to the same files inside the image as outside it, and runs as the host's user, so what it writes is theirs. The
 image is tagged by the Dockerfile's checksum and rebuilt when it changes.
 
 **Stations come as device files** ([NODE.md](NODE.md)): the ELF, its
 `/fixed` tree, any tools its kind needs and a `node.yaml`, zipped under the
-catalogue's own naming with `hw-simesh-<arch>` as the board, and published by
+catalogue's own naming with `hw-sim-mesh-<arch>` as the board, and published by
 the same catalogue build that publishes board images. A catalogue is already
 how a build reaches people, with a stamp per build and a listing a program
 can read; a second channel for the same firmware would be a second thing to
 keep in step. The listing marks each link with its target, so a flasher
-leaves the packages out, and SIMesh finds them by the entry's prefix. One
+leaves the packages out, and sim-mesh finds them by the entry's prefix. One
 file format serves every firmware, so a kind knows nothing of where its
 binary came from: a device imported on the page, fetched from a catalogue or
 described by a compiled build's `node.yaml` resolves to the same executable,
@@ -121,7 +121,7 @@ it: spangap's 9000–9011, the planner's 8787, the front's per-simulation
 control and ether ports counting up from 9100 and 7100, a station's CLI
 (command line) on 8081 and Reticulum's TCP (Transmission Control Protocol)
 interface on 4242. It lives in
-`simesh`, `front.py`, `proxy.py`, `test_front.py` and the docs, and nowhere
+`sim-mesh`, `front.py`, `proxy.py`, `test_front.py` and the docs, and nowhere
 else.
 
 ## One process per simulation
@@ -174,7 +174,7 @@ share any of them, and checks that a port is free on the host before it hands
 it out, so a simd started by hand on one is stepped around. A network is
 given out only when no socket on the host is bound to any of its addresses
 (read from `/proc/net/tcp` and `/proc/net/udp`) and the front wins a
-non-blocking `flock` on `$TMPDIR/simesh-nets/<net>.lock`, held on an open
+non-blocking `flock` on `$TMPDIR/sim-mesh-nets/<net>.lock`, held on an open
 descriptor until the simulation ends and dropped by the kernel if the front
 dies. The lock is what keeps two fronts apart in the window between giving a
 block out and its stations binding it (the loss table and the child's start
@@ -249,7 +249,7 @@ one run from the page; the front pauses only what a runner that died left
 running.
 
 **Scripts run beside the front and the simulation, never in them.** A script
-is a process of its own (`simesh.runner`) that starts its simulation, or
+is a process of its own (`sim_mesh.runner`) that starts its simulation, or
 attaches to one, over the front's port like any other driver; its output is
 read line by line and sent to every page. A script that loops, blocks or
 dies takes nothing else with it. What a station must be given at its first
@@ -394,7 +394,7 @@ and each is its own file so that changing one leaves the others alone:
   firmware or offsets, or changing the script, never recomputes it.
 
 **A firmware rule is a condition, kept.** `firmware(which, device)` holds
-its selection as a condition over each node's facts (`simesh.select`), not
+its selection as a condition over each node's facts (`sim_mesh.select`), not
 as the list of names it matches today, and the run keeps its rules. So a
 node placed later or retagged runs what the rules say of it, and a rule
 written at a script's top, before there is a simulation, means the same
@@ -416,7 +416,7 @@ sent at its maximum: the coverage draws it, and the startup script's radio
 sets it (`tx_dbm="max"`) — said by the script, since a station is told
 nothing behind a script's back. A lower power for one node is a lower
 `max_dbm`, which the map then draws too. The station is told its board
-(`SIMESH_BOARD`) by `testbed/boards.py`, whose front-end figures are the
+(`SIM_MESH_BOARD`) by `testbed/boards.py`, whose front-end figures are the
 Heltec V4 board straddle's own.
 
 **A front end is modelled twice, with one curve.** The chip model
@@ -424,7 +424,7 @@ Heltec V4 board straddle's own.
 chip radiates and what the medium is handed, and adds its receive gain to
 every level the chip reads, so the medium only ever deals in connector
 power. Reticulous on `hw-linux` takes the same figures (`SPANGAP_BOARD`,
-which the kind copies from `SIMESH_BOARD`) in place of its build's Kconfig
+which the kind copies from `SIM_MESH_BOARD`) in place of its build's Kconfig
 and converts the other way, antenna dBm to chip drive and chip RSSI to
 connector RSSI, as it does on the board. Both round the curve the same way,
 so a station asked for 27 dBm behind the GC1109 drives the chip at 18 and
@@ -512,13 +512,13 @@ is a difference between the runs.
 
 ## Real ground: the planner as a sidecar
 
-The ground data and the propagation model are SIMesh's own planner, the Rust
+The ground data and the propagation model are sim-mesh's own planner, the Rust
 workspace in `planner/`: packs compiled from public terrain, clutter,
 building and road data, and ITU-R (International Telecommunication Union,
 radio sector) Recommendation P.1812-8 over a real profile. The crates came
-from Sergey's planner and keep their names; SIMesh carries the ones it runs
+from Sergey's planner and keep their names; sim-mesh carries the ones it runs
 (core, terrain, propag, opt, coverage, pack, buildings, import, render, web,
-wasm, and its own job) and changes them as it needs, since SIMesh takes over
+wasm, and its own job) and changes them as it needs, since sim-mesh takes over
 planning and simulation from the tools it grew out of, building the packs
 included. The front runs the workspace's web server, `planner-web`, as a
 **sidecar**, and asks it.
@@ -531,7 +531,7 @@ front ── GET /loss/start, /loss/status, /loss.bin, one node at a time ──
 ```
 
 - **A process, not a library**, because the planner is Rust and the front is
-  Python, and what it serves over HTTP is exactly what SIMesh needs: tiles
+  Python, and what it serves over HTTP is exactly what sim-mesh needs: tiles
   for the map, roads, buildings, places, and one pair's loss with its
   evidence.
 - **One per pack in use**, because `planner-web` serves one pack. The front
@@ -541,7 +541,7 @@ front ── GET /loss/start, /loss/status, /loss.bin, one node at a time ──
 - **Behind the front's port**, as `/planner/<geodata>/…` with the prefix
   stripped: the page has one origin, `planner-web` needs no CORS
   (cross-origin resource sharing) handling it does not have, and only
-  SIMesh's page calls it, so the planner's own page and its absolute paths
+  sim-mesh's page calls it, so the planner's own page and its absolute paths
   never matter. The page renders the ground with the planner's own renderer,
   `planner-wasm`, from a copy vendored into the page's tree, so the page
   builds with no planner beside it.
@@ -647,7 +647,7 @@ rate-limited, and times out on a city's buildings. The selection is at the
 top of `planner-pack/src/osm.rs`.
 
 **Nodes are never ground.** A planner pack could carry a `Nodes` layer, the
-deployed network baked in at build time. SIMesh's compiler never writes one,
+deployed network baked in at build time. sim-mesh's compiler never writes one,
 and export, import and what the page is told all leave one out: nodes are
 nodesets, which stand on any ground that holds them, and which the layers
 on the Nodes tab show, merge and edit. The public node maps come in as
@@ -997,7 +997,7 @@ Everything the testbed knows about one firmware lives in its kind
 (`testbed/kinds/`); simd, the supervisor and the page know only the kind's
 methods. The station contract ([STATION.md](STATION.md)) is what every kind
 shares, and it is small on purpose: an identity, a directory, an address and
-the ether, in `SIMESH_*`, and a console on stdin/stdout.
+the ether, in `SIM_MESH_*`, and a console on stdin/stdout.
 
 **One chip model for every kind, below the driver.** Every kind links the
 same `radio/`, whatever its language. A rewrite per language would drift on
@@ -1008,7 +1008,7 @@ boards.
 
 **Protocol parts sit behind their protocol.** The ether, the record, the
 map, airtime per carrier and link geometry know no protocol; LXMF traffic,
-delivery analysis and SUPE frame classes live under `simesh.reticulum`, so a
+delivery analysis and SUPE frame classes live under `sim_mesh.reticulum`, so a
 firmware of another protocol gets everything generic and nothing that
 misreads it.
 
@@ -1347,15 +1347,15 @@ model's timers and the host's **wakes** when a grant reaches them, works out
 the next instant the station needs (`until`) and sends the idle. The model
 reads T; the host reads **node time**, f(T), which is where a node's own
 crystal — drift, an offset — goes. f is the identity unless the station's
-environment has `SIMESH_CLOCK_PROFILE`, a piecewise-linear map given as
+environment has `SIM_MESH_CLOCK_PROFILE`, a piecewise-linear map given as
 `T:node` pairs in microseconds, both increasing, slope 1 outside them
 ([STATION.md](STATION.md#the-environment)); `nodeOf` / `conductorOf` are the
 only place it is defined.
 
 **The C library's time is answered by a preloaded shim**,
 `radio/build/libsimclock.so` (built from `radio/shim/simclock.c`), which every
-station of a virtual run is started with (`LD_PRELOAD`, `SIMESH_TIME=virtual`,
-`SIMESH_EPOCH_US`). The chip
+station of a virtual run is started with (`LD_PRELOAD`, `SIM_MESH_TIME=virtual`,
+`SIM_MESH_EPOCH_US`). The chip
 library finds it by name when the station opens its link and hands it the
 clock (`include/simclock.h`); from then on `clock_gettime`, `gettimeofday`
 and `time` read node time (plus the run's epoch for the wall clocks), and
@@ -1374,10 +1374,10 @@ its wait exactly as it ends a real one. Two rules keep it honest:
   waits on it for good.
 
 **The shim is also the station's randomness** when the environment carries
-`SIMESH_SEED` (a kind sets it from the ether's seed): `getentropy`,
+`SIM_MESH_SEED` (a kind sets it from the ether's seed): `getentropy`,
 `getrandom` and `syscall(SYS_getrandom)` — ESP-IDF's host `esp_random` and
 mbedtls's platform entropy between them — draw from a splitmix64 counter keyed
-by the seed and `SIMESH_NODE_ID`. It needs no welcome, so it holds from the
+by the seed and `SIM_MESH_NODE_ID`. It needs no welcome, so it holds from the
 first draw. A call reserves all its words in one atomic step and takes no
 lock, so a thread switched out mid-call neither blocks another nor changes
 its bytes. With the same seed and epoch, a station draws the same bytes in the
@@ -1403,7 +1403,7 @@ way to know it:
   station's clock is a whole number of seconds from every other's, the ticks
   of all of them fall on the same instants of T and share their barriers.
 - a `sergeyculum` or `microreticulum` station, whose threads are plain
-  pthreads: the shim's thread census (`SIMESH_IDLE=threads`). A thread counts
+  pthreads: the shim's thread census (`SIM_MESH_IDLE=threads`). A thread counts
   as blocked while it is in one of the shim's waits, an untimed
   `pthread_cond_wait`, or a read on a blocking descriptor that is not a file;
   when the last one blocks, the station is idle. A read on a regular file
@@ -1458,9 +1458,9 @@ The shim does the station's side of it, with no help from the firmware: it
 counts what `read` takes from descriptor 0 and reports the running total once
 a read leaves nothing waiting; it asks before a `write`/`send` on a TCP
 connection to another station, on a socket of the writing thread's own
-(`SIMESH_ETHER`), and reports what `read`/`recv` take from one; and it makes
+(`SIM_MESH_ETHER`), and reports what `read`/`recv` take from one; and it makes
 a station's TCP connection to a loopback address leave from the station's own
-address (`SIMESH_BIND_ADDR`), so both ends of it say which station they are.
+address (`SIM_MESH_BIND_ADDR`), so both ends of it say which station they are.
 Its reports go on the chip library's own socket to the ether, found from the
 `hello` sent on it, so each is ahead of the idle that follows it. The
 testbed's waits are on T as well: `Kind.pause`, `simd`'s `sleep`, `after`
@@ -1611,29 +1611,29 @@ change.
 **Stations and kinds**
 
 - **The Python reference Reticulum as a station kind**, the oracle: under the
-  time shim with `SIMESH_IDLE=threads`, attached to a `reticulous` station's
+  time shim with `SIM_MESH_IDLE=threads`, attached to a `reticulous` station's
   radio through the RNode-over-TCP endpoint (`s.lora.rnode.tcp`) or through
   `iface-tcp`. It answers what `rnsd` does when an interface stops taking
   packets, and whether real Reticulum agrees with our neighbour and identity
   inference.
 - **`sergeyculum` stations built with `--profile sim`** (opt-level 3), from
-  `target/sim/simesh`, in `devices/local/sergeyculum_local.yaml` and the
+  `target/sim/sim-mesh`, in `devices/local/sergeyculum_local.yaml` and the
   README's developer loop; release is opt-level `z` with LTO (link-time
   optimisation), several times slower at signature checks.
-- **`libudev-dev` in SIMesh's image**: `rncfg` links `libudev` through
+- **`libudev-dev` in sim-mesh's image**: `rncfg` links `libudev` through
   `serialport`, so Sergeyculum's Cargo workspace does not build in the image
   without it.
 - **The mixed-kind walkthrough** in the README: announces crossing both ways,
   a path through our transports, a two-frame split both ways, carrier sense
   under contention, and the hidden terminal, each with its commands and what
   `seq.py` shows.
-- **The chip model as a submodule** of `simesh-radio-sys`, as an alternative
-  to `SIMESH_RADIO_DIR` or the workspace layout.
+- **The chip model as a submodule** of `sim-mesh-radio-sys`, as an alternative
+  to `SIM_MESH_RADIO_DIR` or the workspace layout.
 - **Tests of a station's own screen**: the `lcdmirror` framebuffer tap in
   `lcd_lvgl.cpp`'s flush callback without its WebRTC half, `tinylcd`'s 1-bit
   buffer read directly, and LVGL's `LV_USE_TEST` for time, injected input and
   image comparison. No panel is emulated.
-- **An `hw-qemu` board**, outside SIMesh: a UART0 console, OpenCores Ethernet
+- **An `hw-qemu` board**, outside sim-mesh: a UART0 console, OpenCores Ethernet
   for WiFi, no ADC user, no Bluetooth, to ask regularly whether the real
   binary still boots. LittleFS does not yet format the state partition there.
 
@@ -1644,7 +1644,7 @@ change.
   amount and holds it again. Pause stops simd; this does not.
 - **Single stations off and on** with their state kept (drawn grey), as
   `sel.stop()` and `sel.start()` in the library and on the node menu.
-- **The run analyses as tools** in `testbed/simesh/reticulum/` beside
+- **The run analyses as tools** in `testbed/sim_mesh/reticulum/` beside
   `delivery.py`, reading a run's logs and record: `peer left` withdrawals and
   the routes they dropped; directory entries, full blob pools and evictions;
   neighbour-table rows and evictions (from `table … evicted, … gone

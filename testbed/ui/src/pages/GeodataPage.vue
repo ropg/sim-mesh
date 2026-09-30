@@ -87,7 +87,7 @@
           <q-input v-model="name" dense outlined label="geodata name"
                    hint="lower-case letters, digits and hyphens" />
           <div class="text-caption text-grey-6">
-            A SIMesh geodata pack, as Export zip writes one, or a bare planner pack
+            A sim-mesh geodata pack, as Export zip writes one, or a bare planner pack
             (its manifest.json at the top or inside one directory), which becomes
             geodata by this name. Nodes are never ground: a pack's
             Nodes layer is left out.

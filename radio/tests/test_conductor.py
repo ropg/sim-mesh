@@ -1,6 +1,6 @@
 """The library's clock in a virtual-time run, driven by a fake conductor.
 
-Each test loads its own copy of libsimradio.so with SIMESH_TIME=virtual in
+Each test loads its own copy of libsimradio.so with SIM_MESH_TIME=virtual in
 the environment (the mode, and the clock profile, are read once per copy),
 plays the ether on a UDP socket, and stands in for the host by calling
 simradio_idle itself. Nothing moves until the fake conductor says so.
@@ -134,7 +134,7 @@ def idle(lib, cond):
 
 @pytest.fixture
 def virtual(tmp_path):
-    lib = load_copy(tmp_path, "libsimradio_virtual.so", {"SIMESH_TIME": "virtual"})
+    lib = load_copy(tmp_path, "libsimradio_virtual.so", {"SIM_MESH_TIME": "virtual"})
     cond = Conductor()
     yield lib, cond
     cond.sock.close()
@@ -301,8 +301,8 @@ def test_a_profile_makes_until_come_back_through_the_inverse(tmp_path):
     # Node time runs twice as fast as T for the first second of T, then at
     # T's own rate.
     lib = load_copy(tmp_path, "libsimradio_profile.so",
-                    {"SIMESH_TIME": "virtual",
-                     "SIMESH_CLOCK_PROFILE": "0:0,1000000:2000000"})
+                    {"SIM_MESH_TIME": "virtual",
+                     "SIM_MESH_CLOCK_PROFILE": "0:0,1000000:2000000"})
     cond = Conductor()
     cond.t = 400_000
     try:

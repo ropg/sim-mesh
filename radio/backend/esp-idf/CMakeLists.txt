@@ -6,7 +6,7 @@
 # that wants it called `simradio` gives it a directory of that name whose
 # CMakeLists.txt is one line:
 #
-#     include(<path to SIMesh>/radio/backend/esp-idf/CMakeLists.txt)
+#     include(<path to sim-mesh>/radio/backend/esp-idf/CMakeLists.txt)
 #
 # CMAKE_CURRENT_LIST_DIR below is this file's directory either way.
 set(simradio_root "${CMAKE_CURRENT_LIST_DIR}/../..")
