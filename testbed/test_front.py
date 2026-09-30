@@ -25,6 +25,7 @@ import coverage  # noqa: E402
 import devices  # noqa: E402
 import front  # noqa: E402
 import geodata  # noqa: E402
+import nodeset  # noqa: E402
 import proxy  # noqa: E402
 import sources  # noqa: E402
 import store  # noqa: E402
@@ -534,10 +535,16 @@ def test_a_node_map_becomes_a_layer_and_shown_layers_save_as_one(stores, monkeyp
 
 # ---- coverage, through a planner of the test's own ---------------------------
 
-def fake_planner(calls):
+def fake_planner(calls, loss_options=None):
     """/loss/start, /loss/status and /loss.bin as planner-web answers them:
-    one sweep, which is running for the first status and whole after."""
+    one sweep, which is running for the first status and whole after. With
+    `loss_options`, /api/pack lists them, as a sidecar that takes them does;
+    without, there is no /api/pack, as for a sidecar that predates it."""
     state = {"polls": 0, "radius": None}
+
+    async def pack(request):
+        calls.append(("pack", {}))
+        return web.json_response({"loss_options": loss_options})
 
     async def start(request):
         calls.append(("start", dict(request.query)))
@@ -560,6 +567,8 @@ def fake_planner(calls):
     app.router.add_get("/loss/start", start)
     app.router.add_get("/loss/status", status)
     app.router.add_get("/loss.bin", loss)
+    if loss_options is not None:
+        app.router.add_get("/api/pack", pack)
     return app
 
 
@@ -593,6 +602,7 @@ def test_a_node_raster_is_swept_once_and_then_cached(tmp_path, monkeypatch):
     asyncio.run(go())
     starts = [q for what, q in calls if what == "start"]
     assert len(starts) == 2 and starts[0]["tx_h"] == "20" and starts[0]["rx_h"] == "2"
+    assert "whole" not in starts[0]         # not offered, so not sent
     x, y = gd.to_xy(52.52, 13.41)
     loss = [q for what, q in calls if what == "loss"][0]
     assert float(loss["minx"]) == pytest.approx(x - 10000, abs=1e-3)
@@ -600,6 +610,82 @@ def test_a_node_raster_is_swept_once_and_then_cached(tmp_path, monkeypatch):
     assert coverage.key(gd, node) == coverage.key(gd, dict(node, tx_dbm=30))
     with pytest.raises(store.StoreError):
         coverage.cache_path("berlin", "../../etc/passwd")
+
+
+def test_a_sidecar_that_offers_whole_sweeps_is_asked_for_them(tmp_path, monkeypatch):
+    """Only the whole radius is kept, so a sidecar that lists `whole` is asked
+    for it rather than the ladder of bands, and is asked what it takes once."""
+    monkeypatch.setattr(store, "COVERAGE_DIR", str(tmp_path / "coverage"))
+    monkeypatch.setattr(coverage, "POLL_S", 0.01)
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "manifest.json").write_text(json.dumps(
+        {"region": {"crs_epsg": 32633, "bbox": [13.3, 52.4, 13.5, 52.6]}}))
+    gd = geodata.Geodata("berlin", {"pack": str(pack)})
+    node = {"name": "alex", "lat": 52.52, "lon": 13.41, "height_m": 20}
+    calls = []
+
+    async def go():
+        runner = web.AppRunner(fake_planner(calls, loss_options=["whole"]))
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        url = "http://127.0.0.1:%d" % site._server.sockets[0].getsockname()[1]
+        try:
+            async with aiohttp.ClientSession() as session:
+                sweeps = coverage.Sweeps(session)
+                await sweeps.raster(url, gd, node)
+                await sweeps.raster(url, gd, dict(node, height_m=25))
+        finally:
+            await runner.cleanup()
+    asyncio.run(go())
+    starts = [q for what, q in calls if what == "start"]
+    assert [q.get("whole") for q in starts] == ["true", "true"]
+    assert [what for what, _ in calls].count("pack") == 1
+
+
+# ---- heights from a pack's evidence -------------------------------------------
+
+def test_heights_are_estimated_only_on_a_pack(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
+    geodata.write(geodata.geodata_path("flat"), {"synthetic": {"exponent": 3.0}})
+    monkeypatch.setattr(store, "NODESETS_DIR", str(tmp_path / "nodesets"))
+    ns = nodeset.create("few")
+    ns.add_node("a", 0.001, 0.001, height_m=15)
+    ns.save()
+
+    async def check(f, session, base, ws):
+        reply = await ask(ws, "nodeset_heights", name="few", geodata="flat")
+        assert not reply["ok"] and "synthetic" in reply["error"]
+        assert nodeset.load("few").nodes["a"]["height_m"] == 15
+    running_front(check)
+
+
+def test_a_nodesets_assumed_heights_are_estimated_on_a_pack(tmp_path, monkeypatch):
+    if front.planner_web() is None or not os.path.isdir(BERLIN_PACK):
+        pytest.skip("no planner-web build in planner/ or no berlin-city geodata")
+    monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
+    geodata.write(geodata.geodata_path("berlin"), {"pack": BERLIN_PACK})
+    monkeypatch.setattr(store, "NODESETS_DIR", str(tmp_path / "nodesets"))
+    monkeypatch.setattr(store, "RUNS_DIR", str(tmp_path / "runs"))
+    ns = nodeset.create("kiez")
+    # A perimeter block in Kreuzberg, and the same place surveyed.
+    ns.add_node("guess", 52.4930, 13.4190, height_m=15)
+    ns.add_node("known", 52.4931, 13.4191, height_m=11, height_from="measured")
+    ns.save()
+
+    async def check(f, session, base, ws):
+        reply = await ask(ws, "nodeset_heights", name="kiez", geodata="berlin")
+        assert reply["ok"], reply
+        assert reply["changed"] == ["guess"]
+        guess = nodeset.load("kiez").nodes["guess"]
+        got = reply["estimates"]["guess"]
+        assert guess["height_from"] == nodeset.HEIGHT_FROM_BASIS[got["basis"]]
+        assert got["low_m"] <= guess["height_m"] <= got["high_m"]
+        assert got["buildings_index"] in ("ready", "absent")
+        known = nodeset.load("kiez").nodes["known"]
+        assert (known["height_m"], known["height_from"]) == (11, "measured")
+    running_front(check)
 
 
 # ---- the planner behind /planner/<geodata>/ ----------------------------------

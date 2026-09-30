@@ -6,9 +6,12 @@
  * it transmits. Inbound: the frames that reach its antenna, applied to the
  * addressed slot's model.
  *
- * The messages are JSON, one per datagram, payloads base64, times in
- * microseconds on the sender's own clock and meaningful only against each
- * other. A station ignores a message it does not understand.
+ * The messages are JSON, payloads base64, times in microseconds on the
+ * sender's own clock and meaningful only against each other. A station sends
+ * one per datagram; the ether sends one, or, to a station that says `lines`
+ * in its hello, every message of an instant in one datagram, a line each,
+ * which the station applies as one (ether_link.cpp, handleDatagram). A
+ * station ignores a message it does not understand.
  * sim-mesh/ether/README.md is the wire.
  */
 #pragma once
@@ -44,3 +47,8 @@ struct EtherTxFrame {
 
 void etherPublishState(const EtherState& s);
 void etherPublishTx(const EtherTxFrame& f);
+
+/** Who has the floor on the station's host door: the station, once it has
+ *  read what a host sent (`station`), or the host again once it has been
+ *  answered. The ether keeps T still while a testbed tool has the floor. */
+void etherPublishFloor(bool station);

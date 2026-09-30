@@ -15,11 +15,13 @@ import math
 import os
 import queue
 import re
+import select
 import socket
 import subprocess
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -116,11 +118,11 @@ class FakeStation:
     def state(self, mode="RX", **over):
         self.send(dict({"type": "state", "slot": 0}, **radio(mode, **over)))
 
-    def tx(self, fid, payload=b"hello", span_us=FRAME_US, **over):
+    def tx(self, fid, payload=b"hello", span_us=FRAME_US, pre_us=None, hdr_us=None, **over):
         t0 = self.t
         self.send(dict({"type": "tx", "slot": 0, "id": fid, "t0": t0,
-                        "t_pre": t0 + span_us // 10,
-                        "t_hdr": t0 + span_us // 5,
+                        "t_pre": t0 + (span_us // 10 if pre_us is None else pre_us),
+                        "t_hdr": t0 + (span_us // 5 if hdr_us is None else hdr_us),
                         "t_end": t0 + span_us, "power_dbm": POWER_DBM,
                         "payload": base64.b64encode(payload).decode()},
                        **radio("TX", **over)))
@@ -171,10 +173,11 @@ class Bench:
     stated before then — the table is written once, as a run's is.
     """
 
-    def __init__(self, tmp_path, time_mode="real", pairwise=False):
+    def __init__(self, tmp_path, time_mode="real", pairwise=False, *flags):
         self.tmp_path = tmp_path
         self.time_mode = time_mode
         self.pairwise = pairwise
+        self.flags = list(flags)    # more of the ether's own, as its command line takes them
         self.record = tmp_path / "record.tsv"
         self.proc = None
         self.port = None
@@ -215,6 +218,7 @@ class Bench:
             argv += ["--nodeset", str(nodes), "--losses", str(losses)]
         if self.pairwise:
             argv.append("--pairwise")
+        argv += self.flags
         self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE, text=True)
         lines = queue.Queue()
@@ -271,9 +275,17 @@ def pairwise(tmp_path):
         bed.close()
 
 
-@pytest.fixture
-def conductor(tmp_path):
+# The conductors a virtual-time run can have: Ether's own, and ether_core's
+# when it is built (`sim-mesh build ether`); every virtual-time test runs on each.
+CORE_BUILT = os.path.exists(ether_module.CORE_PATH)
+CONDUCTORS = ["python", pytest.param("rust", marks=pytest.mark.skipif(
+    not CORE_BUILT, reason="no ether core built (sim-mesh build ether)"))]
+
+
+@pytest.fixture(params=CONDUCTORS)
+def conductor(tmp_path, request, monkeypatch):
     """The ether in virtual time, as fast as its stations let it go."""
+    monkeypatch.setenv("SIM_MESH_ETHER_CORE", request.param)
     bed = Bench(tmp_path, "max")
     try:
         yield bed
@@ -556,6 +568,351 @@ def test_carrier_sense_hears_energy_over_the_threshold_at_any_sf(ether):
     receiving.expect_nothing()
 
 
+# A frame long enough to start listening in the middle of. Its stated sync
+# word is a tenth of the way in, 40 ms, so its preamble proper ends 17 ms
+# before that at SF9 and a slot starting 100 ms in has long missed it.
+LONG_US = 400_000
+
+
+@pytest.mark.parametrize("mode", ["RX", "CAD"])
+def test_a_station_that_starts_listening_mid_frame_is_told_its_energy_only(ether, mode):
+    """A frame reaches the slots listening when it starts. One that starts
+    listening later, here out of standby, has missed the preamble and cannot
+    demodulate the frame; its RSSI still reads it and a CAD still finds it.
+    It is told the energy, from the instant it was told to the frame's end,
+    and nothing else."""
+    ether.link(1, 2, NEAR_DB)
+    sender, late = ether(1), ether(2)
+    sender.hello()
+    late.hello()
+    late.state("STDBY_RC")
+    time.sleep(0.05)
+
+    sender.tx(44, payload=b"already on the air", span_us=LONG_US)
+    time.sleep(0.1)
+    late.state(mode)
+    begin = late.expect("rx_begin")
+    assert begin["cad"] is True
+    assert begin["level"] == round(level_for(NEAR_DB))
+    assert 0 < begin["t_end"] - begin["t0"] < LONG_US - 50_000     # what is left
+    late.expect_nothing(timeout=LONG_US / 1e6)                     # and no rx_end
+
+
+def test_a_station_that_starts_listening_early_in_a_long_preamble_still_locks_on(ether):
+    """With four symbols or more of the preamble still to come, a slot that
+    starts listening finds it as one listening all along would, and receives
+    the frame."""
+    ether.link(1, 2, NEAR_DB)
+    sender, late = ether(1), ether(2)
+    sender.hello()
+    late.hello()
+    late.state("STDBY_RC")
+    time.sleep(0.05)
+
+    sender.tx(45, payload=b"a long preamble", span_us=LONG_US, pre_us=300_000,
+              hdr_us=320_000)
+    time.sleep(0.05)
+    late.state("RX")
+    begin = late.expect("rx_begin")
+    assert "cad" not in begin
+    assert begin["t_pre"] - begin["t0"] < 300_000       # measured from when it was told
+    end = late.expect("rx_end")
+    assert end["verdict"] == "clean"
+    assert base64.b64decode(end["payload"]) == b"a long preamble"
+
+
+def test_a_late_listener_is_told_only_of_frames_it_could_have_been_told_of(ether):
+    """By the rules a frame's start would have applied: not a frame already
+    over, not one at another spreading factor under the sense threshold, but
+    one at another spreading factor over it, as energy."""
+    ether.link(1, 3, 90.0)          # −76 dBm, over the −81 dBm threshold
+    ether.link(2, 3, 110.0)         # −96 dBm, under it
+    loud, quiet, late = ether(1), ether(2), ether(3)
+    for station in (loud, quiet, late):
+        station.hello()
+    late.state("STDBY_RC")
+    time.sleep(0.05)
+
+    quiet.tx(46, span_us=100_000)
+    time.sleep(0.2)
+    late.state("RX")                # it ended before anyone listened
+    late.expect_nothing()
+
+    late.state("STDBY_RC")
+    quiet.tx(47, span_us=LONG_US, sf=7)
+    time.sleep(0.1)
+    late.state("RX")                # another SF, and under the threshold
+    late.expect_nothing(timeout=LONG_US / 1e6)
+
+    late.state("STDBY_RC")
+    loud.tx(48, span_us=LONG_US, sf=7)
+    time.sleep(0.1)
+    late.state("RX")                # another SF, over the threshold
+    begin = late.expect("rx_begin")
+    assert begin["cad"] is True
+    assert begin["level"] == round(level_for(90.0))
+    late.expect_nothing(timeout=LONG_US / 1e6)
+
+
+def test_a_station_back_from_its_own_frame_is_told_of_one_that_began_meanwhile(ether):
+    """Half duplex hides a frame that begins while a station is sending, and
+    it is the frame carrier sense most needs: the station, done sending,
+    wants the channel again. Back in RX, it is told the frame's energy."""
+    ether.link(1, 2, NEAR_DB)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+
+    a.tx(51, payload=b"a first", span_us=100_000)
+    b.expect("rx_begin")
+    time.sleep(0.02)
+    b.tx(52, payload=b"b over it", span_us=LONG_US)
+    a.expect_nothing(timeout=0.15)  # sending, and then not told: not listening
+    a.state("STDBY_RC")
+    a.state("RX")
+    begin = a.expect("rx_begin")
+    assert begin["cad"] is True
+
+
+def test_a_receiver_that_leaves_rx_mid_frame_is_not_told_how_it_ended(ether):
+    """Out of RX into standby, the chip lets go of the frame it was following,
+    and the medium rules on nothing it did not receive: no rx_end, and none in
+    the record."""
+    ether.link(1, 2, NEAR_DB)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+
+    a.tx(53, payload=b"left behind", span_us=LONG_US)
+    assert "cad" not in b.expect("rx_begin")
+    time.sleep(0.05)
+    b.state("STDBY_RC")
+    b.expect_nothing(timeout=LONG_US / 1e6 + 0.2)
+    time.sleep(0.1)
+    ends = [line for line in ether.record.read_text().splitlines()
+            if '"type":"rx_end"' in line]
+    assert ends == []
+
+
+def test_a_receiver_retuned_mid_frame_is_not_told_how_it_ended(ether):
+    """Retuned while in RX, the demodulator cannot follow a frame on the
+    channel it left, so that reception is abandoned as if it had left RX."""
+    ether.link(1, 2, NEAR_DB)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+
+    a.tx(54, payload=b"on the old channel", span_us=LONG_US)
+    assert "cad" not in b.expect("rx_begin")
+    time.sleep(0.05)
+    b.state("RX", freq=FREQ + 600_000)
+    b.expect_nothing(timeout=LONG_US / 1e6 + 0.2)
+
+
+# ---- the CRC band ----------------------------------------------------------
+
+def test_the_crc_band_fails_frames_in_proportion_to_how_near_the_threshold_they_are():
+    """Certain at the threshold, never at the band's top, and in between in
+    proportion: a straight line down, over many frames."""
+    band = 2.0
+    for margin, expected in ((-1.0, 1.0), (0.0, 1.0), (0.5, 0.75), (1.0, 0.5),
+                             (1.5, 0.25), (2.0, 0.0), (5.0, 0.0)):
+        failed = sum(ether_module.crc_margin_fails(7, eid, 2, 0, margin, band)
+                     for eid in range(4000))
+        assert failed / 4000 == pytest.approx(expected, abs=0.03), margin
+    assert not any(ether_module.crc_margin_fails(7, eid, 2, 0, -3.0, 0.0)
+                   for eid in range(100)), "no band, no failures"
+
+
+def test_a_physics_without_a_crc_band_says_nothing_of_one():
+    """A run records what was asked for: no band, no key; a band round-trips."""
+    assert ether_module.Physics().as_dict() == {"noise_figure_db": 6.0}
+    physics = ether_module.Physics(5.0, 2.5)
+    assert physics.as_dict() == {"noise_figure_db": 5.0, "crc_margin_db": 2.5}
+    assert ether_module.Physics.from_dict(physics.as_dict()).crc_margin_db == 2.5
+    with pytest.raises(ValueError):
+        ether_module.Physics(6.0, -1.0)
+
+
+def test_the_crc_band_verdict_is_the_draw_for_that_frame_and_receiver(tmp_path):
+    """A frame 1 dB over SF9's threshold, in a 2 dB band, fails half the
+    time: each one as its own draw from the seed says, whichever that is."""
+    bench = Bench(tmp_path, "real", False, "--crc-margin-db", "2", "--seed", "11")
+    try:
+        loss = POWER_DBM - (NOISE_DBM - 12.5 + 1.0)       # 1 dB over the threshold
+        bench.link(1, 2, loss)
+        a, b = bench(1), bench(2)
+        seed = a.hello()["seed"]
+        assert seed == 11
+        b.hello()
+        b.state("RX")
+        time.sleep(0.1)
+        margin = level_for(loss) - NOISE_DBM + 12.5
+        verdicts = []
+        for n in range(8):
+            a.tx(70 + n, payload=b"near the edge %d" % n, span_us=100_000)
+            begin = b.expect("rx_begin")
+            end = b.expect("rx_end")
+            assert end["id"] == begin["id"]
+            fails = ether_module.crc_margin_fails(seed, end["id"], 2, 0, margin, 2.0)
+            assert end["verdict"] == ("crc" if fails else "clean")
+            verdicts.append(end["verdict"])
+        assert set(verdicts) == {"crc", "clean"}
+    finally:
+        bench.close()
+
+
+def test_without_a_crc_band_a_frame_over_its_threshold_is_clean(ether):
+    """Off by default: a frame half a dB over its threshold is delivered."""
+    loss = POWER_DBM - (NOISE_DBM - 12.5 + 0.5)
+    ether.link(1, 2, loss)
+    a, b = ether(1), ether(2)
+    listen(a, b)
+    for n in range(4):
+        a.tx(80 + n, span_us=100_000)
+        assert b.expect("rx_end")["verdict"] == "clean"
+
+
+# ---- bench capture ---------------------------------------------------------
+#
+# The table's cases are the reticulum project's rnscale medium tests
+# (tools/rnscale/src/medium.rs): the bench at both ends of its table, a late
+# stronger frame costing both, a late weaker one lost alone, and two frames
+# each kept by the listener nearer its sender.
+
+def outcomes(lead, locked=False, pairs=3000):
+    """bench_outcome over many pairs of frames at one receiver."""
+    return [ether_module.bench_outcome(11, 2 * n + 1, 2 * n + 2, 5, lead, locked)
+            for n in range(pairs)]
+
+
+def test_bench_equals_are_both_lost_one_time_in_four_and_never_both_kept():
+    seen = outcomes(0.5)
+    assert (True, True) not in seen
+    both_lost = seen.count((False, False)) / len(seen)
+    assert both_lost == pytest.approx(9 / 39, abs=0.03)
+    first = seen.count((True, False)) / (len(seen) - seen.count((False, False)))
+    assert first == pytest.approx(0.5, abs=0.04)
+
+
+def test_bench_keeps_the_stronger_nine_times_in_ten_at_2_db_and_never_the_weaker():
+    seen = outcomes(2.0)
+    assert all(second is False for _, second in seen)
+    kept = sum(first for first, _ in seen) / len(seen)
+    assert kept == pytest.approx(119 / 136, abs=0.025)
+    assert set(outcomes(-2.0)) <= {(False, True), (False, False)}
+
+
+def test_bench_keeps_the_stronger_every_time_from_6_1_db():
+    assert set(outcomes(6.1, pairs=500)) == {(True, False)}
+    assert set(outcomes(-7.0, pairs=500)) == {(False, True)}
+
+
+def test_bench_a_late_frame_is_never_received_and_a_stronger_one_spoils_both():
+    assert set(outcomes(-2.0, locked=True, pairs=500)) == {(False, False)}
+    assert set(outcomes(7.0, locked=True, pairs=500)) == {(True, False)}
+    assert all(second is False for _, second in outcomes(0.0, locked=True))
+
+
+@pytest.fixture
+def bench(tmp_path):
+    """The ether with bench capture, its seed pinned."""
+    bed = Bench(tmp_path, "real", False, "--bench-capture", "--seed", "3")
+    try:
+        yield bed
+    finally:
+        bed.close()
+
+
+def test_bench_capture_keeps_a_frame_8_db_up_as_the_same_sf_figure_does(bench):
+    """The hidden terminal, judged as the bench saw it: 8 dB is past 6.1."""
+    bench.link(1, 2, 110.0)
+    bench.link(3, 2, 118.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    listen(a, b, c)
+
+    a.tx(151, payload=b"from a")
+    c.tx(152, payload=b"from c")
+    ends = b.ends(2)
+    assert ends[b"from a"]["verdict"] == "clean"
+    assert ends[b"from c"]["verdict"] == "crc"
+
+
+def test_bench_capture_frames_a_decibel_apart_end_as_their_pairs_draw(bench):
+    """1 dB apart, the two are equals, and which survives, if either, is the
+    pair's draw from the seed: the lock and both verdicts read the same one."""
+    bench.link(1, 2, 110.0)
+    bench.link(3, 2, 111.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    seed = a.hello()["seed"]
+    listen(b, c)
+    lead = level_for(110.0) - level_for(111.0)
+    for n in range(5):
+        a.tx(160 + n, payload=b"a %d" % n, pre_us=100_000, hdr_us=120_000)
+        c.tx(170 + n, payload=b"c %d" % n, pre_us=100_000, hdr_us=120_000)
+        first, second = b.expect("rx_begin"), b.expect("rx_begin")
+        ends = b.ends(2)
+        want = ether_module.bench_outcome(seed, first["id"], second["id"], 2, lead, False)
+        assert ends[b"a %d" % n]["verdict"] == ("clean" if want[0] else "crc")
+        assert ends[b"c %d" % n]["verdict"] == ("clean" if want[1] else "crc")
+        assert ("cad" in second) == (not want[1]), "the second takes b only if it survives"
+
+
+def test_bench_capture_a_stronger_frame_after_the_preamble_spoils_both(bench):
+    """b follows a's frame; c's lands after its preamble, 8 dB louder: it
+    never takes b, and a is lost as well."""
+    bench.link(1, 2, 118.0)
+    bench.link(3, 2, 110.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    listen(a, b, c)
+
+    a.tx(181, payload=b"from a")
+    assert "cad" not in b.expect("rx_begin")
+    time.sleep(FRAME_US / 4e6)          # past a's preamble, a tenth of the frame
+    c.tx(182, payload=b"from c")
+    assert b.expect("rx_begin")["cad"] is True
+    ends = b.ends(2)
+    assert ends[b"from a"]["verdict"] == "crc"
+    assert ends[b"from c"]["verdict"] == "crc"
+
+
+def test_bench_capture_a_weaker_frame_after_the_preamble_leaves_the_first(bench):
+    """b follows a's frame; c's lands after its preamble, 8 dB quieter."""
+    bench.link(1, 2, 110.0)
+    bench.link(3, 2, 118.0)
+    a, b, c = bench(1), bench(2), bench(3)
+    listen(a, b, c)
+
+    a.tx(191, payload=b"from a")
+    b.expect("rx_begin")
+    time.sleep(FRAME_US / 4e6)
+    c.tx(192, payload=b"from c")
+    assert b.expect("rx_begin")["cad"] is True
+    ends = b.ends(2)
+    assert ends[b"from a"]["verdict"] == "clean"
+    assert ends[b"from c"]["verdict"] == "crc"
+
+
+def test_bench_capture_keeps_each_frame_at_the_listener_nearer_its_sender(bench):
+    """Two frames that meet are each kept where their sender is 10 dB nearer."""
+    bench.link(1, 2, 105.0)
+    bench.link(3, 2, 115.0)
+    bench.link(1, 4, 115.0)
+    bench.link(3, 4, 105.0)
+    a, near_a, c, near_c = bench(1), bench(2), bench(3), bench(4)
+    listen(a, near_a, c, near_c)
+
+    a.tx(201, payload=b"from a")
+    c.tx(202, payload=b"from c")
+    at_a, at_c = near_a.ends(2), near_c.ends(2)
+    assert at_a[b"from a"]["verdict"] == "clean" and at_a[b"from c"]["verdict"] == "crc"
+    assert at_c[b"from c"]["verdict"] == "clean" and at_c[b"from a"]["verdict"] == "crc"
+
+
+def test_bench_capture_is_not_a_variant_of_the_pairwise_rule(tmp_path):
+    done = subprocess.run([sys.executable, ETHER, "--bench-capture", "--pairwise",
+                           "--record", str(tmp_path / "r.tsv")],
+                          capture_output=True, text=True, timeout=30)
+    assert done.returncode == 2 and "--bench-capture" in done.stderr
+
+
 def test_a_station_is_deaf_while_its_own_frame_is_going_out(ether):
     """Half duplex: a radio transmitting hears nothing, however loud."""
     ether.link(1, 2, NEAR_DB)
@@ -679,6 +1036,61 @@ def test_interference_is_summed_within_a_class(ether):
 def test_the_pairwise_rule_takes_each_interferer_alone(pairwise):
     ends = summed_interference(pairwise)
     assert ends[b"signal"]["verdict"] == "clean"
+
+
+@pytest.fixture
+def oracle(tmp_path):
+    """The ether without interference (`--no-interference`)."""
+    bed = Bench(tmp_path, "real", False, "--no-interference")
+    try:
+        yield bed
+    finally:
+        bed.close()
+
+
+def test_without_interference_a_frame_is_judged_against_noise_alone(oracle):
+    ends = summed_interference(oracle)
+    assert ends[b"signal"]["verdict"] == "clean"
+
+
+def test_without_interference_a_louder_frame_does_not_take_the_receiver(oracle):
+    """The louder frame arriving 8 dB up would take the receiver; without
+    interference the receiver keeps the frame it follows, which ends clean,
+    and the louder one is energy to it."""
+    oracle.link(1, 2, 118.0)
+    oracle.link(3, 2, 110.0)
+    quiet, b, loud = oracle(1), oracle(2), oracle(3)
+    listen(quiet, b, loud)
+
+    quiet.tx(1, payload=b"quiet")
+    assert "cad" not in b.expect("rx_begin")
+    time.sleep(0.03)
+    loud.tx(2, payload=b"loud")
+    assert b.expect("rx_begin")["cad"] is True, "one frame at a time, the first kept"
+
+    ends = b.ends(2)
+    assert ends[b"quiet"]["verdict"] == "clean"
+    assert ends[b"loud"]["verdict"] == "crc"
+
+
+def test_without_interference_a_receiver_still_cannot_hear_while_it_sends(oracle):
+    oracle.link(1, 2, 110.0)
+    a, b = oracle(1), oracle(2)
+    listen(a, b)
+    a.tx(1, payload=b"from a")
+    assert "cad" not in b.expect("rx_begin")
+    b.tx(2, payload=b"from b")
+    end = b.expect("rx_end")
+    assert end["verdict"] == "crc", "half duplex is the radio's, not interference"
+
+
+def test_without_interference_is_said_and_kept_with_the_run():
+    physics = ether_module.Physics(interference=False)
+    assert "no interference" in physics.describe()
+    assert physics.as_dict()["interference"] is False
+    assert ether_module.Physics.from_dict(physics.as_dict()).interference is False
+    assert "interference" not in ether_module.Physics().as_dict()
+    assert ether_module.Physics.from_dict({}).interference is True
 
 
 # ---------------------------------------------------------------------------
@@ -1065,6 +1477,32 @@ def test_one_instant_is_ruled_in_station_order(conductor):
     assert [m["id"] for m in begins] == sorted(m["id"] for m in begins)
 
 
+def test_a_message_the_barrier_cannot_take_drops_only_itself(conductor):
+    conductor.link(1, 3, NEAR_DB)
+    conductor.link(2, 3, NEAR_DB)
+    bad, good, rx = conductor(1), conductor(2), conductor(3)
+    for st in (bad, good, rx):
+        join_virtual(st)
+    rx.state("RX")
+    for st in (rx, bad, good):
+        idle(st, 1, None)
+    # Station 1's frame states a start that is no number. It is taken first,
+    # in station order, and must not take station 2's at the same T with it.
+    for st, t0, payload in ((bad, "soon", b"bad"), (good, 0, b"good")):
+        st.send(dict({"type": "tx", "slot": 0, "id": 1, "t0": t0,
+                      "t_pre": FRAME_US // 10, "t_hdr": FRAME_US // 5,
+                      "t_end": FRAME_US, "power_dbm": POWER_DBM,
+                      "payload": base64.b64encode(payload).decode()}, **radio("TX")))
+    idle(bad, 1, None)
+    idle(good, 1, None)
+    begin = rx.expect("rx_begin")
+    assert "cad" not in begin
+    idle(rx, begin["seq"], None)
+    end = rx.expect("rx_end")
+    assert end["id"] == begin["id"] and base64.b64decode(end["payload"]) == b"good"
+    assert end["verdict"] == "clean"
+
+
 def test_a_station_that_leaves_restarts_with_a_hello(conductor):
     a, b = conductor(1), conductor(2)
     join_virtual(a)
@@ -1242,19 +1680,21 @@ class InProcess:
         self.sock.setblocking(False)
 
     async def start(self):
-        _, self.ether = await self.loop.create_datagram_endpoint(
-            lambda: ether_module.Ether(None, time_mode="max"),
-            local_addr=("127.0.0.1", 0))
+        _, self.ether = await ether_module.open_ether(("127.0.0.1", 0), None, time_mode="max")
         self.addr = self.ether.transport.get_extra_info("sockname")
 
     def send(self, msg):
         self.sock.sendto(json.dumps(dict(msg, sid=1)).encode(), self.addr)
 
     async def recv(self, timeout=1.0):
+        raw = await self.recv_raw(timeout)
+        return None if raw is None else json.loads(raw)
+
+    async def recv_raw(self, timeout=1.0):
         end = self.loop.time() + timeout
         while self.loop.time() < end:
             try:
-                return json.loads(self.sock.recv(65535))
+                return self.sock.recv(65535)
             except BlockingIOError:
                 await asyncio.sleep(0.005)
         return None
@@ -1270,17 +1710,57 @@ class InProcess:
         self.ether.close()
 
 
-def in_process(test):
-    loop = asyncio.new_event_loop()
-    try:
-        bed = InProcess(loop)
-        loop.run_until_complete(bed.start())
+def in_process(test, conductors=None):
+    """Run `test` on an in-process ether, once for each conductor built (or
+    each of `conductors`)."""
+    for conductor in conductors or (("python", "rust") if CORE_BUILT else ("python",)):
+        before = os.environ.get("SIM_MESH_ETHER_CORE")
+        os.environ["SIM_MESH_ETHER_CORE"] = conductor
+        loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(test(bed))
+            bed = InProcess(loop)
+            loop.run_until_complete(bed.start())
+            assert isinstance(bed.ether, ether_module.CoreEther) == (conductor == "rust")
+            try:
+                loop.run_until_complete(test(bed))
+            finally:
+                bed.close()
         finally:
-            bed.close()
-    finally:
-        loop.close()
+            loop.close()
+            if before is None:
+                os.environ.pop("SIM_MESH_ETHER_CORE", None)
+            else:
+                os.environ["SIM_MESH_ETHER_CORE"] = before
+
+
+def test_a_station_that_takes_lines_is_told_an_instant_in_one_datagram():
+    """What the barrier tells a station at one instant in one go (here two
+    things that fell due there) goes as one datagram, a line each, to a
+    station that said `lines` in its hello: it applies them as one, so none
+    of its threads sees part of the instant. One that did not say so gets
+    one a datagram. Its run comes, as ever, once it has said it is idle."""
+    def check(lines):
+        async def test(bed):
+            ether = bed.ether
+            bed.send({"type": "hello", "slots": [0], "t": 0, **({"lines": 1} if lines else {})})
+            welcome = await bed.recv()
+            for n in (1, 2):
+                ether.call_at(1_000_000, lambda n=n: ether.send(1, {"type": "note", "n": n}))
+            bed.send({"type": "idle", "seq": welcome["seq"], "until": 1_000_000})
+            got = [await bed.recv_raw()]
+            if not lines:
+                got.append(await bed.recv_raw())
+            assert await bed.recv_raw(0.1) is None
+            said = [json.loads(line) for raw in got for line in raw.split(b"\n")]
+            assert [(m["type"], m["n"]) for m in said] == [("note", 1), ("note", 2)]
+            assert [m["seq"] for m in said] == [welcome["seq"] + 1, welcome["seq"] + 2]
+            assert all(m["t"] == 1_000_000 for m in said)
+            bed.send({"type": "idle", "seq": said[-1]["seq"], "until": 1_000_000})
+            run = await bed.recv()
+            assert run["type"] == "run" and run["t"] == 1_000_000
+        in_process(test)
+    check(lines=True)
+    check(lines=False)
 
 
 def test_t_stays_at_a_sleeps_end_until_what_it_woke_has_run():
@@ -1329,6 +1809,270 @@ def test_a_line_typed_at_a_station_waits_for_it_to_have_t_and_holds_t_until_read
         assert not ether.busy()
 
     in_process(test)
+
+
+def test_t_stands_at_a_hello_until_what_waited_for_it_has_run():
+    """joined(): done at the expected station's hello, with T held there until
+    what it woke has run; nothing waiting, nothing held."""
+    async def test(bed):
+        ether = bed.ether
+        ether.expect(1)
+        ether.call_at(1_000_000, lambda: None)
+        seen = []
+
+        async def waiter():
+            await ether.joined(1)
+            await asyncio.sleep(0)              # a turn of the loop later
+            seen.append(ether.now())
+            ether.tool_session(1)               # T stays for this from here
+
+        task = asyncio.ensure_future(waiter())
+        await asyncio.sleep(0.01)
+        bed.send({"type": "hello", "slots": [0], "t": 0})
+        welcome = await bed.recv()
+        bed.send({"type": "idle", "seq": welcome["seq"], "until": None})
+        await asyncio.sleep(0.05)
+        await task
+        assert seen == [0]
+        assert ether.now() == 0                 # held: the session has the floor
+        assert ether.joined(1).done()
+
+    in_process(test)
+
+
+def test_what_stations_say_at_one_instant_is_recorded_in_station_order(conductor):
+    """A virtual run's state and tx are taken at the barrier in station
+    order, and recorded then: the record does not depend on which of two
+    stations the host ran first."""
+    one, two = conductor(1), conductor(2)
+    seqs = {}
+    for station in (one, two):
+        seqs[station.sid] = station.hello()["seq"]
+        station.send({"type": "idle", "seq": seqs[station.sid], "until": None})
+    time.sleep(0.1)
+    two.state("RX")
+    one.state("RX")
+    time.sleep(0.1)
+    for station in (two, one):
+        station.send({"type": "idle", "seq": seqs[station.sid], "until": None})
+    time.sleep(0.2)
+    conductor.close()
+    lines = [line.split("\t") for line in conductor.record.read_text().splitlines()
+             if not line.startswith("#")]
+    states = [int(sid) for _, direction, sid, text in lines
+              if direction == "in" and '"type":"state"' in text]
+    assert states == [1, 2]
+
+
+def test_a_tool_session_holds_t_while_the_tool_has_the_floor():
+    """tool_session(): T stands from the start until the station says it has
+    read what the tool wrote (`floor` to the station), runs while the
+    station works, stands again once it has answered (`floor` to the tool),
+    and goes when the session ends. A floor outside a session holds nothing."""
+    async def test(bed):
+        ether = bed.ether
+        await bed.join()
+        ether.call_at(1_000_000, lambda: None)
+        end = ether.tool_session(1)
+        ether.kick()
+        await asyncio.sleep(0.05)
+        assert ether.now() == 0                 # the tool has the floor
+        bed.send({"type": "floor", "to": "station"})
+        brought = await bed.recv()              # brought to the run's T first
+        assert (brought["type"], brought["t"], brought["floor"]) == ("run", 0, 1)
+        await asyncio.sleep(0.05)
+        assert ether.now() == 0                 # it owes an idle for that
+        bed.send({"type": "idle", "seq": brought["seq"], "until": 2_000_000})
+        await asyncio.sleep(0.05)
+        run = await bed.recv()                  # the station's floor: T runs, to its wake
+        assert (run["type"], run["t"]) == ("run", 2_000_000)
+        assert ether.now() == 2_000_000
+        bed.send({"type": "floor", "to": "tool"})
+        await asyncio.sleep(0.05)
+        assert ether.holds == 1
+        end()
+        await asyncio.sleep(0.05)
+        assert ether.holds == 0 and 1 not in ether.floors
+        # No session: a floor is only the station speaking.
+        bed.send({"type": "floor", "to": "tool"})
+        await asyncio.sleep(0.05)
+        assert ether.holds == 0
+
+    in_process(test)
+
+
+def test_t_does_not_wait_on_a_drain_that_found_nothing_printed():
+    """A drain that says False has read nothing and set nothing going, and
+    is not waited for: T moves on at once, with no turn of the loop taken."""
+    async def test(bed):
+        ether = bed.ether
+        asked = []
+
+        def on_drain(sids, done):
+            asked.append((sids, ether.now()))
+            return False
+        ether.on_drain = on_drain
+        await bed.join()
+        ether.call_at(3_000_000, lambda: None)
+        ether.kick()
+        assert asked == [([1], 0)]
+        assert ether.now() == 3_000_000         # in the same kick, no hold left
+        assert ether.holds == 0
+
+    in_process(test)
+
+
+def test_a_watched_console_holds_t_only_once_it_has_printed():
+    """With drains_watched, on_drain answers exactly whether a watched
+    console shows something: T goes on at once past a station that printed
+    nothing, and waits for the read of one that did. A core looks at the
+    console itself and asks only then; Ether's own conductor asks each time."""
+    async def test(bed):
+        ether = bed.ether
+        r, w = os.pipe()
+        os.set_blocking(r, False)
+        marks = ether.console_marks(r)
+        if marks is None:
+            marks = types.SimpleNamespace(master=r, reading=False, taking=False,
+                                          taken=0, caught=0)
+        marks.reading = True
+        asked = []
+
+        def on_drain(sids, done):
+            asked.append((sids, ether.now()))
+            if not select.select([r], [], [], 0)[0]:
+                return False
+            os.read(r, 100)
+            bed.loop.call_later(0.05, done)
+            return True
+        ether.watch(1, marks)
+        ether.on_drain = on_drain
+        ether.drains_watched = True
+        ether.call_at(1_000_000, lambda: None)
+        try:
+            bed.send({"type": "hello", "slots": [0], "t": 0})
+            welcome = await bed.recv()
+            bed.send({"type": "idle", "seq": welcome["seq"], "until": 500_000})
+            run = await bed.recv()                  # nothing printed: T went on
+            assert (run["type"], run["t"]) == ("run", 500_000)
+            os.write(w, b"hello\n")                 # it prints, and is idle
+            bed.send({"type": "idle", "seq": run["seq"], "until": None})
+            await asyncio.sleep(0.02)
+            assert ether.now() == 500_000           # held for the read
+            assert asked[-1] == ([1], 500_000)
+            await asyncio.sleep(0.1)
+            assert ether.now() == 1_000_000         # read, and T went on
+            if isinstance(ether, ether_module.CoreEther):
+                assert asked == [([1], 500_000)]    # never asked about nothing
+            else:
+                assert asked == [([1], 0), ([1], 500_000)]
+        finally:
+            ether.unwatch(1, marks)
+            os.close(r)
+            os.close(w)
+
+    in_process(test)
+
+
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim-mesh build ether)")
+def test_a_burst_the_kernel_could_not_hold_is_heard_whole_by_the_core():
+    """The core's reader thread takes datagrams off the socket as they come,
+    whatever the loop's thread is doing: a burst far past the kernel's receive
+    buffer, sent while the loop is busy, arrives whole. The kernel dropping
+    one would be a station's `state` or `tx` the medium never heard."""
+    async def test(bed):
+        ether = bed.ether
+        socks = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(4)]
+        try:
+            for s in socks:
+                s.bind(("127.0.0.1", 0))
+            # 1500 hellos, the loop blocked the while: past 200 KB of buffer.
+            for sid in range(2, 1502):
+                hello = {"type": "hello", "sid": sid, "slots": [0], "t": 0}
+                socks[sid % 4].sendto(json.dumps(hello).encode(), bed.addr)
+            time.sleep(0.2)
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if len(ether.stations) == 1500:
+                    break
+            assert len(ether.stations) == 1500
+            assert ether.core.drops == 0
+        finally:
+            for s in socks:
+                s.close()
+
+    in_process(test, conductors=("rust",))
+
+
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim-mesh build ether)")
+def test_datagrams_that_come_while_the_core_is_handling_others_are_all_heard():
+    """Datagrams keep coming from another thread while the loop handles the
+    ones before them: every one is heard, none left queued with nothing to
+    wake the loop for it."""
+    async def test(bed):
+        ether = bed.ether
+
+        def send_all():
+            socks = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(4)]
+            try:
+                for sid in range(2, 3002):
+                    hello = {"type": "hello", "sid": sid, "slots": [0], "t": 0}
+                    socks[sid % 4].sendto(json.dumps(hello).encode(), bed.addr)
+                    if sid % 50 == 0:
+                        time.sleep(0.001)
+            finally:
+                for s in socks:
+                    s.close()
+        sender = threading.Thread(target=send_all)
+        sender.start()
+        for _ in range(600):
+            await asyncio.sleep(0.01)
+            if len(ether.stations) == 3000 and not sender.is_alive():
+                break
+        sender.join()
+        assert len(ether.stations) == 3000
+
+    in_process(test, conductors=("rust",))
+
+
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim-mesh build ether)")
+def test_the_core_counts_what_the_kernel_dropped_on_its_socket():
+    """Datagrams the kernel could not hold before anyone read them are
+    counted, from what it says with the next one (SO_RXQ_OVFL), and simd
+    reports them as what may void the run."""
+    async def test():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        sock.bind(("127.0.0.1", 0))
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            for _ in range(500):            # far past a 4 KB buffer, nobody reading
+                sender.sendto(b'{"type": "hello"}', sock.getsockname())
+            ether = ether_module.CoreEther(sock, None, time_mode="max",
+                                           module=ether_module.core_module())
+            try:
+                # The kernel stamps its count on a datagram as it queues it,
+                # from when the core has asked for it: the next one says.
+                for _ in range(100):
+                    await asyncio.sleep(0.01)
+                    sender.sendto(b'{"type": "hello"}', sock.getsockname())
+                    if ether.core.drops:
+                        break
+                assert ether.core.drops > 0
+            finally:
+                ether.close()
+        finally:
+            sender.close()
+
+    before = os.environ.get("SIM_MESH_ETHER_CORE")
+    os.environ["SIM_MESH_ETHER_CORE"] = "rust"
+    try:
+        asyncio.run(test())
+    finally:
+        if before is None:
+            os.environ.pop("SIM_MESH_ETHER_CORE", None)
+        else:
+            os.environ["SIM_MESH_ETHER_CORE"] = before
 
 
 def test_what_stations_printed_is_read_before_t_moves():

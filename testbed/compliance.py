@@ -35,6 +35,7 @@ import os
 import sys
 
 import antennas as antennas_module
+import referee
 from sim_mesh import record as record_module
 from sim_mesh.view import RunView
 
@@ -117,18 +118,33 @@ class OnAir:
 
 
 def frames_of(path):
-    """(station id, start s, end s, carrier Hz, bandwidth Hz, power dBm) for
-    every transmission in the record."""
+    """(station id, start s, end s, carrier Hz, bandwidth Hz, power dBm, run s)
+    for every transmission in the record. Start and end are the `tx`'s own,
+    on its station's clock, which an hour is summed on; run s is when the
+    record took it, on the run's clock (`referee.Record.seconds`: T, or the
+    wall clock since the record's first line), which in a real-time run a
+    station's own clock is not."""
     out = []
-    for _stamp, direction, sid, msg in record_module.lines(path):
-        if direction != "in" or msg.get("type") != "tx":
+    first = record_module.first_stamp(path)
+    origin = None if first is None else 0 if ":" not in first else referee.to_us(first)
+    for stamp, direction, sid, msg in record_module.lines(path, types=("tx",)):
+        if direction != "in":
             continue
         t0, t_end = msg.get("t0"), msg.get("t_end")
         if t0 is None or t_end is None:
             continue
         out.append((sid, t0 / 1e6, t_end / 1e6, int(msg.get("freq") or 0),
-                    int(msg.get("bw") or 125_000), float(msg.get("power_dbm") or 0)))
+                    int(msg.get("bw") or 125_000), float(msg.get("power_dbm") or 0),
+                    (referee.to_us(stamp) - origin) / 1e6))
     return out
+
+
+def run_seconds(frames, t):
+    """An instant on one station's clock in run seconds, through the first
+    of its frames from then on (its last, when none is)."""
+    later = [f for f in frames if f[1] >= t]
+    f = min(later, key=lambda f: f[1]) if later else max(frames, key=lambda f: f[1])
+    return f[6] + (t - f[1])
 
 
 def shortest_pause(frames):
@@ -154,7 +170,8 @@ def judge(frames, entry, gain_dbi):
     power_ok = erp <= erp_limit + 0.005
     allowed = None if (free_below is not None and erp <= free_below + 0.005) else duty * HOUR_S
     row = {"band": band_name(entry), "frames": len(frames),
-           "worst_hour_s": round(worst_s, 3), "worst_hour_from": round(worst_at, 3),
+           "worst_hour_s": round(worst_s, 3),
+           "worst_hour_from": round(run_seconds(frames, worst_at), 3),
            "allowed_s": allowed, "duty": None if allowed is None else duty,
            "erp_dbm": round(erp, 2), "erp_limit_dbm": round(erp_limit, 2),
            "power_ok": power_ok}

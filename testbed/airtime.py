@@ -4,9 +4,9 @@
     airtime.py RUN [--record PATH] [--from S] [--to S] [--calling HZ]
                [--gap S] [--busy] [--roles] [--json OUT]
 
-Reads the run's `record.tsv` (or --record; a virtual-time run's: the first
-column is T in seconds) and counts every transmission that starts inside
-[--from, --to):
+Reads the run's `record.tsv` (or --record) and counts every transmission
+that starts inside [--from, --to): seconds of T in a virtual-time run, of
+the wall clock since the record's first line in a real one.
 
 - airtime: total seconds on the air, per station (mean and maximum), and as
   a fraction of the window; split into the calling channel (--calling; by
@@ -27,10 +27,12 @@ column is T in seconds) and counts every transmission that starts inside
   station received and every one of them lost, and frames nobody was in a
   position to receive.
 
-A reception is tied to its transmission by the instant the frame went on the
-air and its payload: the ether starts a frame at the T it takes it, which is
-the T its `tx` line is stamped with, and names it in `rx_begin` / `rx_end`
-by a number of its own that the `tx` line does not carry.
+A reception is tied to its transmission by the ether's own number for the
+frame, which `rx_begin` and `rx_end` carry and the `tx` line does not, the
+way the referee ties them (`referee.Record`, at the run's levels), and not
+by when the frame went on the air and what it carried: two frames at one T
+can carry the same bytes, and a slot told of a frame mid-way is told it
+from then.
 
 --busy adds, per station, the share of the window the calling channel was
 occupied where it stands: its own frames and every frame it was told of.
@@ -47,10 +49,11 @@ of traffic channels any frame in the window used; and in total.
 import argparse
 import base64
 import collections
-import hashlib
 import json
 import sys
 
+import referee
+from sim_mesh import record as record_module
 from sim_mesh import reticulum
 from sim_mesh.reticulum import frames as rframes
 from sim_mesh.view import RunView
@@ -85,29 +88,22 @@ def generic_kind(payload, part):
     return "frame"
 
 
-def analyse(args, kind_of=rframes.kind_of):
+def analyse(args, kind_of=rframes.kind_of, level_at=None):
     lo = int(args.frm * 1e6) if args.frm is not None else None
     hi = int(args.to * 1e6) if args.to is not None else None
     calling = args.calling
 
+    record = referee.Record(args.record, level_at)
+    tx_line = {eid: f.line for eid, f in record.by_eid.items()}   # ether frame id -> its `tx`
     frames = []                     # one dict per transmission in the window
-    by_key = {}                     # (t_us, payload digest) -> index into frames
-    begins = {}                     # (receiver, ether frame id) -> the frame's start
-    carrier = {}                    # (start, length) -> carrier, for --busy
+    at_line = {}                    # its `tx`'s place among the record's lines -> index into frames
     halves = rframes.Halves()
     busy = collections.defaultdict(list)
-    for line in open(args.record, encoding="utf-8"):
-        if line.startswith("#"):
-            continue
-        is_tx = '"type":"tx"' in line
-        if not is_tx and '"type":"rx_' not in line:
-            continue
-        stamp, direction, sid, blob = line.rstrip("\n").split("\t", 3)
-        msg = json.loads(blob)
-        if is_tx and direction == "in":
-            t_us = int(round(float(stamp) * 1e6))
+    for line, (stamp, direction, s, msg) in enumerate(record_module.lines(args.record)):
+        kind = msg.get("type")
+        if direction == "in" and kind == "tx":
+            t_us = referee.to_us(stamp) - record.origin
             payload = base64.b64decode(msg.get("payload") or "")
-            s = int(sid)
             part = halves.part(s, payload)
             if (lo is not None and t_us < lo) or (hi is not None and t_us >= hi):
                 continue
@@ -118,39 +114,27 @@ def analyse(args, kind_of=rframes.kind_of):
             if f["kind"] is None:
                 prev = next((g for g in reversed(frames[-64:]) if g["sid"] == s), None)
                 f["kind"] = prev["kind"] if prev else "data"
-            by_key[(t_us, hashlib.blake2b(payload, digest_size=8).digest())] = len(frames)
-            carrier[(t_us, span)] = f["freq"]
+            at_line[line] = len(frames)
             frames.append(f)
             if args.busy and abs(f["freq"] - calling) <= TOLERANCE_HZ:
                 busy[s].append((t_us, t_us + span))
-        elif direction == "out" and msg.get("type") == "rx_begin":
-            if msg.get("cad"):
-                continue
-            t0 = int(msg["t0"])
-            if (lo is not None and t0 < lo) or (hi is not None and t0 >= hi):
-                continue
-            begins[(int(sid), msg["id"])] = t0
-            if args.busy:
-                # rx_begin does not name the carrier; the transmission that
-                # started at that instant and runs that long does.
-                t_end = int(msg["t_end"])
-                freq = carrier.get((t0, t_end - t0))
-                if freq is not None and abs(freq - calling) <= TOLERANCE_HZ:
-                    busy[int(sid)].append((t0, t_end))
-        elif direction == "out" and msg.get("type") == "rx_end":
-            t0 = begins.pop((int(sid), msg["id"]), None)
-            if t0 is None:
-                continue
-            payload = base64.b64decode(msg.get("payload") or "")
-            i = by_key.get((t0, hashlib.blake2b(payload, digest_size=8).digest()))
+        elif direction == "out" and kind in ("rx_begin", "rx_end"):
+            i = at_line.get(tx_line.get(msg.get("id")))
             if i is None:
                 continue
             f = frames[i]
-            f["rx"] += 1
-            if msg.get("verdict") == "clean":
-                f["clean"] += 1
-            else:
-                f["crc"] += 1
+            if kind == "rx_end":
+                f["rx"] += 1
+                if msg.get("verdict") == "clean":
+                    f["clean"] += 1
+                else:
+                    f["crc"] += 1
+            elif args.busy and not msg.get("cad") and abs(f["freq"] - calling) <= TOLERANCE_HZ:
+                # Occupied from when the slot was told, on the record's
+                # clock, to the frame's end.
+                told = referee.to_us(stamp) - record.origin
+                if (lo is None or told >= lo) and (hi is None or told < hi):
+                    busy[s].append((told, f["t"] + f["span"]))
 
     if not frames:
         return frames, 0.0, busy
@@ -211,11 +195,12 @@ def report(frames, window, busy, args, names, roles=None):
         if not fs:
             return None
         air = sum(f["span"] for f in fs)
+        top = max(g["power"] for g in fs)
         return {"frames": len(fs),
                 "mean_by_frame": sum(f["power"] for f in fs) / len(fs),
                 "mean_by_airtime": sum(f["power"] * f["span"] for f in fs) / air if air else None,
                 "min_q1_median_q3_max": quartiles([f["power"] for f in fs]),
-                "below_max_frames": sum(1 for f in fs if f["power"] < max(g["power"] for g in fs))}
+                "below_max_frames": sum(1 for f in fs if f["power"] < top)}
     out["power_calling"] = power(on_call)
     out["power_traffic_channels"] = power(lambda f: not on_call(f))
 
@@ -293,7 +278,7 @@ def main(argv=None):
     if args.calling is None:
         args.calling = view.calling_hz()
     kind_of = rframes.kind_of if reticulum in view.protocols() else generic_kind
-    frames, window, busy = analyse(args, kind_of)
+    frames, window, busy = analyse(args, kind_of, referee.Air(view.medium()).level)
     out = report(frames, window, busy, args, view.names,
                  view.roles() if args.roles else None)
     text = json.dumps(out, indent=1, default=list)

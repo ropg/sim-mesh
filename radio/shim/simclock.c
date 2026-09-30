@@ -38,8 +38,9 @@
  * thread is blocked while it is inside one of the waits above, an untimed
  * pthread_cond_wait or sem_wait, or a read, recv or accept on a blocking
  * descriptor that is not a file (a regular file, directory or disk never
- * waits on anything outside the process); when the last one blocks, the
- * station is idle, and the shim says so to the chip library, whose wakes
+ * waits on anything outside the process); when the last one blocks, and none
+ * of the descriptors the blocked threads wait on has anything ready for them,
+ * the station is idle, and the shim says so to the chip library, whose wakes
  * already hold every deadline the blocked threads are waiting for. A wake
  * that fires counts its thread as running at once, and so does a
  * pthread_cond_signal or pthread_cond_broadcast every thread waiting on that
@@ -265,6 +266,8 @@ static int64_t clock_now(const struct simclock_ops* o, clockid_t c)
 
 /* ---- Threads: their wake, and the census ---- */
 
+#define WAIT_FDS 8          /* the descriptors of one wait the census looks at */
+
 struct thread_rec {
     int         efd;        /* the eventfd a wake writes to */
     int         wake;       /* the chip library's wake for this thread */
@@ -277,6 +280,11 @@ struct thread_rec {
     sem_t* _Atomic sem;             /* the semaphore it waits on */
     atomic_int  sem_fired;          /* a timed wait's deadline came */
     int         counted;    /* in the census */
+    /* The descriptors it waits on while it is blocked (census_quiet): set
+     * before it counts itself blocked, cleared after it counts itself
+     * running, so whoever sees it blocked sees them. */
+    struct pollfd waiting[WAIT_FDS];
+    atomic_int  nwaiting;
 };
 
 static __thread struct thread_rec* t_rec;
@@ -408,13 +416,68 @@ static struct thread_rec* rec(const struct simclock_ops* o)
     return r;
 }
 
-/* The census: the station is idle when every thread it counts is blocked. */
+/* What a thread is about to block on, for census_quiet. */
+static void wait_on(struct thread_rec* r, const struct pollfd* fds, nfds_t n)
+{
+    if (!r) return;
+    int k = 0;
+    for (nfds_t i = 0; i < n && k < WAIT_FDS; i++) {
+        if (fds[i].fd < 0) continue;
+        r->waiting[k].fd = fds[i].fd;
+        r->waiting[k].events = fds[i].events;
+        r->waiting[k].revents = 0;
+        k++;
+    }
+    atomic_store(&r->nwaiting, k);
+}
+
+static void wait_on_fd(struct thread_rec* r, int fd, short events)
+{
+    struct pollfd p = { fd, events, 0 };
+    wait_on(r, &p, 1);
+}
+
+static void wait_done(struct thread_rec* r)
+{
+    if (r) atomic_store(&r->nwaiting, 0);
+}
+
+/* Whether nothing is on its way to a blocked thread: none of the descriptors
+ * the blocked threads wait on is ready for them. A thread woken through a
+ * descriptor - a pipe another thread of the station wrote, a socket - counts
+ * as blocked until it runs and says otherwise, and a station that said idle
+ * in between had T move under the work it was woken for; which of the two
+ * the host ran first decided it. */
+static int census_quiet(void)
+{
+    struct pollfd all[64];
+    int n = 0;
+    sigset_t sigs, old;
+    sigfillset(&sigs);
+    pthread_sigmask(SIG_BLOCK, &sigs, &old);
+    pthread_mutex_lock(&s_condLock);
+    for (int i = 0; i < MAX_RECS && n < 64; i++) {
+        struct thread_rec* w = s_recs[i];
+        if (!w || !atomic_load(&w->blocked)) continue;
+        int k = atomic_load(&w->nwaiting);
+        for (int j = 0; j < k && n < 64; j++) all[n++] = w->waiting[j];
+    }
+    pthread_mutex_unlock(&s_condLock);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    if (n == 0) return 1;
+    for (int i = 0; i < n; i++) all[i].revents = 0;
+    return REAL(poll)(all, (nfds_t)n, 0) <= 0;
+}
+
+/* The census: the station is idle when every thread it counts is blocked and
+ * nothing is ready to wake one of them. A station not yet idle for the second
+ * reason says so when the thread that was woken blocks again. */
 static void census_block(const struct simclock_ops* o, struct thread_rec* r)
 {
     if (!s_census || !o || !r || !r->counted) return;
     if (!atomic_exchange(&r->blocked, 1)) {
         int b = atomic_fetch_add(&s_blocked, 1) + 1;
-        if (b >= atomic_load(&s_live)) o->idle();
+        if (b >= atomic_load(&s_live) && census_quiet()) o->idle();
     }
 }
 
@@ -486,18 +549,21 @@ static struct thread_rec* ready_rec(const struct simclock_ops* o)
 }
 
 /* A wait with no timeout has nothing to do with the clock: the C library's
- * own, counted in the census as a blocked thread. */
-#define UNTIMED_CALL(call)                                            \
+ * own, counted in the census as a blocked thread, waiting on `wfds`. */
+#define UNTIMED_CALL_ON(call, wfds, wn)                               \
     do {                                                              \
         if (!s_census) return call;                                   \
         struct thread_rec* r_ = ready_rec(o);                         \
+        wait_on(r_, wfds, wn);                                        \
         census_block(o, r_);                                          \
         __typeof__(call) rc_ = call;                                  \
         int e_ = errno;                                               \
         census_run(r_);                                               \
+        wait_done(r_);                                                \
         errno = e_;                                                   \
         return rc_;                                                   \
     } while (0)
+#define UNTIMED_CALL(call) UNTIMED_CALL_ON(call, NULL, 0)
 
 /* Wait on this thread's eventfd, and `extra` descriptors, until one is ready,
  * a signal arrives, or node time reaches `deadline` (µs, NEVER for none).
@@ -519,10 +585,12 @@ static int node_wait(const struct simclock_ops* o, struct pollfd* extra, nfds_t 
     int result = 0;
     for (;;) {
         if (deadline != NEVER && o->node_us() >= deadline) { result = 0; break; }
+        wait_on(r, fds, n + 1);
         census_block(o, r);
         fds[n].revents = 0;
         int rc = REAL(ppoll)(fds, n + 1, NULL, mask);
         census_run(r);
+        wait_done(r);
         if (rc < 0) { result = -1; break; }
         if (fds[n].revents) drain(r->efd);
         int ready = 0;
@@ -702,7 +770,7 @@ int ppoll(struct pollfd* fds, nfds_t n, const struct timespec* tmo, const sigset
     const struct simclock_ops* o = ops();
     if (!o || (tmo && tmo->tv_sec == 0 && tmo->tv_nsec == 0))
         return REAL(ppoll)(fds, n, tmo, mask);
-    if (!tmo) UNTIMED_CALL(REAL(ppoll)(fds, n, tmo, mask));
+    if (!tmo) UNTIMED_CALL_ON(REAL(ppoll)(fds, n, tmo, mask), fds, n);
     int64_t deadline = o->node_us() + ts_us(tmo);
     int rc = node_wait(o, fds, n, deadline, mask);
     if (rc == -2) return REAL(ppoll)(fds, n, tmo, mask);
@@ -783,7 +851,10 @@ int epoll_pwait(int epfd, struct epoll_event* ev, int max, int timeout, const si
 {
     const struct simclock_ops* o = ops();
     if (!o || timeout == 0) return REAL(epoll_pwait)(epfd, ev, max, timeout, mask);
-    if (timeout < 0) UNTIMED_CALL(REAL(epoll_pwait)(epfd, ev, max, timeout, mask));
+    if (timeout < 0) {
+        struct pollfd ep = { epfd, POLLIN, 0 };
+        UNTIMED_CALL_ON(REAL(epoll_pwait)(epfd, ev, max, timeout, mask), &ep, 1);
+    }
     int64_t deadline = o->node_us() + (int64_t)timeout * 1000;
     for (;;) {
         struct pollfd p = { epfd, POLLIN, 0 };
@@ -1057,10 +1128,12 @@ static int blocking(int fd, int flags)
         const struct simclock_ops* o_ = ops();                            \
         if (!o_ || !s_census || !blocking(fd, flags)) { rc = call; break; } \
         struct thread_rec* r_ = ready_rec(o_);                            \
+        wait_on_fd(r_, fd, POLLIN);                                       \
         census_block(o_, r_);                                             \
         rc = call;                                                        \
         int e_ = errno;                                                   \
         census_run(r_);                                                   \
+        wait_done(r_);                                                    \
         errno = e_;                                                       \
     } while (0)
 
@@ -1283,8 +1356,13 @@ static int is_timerfd(int fd)
     return yes;
 }
 
-/* Whether any thread of the process but this one is on the CPU or waiting
- * for it; and the user and system time, in clock ticks, of all of them. */
+/* What the process's other threads are doing: WORKING_CPU when one is on the
+ * CPU or waiting for it, WORKING_DISK when one waits on the disk (state D: a
+ * read or write it started, which ends on its own); and the user and system
+ * time, in clock ticks, of all of them. */
+#define WORKING_CPU  1
+#define WORKING_DISK 2
+
 static int others_running(long long* user, long long* sys)
 {
     *user = *sys = 0;
@@ -1313,7 +1391,8 @@ static int others_running(long long* user, long long* sys)
              * stime; the name may hold anything, so from its last ')'. */
             char* p = strrchr(stat, ')');
             if (!p || p[1] != ' ') continue;
-            if (p[2] == 'R') running = 1;
+            if (p[2] == 'R') running |= WORKING_CPU;
+            if (p[2] == 'D') running |= WORKING_DISK;
             p += 3;
             for (int field = 0; field < 10 && p; field++) p = strchr(p + 1, ' ');
             if (!p) continue;
@@ -1334,7 +1413,11 @@ static int64_t mono_ns(void)
 }
 
 /* The timer `fd` has expired and `buf` holds the count: hand it on once no
- * other thread is computing. */
+ * other thread is computing or waiting on the disk. A thread in a disk wait
+ * is in the middle of work: let go, T would move under it, and it would
+ * carry on at an instant that depends on the disk. Nor is it a spin, which
+ * is told by time spent and nothing read or written: its write is under way,
+ * and takes no CPU while it waits. */
 static ssize_t hold_expiry(int fd, void* buf)
 {
     int64_t start = mono_ns();
@@ -1347,9 +1430,11 @@ static ssize_t hold_expiry(int fd, void* buf)
         if (timerfd_settime(fd, 0, &again, NULL) != 0) break;
         ssize_t rc = REAL(read)(fd, buf, sizeof(uint64_t));
         if (rc != (ssize_t)sizeof(uint64_t)) return rc;
-        if (!others_running(&user, &sys)) break;
+        int working = others_running(&user, &sys);
+        if (!working) break;
         int64_t spent = mono_ns() - start;
         if (spent >= WATCH_CAP_NS) break;
+        if (working & WORKING_DISK) continue;
         if (spent >= WATCH_SPIN_NS && sys - sys0 >= user - user0
             && atomic_load(&s_ioCalls) == io0)
             break;

@@ -3,8 +3,8 @@
 #
 #     sim-mesh [front] [FRONT-ARGS…]   start the front on port 8800 and open the page,
 #                                      first building whichever of the page, the chip
-#                                      library and the planner is missing or older
-#                                      than a file of its sources
+#                                      library, the ether's conductor and the planner is
+#                                      missing or older than a file of its sources
 #     sim-mesh new [NAME] (--geodata G --nodeset N | --snapshot S)
 #                  [--time max|<k>x|real] [--stagger N] [--build B] [--pairwise]
 #                                      start a simulation (and the front, when none runs);
@@ -32,16 +32,22 @@
 #     sim-mesh devices delete DEVICE   remove a saved build
 #     sim-mesh devices import ZIP      a device zip into the saved builds
 #     sim-mesh devices resolve DEVICE  what a device name runs, as JSON
-#     sim-mesh build [page|radio|planner]…
-#                                      build the page, the chip library and the planner
-#                                      (all three when none is named)
+#     sim-mesh build [page|radio|ether|planner]…
+#                                      build the page, the chip library, the ether's
+#                                      conductor and the planner (all four when none is
+#                                      named)
+#     sim-mesh install [--dry-run]     on Linux, what running natively needs, as sim-mesh's
+#                                      image holds it: the system's packages (sudo), Node
+#                                      22 where the system's is older, Rust, and Reticulum
+#                                      and LXMF in .venv beside this script; then the build
 #
 # The simulation verbs (new, stop, pause, resume, list, plan, run) take --port, the front's
 # (default 8800).
 #
 # Stations need Linux: each binds its own 127.x.y.z address and the virtual-time
 # shim is an LD_PRELOAD library. On Linux everything runs natively. Anywhere else,
-# or with SIM_MESH_DOCKER=1, the same command runs inside sim-mesh's own image
+# or with SIM_MESH_DOCKER=1, the same command runs inside sim-mesh's own image, under
+# docker, or podman where there is no docker (SIM_MESH_RUNTIME chooses)
 # (Dockerfile beside this script), built on first use and again whenever the
 # Dockerfile changes, with the directory holding sim-mesh mounted at its own path
 # so a workspace beside it is where a workspace build expects it, and port 8800
@@ -54,14 +60,22 @@
 #
 # Environment:
 #     SIM_MESH_PYTHON      the python3 to run (default: the first of python3,
-#                          /usr/bin/python3 that has aiohttp and yaml)
+#                          /usr/bin/python3 that has aiohttp and yaml); with a .venv
+#                          beside this script (sim-mesh install), its python3 is first,
+#                          for sim-mesh and every station it starts
 #     SIM_MESH_CATALOGUES  where bare catalogue names are fetched from
 #                          (default https://reticulous.net/builds/)
 #     SIM_MESH_DOCKER=1    use the container on Linux too
+#     SIM_MESH_RUNTIME     the container runtime, docker or podman (default: docker
+#                          when it is installed, else podman)
 
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# The Python environment `sim-mesh install` makes: first on the path, so the front,
+# the tools and a station that is a Python script (standard_reticulum's) all
+# find what it holds.
+if [ -x "$ROOT/.venv/bin/python3" ]; then PATH="$ROOT/.venv/bin:$PATH"; fi
 PORT=8800
 URL="http://localhost:$PORT/"
 PLANNER=$ROOT/planner
@@ -101,46 +115,70 @@ open_when_up() {
     ) &
 }
 
+# The container runtime: SIM_MESH_RUNTIME when set, else docker, else podman.
+runtime() {
+    local r=${SIM_MESH_RUNTIME:-}
+    if [ -z "$r" ]; then
+        if command -v docker >/dev/null; then r=docker
+        elif command -v podman >/dev/null; then r=podman
+        else die "stations need Linux; on $(uname -s) sim-mesh runs in a container, and neither docker nor podman is installed"
+        fi
+    fi
+    command -v "$r" >/dev/null || die "SIM_MESH_RUNTIME is $r, which is not installed"
+    printf '%s\n' "$r"
+}
+
+# Whether the runtime is podman (a `docker` that is podman says so too).
+is_podman() { "$1" --version 2>/dev/null | grep -qi podman; }
+
 in_container() {
     local publish=$1; shift
-    command -v docker >/dev/null || die "stations need Linux; on $(uname -s) sim-mesh runs in Docker, which is not installed"
-    local tag image
+    local rt tag image
+    rt=$(runtime)
     tag=$(cksum < "$ROOT/Dockerfile" | cut -d' ' -f1)
     image="sim-mesh:$tag"
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
+    if ! "$rt" image inspect "$image" >/dev/null 2>&1; then
         say "building the sim-mesh image ($image)…"
-        docker build -t "$image" "$ROOT"
+        "$rt" build -t "$image" "$ROOT"
     fi
     local outer
     outer=$(cd "$ROOT/.." && pwd)
+    # A station binds its web UI's port 80 and 443 as the caller's user: the
+    # container lets any user take a port under 1024, as Docker's do by
+    # default and podman's do not.
     local args=(run --rm --init -i
                 --user "$(id -u):$(id -g)"
+                --sysctl net.ipv4.ip_unprivileged_port_start=0
                 -v "$outer:$outer" -w "$ROOT"
                 -v sim-mesh-home:/home/sim-mesh -e HOME=/home/sim-mesh
                 -e SIM_MESH_IN_CONTAINER=1)
+    # A rootless podman keeps the caller's id inside, or what the container
+    # writes in the mounted directory would belong to a subordinate id.
+    if is_podman "$rt" && [ "$(id -u)" != 0 ]; then args+=(--userns=keep-id); fi
     [ -t 0 ] && [ -t 1 ] && args+=(-t)
     [ -z "${SIM_MESH_CATALOGUES:-}" ] || args+=(-e "SIM_MESH_CATALOGUES=$SIM_MESH_CATALOGUES")
     if [ "$publish" = 1 ]; then
         # One front at a time: a running one is said so, and one left behind
         # stopped (--rm did not get to it) is cleared out of the name's way.
-        if [ -n "$(docker ps -q -f "name=^${FRONT_CONTAINER}\$")" ]; then
-            die "a front is already running ($FRONT_CONTAINER): to restart it, docker stop $FRONT_CONTAINER first"
+        if [ -n "$("$rt" ps -q -f "name=^${FRONT_CONTAINER}\$")" ]; then
+            die "a front is already running ($FRONT_CONTAINER): to restart it, $rt stop $FRONT_CONTAINER first"
         fi
-        if [ -n "$(docker ps -aq -f "name=^${FRONT_CONTAINER}\$")" ]; then
-            docker rm -f "$FRONT_CONTAINER" >/dev/null
+        if [ -n "$("$rt" ps -aq -f "name=^${FRONT_CONTAINER}\$")" ]; then
+            "$rt" rm -f "$FRONT_CONTAINER" >/dev/null
         fi
         args+=(--name "$FRONT_CONTAINER" -p "$PORT:$PORT/tcp" -p "$PORT:$PORT/udp")
         say "the page: $URL"
         open_when_up "$URL"
     fi
-    docker "${args[@]}" "$image" ./sim-mesh "$@"
+    "$rt" "${args[@]}" "$image" "$ROOT/sim-mesh" "$@"
 }
 
 # in_front VERB…: a simulation verb inside the running front's container,
 # where the front's port is its own.
 in_front() {
-    command -v docker >/dev/null || die "stations need Linux; on $(uname -s) sim-mesh runs in Docker, which is not installed"
-    [ -n "$(docker ps -q -f "name=^${FRONT_CONTAINER}\$")" ] \
+    local rt
+    rt=$(runtime)
+    [ -n "$("$rt" ps -q -f "name=^${FRONT_CONTAINER}\$")" ] \
         || die "no front running: start it with sim-mesh"
     # The shell's directory when the container has it, so a path given is the same path.
     local outer here=$ROOT
@@ -148,7 +186,10 @@ in_front() {
     case "$PWD/" in "$outer"/*) here=$PWD ;; esac
     local args=(exec -i -w "$here")
     [ -t 0 ] && [ -t 1 ] && args+=(-t)
-    docker "${args[@]}" "$FRONT_CONTAINER" ./sim-mesh "$@"
+    # This script by its own path, which the container has as well: the
+    # shell's directory need not be the one it is in (the README's steps run
+    # it as sim-mesh/sim-mesh from the directory above).
+    "$rt" "${args[@]}" "$FRONT_CONTAINER" "$ROOT/sim-mesh" "$@"
 }
 
 # ---- native -------------------------------------------------------------------
@@ -196,6 +237,10 @@ planner_stale() {
     stale "$PLANNER" "$PLANNER/target/release/planner-web" "$PLANNER/target/release/planner-job" -- target
 }
 
+ether_stale() {
+    stale "$ROOT/ether/core" "$ROOT/ether/build/ether_core.abi3.so" -- target
+}
+
 build_page() {
     local ui="$ROOT/testbed/ui"
     command -v npm >/dev/null || die "the page needs node and npm"
@@ -218,6 +263,17 @@ build_radio() {
     cmake --build "$ROOT/radio/build" -j "$(nproc 2>/dev/null || echo 2)"
     # Up to date now, whichever sources the build found nothing to redo for.
     touch "$ROOT/radio/build/libsimclock.so" "$ROOT/radio/build/libsimradio.so" "$ROOT/radio/build/libsimradio.a"
+}
+
+# The ether's conductor in Rust (ether/core), a Python extension module the
+# ether loads from ether/build/; without it the ether's own conductor, in
+# Python, runs a virtual-time run, and gives the same run.
+build_ether() {
+    command -v cargo >/dev/null || die "the ether's conductor needs cargo"
+    say "the ether's conductor: ether_core (cargo build --release)"
+    (cd "$ROOT/ether/core" && PYO3_PYTHON="$(pick_python)" \
+        cargo build --release --target-dir "$ROOT/ether/build/target")
+    cp "$ROOT/ether/build/target/release/libether_core.so" "$ROOT/ether/build/ether_core.abi3.so"
 }
 
 # planner-web embeds planner-wasm's output (crates/planner-web/static), so the
@@ -252,14 +308,15 @@ build_planner() {
 
 cmd_build() {
     local parts=("$@")
-    [ ${#parts[@]} -gt 0 ] || parts=(page radio planner)
+    [ ${#parts[@]} -gt 0 ] || parts=(page radio ether planner)
     local p
     for p in "${parts[@]}"; do
         case "$p" in
             page) build_page ;;
             radio) build_radio ;;
+            ether) build_ether ;;
             planner) build_planner ;;
-            *) die "build: no part '$p' (page, radio, planner)" ;;
+            *) die "build: no part '$p' (page, radio, ether, planner)" ;;
         esac
     done
 }
@@ -280,6 +337,8 @@ cmd_front() {
     local py
     py=$(pick_python)
     ! radio_stale || build_radio
+    ! ether_stale || { command -v cargo >/dev/null && build_ether; } \
+        || say "the ether's conductor in Rust is not built; its Python one runs"
     # The planner first: its wasm lands in the page's vendor/, which the page
     # then builds from.
     ! planner_stale || (build_planner) \
@@ -319,12 +378,115 @@ cmd_run() {
     PYTHONPATH="$ROOT/testbed${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m sim_mesh.runner "$@"
 }
 
+# ---- installing on Linux --------------------------------------------------------
+# What running natively needs on a fresh Linux, as sim-mesh's image holds it
+# (Dockerfile): the system's packages through its package manager, with sudo;
+# where the system's Node is older than the page's Vite and Quasar take,
+# NodeSource's on Debian and Ubuntu (which ship 18) and Fedora's own later one
+# on Fedora (which defaults to 22.21); Rust through rustup, in the
+# user's home; and a Python environment beside this script, .venv, over the
+# system's own packages, holding Reticulum and LXMF for standard_reticulum
+# stations. Then the build. A step whose result is already there is left out,
+# so running it again costs nothing. apt (Debian, Ubuntu) and dnf (Fedora);
+# elsewhere it says what to install. The two lists and the pins are the
+# Dockerfile's (testbed/test_install.py keeps them so).
+
+APT_PACKAGES=(ca-certificates curl gnupg git python3 python3-aiohttp python3-yaml
+              python3-pytest python3-venv python3-pip build-essential cmake pkg-config
+              libstdc++6 zlib1g libbsd0 procps)
+DNF_PACKAGES=(ca-certificates curl git python3 python3-aiohttp python3-pyyaml python3-pytest
+              python3-pip gcc gcc-c++ make cmake pkgconf-pkg-config libstdc++ zlib libbsd
+              procps-ng)
+NODE_MAJOR=22                       # NodeSource's, as the image's
+NODE_FEDORA=24                      # Fedora's own, beside its default
+PYPI_PINS=(rns==1.5.2 lxmf==1.1.1)
+
+# Whether the node on the path is one the page builds with: 22.22 or later.
+# Quasar's app-vite refuses anything older when it starts
+# (lib/node-version-check.js), whatever its package.json says; Fedora 41 ships
+# 22.21.
+node_fits() {
+    command -v node >/dev/null && node -e '
+        const [a, b] = process.versions.node.split(".").map(Number);
+        process.exit((a === 22 && b >= 22) || a > 22 ? 0 : 1)' 2>/dev/null
+}
+
+cmd_install() {
+    local dry=0
+    case "${1:-}" in
+        "") ;;
+        --dry-run) dry=1 ;;
+        *) die "install: the one option is --dry-run" ;;
+    esac
+    [ "$(uname -s)" = Linux ] || die "install: Linux only; anywhere else sim-mesh runs in its image (docker)"
+    local sudo=()
+    [ "$(id -u)" = 0 ] || sudo=(sudo)
+    step() { say "$*"; [ "$dry" = 1 ] || "$@"; }
+    local manager
+    if command -v apt-get >/dev/null; then manager=apt
+    elif command -v dnf >/dev/null; then manager=dnf
+    else die "install: neither apt-get nor dnf here; install by hand what README.md's Getting started lists"
+    fi
+    if [ "$manager" = apt ]; then
+        step "${sudo[@]}" apt-get update
+        step "${sudo[@]}" env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
+    else
+        step "${sudo[@]}" dnf install -y "${DNF_PACKAGES[@]}"
+    fi
+    # The environment first: it is also where a Node the system names by its
+    # major is given its plain name.
+    if [ ! -x "$ROOT/.venv/bin/python3" ]; then
+        step python3 -m venv --system-site-packages "$ROOT/.venv"
+    fi
+    PATH="$ROOT/.venv/bin:$PATH"
+    if ! node_fits; then
+        if [ "$manager" = apt ]; then
+            say "Node $NODE_MAJOR from NodeSource: the system's is older than the page takes"
+            if [ "$dry" = 0 ]; then
+                "${sudo[@]}" mkdir -p /etc/apt/keyrings
+                curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+                    | "${sudo[@]}" gpg --batch --yes --dearmor -o /etc/apt/keyrings/nodesource.gpg
+                echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" \
+                    | "${sudo[@]}" tee /etc/apt/sources.list.d/nodesource.list >/dev/null
+            fi
+            step "${sudo[@]}" apt-get update
+            step "${sudo[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+        else
+            # Fedora ships a Node newer than its default under the major's
+            # name (nodejs24: node-24, npm-24), beside the default, which
+            # stays as it is: the plain names go into the environment.
+            say "Node $NODE_FEDORA, Fedora's own: its default is older than the page takes"
+            step "${sudo[@]}" dnf install -y "nodejs$NODE_FEDORA" "nodejs$NODE_FEDORA-npm"
+            local tool
+            for tool in node npm npx; do
+                step ln -sf "/usr/bin/$tool-$NODE_FEDORA" "$ROOT/.venv/bin/$tool"
+            done
+        fi
+    fi
+    [ "$dry" = 1 ] || node_fits || die "install: node $(node --version 2>/dev/null) is still older than the page takes"
+    if ! command -v cargo >/dev/null && [ -x "$HOME/.cargo/bin/cargo" ]; then PATH="$HOME/.cargo/bin:$PATH"; fi
+    if ! command -v cargo >/dev/null; then
+        say "Rust through rustup, into $HOME/.cargo"
+        if [ "$dry" = 0 ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            PATH="$HOME/.cargo/bin:$PATH"
+        fi
+    fi
+    if command -v rustup >/dev/null; then step rustup target add wasm32-unknown-unknown; fi
+    step "$ROOT/.venv/bin/python3" -m pip install --quiet "${PYPI_PINS[@]}"
+    [ "$dry" = 1 ] && return 0
+    cmd_build
+    say "installed: start it with $0"
+}
+
 # ---- dispatch -------------------------------------------------------------------
 
 verb=${1:-}
 case "$verb" in
     -h|--help|help) usage; exit 0 ;;
     ""|front|-*|build|devices|new|stop|pause|resume|list|plan|run) ;;
+    install) shift; cmd_install "$@"; exit $? ;;
     *) die "no verb '$verb' (sim-mesh help lists them)" ;;
 esac
 

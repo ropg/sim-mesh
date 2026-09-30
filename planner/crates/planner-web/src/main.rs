@@ -24,6 +24,8 @@ use planner_core::geo::Xy;
 use planner_pack::{LayerKind, PackManifest};
 use planner_render::{BaseLayer, RenderOpts, ViewRect};
 use planner_terrain::cog::CogReader;
+#[cfg(unix)]
+use planner_terrain::cog::SharedRows;
 use rayon::prelude::*;
 use serde::Deserialize;
 use std::fs::File;
@@ -63,6 +65,11 @@ struct Cli {
     /// 2 GB VPS.
     #[arg(long, default_value_t = 1)]
     sweep_slots: usize,
+    /// Threads a propagation sweep runs on. Default: cores minus two, never
+    /// below one. On a host shared with others, or one running several
+    /// sidecars, the caller says how many are its to use.
+    #[arg(long)]
+    sweep_threads: Option<usize>,
 }
 
 struct Layers {
@@ -88,6 +95,56 @@ struct Layers {
     /// is the right input for an area sweep that treats every cell as a
     /// receiver; this is the right input for one specific path.
     building_top: Option<Mutex<CogReader<BufReader<File>>>>,
+    /// The four layers `/link.json` reads, readable without their locks.
+    ///
+    /// Every request used to queue on `terrain`'s lock for its windows, so a
+    /// pack table's pairs were read one at a time however many render slots
+    /// there were: at 8 slots, 173 nodes, ~15 k pairs, the reads were 58 s of
+    /// a 61 s build. A layer whose rows are directly readable is read here
+    /// by positioned reads instead (see `SharedRows`); the grid is the one
+    /// `CogReader::window` returns. `None` where a layer's layout allows no
+    /// such read, and that layer is read through its lock as before.
+    #[cfg(unix)]
+    unlocked: Unlocked,
+}
+
+#[cfg(unix)]
+struct Unlocked {
+    terrain: Option<SharedRows>,
+    clutter: Option<SharedRows>,
+    building_top: Option<SharedRows>,
+    built_fraction: Option<SharedRows>,
+}
+
+/// `/link.json`'s four windows — terrain, clutter, building top, built
+/// fraction — read without the locks where the layers allow it, all four at
+/// once. `None` for a layer with no lock-free reader, or whose reader could
+/// not read this box; the caller reads that one through its lock.
+#[cfg(unix)]
+fn link_windows_unlocked(layers: &Layers, lo: Xy, hi: Xy) -> [Option<planner_terrain::Grid>; 4] {
+    let u = &layers.unlocked;
+    let read = |s: &Option<SharedRows>| s.as_ref().and_then(|s| s.window(lo, hi).ok().flatten());
+    let ((t, c), (bt, bf)) = rayon::join(
+        || rayon::join(|| read(&u.terrain), || read(&u.clutter)),
+        || rayon::join(|| read(&u.building_top), || read(&u.built_fraction)),
+    );
+    [t, c, bt, bf]
+}
+
+#[cfg(not(unix))]
+fn link_windows_unlocked(_: &Layers, _: Xy, _: Xy) -> [Option<planner_terrain::Grid>; 4] {
+    [None, None, None, None]
+}
+
+/// One layer's window through its lock: the read every request made before
+/// the lock-free readers, and still the one for a layer without one.
+async fn locked_window(
+    layer: &Mutex<CogReader<BufReader<File>>>,
+    lo: Xy,
+    hi: Xy,
+) -> Result<planner_terrain::Grid, planner_terrain::TerrainError> {
+    let mut guard = layer.lock().await;
+    tokio::task::block_in_place(|| guard.window(lo, hi))
 }
 
 struct AppState {
@@ -212,6 +269,8 @@ enum ProgressiveSweep {
     Idle,
     Running {
         key: CoverageKey,
+        /// Bands in this sweep: the ladder's, or one for a `whole` sweep.
+        bands: usize,
         /// Bands finished so far, and the radius of the last one.
         done: usize,
         band_radius_m: f64,
@@ -314,6 +373,11 @@ struct BuildingIndex {
     /// approximated by an equal-area disc. Reported so an answer can say
     /// which it rested on rather than presenting the two alike.
     with_geometry: usize,
+    /// Each building's footprint area (m²) and height above its ground (m),
+    /// as its record gave them, by the same index as `items`: what planner's
+    /// height estimator takes of a building (`/height.json`), kept beside the
+    /// records a path reads rather than in them.
+    area_height: Vec<[f32; 2]>,
 }
 
 const BLDG_CELL_M: f32 = 100.0;
@@ -689,6 +753,42 @@ impl BuildingIndex {
         } else {
             dx * dx + dy * dy <= b.r * b.r
         }
+    }
+
+    /// The buildings whose centroid lies within `radius_m` of (x, y), as
+    /// planner's height estimator takes them: centroid, footprint area and
+    /// height above ground. The centroid is the index's own, good to a few
+    /// millimetres (see [`Bldg::x`]). A building indexed without an area and
+    /// height is left out.
+    fn hints_near(&self, x: f64, y: f64, radius_m: f64) -> Vec<planner_coverage::environment::BuildingHint> {
+        let (xf, yf) = ((x - self.origin.0) as f32, (y - self.origin.1) as f32);
+        let r = radius_m as f32;
+        let cell = |v: f32| (v / BLDG_CELL_M).floor() as i32;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for cx in cell(xf - r)..=cell(xf + r) {
+            for cy in cell(yf - r)..=cell(yf + r) {
+                for &i in self.cells.get(&(cx, cy)).map(Vec::as_slice).unwrap_or(&[]) {
+                    if !seen.insert(i) {
+                        continue;
+                    }
+                    let b = &self.items[i as usize];
+                    let (dx, dy) = ((b.x - xf) as f64, (b.y - yf) as f64);
+                    if dx.hypot(dy) > radius_m {
+                        continue;
+                    }
+                    let Some(&[area_m2, height_m]) = self.area_height.get(i as usize) else {
+                        continue;
+                    };
+                    out.push(planner_coverage::environment::BuildingHint {
+                        xy: Xy { x: self.origin.0 + b.x as f64, y: self.origin.1 + b.y as f64 },
+                        footprint_m2: area_m2,
+                        height_m,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// The building an antenna at (x, y), `antenna_masl` above sea level, is
@@ -1972,6 +2072,13 @@ struct LossQuery {
     radius_km: f64,
     #[serde(default = "d_budget")]
     budget_db: f32,
+    /// Sweep the whole radius in one band, without the inner bands a map
+    /// paints while it waits. Every band is a complete sweep of its own
+    /// radius, computed afresh, so the last one is the same raster either
+    /// way: a caller that keeps only that one, as sim-mesh's coverage does,
+    /// asks this and is spared the rest of the ladder.
+    #[serde(default)]
+    whole: bool,
     /// Radials to sweep. Omit for the resolution-matched count.
     ///
     /// Exposed because the right value is a MEASUREMENT, not a constant: the
@@ -2049,6 +2156,29 @@ fn merge_building_tops(
     Some(c)
 }
 
+/// Until the building index has landed or is known to be absent.
+///
+/// A sweep reads the index once, for the terminal surroundings at the
+/// transmitter, and one begun while it loads read `Loading` and ran without
+/// them: measured on a 0.5 km sweep, 19,548 of 40,000 cells came out 27 dB
+/// lower to 8 dB higher in loss than the same sweep a second later, and
+/// nothing in the raster says which it was, so a caller that caches it kept
+/// the wrong one. A pair table waits for the index for the same reason (see
+/// `profile_evidence.buildings_index`); a sweep has no evidence to carry, so
+/// it waits here. A superseded sweep stops waiting.
+fn wait_for_index(
+    buildings: &std::sync::RwLock<BuildingsIndexState>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    while matches!(*buildings.read().expect("buildings lock"), BuildingsIndexState::Loading) {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("superseded by a newer request".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 /// One complete sweep out to `radius_m`. Blocking; call from a worker.
 ///
 /// Split out of the request handler so the same code can serve one shot or a
@@ -2060,6 +2190,7 @@ fn run_sweep(
     radius_m: f64,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<planner_terrain::Grid, String> {
+    wait_for_index(&st.buildings, &cancel)?;
     let tx = match (q.x, q.y) {
         (Some(x), Some(y)) => Xy { x, y },
         _ => st.to_xy(q.lat, q.lon),
@@ -2360,10 +2491,12 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
     // the instant the caller is told the sweep began.
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started = std::time::Instant::now();
+    let bands: &'static [f64] = if q.whole { &[1.0] } else { SWEEP_BANDS };
     {
         let mut g = st.sweep.lock().await;
         *g = ProgressiveSweep::Running {
             key,
+            bands: bands.len(),
             done: 0,
             band_radius_m: 0.0,
             started: Some(started),
@@ -2394,7 +2527,7 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        for (i, frac) in SWEEP_BANDS.iter().enumerate() {
+        for (i, frac) in bands.iter().enumerate() {
             let band_m = (radius_m * frac).max(cell_m * 8.0);
             let t0 = std::time::Instant::now();
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2417,6 +2550,7 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
                     if matches!(&*g, ProgressiveSweep::Running { key: k, .. } if *k == key) {
                         *g = ProgressiveSweep::Running {
                             key,
+                            bands: bands.len(),
                             done: i + 1,
                             band_radius_m: band_m,
                             started: Some(started),
@@ -2454,7 +2588,7 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
         }
     });
     axum::Json(serde_json::json!({
-        "state": "running", "bands": SWEEP_BANDS.len(), "done": 0
+        "state": "running", "bands": bands.len(), "done": 0
     }))
     .into_response()
 }
@@ -2475,10 +2609,10 @@ fn sweep_status(
             "state": "idle", "band_km": band_km, "bands": SWEEP_BANDS.len(),
             "done": if band_km > 0.0 { SWEEP_BANDS.len() } else { 0 }
         }),
-        ProgressiveSweep::Running { done, band_radius_m, started, .. } => serde_json::json!({
+        ProgressiveSweep::Running { bands, done, band_radius_m, started, .. } => serde_json::json!({
             "state": "running",
             "done": done,
-            "bands": SWEEP_BANDS.len(),
+            "bands": bands,
             "band_km": band_radius_m / 1000.0,
             "ready_km": band_km,
             "elapsed_s": started.map(|t| t.elapsed().as_secs()).unwrap_or(0),
@@ -2567,6 +2701,57 @@ struct LinkQuery {
     /// operator running a 5.8 dBi collinear was previously unable to say so.
     tx_gain_dbi: Option<f64>,
     rx_gain_dbi: Option<f64>,
+    /// Percentage of locations the loss is not exceeded at, pL of P.1812
+    /// §4.7 eq. (69), both ways of the both-way mean. Left unset, the model's
+    /// own (`LinkParams::eu868_defaults`, 90), so every URL that worked before
+    /// returns the number it did. A caller that lays its own location spread
+    /// over the answer, as sim-mesh's shadowing does, asks for the median: at
+    /// 90 the spread is counted twice.
+    loc_pct: Option<f64>,
+    /// Leave out the profile drawn for the page (240 points, ~40 KB): a
+    /// caller that keeps only the loss and its verdicts, such as sim-mesh's
+    /// loss tables asking every pair, has no use for it. Everything else in
+    /// the reply is the same.
+    #[serde(default)]
+    lean: bool,
+}
+
+/// The location percentage a link is judged at: the caller's, held to
+/// P.1812's own range (`p1812::lb_from_arrays` refuses anything outside
+/// 1..=99), else the model's default.
+///
+/// Checked here rather than left to the model, whose refusal is no 4xx: on a
+/// path P.1812 judges it is the server's error (`link_model`), and inside the
+/// 0.25 km floor the near-field model answers, which has no pL, so a bad one
+/// would pass unremarked.
+fn resolve_loc_pct(loc_pct: Option<f64>) -> Result<f64, String> {
+    match loc_pct {
+        None => Ok(planner_core::model::LinkParams::eu868_defaults().loc_pct),
+        Some(p) if (1.0..=99.0).contains(&p) => Ok(p),
+        Some(p) => Err(format!("loc_pct must be in [1, 99], not {p}")),
+    }
+}
+
+/// The loss a link reply gives, and the model it came from: P.1812's own
+/// answer, or on a path inside its 0.25 km floor the near-field model's.
+///
+/// Only that refusal is answered from the near field, the one
+/// `p1812::lb_from_arrays` gives a path shorter than 0.25 km (§1). Any other
+/// is P.1812 refusing a path it does judge, and answering it from the near
+/// field would give a free-space figure, labelled as a path inside the
+/// floor, for one that is not; it is an error, and the reply says so.
+fn link_model(
+    p1812: Result<f64, planner_core::model::ModelError>,
+    d_total_km: f64,
+    near_field: impl FnOnce() -> Option<f64>,
+) -> Result<(f64, &'static str), (StatusCode, String)> {
+    match p1812 {
+        Ok(lb) => Ok((lb, "ITU-R P.1812-8")),
+        Err(planner_core::model::ModelError::OutOfRange(_)) if d_total_km < 0.25 => near_field()
+            .map(|v| (v, "free space + P.526 diffraction (inside P.1812's 0.25 km floor)"))
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "path too short to evaluate".into())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
 }
 
 /// The budget a link reply was judged against, and what it is made of.
@@ -2630,6 +2815,81 @@ fn resolve_budget(
 /// a 2 m-receiver map. Here both ends carry their own antenna height, and the
 /// terrain profile comes back with the answer so the margin is auditable
 /// rather than a single colour on a raster.
+/// `/height.json`'s query: a point in the pack's CRS, as `/link.json`'s ends.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeightQuery {
+    x: f64,
+    y: f64,
+}
+
+/// `/height.json`: the antenna height a node standing at (x, y) most
+/// plausibly has when nobody measured it. It is planner's estimator for a
+/// deployed node whose advert gave none
+/// (`planner_coverage::environment::estimate_height`), on this pack's
+/// evidence: a LoD2 roof under the node with a mast on it, else the clutter
+/// over its neighbourhood, else its land class's convention, else a
+/// documented fallback. Each answer carries the band it believes and what it
+/// rested on. While the building index is still loading no roof is asked,
+/// and the reply says so, as `/link.json`'s does.
+async fn height_json(State(st): State<Arc<AppState>>, Query(q): Query<HeightQuery>) -> Response {
+    let p = Xy { x: q.x, y: q.y };
+    if !(p.x.is_finite() && p.y.is_finite())
+        || p.x < st.extent.min_x
+        || p.x > st.extent.max_x
+        || p.y < st.extent.min_y
+        || p.y > st.extent.max_y
+    {
+        return (StatusCode::BAD_REQUEST, "the point is outside the pack").into_response();
+    }
+    match tokio::task::spawn_blocking(move || estimate_height_at(&st, p)).await {
+        Ok(body) => ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// The estimate at `p`, with the windows and buildings it needs read here.
+/// Blocking.
+fn estimate_height_at(st: &AppState, p: Xy) -> serde_json::Value {
+    use planner_coverage::environment as env;
+    let params = env::EstimateParams::default();
+    // The neighbourhood the clutter tier samples, and a cell to spare.
+    let reach = params.clutter_radius_m.max(params.building_search_radius_m) + 2.0 * terrain_res_hint(st);
+    let lo = st.clamp(Xy { x: p.x - reach, y: p.y - reach });
+    let hi = st.clamp(Xy { x: p.x + reach, y: p.y + reach });
+    let clutter = st.layers.clutter.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
+    let classes = st.layers.classes.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
+    let (index_state, hints) = {
+        let guard = st.buildings.read().unwrap_or_else(|e| e.into_inner());
+        let hints = guard
+            .get()
+            .map(|ix| ix.hints_near(p.x, p.y, params.building_search_radius_m))
+            .unwrap_or_default();
+        (guard.label(), hints)
+    };
+    let ev = env::SiteEvidence { clutter: clutter.as_ref(), classes: classes.as_ref(), buildings: &hints };
+    let e = env::estimate_height(p, None, &ev, &params);
+    let detail = match &e.basis {
+        env::HeightBasis::Lod2Building { footprint_m2, building_h_m, distance_m } => serde_json::json!({
+            "footprint_m2": footprint_m2, "building_h_m": building_h_m, "distance_m": distance_m,
+        }),
+        env::HeightBasis::ClutterNeighbourhood { radius_m, percentile, sampled_cells } => serde_json::json!({
+            "radius_m": radius_m, "percentile": percentile, "sampled_cells": sampled_cells,
+        }),
+        env::HeightBasis::ClassTypical(class) => serde_json::json!({ "class": format!("{class:?}") }),
+        env::HeightBasis::OperatorSupplied | env::HeightBasis::NoEvidence => serde_json::json!({}),
+    };
+    serde_json::json!({
+        "h_agl_m": e.h_agl_m,
+        "low_m": e.low_m,
+        "high_m": e.high_m,
+        "basis": e.basis.kind().label(),
+        "detail": detail,
+        "clamped_from_m": e.clamped_from_m,
+        "buildings_index": index_state,
+    })
+}
+
 async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) -> Response {
     // ---- the budget, and where every decibel of it comes from --------------
     //
@@ -2645,6 +2905,10 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
         rx_gain_dbi: rx_gain,
         gains_given,
     } = resolve_budget(q.budget_db, q.tx_gain_dbi, q.rx_gain_dbi);
+    let loc_pct = match resolve_loc_pct(q.loc_pct) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
     let a = st.clamp(Xy { x: q.ax, y: q.ay });
     let b = st.clamp(Xy { x: q.bx, y: q.by });
     let dist = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
@@ -2673,35 +2937,36 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     let lo = st.clamp(Xy { x: a.x.min(b.x) - res * 4.0, y: a.y.min(b.y) - res * 4.0 });
     let hi = st.clamp(Xy { x: a.x.max(b.x) + res * 4.0, y: a.y.max(b.y) + res * 4.0 });
 
-    let mut t_guard = st.layers.terrain.lock().await;
-    let mut h_guard = match st.layers.clutter.as_ref() {
-        Some(m) => Some(m.lock().await),
-        None => None,
-    };
     // The two unblended layers. `building_top` is the obstacle a path
     // crossing a building actually meets; `built_fraction` says how much of
     // the cell that building covers, which is what separates "this sample is
     // inside a Vorderhaus" from "this sample is on the street beside one".
-    let mut bt_guard = match st.layers.building_top.as_ref() {
-        Some(m) => Some(m.lock().await),
-        None => None,
+    //
+    // No lock is held past its own read. Held to the end of the request, as
+    // they once were, the locks made every other request wait out this one's
+    // profile, both P.1812 runs and the Fresnel trace, so however many render
+    // slots there were, one pair was computed at a time.
+    let [terrain, clutter, building_top, built_fraction] =
+        tokio::task::block_in_place(|| link_windows_unlocked(&st.layers, lo, hi));
+    let terrain = match terrain {
+        Some(g) => Ok(g),
+        None => locked_window(&st.layers.terrain, lo, hi).await,
     };
-    let mut bf_guard = match st.layers.built_fraction.as_ref() {
-        Some(m) => Some(m.lock().await),
-        None => None,
+    let clutter = match (clutter, st.layers.clutter.as_ref()) {
+        (Some(g), _) => Some(g),
+        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
+        (None, None) => None,
     };
-    let (terrain, clutter) = tokio::task::block_in_place(|| {
-        rayon::join(
-            || t_guard.window(lo, hi),
-            || h_guard.as_mut().and_then(|g| g.window(lo, hi).ok()),
-        )
-    });
-    let (building_top, built_fraction) = tokio::task::block_in_place(|| {
-        rayon::join(
-            || bt_guard.as_mut().and_then(|g| g.window(lo, hi).ok()),
-            || bf_guard.as_mut().and_then(|g| g.window(lo, hi).ok()),
-        )
-    });
+    let building_top = match (building_top, st.layers.building_top.as_ref()) {
+        (Some(g), _) => Some(g),
+        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
+        (None, None) => None,
+    };
+    let built_fraction = match (built_fraction, st.layers.built_fraction.as_ref()) {
+        (Some(g), _) => Some(g),
+        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
+        (None, None) => None,
+    };
     let terrain = match terrain {
         Ok(g) => g,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2895,6 +3160,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     link.delta_n = st.manifest.region.delta_n;
     link.n0 = st.manifest.region.n0;
     link.path_center_lat_deg = lat;
+    link.loc_pct = loc_pct;
 
     let d_total = dist / 1000.0;
     let x = planner_propag::p1812::ArrayInputs {
@@ -3001,19 +3267,16 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     // opposite are, and a measure-link tool that returns an error there is
     // useless for exactly the neighbour-to-neighbour hop a mesh is built
     // from. Free space plus diffraction over the real roofs on the path.
-    let (lb_p1812, model_used) = match loss {
-        Ok(l) => (l.lb_db, "ITU-R P.1812-8"),
-        // Both ways here too, for the same reason.
-        Err(_) => match planner_propag::near_field::loss_db(
-            &planner_propag::near_field::NearFieldPath {
-                d_km: &md_km,
-                h_masl: &mh_masl,
-                g_masl: &mg_masl,
-                f_mhz: link.freq_mhz,
-                tx_h_agl_m: link.tx_h_agl_m,
-                rx_h_agl_m: link.rx_h_agl_m,
-            },
-        )
+    // Both ways here too, for the same reason.
+    let near_field = || {
+        planner_propag::near_field::loss_db(&planner_propag::near_field::NearFieldPath {
+            d_km: &md_km,
+            h_masl: &mh_masl,
+            g_masl: &mg_masl,
+            f_mhz: link.freq_mhz,
+            tx_h_agl_m: link.tx_h_agl_m,
+            rx_h_agl_m: link.rx_h_agl_m,
+        })
         .zip(planner_propag::near_field::loss_db(&planner_propag::near_field::NearFieldPath {
             d_km: &rd_km,
             h_masl: &rh_masl,
@@ -3023,12 +3286,10 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
             rx_h_agl_m: link_rev.rx_h_agl_m,
         }))
         .map(|(f, r)| (f + r) / 2.0)
-        {
-            Some(v) => (v, "free space + P.526 diffraction (inside P.1812's 0.25 km floor)"),
-            None => {
-                return (StatusCode::BAD_REQUEST, "path too short to evaluate").into_response()
-            }
-        },
+    };
+    let (lb_p1812, model_used) = match link_model(loss.map(|l| l.lb_db), d_total, near_field) {
+        Ok(answer) => answer,
+        Err(refused) => return refused.into_response(),
     };
     let lb = lb_p1812 + ah_tx + ah_rx;
 
@@ -3258,7 +3519,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     // Downsample the profile for display. The Fresnel block above used every
     // fine sample; P.1812 used the §3.2.1-spaced decimation, and
     // `profile_evidence` reports both so the two are not confused.
-    let want = 240usize.min(d_km.len());
+    let want = if q.lean { 0 } else { 240usize.min(d_km.len()) };
     let denom = want.max(2) - 1;
     let profile: Vec<serde_json::Value> = (0..want)
         .map(|i| {
@@ -3278,7 +3539,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
         })
         .collect();
 
-    axum::Json(serde_json::json!({
+    let mut reply = serde_json::json!({
         "distance_km": d_total,
         "lb_db": lb,
         "budget_db": budget_db,
@@ -3393,8 +3654,13 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
             "verdict": verdict,
         },
         "profile": profile,
-    }))
-    .into_response()
+    });
+    if q.lean {
+        if let Some(map) = reply.as_object_mut() {
+            map.remove("profile");
+        }
+    }
+    axum::Json(reply).into_response()
 }
 
 #[derive(Deserialize)]
@@ -3903,6 +4169,12 @@ async fn pack_info(State(st): State<Arc<AppState>>) -> Response {
         // 3 km view, where the held tile already covered it at 5 m.
         "res_m": terrain_res_hint(&st),
         "layers": st.manifest.layers.iter().map(|l| format!("{:?}", l.kind)).collect::<Vec<_>>(),
+        // What `/link.json` takes beyond the page's own query, so a caller
+        // asks for it only of a sidecar that has it: the query refuses a name
+        // it does not know.
+        "link_options": ["lean"],
+        // And what `/loss/start` takes beyond the page's.
+        "loss_options": ["whole"],
         "licenses": st.manifest.licenses.iter()
             .map(|l| serde_json::json!({"source": l.source, "notice": l.notice}))
             .collect::<Vec<_>>(),
@@ -4018,7 +4290,7 @@ async fn main() {
     } else {
         BuildingsIndexState::Absent
     }));
-    let open = |p: PathBuf| CogReader::open(&p).map(Mutex::new).ok();
+    let open = |p: PathBuf| CogReader::open(&p).ok();
     let terrain = CogReader::open(&terrain_path).expect("open terrain");
     let m = *terrain.meta();
     let extent = ViewRect {
@@ -4126,6 +4398,7 @@ async fn main() {
                 }) {
                     suspect += 1;
                 }
+                idx.area_height.push([r.area_m2 as f32, r.height_m as f32]);
             }
             // Say whether the footprints are REAL or approximated. A pack
             // built without --lod2-geometry answers every containment test
@@ -4158,13 +4431,27 @@ async fn main() {
         centre_lat: c.1.to_degrees(),
         centre_lon: c.0.to_degrees(),
         manifest,
-        layers: Layers {
-            terrain: Mutex::new(terrain),
-            clutter: clutter_path.and_then(open),
-            population: population_path.and_then(open),
-            classes: classes_path.and_then(open),
-            built_fraction: built_fraction_path.and_then(open),
-            building_top: building_top_path.and_then(open),
+        layers: {
+            let clutter = clutter_path.and_then(open);
+            let built_fraction = built_fraction_path.and_then(open);
+            let building_top = building_top_path.and_then(open);
+            #[cfg(unix)]
+            let unlocked = Unlocked {
+                terrain: terrain.shared_rows(),
+                clutter: clutter.as_ref().and_then(CogReader::shared_rows),
+                building_top: building_top.as_ref().and_then(CogReader::shared_rows),
+                built_fraction: built_fraction.as_ref().and_then(CogReader::shared_rows),
+            };
+            Layers {
+                terrain: Mutex::new(terrain),
+                clutter: clutter.map(Mutex::new),
+                population: population_path.and_then(open).map(Mutex::new),
+                classes: classes_path.and_then(open).map(Mutex::new),
+                built_fraction: built_fraction.map(Mutex::new),
+                building_top: building_top.map(Mutex::new),
+                #[cfg(unix)]
+                unlocked,
+            }
         },
         roads,
         places,
@@ -4182,7 +4469,7 @@ async fn main() {
             let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             // Two threads held back for interactive work. On a 2-core VPS
             // that would leave nothing, so never go below one.
-            let n = cores.saturating_sub(2).max(1);
+            let n = cli.sweep_threads.unwrap_or_else(|| cores.saturating_sub(2)).max(1);
             eprintln!(
                 "sweeps run on {n} of {cores} thread(s); the rest stay free for tiles"
             );
@@ -4216,6 +4503,7 @@ async fn main() {
         .route("/search", get(search))
         .route("/area.bin", get(area_bin))
         .route("/link.json", get(link_json))
+        .route("/height.json", get(height_json))
         .route("/api/presets", get(presets_json))
         .route("/nodes.json", get(nodes_json))
         .route("/network/start", get(network_start))
@@ -4245,6 +4533,29 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// A sweep waits out a loading index and goes on once it lands; a
+    /// superseded one stops waiting, as a cancelled sweep, not a failure.
+    #[test]
+    fn a_sweep_waits_for_the_building_index() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, RwLock};
+        let index = Arc::new(RwLock::new(super::BuildingsIndexState::Loading));
+        let landed = Arc::new(AtomicBool::new(false));
+        let (i2, l2) = (Arc::clone(&index), Arc::clone(&landed));
+        let lander = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            l2.store(true, std::sync::atomic::Ordering::SeqCst);
+            *i2.write().unwrap() = super::BuildingsIndexState::Absent;
+        });
+        super::wait_for_index(&index, &AtomicBool::new(false)).unwrap();
+        assert!(landed.load(std::sync::atomic::Ordering::SeqCst), "returned before the index landed");
+        lander.join().unwrap();
+
+        let loading = RwLock::new(super::BuildingsIndexState::Loading);
+        let err = super::wait_for_index(&loading, &AtomicBool::new(true)).unwrap_err();
+        assert!(err.contains("superseded"), "{err}");
+    }
+
 
     /// The defect: `/link.json` had no way to state either antenna. The budget
     /// carried the shipped `GENERIC_SX1262` placeholder gain applied to BOTH
@@ -4276,6 +4587,63 @@ mod tests {
         let forced = resolve_budget(Some(150.0), Some(5.8), Some(9.0));
         assert_eq!(forced.budget_db, 150.0);
         assert!(forced.source.contains("caller"));
+    }
+
+    /// `loc_pct` is the one way to ask for another location percentage, and
+    /// a URL without it must keep the number it always had.
+    #[test]
+    fn the_location_percentage_is_the_models_unless_the_caller_names_one() {
+        let dflt = planner_core::model::LinkParams::eu868_defaults().loc_pct;
+        assert_eq!(dflt, 90.0);
+        assert_eq!(resolve_loc_pct(None), Ok(dflt), "an untouched URL must not change");
+        for good in [1.0, 50.0, 99.0] {
+            assert_eq!(resolve_loc_pct(Some(good)), Ok(good));
+        }
+        // Refused here, not handed to the model, whose refusal is a server
+        // error, and inside the 0.25 km floor none at all.
+        for bad in [0.0, 0.5, 99.5, 100.0, -50.0, f64::NAN, f64::INFINITY] {
+            assert!(resolve_loc_pct(Some(bad)).is_err(), "loc_pct {bad} must be refused");
+        }
+        // As axum parses the query: absent is None, the name is known, and
+        // a misspelling is still a 4xx rather than the default.
+        let parse = |extra: &str| {
+            let uri: axum::http::Uri =
+                format!("/link.json?ax=1&ay=2&bx=3&by=4{extra}").parse().unwrap();
+            Query::<LinkQuery>::try_from_uri(&uri).map(|Query(q)| q.loc_pct)
+        };
+        assert_eq!(parse("").unwrap(), None);
+        assert_eq!(parse("&loc_pct=50").unwrap(), Some(50.0));
+        assert!(parse("&loc=50").is_err());
+    }
+
+    /// The near-field model answers inside P.1812's 0.25 km floor and only
+    /// there. Every refusal used to be answered from it, as a free-space
+    /// figure labelled as a path inside the floor.
+    #[test]
+    fn only_the_distance_floor_is_answered_from_the_near_field() {
+        use planner_core::model::ModelError;
+        let near = || Some(71.5);
+        assert_eq!(link_model(Ok(120.0), 1.2, near), Ok((120.0, "ITU-R P.1812-8")));
+        let floor = || {
+            Err(ModelError::OutOfRange("path length 0.150 km outside P.1812's 0.25–3000 km".into()))
+        };
+        let (lb, model) = link_model(floor(), 0.15, near).unwrap();
+        assert!(lb == 71.5 && model.contains("inside P.1812's 0.25 km floor"), "{model}");
+        // A path the near-field model cannot take either is still the caller's.
+        assert_eq!(link_model(floor(), 0.15, || None).unwrap_err().0, StatusCode::BAD_REQUEST);
+        // Past the floor, whatever P.1812 refuses is its error, and the near
+        // field is never asked.
+        for (refusal, says) in [
+            (ModelError::BadProfile("profile spacing 5.00 m is below the 30 m floor".into()),
+             "spacing"),
+            (ModelError::OutOfRange("frequency 10000 MHz outside P.1812's 30 MHz–6 GHz".into()),
+             "frequency"),
+        ] {
+            let (status, text) =
+                link_model(Err(refusal), 1.2, || panic!("the near field was asked")).unwrap_err();
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(text.contains(says), "{text}");
+        }
     }
 
     use super::*;
@@ -4509,6 +4877,38 @@ mod tests {
         assert_eq!(lens.len(), 2, "two footprints, one ring each");
         assert_eq!(ids, vec![0, 1]);
         assert_eq!(ids, from_outlines);
+    }
+
+    /// `/height.json`'s building evidence: the buildings whose centroid is
+    /// within the radius, each with its record's area and height, and none
+    /// from outside it — the estimator then stands the node on the roof it
+    /// picks, with planner's mast.
+    #[test]
+    fn a_node_by_a_roof_is_estimated_on_it() {
+        use planner_coverage::environment as env;
+        let mut ix = BuildingIndex::default();
+        ix.origin = (1000.0, 2000.0);
+        // A 400 m² block 22 m tall 10 m from the node, a shed of 9 m² 20 m
+        // tall 5 m from it, and a 30 m tower 60 m away.
+        for (x, y, area, h) in [(60.0f32, 50.0f32, 400.0f32, 22.0f32), (45.0, 50.0, 9.0, 20.0), (110.0, 50.0, 900.0, 30.0)] {
+            let r = (area / std::f32::consts::PI).sqrt();
+            assert!(!ix.insert(Bldg { x, y, r, br: r, top_masl: 34.0 + h, poly_start: 0, poly_end: 0 }));
+            ix.area_height.push([area, h]);
+        }
+        let at = (1050.0, 2050.0);
+        let mut hints = ix.hints_near(at.0, at.1, env::BUILDING_SEARCH_RADIUS_M);
+        hints.sort_by(|a, b| a.footprint_m2.total_cmp(&b.footprint_m2));
+        assert_eq!(hints.len(), 2, "the tower is beyond the radius");
+        assert_eq!((hints[0].footprint_m2, hints[0].height_m), (9.0, 20.0));
+        assert_eq!((hints[1].footprint_m2, hints[1].height_m), (400.0, 22.0));
+        assert!((hints[1].xy.x - 1060.0).abs() < 1e-3 && (hints[1].xy.y - 2050.0).abs() < 1e-3);
+        let ev = env::SiteEvidence { clutter: None, classes: None, buildings: &hints };
+        let e = env::estimate_height(Xy { x: at.0, y: at.1 }, None, &ev, &env::EstimateParams::default());
+        assert_eq!(e.basis.kind(), env::BasisKind::Lod2Building, "the shed is no roof to mount on");
+        assert!((e.h_agl_m - (22.0 + env::ROOF_MAST_TYPICAL_M)).abs() < 1e-6, "{}", e.h_agl_m);
+        // A building indexed without its area and height is not evidence.
+        ix.area_height.clear();
+        assert!(ix.hints_near(at.0, at.1, env::BUILDING_SEARCH_RADIUS_M).is_empty());
     }
 
     /// A raster whose value is its own x coordinate, so a shifted window is

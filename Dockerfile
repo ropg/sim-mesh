@@ -20,7 +20,9 @@
 #   - Reticulum and LXMF, the Python reference implementations a
 #     standard_reticulum station runs, and what they need (cryptography,
 #     pyserial), from PyPI
-FROM ubuntu:24.04
+# By its full name: podman will not guess a registry for a short one without a
+# terminal to ask on, and Docker reads it the same.
+FROM docker.io/library/ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 

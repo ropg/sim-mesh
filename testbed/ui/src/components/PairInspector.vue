@@ -50,7 +50,8 @@
  * answer for the pair, with its terrain profile drawn. The loss table's cell
  * for the same pair is shown beside it when there is a table, and the two
  * agree, near-field pairs included, because the table is built from these
- * very replies. */
+ * very replies, asked at the geodata's percentage of locations as the table
+ * was. */
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import FloatingWindow from './FloatingWindow.vue'
 import { link, type LinkReply } from '../lib/planner'
@@ -66,6 +67,7 @@ defineEmits<{ close: []; reverse: [] }>()
 const ground = useGeodata()
 const nodes = useNodes()
 const sidecar = computed(() => ground.sidecar)
+const locPct = computed(() => ground.current?.loc_pct)
 
 /* The pair's offset, in either order: shown, edited, and applied here. */
 const heldOffset = computed(() => nodes.offsets.find(o =>
@@ -97,7 +99,8 @@ async function ask() {
   const f = ground.frame
   try {
     const got = await link(base, f.toXY(props.a.lat, props.a.lon), f.toXY(props.b.lat, props.b.lon),
-                           props.a.height_m, props.b.height_m, props.a.gain_dbi, props.b.gain_dbi, ctrl.signal)
+                           props.a.height_m, props.b.height_m, props.a.gain_dbi, props.b.gain_dbi, ctrl.signal,
+                           locPct.value)
     if (ctrl.signal.aborted) return
     reply.value = got
   } catch (e) {
@@ -168,7 +171,7 @@ function drawProfile() {
   c.fillText('0', X(0) + 4, h - 6)
 }
 
-watch(() => [props.a, props.b, sidecar.value], ask, { immediate: true, deep: true })
+watch(() => [props.a, props.b, sidecar.value, locPct.value], ask, { immediate: true, deep: true })
 let observer: ResizeObserver | null = null
 watch(chart, (cv) => {
   observer?.disconnect()

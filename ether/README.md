@@ -11,7 +11,8 @@ and knows a frame only as a carrier, a duration and a payload it never opens.
 ```sh
 python3 ether.py --bind 127.0.0.1:7000 --record record.tsv \
     --geodata <geodata.yaml> --nodeset <nodeset.yaml> --losses <dir> \
-    [--noise-figure 6] [--pairwise] [--time real|max|<k>x]
+    [--noise-figure 6] [--pairwise | --bench-capture] [--crc-margin-db 0] [--seed N]
+    [--time real|max|<k>x]
 ```
 
 Stations reach it through the testbed, which holds it in its own event loop and
@@ -94,6 +95,16 @@ limit of the European Telecommunications Standards Institute's (ETSI) EN 300
 same threshold the same way, which is what its instantaneous RSSI (received
 signal strength indication) reads.
 
+**A station that starts listening mid-frame** — back from its own
+transmission, out of standby, out of a CAD into RX — is judged by the same
+rules at that instant. While at least four symbols of a frame's preamble are
+still to come it can lock on to the frame, as a receiver listening all along
+would; after that it has missed the preamble and is told the frame's energy
+until its end, stamped with the instant it was told. A receiver that leaves
+RX for anything but its own transmission, or is retuned, while following a
+frame is told nothing of how that frame ended, and the record holds no end
+for it.
+
 The ether does not match on preamble length: two radios whose preambles
 differ hear each other here, and may not on a bench.
 
@@ -110,9 +121,28 @@ survives only by leading each audible interferer on its carrier by 6 dB, one
 at a time, whatever their spreading factors, with nothing summed. It is there
 to compare against.
 
-Absent at this depth: fading, the CRC band just above the demodulation
-threshold, and a referee. A pair's loss is the table's and does not change from
-one frame to the next.
+**Bench capture** (`--bench-capture`, or `Ether(bench_capture=True)`) rules
+on two frames of one spreading factor the way a bench saw them meet (289
+collisions of an SX1262 receiver, SF7 at 125 kHz), instead of by the same-SF
+figure. Within 1.2 dB the two are equals: both are lost about one time in
+four, and otherwise one of them survives. From there the stronger survives
+seven times in eight, rising to always at 6.1 dB, and the weaker never does.
+A frame that starts after the receiver has passed the first one's preamble
+never takes it, and spoils the first unless the first is the stronger. Each
+outcome is a draw from the seed, the pair and the receiver, so the lock and
+both verdicts read the same one. Against three or more frames of its class a
+frame's lead is over their sum. Inter-SF rejection and the noise threshold
+are as without it.
+
+Absent at this depth: fading and a referee. A pair's loss is the table's and
+does not change from one frame to the next.
+
+**The CRC band** (`--crc-margin-db`, off unless given) is the few dB just
+above a spreading factor's demodulation threshold where a frame locks but
+fails its cyclic redundancy check at a probability: certain at the threshold,
+never at the band's top, a straight line between. Each frame at each receiver
+draws once, from a hash of the seed (`--seed`), so a verdict does not depend
+on the order receptions end in.
 
 ## Losses
 
@@ -141,8 +171,9 @@ Run alone, `--nodeset` names the nodes, their ids and `antenna.gain_dbi` (a
 file of the ether's own: a sim-mesh nodeset's antenna is a type, and gives 0),
 and `--losses` is the directory holding `<band>.bin` for each band computed.
 `--geodata` is named in the log and read for nothing else: the tables already
-belong to it. The tables are handed over as they are: whatever offsets a
-nodeset holds are the caller's to add first.
+belong to it. The tables are handed over as they are: whatever links and
+offsets a nodeset holds, and whatever shadowing a geodata asks for, are the
+caller's to put on first.
 
 ## Watching the air
 
@@ -213,7 +244,11 @@ reader → ether    idle {seq: 13, …}
 station → ether   read {ch: "tty", total: 36}            the console, typed by the testbed
 ```
 
-JSON, one message per datagram, payloads base64, times in microseconds.
+JSON, payloads base64, times in microseconds. A station sends one message
+per datagram. The ether sends one too, except to a station whose `hello`
+says `"lines": 1`: that station gets, in a virtual-time run, everything the
+barrier tells it at one go in one datagram, a message a line. It applies
+the lines as one, telling its host of nothing until all are in (below).
 Losses and positions are not on it in either direction: a station never
 learns where it is.
 
@@ -221,7 +256,7 @@ learns where it is.
 
 | Message | Says |
 |---|---|
-| `hello` | this station exists, and which radio slots it has |
+| `hello` | this station exists, and which radio slots it has; `"lines": 1`, it takes several messages to a datagram |
 | `state` | a slot's mode and carrier — the ether matches on these |
 | `tx` | a transmission: its carrier, its power, its three instants, and its payload |
 | `idle` | virtual time: the station has done everything the message numbered `seq` gave it to do, and next needs to run at T `until` (`null`: not on its own) |
@@ -267,6 +302,15 @@ sends — a `state`, a `tx`, a second `hello` — means it is not idle.
 - **What stations say while T stands is held** and taken when every station
   is idle again, in station-id order, so two stations acting at one instant
   are ruled on the same way every run.
+- **A station takes an instant whole.** What the barrier tells a station at
+  one go, such as a frame that ends at T and another that begins there,
+  reaches a station that said `lines` as one datagram. The station's chip
+  library applies every line, its own timers running as T moves, before it
+  tells its host anything: the host's waits that fall due, and DIO1. A host
+  thread woken at T then finds all of T. Told message by message, it had
+  been woken as T first moved. Whether it looked at the chip before or after
+  the reader applied the rest depended on how the host scheduled two threads,
+  and so, now and then, did a run.
 - **Input from outside the air lands at an instant.** A station with bytes
   it has not read — typed at its console, written to it over TCP by another
   station — holds T until its `read` says it has them, and is then sent a
@@ -280,6 +324,18 @@ sends — a `state`, a `tx`, a second `hello` — means it is not idle.
   working in no time at all; it is given 10 ms of T instead, one FreeRTOS tick.
 - **A station that restarts** says `hello` again, and everything it had
   scheduled or said goes with its old process.
+
+The conductor is the barrier above, and most of what the ether does in a
+virtual-time run: a few microseconds of work at every one of hundreds of
+thousands of instants. [`core/`](core/) does it in Rust (`sim-mesh build
+ether`, into `build/`), in the event loop's thread, on the ether's socket:
+T, the stations' numbering and idles, the resend buffer, the barrier itself,
+and whether the stations that just ran printed anything. Everything else —
+the medium, the ether's timers, hello, the channels, the testbed's holds —
+stays in `ether.py`, called at the same points as before, so the run is the
+same: `Ether`'s own conductor is the reference, and the two give the same
+record. `SIM_MESH_ETHER_CORE=python` runs `Ether`'s, `rust` the core (an error
+when it is not built); unset, the core runs when it is built.
 
 A station that stays busy cannot stop T for good: its own side reports idle
 after 20 ms of wall time with nothing to show for it (the busy watchdog in

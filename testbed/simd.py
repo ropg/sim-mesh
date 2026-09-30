@@ -58,7 +58,8 @@ node's maximum power, among their macros.
 
 Loss tables. The run holds one table per band its nodes' carriers use
 (`losses.bands_of`), and the ether rules on every frame from them, with the
-nodes' antennas and the nodeset's offsets on them (`losses.medium_tables`);
+nodeset's links, the geodata's shadowing, the nodes' antennas and the
+nodeset's offsets on them (`losses.medium_tables`);
 the antennas need the ground under each node, which is asked of the sidecar
 on a pack (`losses.grounds`) and kept in the run as `grounds`. A nodeset edit that changes
 the geometry (a move, a height, a node added) recomputes the touched nodes'
@@ -106,7 +107,7 @@ snapshot {run, geodata, nodeset, script, bands, nodes: [node…], port, clock,
 node {name, id, kind, firmware, device_name, web, lat, lon, height_m, height_from,
       max_dbm, antenna, tags, role, status, stale, mode?, freq?, sf?, bw?}
 node_gone {name}
-nodeset {name, dirty, geometry_hash, nodes, offsets}
+nodeset {name, dirty, geometry_hash, nodes, offsets, links?}
 store {geodata_names, nodesets, scripts, snapshots}   after a snapshot is saved
 losses_progress {band, done, total}                 while a sim_load computes
 levels {name, freq, heard: {name: dBm}}
@@ -203,15 +204,24 @@ def free_run_dir(path):
     return candidate
 
 
-def udp_drops():
-    """The kernel's count of UDP datagrams dropped on a full receive buffer
-    in this network namespace (Linux's /proc/net/snmp), or None."""
+def socket_drops(sock):
+    """The datagrams the kernel has dropped on `sock`'s full receive buffer:
+    the last field of its row in /proc/net/udp (or udp6), found by its inode.
+    None when there is no such row to read."""
     try:
-        with open("/proc/net/snmp", encoding="ascii") as handle:
-            rows = [line.split() for line in handle if line.startswith("Udp:")]
-        return int(dict(zip(rows[0][1:], rows[1][1:]))["RcvbufErrors"])
-    except (OSError, IndexError, KeyError, ValueError):
+        inode = str(os.fstat(sock.fileno()).st_ino)
+    except (AttributeError, OSError, ValueError):
         return None
+    for table in ("/proc/net/udp", "/proc/net/udp6"):
+        try:
+            with open(table, encoding="ascii") as handle:
+                for line in handle:
+                    fields = line.split()
+                    if len(fields) >= 13 and fields[9] == inode:
+                        return int(fields[12])
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def store_lists():
@@ -289,6 +299,15 @@ class Simd:
         self.pages = {}                     # the control websockets -> quiet
         self.consoles = {}                  # node name -> set of websockets
         self.poller = None
+        self.role_wake = asyncio.Event()    # set when a page or a station comes or goes
+        # The driver (a script's socket that said `drive`) takes turns with T:
+        # T stands while it has the floor, from each answer simd gives it
+        # until it says `yield`, having nothing left to do but wait on simd.
+        self.driver = None
+        self.driver_floor = False
+        self.floor_turn = 0                 # moves each time the driver is given the floor
+        self.driver_ids = set()             # its requests not yet answered
+        self.status_changed = asyncio.Event()   # a station's status moved (`wait` for up)
         self.stopping = False
         self.control_port = None            # where the aiohttp app really listens
         self.front = None
@@ -374,27 +393,28 @@ class Simd:
             # A transport lets go of its socket on the loop's next turn.
             for _ in range(3):
                 await asyncio.sleep(0)
-        loop = asyncio.get_running_loop()
         record = None
         if record_dir is not None:
             os.makedirs(record_dir, exist_ok=True)
             record = os.path.join(record_dir, "record.tsv")
         bind = ether_module.parse_bind(self.ether_addr)
-        physics = ether_module.Physics(self.args.noise_figure)
-        self.ether_transport, self.ether = await loop.create_datagram_endpoint(
-            lambda: ether_module.Ether(record, physics=physics, time_mode=self.args.time,
-                                       pairwise=self.args.pairwise, seed=self.args.seed,
-                                       epoch=self.args.epoch),
-            local_addr=bind)
+        physics = ether_module.Physics(self.args.noise_figure, self.args.crc_margin_db,
+                                       interference=not self.args.no_interference)
+        self.ether_transport, self.ether = await ether_module.open_ether(
+            bind, record, physics=physics, time_mode=self.args.time,
+            pairwise=self.args.pairwise, seed=self.args.seed, epoch=self.args.epoch,
+            bench_capture=self.args.bench_capture)
         self.ether.on_tx = self.ether_tx
         self.ether.on_rx = self.ether_rx
         self.ether.on_station = self.ether_station
         self.ether.on_drain = self.drain_consoles
+        self.ether.drains_watched = True        # the stations' readers are watched there
         if record is not None:
             log("ether on %s, recording to %s" % (self.ether_addr, record))
             log("time: %s; %s; %s rule" % (
                 ether_module.describe_time(self.ether.mode, self.ether.rate),
-                physics.describe(), "pairwise" if self.args.pairwise else "receiver-centred"))
+                physics.describe(),
+                ether_module.rule_name(self.args.pairwise, self.args.bench_capture)))
         if self.ether.clock.virtual and not os.path.exists(kinds_module.SHIM):
             log("error: no time shim at %s: a virtual-time run needs it "
                 "(see sim-mesh/README.md)" % kinds_module.SHIM)
@@ -413,25 +433,41 @@ class Simd:
             return None
         return {"type": "clock", "mode": self.ether.mode, "rate": self.ether.rate,
                 "t": self.ether.now(), "observed": self.observed_rate,
-                "barriers": self.ether.barriers,
+                "barriers": self.ether.barriers, "runs": self.ether.runs,
                 "slow_idles": sum(st.slow_idles for st in self.ether.stations.values()),
+                "ether_drops": self.ether_drops(),
                 "plan": self.plan}
+
+    def ether_drops(self):
+        """What the kernel has dropped on the ether's socket, or None: as
+        the core counts it while it reads (SO_RXQ_OVFL), else from its row in
+        /proc/net/udp, a file that grows with every station's sockets."""
+        if self.ether is None:
+            return None
+        core = getattr(self.ether, "core", None)
+        if core is not None:
+            return core.drops
+        transport = self.ether.transport
+        if transport is None:
+            return None
+        return socket_drops(transport.get_extra_info("socket"))
 
     async def watch_clock(self):
         """Tell the page how fast T is going, once a second of wall."""
         loop = asyncio.get_running_loop()
         last_wall, last_t = loop.time(), self.ether.now()
         slow_seen = {}
-        dropped = udp_drops()
+        dropped = self.ether_drops()
         while not self.stopping:
             await asyncio.sleep(CLOCK_REPORT_S)
             wall, t = loop.time(), self.ether.now()
-            now_dropped = udp_drops()
+            now_dropped = self.ether_drops()
             if dropped is not None and now_dropped is not None and now_dropped > dropped:
                 # A drop between two stations and the ether is resent (the
                 # ether's `resend`); anything else lost is lost, so say so.
-                log("the kernel dropped %d UDP datagram(s) on a full receive buffer at "
-                    "T %.3f s (net.core.rmem_max is the ceiling)" % (now_dropped - dropped, t / 1e6))
+                log("the kernel dropped %d datagram(s) on the ether's full receive buffer "
+                    "by T %.3f s: what a station said may be lost, and the run with it "
+                    "(net.core.rmem_max is the ceiling)" % (now_dropped - dropped, t / 1e6))
             dropped = now_dropped
             if t < last_t:                  # a new run, a new ether
                 last_t, slow_seen = t, {}
@@ -453,8 +489,9 @@ class Simd:
             self.broadcast(self.clock_message())
 
     def apply_to_ether(self):
-        """Give the medium the tables with the antennas and the offsets on
-        them, and which station id is which node, wholesale.
+        """Give the medium the tables with the links, the shadowing, the
+        antennas and the offsets on them, and which station id is which node,
+        wholesale.
 
         Cheap enough to redo outright on every change of ids, antennas,
         offsets or the node set; a node the tables have no row for yet is in
@@ -481,23 +518,33 @@ class Simd:
     def drain_consoles(self, sids, done):
         """The ether is about to move T past stations `sids`, which have run
         since it last did: read everything they printed first (their replies,
-        the marker), so what it makes the testbed do happens at this T."""
+        the marker), so what it makes the testbed do happens at this T. False,
+        and `done` not called, when none of them printed anything
+        (stations.printed), which is most of the time. A station whose kind
+        is not acted on by what it prints (console_acted_on) is not waited for:
+        its console is read as it comes."""
         wanted = set(sids)
-        drains = [s.drain for s in self.stations.values()
-                  if wanted.intersection(s.kind.sids(s)) and s.drain is not None]
+        drains = stations_module.printed([s.drain for s in self.stations.values()
+                                          if wanted.intersection(s.kind.sids(s))
+                                          and s.drain is not None
+                                          and s.kind.console_acted_on])
         if not drains:
-            done()
-            return
+            return False
         stations_module.ptys().call(stations_module.catch_up, drains,
                                     asyncio.get_running_loop(), done)
+        return True
 
     def ether_tx(self, sid, eid, freq, t_start, t_end):
+        if not self.heard_loud():
+            return
         name = self.name_of(sid)
         if name is not None:
             self.broadcast({"type": "tx", "name": name, "eid": eid, "freq": freq,
                             "t_start": t_start, "t_end": t_end})
 
     def ether_rx(self, sid, from_sid, eid, verdict, level):
+        if not self.heard_loud():
+            return
         name, sender = self.name_of(sid), self.name_of(from_sid)
         if name is not None and sender is not None:
             self.broadcast({"type": "rx", "name": name, "from": sender,
@@ -505,6 +552,8 @@ class Simd:
 
     def ether_station(self, sid, state):
         """A station said what its radio is doing; the map draws only the carrier."""
+        if not self.heard_loud():
+            return
         name = self.name_of(sid)
         if name is None:
             return
@@ -574,7 +623,18 @@ class Simd:
             clock=self.ether if self.virtual else None)
         station.watchers = len(self.consoles.get(name, ()))
         station.board = boards_module.environment(node.get("max_dbm"))
+        station.clock_profile = self.clock_profile(name)
         return station
+
+    def clock_profile(self, name):
+        """A station's crystal, off by a draw uniform within ±`--clock-ppm`
+        parts per million, from the seed and its name: its node time as a
+        function of T (STATION.md, `SIM_MESH_CLOCK_PROFILE`), or None for a
+        true clock. A kind's own profile in its `env:` still wins."""
+        if not self.args.clock_ppm or not self.virtual:
+            return None
+        draw = ether_module.seeded_draw(self.ether.seed, name, "clock")
+        return drift_profile(self.args.clock_ppm * (2.0 * draw - 1.0))
 
     def watched(self, name):
         """The console windows open on a station, as the pty thread sees it:
@@ -586,6 +646,8 @@ class Simd:
     def station_status(self, station, status):
         if self.stations.get(station.name) is station:
             self.broadcast(self.node_message(station.name))
+        self.role_wake.set()
+        self.status_changed.set()
 
     def station_output(self, station, data):
         """Console bytes go to whoever has that station's terminal open."""
@@ -828,15 +890,36 @@ class Simd:
             if self.stations.get(station.name) is station:
                 self.broadcast(self.node_message(station.name))
 
+    def roles_wanted(self):
+        """Whether a live role has anyone to go to: a page that draws the map
+        is open, and a station is up to be asked. A quiet socket is a
+        driver's, and a script goes by a node's role tag until a role is
+        reported (sim_mesh.sim)."""
+        return (any(not quiet for quiet in self.pages.values())
+                and any(s.status == stations_module.UP for s in self.stations.values()))
+
     async def poll_roles(self):
-        """Every ROLE_POLL_S of the run's clock: of T in a virtual run, so the
-        questions reach the stations at the same instants in every run."""
+        """Every ROLE_POLL_S of the run's clock while roles are wanted: of T
+        in a virtual run, so the questions reach the stations at the same
+        instants in every run.
+
+        Only then. A question is a tool run against the station's console,
+        which wakes the station and holds T while it answers: a Berlin run
+        asked 170 stations every six seconds for a map nobody had open. And
+        a sleep on T while nothing runs moves T as fast as the host goes, so
+        a virtual run began wherever that had taken T by the time its
+        stations started, which is a matter of the host's speed."""
         while not self.stopping:
+            if not self.roles_wanted():
+                self.role_wake.clear()
+                await self.role_wake.wait()
+                continue
             await self.sleep(ROLE_POLL_S)
+            if not self.roles_wanted():
+                continue
             running = [s for s in self.stations.values() if s.status == stations_module.UP]
-            if running:
-                await asyncio.gather(*(self.read_role(s) for s in running),
-                                     return_exceptions=True)
+            await asyncio.gather(*(self.read_role(s) for s in running),
+                                 return_exceptions=True)
 
     # ---- talking to the page ---------------------------------------------
 
@@ -871,6 +954,9 @@ class Simd:
                 "status": station.status if station else stations_module.STOPPED,
                 "role": station.role if station else None,
                 "stale": name in self.stale,
+                # The T it is said at: a station's `up` comes at the instant it
+                # came up, which is the run's, whenever a driver hears it.
+                "t": self.ether.now() if self.ether is not None else None,
                 **self.radio_of(node["id"])}
 
     def nodeset_message(self):
@@ -900,11 +986,23 @@ class Simd:
                 **store_lists()}
 
     def broadcast(self, message):
-        text = json.dumps(message)
+        if message.get("type") == "command_result" and message.get("id") in self.driver_ids:
+            # An answer to the driver: it has the floor from this T until it
+            # yields, so what it does about the answer it does at this T.
+            self.driver_ids.discard(message["id"])
+            self.take_floor()
         loud = message.get("type") in LOUD
-        for socket, quiet in list(self.pages.items()):
-            if not (quiet and loud):
-                asyncio.ensure_future(self.send_page(socket, text))
+        pages = [socket for socket, quiet in self.pages.items() if not (quiet and loud)]
+        if not pages:
+            return
+        text = json.dumps(message)
+        for socket in pages:
+            asyncio.ensure_future(self.send_page(socket, text))
+
+    def heard_loud(self):
+        """Whether a page takes what the medium does, frame by frame (LOUD):
+        a run driven by a quiet socket alone need not be told it."""
+        return not all(self.pages.values())
 
     async def send_page(self, socket, text):
         try:
@@ -940,11 +1038,74 @@ class Simd:
         try:
             await handler(msg)
         except (store.StoreError, kinds_module.CommandError) as err:
-            self.error(str(err))
+            self.refused(msg, str(err))
         except OSError as err:
-            self.error("%s: %s" % (kind, err))
+            self.refused(msg, "%s: %s" % (kind, err))
         except (KeyError, TypeError, ValueError) as err:
-            self.error("%s: malformed message (%s)" % (kind, err))
+            self.refused(msg, "%s: malformed message (%s)" % (kind, err))
+
+    def refused(self, msg, text):
+        """What `msg` asked for could not be done: the page is told, and a
+        request (one with an `id`, which a script waits on) is answered with
+        the error. Unanswered, a script waited on it for ever, and a
+        virtual-time run went on without its driver as fast as it goes."""
+        self.error(text)
+        if msg.get("id") is not None:
+            self.broadcast({"type": "command_result", "id": msg["id"], "name": msg.get("name"),
+                            "results": {}, "error": text,
+                            "t": self.ether.now() if self.ether is not None else None})
+
+    # ---- the driver's turns -------------------------------------------------
+
+    def take_floor(self):
+        """The driver has the floor: T stands until it yields."""
+        self.floor_turn += 1
+        if self.driver is not None and not self.driver_floor and self.virtual:
+            self.driver_floor = True
+            self.ether.holds += 1
+
+    def driver_yields(self):
+        """The driver has nothing left to do but wait on us: it lets go once
+        everything it sent before has been set going (settle), so what it
+        asked for is put at the T it asked at; not if it has been answered
+        again meanwhile, which gives it the floor for that answer."""
+        turn = self.floor_turn
+
+        def let_go():
+            if self.floor_turn == turn:
+                self.give_floor()
+        self.ether.settle(let_go)
+
+    def give_floor(self):
+        """The driver yields, or has gone: T runs again."""
+        if self.driver_floor:
+            self.driver_floor = False
+            self.ether.release()
+
+    async def do_wait(self, msg):
+        """A driver's wait, answered at the instant it ends, so the driver
+        goes on at an instant of the run and not at whatever instant a look
+        at a clock report happened to catch: `until`, T in µs; or `for: up`,
+        until every station (or `names`) is up. A task of its own, as a
+        message put off with `after` is."""
+        async def wait():
+            if msg.get("until") is not None:
+                left = int(msg["until"]) - self.ether.now()
+                if left > 0:
+                    await self.sleep(left / 1e6)
+            elif msg.get("for") == "up":
+                names = msg.get("names")
+                while True:
+                    chosen = [s for n, s in self.stations.items()
+                              if names is None or n in names]
+                    wanted = set(names) if names is not None else set(self.firmware)
+                    if chosen and {s.name for s in chosen} >= wanted and all(
+                            s.status == stations_module.UP for s in chosen):
+                        break
+                    self.status_changed.clear()
+                    await self.status_changed.wait()
+            self.answered(msg, {})
+        asyncio.ensure_future(wait())
 
     def need_run(self):
         if self.run is None:
@@ -1498,11 +1659,23 @@ class Simd:
         self.sidecar = sidecar or self.args.sidecar
         self.plan = None                    # a plan is for the run it was sent in
         await self.start_ether(run.dir)
+        # The medium the run is started on, for whatever reads it later: the
+        # analysis tools' levels take their noise figure from it, and a seed
+        # drawn at random is otherwise nowhere to be found again.
+        medium = dict(self.ether.physics.as_dict(), pairwise=self.ether.pairwise)
+        if self.ether.bench_capture:
+            medium["bench_capture"] = True
+        if self.args.clock_ppm:
+            medium["clock_ppm"] = self.args.clock_ppm
+        run.set(physics=medium, seed=self.ether.seed)
         await self.find_grounds([n for n in ns.nodes if n not in self.grounds])
         self.apply_to_ether()
         log("run %s: geodata %s (%s), nodeset %s (%d nodes), script %s, tables %s"
             % (run.dir, gd.name, gd.kind, ns.name, len(ns.nodes),
                run.meta.get("script") or "none", ", ".join(sorted(tables)) or "none"))
+        warning = losses_module.shadowing_warning(gd)
+        if warning:
+            log("warning: %s" % warning)
         await self.settle_firmware()
         bare = [n for n in ns.nodes if not self.firmware.get(n)]
         if bare:
@@ -1567,7 +1740,20 @@ class Simd:
         socket = web.WebSocketResponse(heartbeat=30, max_msg_size=0)
         await socket.prepare(request)
         self.pages[socket] = request.query.get("quiet", "") not in ("", "0")
+        self.role_wake.set()
         await socket.send_str(json.dumps(self.snapshot()))
+        # A socket's messages are handled in the order they came, by a worker
+        # of its own, so that its `yield` is taken at once even while
+        # something it asked for is still being done (which may need T).
+        work = asyncio.Queue()
+
+        async def worker():
+            while True:
+                msg = await work.get()
+                if msg is None:
+                    return
+                await self.handle(msg)
+        handling = asyncio.ensure_future(worker())
         try:
             async for message in socket:
                 if message.type is WSMsgType.TEXT:
@@ -1575,10 +1761,40 @@ class Simd:
                         msg = json.loads(message.data)
                     except ValueError:
                         continue
-                    if isinstance(msg, dict):
-                        await self.handle(msg)
+                    if not isinstance(msg, dict):
+                        continue
+                    kind = msg.get("type")
+                    if kind == "drive":
+                        if self.driver is not None and self.driver is not socket:
+                            self.give_floor()
+                        self.driver = socket
+                        self.driver_ids.clear()
+                        self.take_floor()
+                        continue
+                    if kind == "yield":
+                        if socket is self.driver:
+                            self.driver_yields()
+                        continue
+                    if socket is self.driver:
+                        # Each of the driver's requests is set going at
+                        # once, in order, so its `yield` finds them all under
+                        # way (and one waiting on T does not hold up the rest).
+                        if msg.get("id") is not None:
+                            self.driver_ids.add(msg["id"])
+                        asyncio.ensure_future(self.handle(msg))
+                        continue
+                    work.put_nowait(msg)
         finally:
             self.pages.pop(socket, None)
+            if socket is self.driver:
+                self.give_floor()
+                self.driver = None
+                self.driver_ids.clear()
+            work.put_nowait(None)
+            try:
+                await handling
+            except Exception:           # noqa: BLE001 - a handler's own error, logged there
+                pass
         return socket
 
     async def ws_console(self, request):
@@ -1721,6 +1937,18 @@ class Simd:
             self.ether.close()
 
 
+
+# How far ahead of T 0 a drifting clock's profile reaches: thirty days, past
+# any run, since past its last point node time runs at T's own rate again.
+CLOCK_HORIZON_US = 30 * 86_400 * 1_000_000
+
+
+def drift_profile(ppm, horizon_us=CLOCK_HORIZON_US):
+    """A `SIM_MESH_CLOCK_PROFILE` for a crystal `ppm` parts per million fast (or
+    slow, below zero): node time running that much ahead of T from T 0."""
+    return "0:0,%d:%d" % (horizon_us, horizon_us + round(horizon_us * ppm * 1e-6))
+
+
 def parse_args(argv):
     ap = argparse.ArgumentParser(
         description="the simulated testbed: ether, stations, proxy and control page")
@@ -1744,6 +1972,23 @@ def parse_args(argv):
     ap.add_argument("--pairwise", action="store_true",
                     help="rule on collisions pairwise, per interferer by the capture "
                          "margin, instead of on the summed interference")
+    ap.add_argument("--clock-ppm", type=float, default=0.0, metavar="PPM",
+                    help="in a virtual-time run, each station's crystal off by a draw "
+                         "uniform within this many parts per million, from the seed "
+                         "and its name (default 0: every clock true)")
+    ap.add_argument("--bench-capture", action="store_true",
+                    help="rule on two frames of one spreading factor as a bench saw them "
+                         "meet, instead of by the same-SF figure")
+    ap.add_argument("--crc-margin-db", type=float,
+                    default=ether_module.DEFAULT_CRC_MARGIN_DB,
+                    help="the CRC band: how far above its threshold a frame may still "
+                         "fail its CRC, the chance falling linearly to nothing "
+                         "(default %g: none)" % ether_module.DEFAULT_CRC_MARGIN_DB)
+    ap.add_argument("--no-interference", action="store_true",
+                    help="an oracle: the ether judges every frame against noise alone "
+                         "and never takes a receiver off the frame it follows; what "
+                         "overlapping frames cost a run is its delivery with this less "
+                         "without")
     ap.add_argument("--seed", type=int,
                     help="the ether's seed, which its welcome hands every station "
                          "(default: drawn at random)")
@@ -1777,6 +2022,14 @@ def parse_args(argv):
         ether_module.parse_time_mode(args.time)
     except ValueError as err:
         ap.error(str(err))
+    if args.bench_capture and args.pairwise:
+        ap.error("--bench-capture is a variant of the receiver-centred rule, not --pairwise's")
+    if args.crc_margin_db < 0:
+        ap.error("--crc-margin-db is a width in dB")
+    if not 0 <= args.clock_ppm <= 1000:
+        ap.error("--clock-ppm is parts per million, 0 to 1000")
+    if args.clock_ppm and args.time == "real":
+        ap.error("--clock-ppm needs virtual time: in real time a station's clock is the host's")
     args.run = os.path.abspath(args.run)
     args.public_port = args.bind.rpartition(":")[2]
     # The relay binds the same number as the page, on UDP — one number to

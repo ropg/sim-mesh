@@ -18,15 +18,29 @@
 #include "services.h"
 #include "simradio.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
 
 namespace {
 
 constexpr size_t kMaxPayload = 256;
+
+/* How long, in wall time, station_open waits for the ether's welcome. */
+constexpr int kJoinWaitMs = 60 * 1000;
+
+/* How long, in wall time, a station that has read a host's bytes waits for
+ * the ether to bring it to the run's T before it goes on without. */
+constexpr int kFloorWaitMs = 2000;
+
+/* Runs the ether sent in answer to a floor to the station, applied. */
+std::atomic<uint64_t> s_floorRuns{0};
 
 const struct simradio_services* S() { return conductor::modelServices(); }
 
@@ -142,11 +156,66 @@ void handleMessage(const char* text, size_t len)
      * does not understand. */
 
     if (timed) conductor::granted((uint64_t)msg.num("seq", 0));
+    if (timed && type == "run" && msg.num("floor", 0)) s_floorRuns.fetch_add(1);
+}
+
+/* A datagram: one message, or several, one per line, all of one instant (a
+ * station that says `lines` in its hello is sent every message of an instant
+ * in one). They are applied together: the host is told of nothing (its waits
+ * that fall due, DIO1) until all are in, so a thread woken at T finds the
+ * whole of T, and not whatever part of it the reader had got to. */
+void handleDatagram(const char* text, size_t len)
+{
+    conductor::hold();
+    modelHoldPins();
+    const char* p = text;
+    const char* end = text + len;
+    while (p < end) {
+        const char* nl = static_cast<const char*>(memchr(p, '\n', (size_t)(end - p)));
+        size_t n = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        if (n) handleMessage(p, n);
+        if (!nl) break;
+        p = nl + 1;
+    }
+    /* DIO1 first: a host thread the release wakes reads the pin at once. */
+    modelReleasePins();
+    conductor::release();
 }
 
 }  // namespace
 
 /* ---- Outbound ---- */
+
+void etherPublishFloor(bool station)
+{
+    if (!conductor::isVirtual()) return;
+    /* A host can write to the door before the welcome has landed (the door
+     * is open before the hello, and the testbed starts talking at the
+     * hello): wait for it, or the floor would be lost, and T held for a tool
+     * that is waiting on a station that cannot move. Raw sleeps, as below. */
+    struct timespec ms = {0, 1000 * 1000};
+    for (int i = 0; i < kJoinWaitMs && !conductor::joined(); i++)
+        syscall(SYS_nanosleep, &ms, nullptr);
+    if (!conductor::joined()) return;
+    uint64_t answered = s_floorRuns.load();
+    char line[96];
+    int n = snprintf(line, sizeof line, "{\"type\":\"floor\",\"sid\":%d,\"to\":\"%s\"}",
+                     s_sid, station ? "station" : "tool");
+    sendLine(line, (size_t)n);
+    if (!station) return;
+    /* A station that has been idle has the T it was last given, which may
+     * be long past: the run went on without it. What the host wrote is to be
+     * taken at the run's T, so the ether answers a floor to the station with
+     * a run at it (marked `floor`, so a run already on its way for another
+     * reason does not pass for it), and the host's bytes wait for that. Raw
+     * sleeps: the time shim's would wait on T. */
+    struct timespec step = {0, 50 * 1000};
+    for (int i = 0; i < kFloorWaitMs * 20 && s_floorRuns.load() == answered; i++)
+        syscall(SYS_nanosleep, &step, nullptr);
+    if (s_floorRuns.load() == answered)
+        S()->log(SIMRADIO_LOG_WARN, "ether: no run after a host's bytes in %d ms; going on",
+                 kFloorWaitMs);
+}
 
 void etherPublishState(const EtherState& s)
 {
@@ -202,16 +271,30 @@ extern "C" int simradio_station_open(int sid, const char* bind_addr, const char*
     conductor::setIdleSender(sendIdle);
     conductor::start();
 
-    if (S()->spawn_reader(fd, handleMessage) != 0) {
+    if (S()->spawn_reader(fd, handleDatagram) != 0) {
         S()->log(SIMRADIO_LOG_ERROR, "ether: no reader");
         return -1;
     }
 
     char hello[160];
     int n = snprintf(hello, sizeof hello,
-        "{\"type\":\"hello\",\"sid\":%d,\"t\":%lld,\"slots\":[0]}",
+        "{\"type\":\"hello\",\"sid\":%d,\"t\":%lld,\"slots\":[0],\"lines\":1}",
         s_sid, (long long)S()->now_us());
     sendRaw(hello, (size_t)n);
     S()->log(SIMRADIO_LOG_INFO, "ether: %s, station %d", ether_addr, s_sid);
+    if (conductor::isVirtual()) {
+        /* Not back to the host before the welcome has set T. What the host
+         * does next reads node time, and until the welcome that is 0, not
+         * the instant the station joins at: a sleep begun before the welcome
+         * landed ended at another millisecond than one begun after it, so a
+         * station's first steps depended on which of two threads the host
+         * ran first. Raw sleeps: the time shim's would wait on T. */
+        struct timespec ms = {0, 1000 * 1000};
+        for (int i = 0; i < kJoinWaitMs && !conductor::joined(); i++)
+            syscall(SYS_nanosleep, &ms, nullptr);
+        if (!conductor::joined())
+            S()->log(SIMRADIO_LOG_WARN, "ether: no welcome in %d ms; going on without it",
+                     kJoinWaitMs);
+    }
     return 0;
 }

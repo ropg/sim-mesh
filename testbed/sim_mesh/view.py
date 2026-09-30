@@ -17,8 +17,9 @@ resolved, and the loss tables the ether read.
 - **Kind.** A node's kind is its firmware's, as the run resolved it; what its
   frames mean belongs to that kind's protocol (`sim_mesh.protocol_for`).
 - **Levels** are the medium's own: an `Ether` holding the run's tables with
-  the nodeset's antennas (over the grounds the run kept) and offsets on
-  them, the names, and the noise figure from
+  the nodeset's links, the geodata's shadowing, the nodeset's antennas (over
+  the grounds the run kept) and offsets on them (`losses.medium_tables`),
+  the names, and the noise figure from
   the run's `physics` (the ether's default when the run names none), asked
   through the ether's own `level` and `audible`. Nothing here recomputes a
   loss from positions.
@@ -136,8 +137,8 @@ class RunView:
     # ---- the medium ------------------------------------------------------
 
     def medium(self):
-        """An `Ether` with the run's tables with antennas and offsets, names and
-        noise figure, for its `level` and `audible`; it carries no traffic."""
+        """An `Ether` with the run's tables with their layers, names and noise
+        figure, for its `level` and `audible`; it carries no traffic."""
         if self._medium is None:
             e = ether_module.Ether.__new__(ether_module.Ether)
             e.physics = ether_module.Physics.from_dict(self.run.meta.get("physics"))

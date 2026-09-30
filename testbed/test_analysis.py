@@ -3,10 +3,12 @@ stations (testdata/four.yaml) on plain-27, its loss table computed there, and a
 hand-written record and station logs; and the traffic driver against a
 stand-in simulation."""
 
+import argparse
 import asyncio
 import base64
 import calendar
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -24,6 +26,7 @@ import antennas  # noqa: E402
 import compare  # noqa: E402
 import compliance  # noqa: E402
 import delivery  # noqa: E402
+import ledger  # noqa: E402
 import geodata  # noqa: E402
 import links  # noqa: E402
 import losses  # noqa: E402
@@ -73,8 +76,8 @@ class Record:
         b64 = base64.b64encode(payload).decode()
         self.add(t, "in", sid, {"type": "tx", "t0": t0, "t_end": t_end, "freq": freq,
                                 "power_dbm": power, "sf": 8, "bw": 125000, "payload": b64})
+        self.eid += 1               # the ether numbers the frame, once, heard or not
         for rsid, verdict in heard.items():
-            self.eid += 1
             self.add(t, "out", rsid, {"type": "rx_begin", "id": self.eid, "t0": t0,
                                       "t_end": t_end})
             self.add(t + span, "out", rsid, {"type": "rx_end", "id": self.eid,
@@ -83,6 +86,18 @@ class Record:
     def write(self, path):
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(self.lines) + "\n")
+
+
+class WallRecord(Record):
+    """A real-time run's record: stamped with the wall clock, `t` seconds
+    after a second before a midnight."""
+
+    MIDNIGHT = datetime.datetime(2026, 9, 29, 23, 59, 59, tzinfo=datetime.timezone.utc)
+
+    def add(self, t, direction, sid, msg):
+        stamp = (self.MIDNIGHT + datetime.timedelta(seconds=t)).isoformat(timespec="microseconds")
+        self.lines.append("%s\t%s\t%d\t%s" % (stamp, direction, sid,
+                                                 json.dumps(msg, separators=(",", ":"))))
 
 
 def lay_out(tmp_path, kind="reticulous", bare=False, name="run"):
@@ -169,6 +184,25 @@ def test_offsets_reach_the_medium_the_tools_read(tmp_path):
     ns.set_offset("n01", "n02", 20)
     ns.save()
     assert RunView(run.dir).medium().level(1, 2, CALLING, 14) == pytest.approx(before - 20)
+
+
+def test_links_reach_the_medium_the_tools_read(tmp_path):
+    run = lay_out(tmp_path)
+    ns = run.nodeset()
+    before = RunView(run.dir).medium().level(1, 2, CALLING, 14)
+    model = slt.Table.read(run.table_path("868")).get("n01", "n02")
+    ns.data["links"] = [{"between": ["n01", "n02"], "loss_db": 100.0}]
+    ns.save()
+    after = RunView(run.dir).medium().level(1, 2, CALLING, 14)
+    assert after == pytest.approx(before + model - 100, abs=0.01)
+
+
+def test_shadowing_reaches_the_medium_the_tools_read(tmp_path):
+    run = lay_out(tmp_path)
+    before = RunView(run.dir).medium().level(1, 2, CALLING, 14)
+    geodata.write(run.geodata_path, dict(run.geodata().data, shadowing_db=7, shadowing_seed=3))
+    after = RunView(run.dir).medium().level(1, 2, CALLING, 14)
+    assert after == pytest.approx(before - 7 * losses.shadowing_unit(3, "n01", "n02"), abs=0.01)
 
 
 def test_a_run_with_no_reticulous_station_reads_no_protocol(tmp_path):
@@ -259,6 +293,20 @@ def test_compliance_over(tmp_path):
     assert "n04 sent 1 frame (0.2 s)" in text and "within PSA" in text
 
 
+def test_compliance_says_when_the_worst_hour_began_on_the_runs_clock(tmp_path):
+    """A real-time run: a station's `tx` states its own clock, here 1000 s
+    ahead of the record's, and the hour's start is told on the record's."""
+    run = lay_out(tmp_path)
+    rec = WallRecord()
+    rec.add(0.0, "in", 1, {"type": "hello", "sid": 1, "slots": [0], "t": 0})
+    sent(rec, 5.0, 1, data_packet(), 0.5, own=1000.0)
+    sent(rec, 65.0, 1, data_packet(), 0.5, own=1000.0)
+    rec.write(os.path.join(run.dir, "record.tsv"))
+    row = compliance.analyse(run.dir)["n01"]["rows"][0]
+    assert row["worst_hour_s"] == pytest.approx(1.0) and row["worst_hour_from"] == 5.0
+    assert "1.0 s (0.03 %) from T 00:00:05" in compliance.section(run.dir)
+
+
 def test_seq(run):
     code, text = call(seq.main, [run.dir])
     assert code == 0
@@ -278,6 +326,148 @@ def test_compare(run, tmp_path):
     assert "n01" in text and "LXMF messages proven delivered" in text
     rows = [line.split() for line in text.splitlines() if line.startswith("n01 ")]
     assert rows[0] == ["n01", "7", "7"]            # delivered 7 s after the first hello
+
+
+def told(rec, t, rsid, eid, t0, t_end, cad=False):
+    """An rx_begin, as the ether records one."""
+    msg = {"type": "rx_begin", "slot": 0, "id": eid, "t0": t0, "t_end": t_end}
+    if cad:
+        msg["cad"] = True
+    rec.add(t, "out", rsid, msg)
+
+
+def ended(rec, t, rsid, eid, verdict, payload):
+    rec.add(t, "out", rsid, {"type": "rx_end", "slot": 0, "id": eid, "verdict": verdict,
+                             "payload": base64.b64encode(payload).decode()})
+
+
+def sent(rec, t, sid, payload, span, own=0.0):
+    """A `tx`, its timeline on the station's clock: T, or in a real-time run
+    its own, `own` seconds ahead of the record's."""
+    t0 = int(round((t + own) * 1e6))
+    rec.add(t, "in", sid, {"type": "tx", "sid": sid, "t0": t0, "t_end": t0 + int(span * 1e6),
+                           "freq": CALLING, "sf": 8, "bw": 125000, "power_dbm": 14,
+                           "payload": base64.b64encode(payload).decode()})
+
+
+def test_a_reception_is_tied_to_its_frame_by_the_ethers_number(tmp_path):
+    """At 5 s n04's tx reaches the ether first, but the barrier numbers n01's
+    frame 1 and n04's 2, and tells their receivers in that order. At 7 s n03
+    comes to RX during n02's frame 3, after n04's frame 4 has gone out, and
+    is told of frame 3 then."""
+    run = lay_out(tmp_path)
+    rec = Record()
+    sent(rec, 5.0, 4, b"four", 0.3)
+    sent(rec, 5.0, 1, b"one", 0.2)
+    told(rec, 5.0, 2, 1, 5_000_000, 5_200_000)
+    told(rec, 5.0, 3, 2, 5_000_000, 5_300_000)
+    ended(rec, 5.2, 2, 1, "clean", b"one")
+    ended(rec, 5.3, 3, 2, "crc", b"four")
+    sent(rec, 7.0, 2, b"two", 0.5)
+    told(rec, 7.0, 1, 3, 7_000_000, 7_500_000)
+    sent(rec, 7.1, 4, b"quick", 0.1)
+    rec.add(7.15, "in", 3, {"type": "state", "slot": 0, "mode": "RX", "freq": CALLING, "sf": 8})
+    told(rec, 7.15, 3, 3, 7_150_000, 7_500_000, cad=True)
+    ended(rec, 7.5, 1, 3, "clean", b"two")
+    path = os.path.join(run.dir, "record.tsv")
+    rec.write(path)
+
+    heard = {f.payload: f.heard for f in seq.read_record(path, seq.read_bytes)}
+    assert heard == {b"four": {3: "crc"}, b"one": {2: "clean"},
+                     b"two": {1: "clean", 3: "cad"}, b"quick": {}}
+    assert compare.rx_senders(path) == {1: 1, 2: 4, 3: 2}
+
+
+def test_airtime_and_links_read_a_real_time_record_across_midnight(tmp_path):
+    """Stamps are the wall clock with its date; a `tx` states its station's
+    own clock and an rx_begin the ether's, neither of them the record's."""
+    run = lay_out(tmp_path)
+    rec = WallRecord()
+    ether_us = lambda t: 7_000_000_000 + int(round(t * 1e6))       # noqa: E731
+    sent(rec, 0.5, 1, announce(0), 0.2, own=1000.0)
+    told(rec, 0.5, 2, 1, ether_us(0.5), ether_us(0.7))
+    ended(rec, 0.7, 2, 1, "clean", announce(0))
+    sent(rec, 1.5, 2, announce(1), 0.2, own=2000.0)                  # after the midnight
+    told(rec, 1.5, 1, 2, ether_us(1.5), ether_us(1.7))
+    ended(rec, 1.7, 1, 2, "crc", announce(1))
+    rec.write(os.path.join(run.dir, "record.tsv"))
+    code, text = call(airtime.main, [run.dir, "--busy"])
+    out = json.loads(text)
+    assert code == 0 and out["frames"] == 2 and out["window_s"] == pytest.approx(1.2)
+    assert out["losses"]["receptions_clean"] == 1 and out["losses"]["receptions_crc"] == 1
+    assert dict(out["busy_calling"]["top"]) == {"n01": pytest.approx(0.4 / 1.2),
+                                                "n02": pytest.approx(0.4 / 1.2)}
+    # --from counts from the record's first line.
+    assert json.loads(call(airtime.main, [run.dir, "--from", "1"])[1])["frames"] == 1
+    code, text = call(links.main, [run.dir, "--min-clean", "1"])
+    assert code == 0 and json.loads(text)["usable_links_one_way"] == 1
+
+
+def test_seq_reads_a_real_time_record_across_midnight(tmp_path):
+    rec = WallRecord()
+    sent(rec, 0.5, 1, announce(0), 0.2, own=1000.0)
+    sent(rec, 1.5, 2, announce(1), 0.2, own=2000.0)                  # after the midnight
+    path = str(tmp_path / "record.tsv")
+    rec.write(path)
+    frames = seq.read_record(path)
+    assert frames[1].at - frames[0].at == pytest.approx(1.0)
+    code, text = call(seq.main, ["--record", path])
+    assert code == 0 and [line.split()[0] for line in text.splitlines()[1:3]] == ["0.000", "1.000"]
+
+
+def test_compare_reads_a_real_time_record_longer_than_a_day(tmp_path):
+    """compare read a stamp's time of day and undid one midnight, and that
+    only after the zero: a station that joined after the midnight joined a
+    day before the first, and a frame a day on was seconds in."""
+    run = lay_out(tmp_path)
+    path = os.path.join(run.dir, "record.tsv")
+
+    def record(joins):
+        rec = WallRecord()
+        for sid, t in joins:
+            rec.add(t, "in", sid, {"type": "hello", "sid": sid, "slots": [0], "t": 0})
+        sent(rec, 86_403.5, 3, announce(0), 0.2, own=1000.0)
+        rec.write(path)
+
+    def last_joined(*argv):
+        code, text = call(compare.main, [run.dir, *argv])
+        assert code == 0
+        return next(line.split()[-1] for line in text.splitlines()
+                    if line.startswith("last station joined"))
+
+    record([(1, 0.5), (2, 1.5), (3, 86_402.5)])         # after the midnight, and a day on
+    got = compare.Run(path, {})
+    assert got.joined == {1: 0.0, 2: pytest.approx(1.0, abs=1e-3),
+                          3: pytest.approx(86_402.0, abs=1e-3)}
+    assert got.first_announce == {3: pytest.approx(86_403.0, abs=1e-3)}
+    assert got.end == pytest.approx(86_403.0, abs=1e-3)
+    # --starts is a real run's time of day: 23:59:59, the second before the midnight,
+    # also for a record whose first line comes after it.
+    assert last_joined("--starts", "86399") == "86402.5"
+    record([(2, 1.5), (3, 86_402.5)])
+    assert last_joined("--starts", "86399") == "86402.5"
+
+
+def test_frames_alike_in_their_bytes_at_one_instant_keep_their_own_receptions(tmp_path):
+    """n01 and n02 send the same bytes at the same T: n04 receives n01's,
+    and n03 loses n02's."""
+    run = lay_out(tmp_path)
+    rec = Record()
+    sent(rec, 5.0, 1, data_packet(), 0.2)
+    sent(rec, 5.0, 2, data_packet(), 0.2)
+    told(rec, 5.0, 4, 1, 5_000_000, 5_200_000)
+    told(rec, 5.0, 3, 2, 5_000_000, 5_200_000)
+    ended(rec, 5.2, 4, 1, "clean", data_packet())
+    ended(rec, 5.2, 3, 2, "crc", data_packet())
+    path = os.path.join(run.dir, "record.tsv")
+    rec.write(path)
+    losses_now = json.loads(call(airtime.main, [run.dir])[1])["losses"]
+    assert losses_now["frames_received_somewhere"] == 2
+    assert losses_now["frames_lost_at_every_receiver"] == 1
+    assert losses_now["frames_nobody_received"] == 0
+    got = {f["sid"]: (f["clean"], f["crc"])
+           for f in links.read(argparse.Namespace(record=path, frm=None, to=None))}
+    assert got == {1: ({4}, 0), 2: (set(), 1)}
 
 
 def test_delivery(run, tmp_path):
@@ -305,6 +495,202 @@ def test_delivery(run, tmp_path):
     assert [r["radio_hops"] for r in rows] == [1, 1, 2]
 
 
+def test_delivery_counts_each_sender_by_its_own_stations_logs(tmp_path):
+    """A station configured with rncfg logs no message id: a send is the first
+    message its sender logged to that recipient from when it was due, a proof
+    closes it, and a log is placed in T at the station's hello, a restart's
+    section at its own. When a send was due is the driver's schedule, not when
+    its tool answered."""
+    run = lay_out(tmp_path, kind="sergeyculum")
+    with open(os.path.join(run.dir, "record.tsv"), "a", encoding="utf-8") as handle:
+        handle.write("30.000000\tin\t4\t%s\n" % json.dumps(
+            {"type": "hello", "sid": 4, "slots": [0], "t": 0}, separators=(",", ":")))
+    boot = "  0.000000 [INFO] sim-mesh 0.1: station %d in d, bound to a, ether e"
+    logs = {
+        "n01": [boot % 1,
+                "  5.100000 [INFO] [lxmf] sent 42 B to 02020202 iface0 — waiting for its proof",
+                "  7.300000 [INFO] [lxmf] the message to 02020202 was delivered (proof ok)",
+                " 20.500000 [INFO] [lxmf] sent 42 B to 02020202 iface0 — waiting for its proof",
+                " 50.000000 [WARN] [lxmf] no proof for the message to 02020202 after 3 attempt(s)"
+                " — giving up on it"],
+        "n02": [boot % 2,
+                "  5.900000 [INFO] [lxmf] nobody answered for 01010101 — the held message is "
+                "dropped"],
+        "n04": [boot % 4,
+                "  1.000000 [INFO] [lxmf] sent 42 B to 03030303 iface0 — waiting for its proof",
+                boot % 4,
+                "  2.000000 [INFO] [lxmf] sent 42 B to 03030303 iface0 — waiting for its proof",
+                "  4.000000 [INFO] [lxmf] the message to 03030303 was delivered (proof ok)"]}
+    for name, lines in logs.items():
+        os.makedirs(run.node_dir(name), exist_ok=True)
+        with open(os.path.join(run.node_dir(name), "log"), "w") as handle:
+            handle.write("\n".join(lines) + "\n")
+    dests = {"n01": "01" * 16, "n02": "02" * 16, "n03": "03" * 16, "n04": "04" * 16}
+    # Traffic starts at T 3 s, so a send is due at 4 s + its `at`. The first
+    # one's tool answered only when the proof was in, at 7.4 s.
+    drive = {"dests": dests, "phases": [["traffic_start", 0.0, 3_000_000]], "sends": [
+        {"marker": "G0001", "src": "n01", "dst": "n02", "cls": "short", "hops": 1,
+         "at": 1.0, "t_sent": 7_400_000},
+        {"marker": "G0002", "src": "n02", "dst": "n01", "cls": "two", "hops": None,
+         "at": 2.0, "t_sent": 6_000_000},
+        {"marker": "G0003", "src": "n03", "dst": "n04", "cls": "big", "at": 3.0,
+         "t_sent": 7_000_000, "reply": "error: send: this board has heard no announce"},
+        {"marker": "G0004", "src": "n01", "dst": "n02", "cls": "short", "hops": 1,
+         "at": 16.0, "t_sent": 20_000_000},
+        {"marker": "G0005", "src": "n04", "dst": "n03", "cls": "short", "hops": 1,
+         "at": 27.5, "t_sent": 31_500_000}]}
+    path = tmp_path / "traffic.json"
+    path.write_text(json.dumps(drive))
+    code, text = call(delivery.main, [str(path), run.dir])
+    out = json.loads(text)
+    assert code == 0 and out["sent"] == 5 and out["delivered"] == 2
+    assert out["latency_s"]["min"] == pytest.approx(2.3)        # 7.3 after it was due at 5.0
+    assert out["latency_s"]["max"] == pytest.approx(2.5)        # the restart's: 30 + 4 - 31.5
+    words = dict(out["undelivered_last_word"])
+    assert words.get("gave up") == 1
+    assert words.get("no path: nobody answered") == 1
+    assert any(w.startswith("not sent: error: send") for w in words)
+
+
+def test_a_send_is_its_own_outcome_however_late_and_a_refused_one_takes_none(tmp_path):
+    """A message held for a path, or behind a tool waiting on another's proof,
+    goes out long after it was due and is still that send's; a send the tool
+    refused takes nothing, so the next one keeps its own outcome."""
+    run = lay_out(tmp_path, kind="sergeyculum")
+    boot = "  0.000000 [INFO] sim-mesh 0.1: station %d in d, bound to a, ether e"
+    os.makedirs(run.node_dir("n01"), exist_ok=True)
+    with open(os.path.join(run.node_dir("n01"), "log"), "w") as handle:
+        handle.write("\n".join([
+            boot % 1,
+            "300.000000 [INFO] [lxmf] sent 42 B to 02020202 iface0 — waiting for its proof",
+            "303.000000 [INFO] [lxmf] the message to 02020202 was delivered (proof ok)",
+            "400.000000 [INFO] [lxmf] nobody answered for 02020202 — the held message is dropped",
+        ]) + "\n")
+    dests = {"n01": "01" * 16, "n02": "02" * 16, "n03": "03" * 16, "n04": "04" * 16}
+    drive = {"dests": dests, "phases": [["traffic_start", 0.0, 3_000_000]], "sends": [
+        {"marker": "G0001", "src": "n01", "dst": "n02", "cls": "short", "at": 1.0},
+        {"marker": "G0002", "src": "n01", "dst": "n02", "cls": "short", "at": 2.0,
+         "reply": "! error: send: the board is already holding as many messages as it can"},
+        {"marker": "G0003", "src": "n01", "dst": "n02", "cls": "short", "at": 3.0,
+         "reply": "asking  : the board has no path yet and is asking for one"}]}
+    path = tmp_path / "traffic.json"
+    path.write_text(json.dumps(drive))
+    code, text = call(delivery.main, [str(path), run.dir])
+    out = json.loads(text)
+    assert code == 0 and out["sent"] == 3 and out["delivered"] == 1
+    assert out["latency_s"]["min"] == pytest.approx(298.0)     # due at 5, proved at 303
+    words = dict(out["undelivered_last_word"])
+    assert words.get("no path: nobody answered") == 1
+    assert any(w.startswith("not sent: ! error: send: the board is already holding") for w in words)
+
+
+def test_a_real_time_record_is_not_counted_for_rncfg_stations(tmp_path):
+    """Their logs are placed in T at the hellos, which a real-time record
+    stamps with the wall clock: refused rather than miscounted."""
+    from sim_mesh.reticulum import rncfg_delivery
+    path = tmp_path / "record.tsv"
+    path.write_text("# 2026-09-29T00:00:00+00:00\tether record: stamp\tdir\tsid\tjson\n"
+                    "2026-09-29T23:59:59.000000+00:00\tin\t1\t"
+                    '{"sid":1,"slots":[0],"t":0,"type":"hello"}\n')
+    with pytest.raises(ValueError, match="virtual time only"):
+        rncfg_delivery.hellos(str(path))
+
+
+def test_a_record_read_for_some_types_is_those_lines_of_it_read_whole(tmp_path):
+    """`lines(path, types)` passes over the lines it cannot want unparsed:
+    what it gives is exactly what reading every line gives, of those types,
+    whatever the spacing, with a nested `type` of theirs not enough, and
+    the malformed lines skipped alike."""
+    from sim_mesh import record as record_module
+    path = tmp_path / "record.tsv"
+    path.write_text("\n".join([
+        "# 2026-09-29T00:00:00+00:00\tether record: stamp\tdir\tsid\tjson",
+        '0.001000\tin\t1\t{"sid":1,"slots":[0],"t":0,"type":"hello"}',
+        '0.002000\tin\t1\t{"mode":"RX","nested":{"type":"tx"},"slot":0,"type":"state"}',
+        '0.003000\tin\t1\t{"t0": 3000, "t_end": 9000, "type": "tx"}',
+        '0.004000\tin\t2\t{"t0":4000,"t_end":9000,"type":"tx"',          # cut short
+        '0.005000\tin\t-\t{"t0":5000,"t_end":9000,"type":"tx"}',         # no station
+        '0.006000\tout\t2\t{"id":1,"type":"rx_begin"}',
+        '0.007000\tin\t2\t{"t0":7000,"t_end":9000,"type":"tx"}',
+        '0.008000\tin\t2\t["type", "tx"]',
+    ]) + "\n")
+    everything = list(record_module.lines(str(path)))
+    for types in (("tx",), ("hello",), ("tx", "rx_begin"), ("state",), ("nothing",)):
+        want = [item for item in everything
+                if isinstance(item[3], dict) and item[3].get("type") in types]
+        assert list(record_module.lines(str(path), types=types)) == want, types
+    assert [m["t0"] for _s, _d, _i, m in record_module.lines(str(path), ("tx",))] == [3000, 7000]
+    assert record_module.first_stamp(str(path)) == "0.001000"
+    empty = tmp_path / "empty.tsv"
+    empty.write_text("# nothing yet\n")
+    assert record_module.first_stamp(str(empty)) is None
+
+
+def rns_packet(ptype, dest, data, hops=0, via=None, ctx=0):
+    """A Reticulum packet's bytes: flags, hops, [transport address,]
+    destination, context, data."""
+    flags = (0x40 if via else 0) | ptype
+    return bytes([flags, hops]) + (via or b"") + dest + bytes([ctx]) + data
+
+
+def tx_line(t_s, sid, frame, span_us=100_000):
+    t = int(t_s * 1e6)
+    return "%.6f\tin\t%d\t%s" % (t_s, sid, json.dumps(
+        {"type": "tx", "sid": sid, "t0": t, "t_end": t + span_us, "freq": 869525000,
+         "payload": base64.b64encode(frame).decode()}, separators=(",", ":"), sort_keys=True))
+
+
+def test_the_ledger_ties_every_copy_of_a_packet_to_it(tmp_path):
+    """A relayed copy (another hop count, a transport address) is the same
+    packet; a split packet is one; a path request's answers are its
+    responders', a station answering twice a repeat; a proof belongs to the
+    packet it proves."""
+    dest, other = bytes(range(16)), bytes(range(16, 32))
+    via1, via2 = b"\xaa" * 16, b"\xbb" * 16
+    data = rns_packet(0, dest, b"hello", hops=0)
+    relayed = rns_packet(0, dest, b"hello", hops=1, via=via1)
+    big = rns_packet(0, other, bytes(range(256)) * 2)
+    path_request = next(d for d, n in frames.PLAIN_DESTS.items()
+                        if n == "rnstransport.path.request")
+    request = rns_packet(0, path_request, other + b"\x01" * 16 + b"\x02" * 16)
+    answer = rns_packet(1, other, b"\x00" * 148, hops=1, via=via2, ctx=0x0B)
+    proof = rns_packet(3, ledger.packet_hash(data)[:16], b"\x03" * 64)
+    lines = ["# 2026-09-30T00:00:00+00:00\tether record: stamp\tdir\tsid\tjson",
+             tx_line(1.0, 1, b"\x00" + data),
+             tx_line(1.5, 2, b"\x00" + relayed),
+             tx_line(2.0, 3, b"\x01" + big[:250]),        # split: first half
+             tx_line(2.2, 3, b"\x01" + big[250:]),        # second half
+             tx_line(3.0, 4, b"\x00" + request),
+             tx_line(3.5, 5, b"\x00" + answer),
+             tx_line(3.9, 6, b"\x00" + rns_packet(1, other, b"\x00" * 148, hops=2, via=via1,
+                                                   ctx=0x0B)),
+             tx_line(4.3, 6, b"\x00" + rns_packet(1, other, b"\x00" * 148, hops=2, via=via1,
+                                                   ctx=0x0B)),
+             tx_line(5.0, 7, b"\x00" + proof),
+             tx_line(5.4, 8, b"\x00" + rns_packet(3, ledger.packet_hash(data)[:16],
+                                                   b"\x03" * 64, hops=1, via=via2)),
+             tx_line(6.0, 9, b"\xc2" + b"\x00" * 10)]  # SUPE HAIL: no Reticulum packet
+    path = tmp_path / "record.tsv"
+    path.write_text("\n".join(lines) + "\n")
+
+    out = ledger.analyse(str(path))
+    by = out["by_kind"]
+    assert by["data"]["packets"] == 2 and by["data"]["transmissions"] == 3
+    assert (by["data"]["first"], by["data"]["other_station"], by["data"]["repeat"]) == (2, 1, 0)
+    assert by["data"]["airtime_s"] == pytest.approx(0.4)     # the split packet is two frames' air
+    pr = out["path_requests"]
+    assert pr["requests"] == 1 and pr["answered"] == 1
+    assert pr["per_request"][0]["responders"] == [5, 6] and pr["per_request"][0]["responses"] == 3
+    assert by["path response"]["packets"] == 1
+    assert (by["path response"]["other_station"], by["path response"]["repeat"]) == (1, 1)
+    assert out["proofs"] == {"proven_packets": 1, "proofs": 1, "transmissions": 2,
+                             "proven_more_than_once": 0}
+    assert out["not_reticulum"] == {"SUPE HAIL": {"frames": 1, "airtime_s": pytest.approx(0.1)}}
+    assert out["airtime_s"] == pytest.approx(1.1)
+    later = ledger.analyse(str(path), lo=3_000_000)
+    assert "data" not in later["by_kind"] and later["path_requests"]["responses"] == 3
+
+
 # ---- the traffic driver, against a stand-in simd ------------------------
 
 class FakeSim:
@@ -312,9 +698,14 @@ class FakeSim:
     snapshot with the stations up, and commands and intents answered by the
     stations chosen, each answer carrying the asker's id."""
 
-    def __init__(self, names):
+    def __init__(self, names, failing_sequences=0):
         self.names = names
         self.got = []
+        self.turns = []                 # drive and yield, as they came
+        # The first this many sequences (a message's route and send) fail on
+        # the way, answered as simd answers a request it could not do.
+        self.failing_sequences = failing_sequences
+        self.sequences = 0
 
     async def handle(self, request):
         from aiohttp import web
@@ -328,10 +719,26 @@ class FakeSim:
                                       for i, n in enumerate(self.names)]})
         async for msg in ws:
             m = json.loads(msg.data)
+            if m["type"] in ("drive", "yield"):
+                self.turns.append(m["type"])
+                continue
             self.got.append(m)
+            if m["type"] == "wait":
+                await ws.send_json({"type": "command_result", "id": m.get("id"), "results": {},
+                                    "t": max(2_000_000, int(m.get("until") or 0))})
             if m["type"] in ("firmware", "first_boot"):
                 await ws.send_json({"type": "command_result", "id": m.get("id"), "results": {},
                                     "t": 2_000_000})
+            if m["type"] == "sequence":
+                self.sequences += 1
+                who = m.get("names") or self.names
+                if self.sequences <= self.failing_sequences:
+                    await ws.send_json({"type": "command_result", "id": m.get("id"), "results": {},
+                                        "error": "rncfg gave no answer in 10s", "t": 2_000_000})
+                else:
+                    await ws.send_json({"type": "command_result", "id": m.get("id"), "t": 2_000_000,
+                                        "results": [{n: "no route" for n in who},
+                                                    {n: "queued %032x" % 7 for n in who}]})
             if m["type"] in ("command", "meta"):
                 who = [m["name"]] if m.get("name") else m.get("names") or self.names
                 line = m.get("line") or m.get("verb")
@@ -381,6 +788,7 @@ def test_a_driver_chooses_stations_and_asks_them(tmp_path):
         await sim.plan(("warm", 10))
 
     with_fake_sim(fake, drive)
+    assert fake.turns[0] == "drive"
     meta = [m for m in fake.got if m["type"] == "meta"][0]
     assert meta["verb"] == "announce" and meta["names"] == ["n02"] and meta["stagger"] == 30
     command = [m for m in fake.got if m["type"] == "command"][0]
@@ -403,6 +811,19 @@ def test_the_traffic_driver_runs_on_a_sim(tmp_path):
     assert json.loads(out.read_text())["phases"][-1][0] == "gathered"
     with pytest.raises(ValueError, match="no traffic option"):
         rtraffic.Options(colour="blue")
+
+
+def test_a_message_whose_send_fails_is_recorded_so_and_the_rest_go_on(tmp_path):
+    """simd answers a request it could not do with the error (a tool that
+    gave no answer, say): that message is recorded as failed, and the
+    traffic goes on. The driver had waited on the answer for ever."""
+    fake = FakeSim(["n01", "n02"], failing_sequences=1)
+    opts = {"warm_rounds": 0, "settle_every": 1, "traffic": 10, "every": 5, "drain": 0}
+    result = with_fake_sim(fake, lambda sim: rtraffic.run_on(sim, opts, str(tmp_path / "out.json")))
+    sends = result["sends"]
+    assert len(sends) == fake.sequences >= 2
+    assert sends[0]["error"] == "rncfg gave no answer in 10s" and "t_sent" not in sends[0]
+    assert all("error" not in s and s["mid"] == "%032x" % 7 for s in sends[1:])
 
 
 def test_a_script_says_it_synchronously(monkeypatch):
@@ -465,3 +886,55 @@ def test_the_schedule_is_the_seed_s():
     one = rtraffic.schedule(["a", "b", "c"], 17, 30, 5, "G")
     assert one == rtraffic.schedule(["c", "b", "a"], 17, 30, 5, "G")
     assert [s[0] for s in one] == [1, 2, 3, 4, 5, 6] and all(s[2] != s[3] for s in one)
+
+
+def the_schedule_as_it_was(names, seed, duration, every, marker):
+    """traffic.schedule before its variants, word for word."""
+    import random
+    rng = random.Random(seed)
+    names = sorted(names)
+    out = []
+    n = 0
+    while n * every < duration:
+        src = rng.choice(names)
+        dst = rng.choice([s for s in names if s != src])
+        cls = rng.choice(rtraffic.CLASSES)
+        out.append((n + 1, n * every, src, dst, cls,
+                    rtraffic.body(rng, cls, "%s%04d" % (marker, n + 1))))
+        n += 1
+    return out
+
+
+def test_the_default_schedule_is_the_one_it_always_was():
+    names = ["n%02d" % i for i in range(1, 28)]
+    for seed in (17, 101, 102, 103):
+        assert rtraffic.schedule(names, seed, 1800, 5.0, "G") == \
+            the_schedule_as_it_was(names, seed, 1800, 5.0, "G")
+
+
+def test_the_variants_keep_the_messages_and_change_when_and_between_whom():
+    names = ["n%02d" % i for i in range(1, 11)]
+    even = rtraffic.schedule(names, 7, 3600, 5.0, "G")
+    texts = [(s[4], s[5]) for s in even]
+
+    poisson = rtraffic.schedule(names, 7, 3600, 5.0, "G", arrivals="poisson")
+    ats = [s[1] for s in poisson]
+    assert ats[0] == 0 and ats == sorted(ats) and ats[-1] < 3600
+    assert 600 < len(poisson) < 840                 # 720 expected, a rate of one per 5 s
+    k = min(len(poisson), len(texts))
+    assert [(s[4], s[5]) for s in poisson][:k] == texts[:k]
+    assert poisson == rtraffic.schedule(names, 7, 3600, 5.0, "G", arrivals="poisson")
+
+    paired = rtraffic.schedule(names, 7, 3600, 5.0, "G", pairs=3)
+    assert len({(s[2], s[3]) for s in paired}) <= 3 and all(s[2] != s[3] for s in paired)
+    assert [(s[4], s[5]) for s in paired] == texts and [s[1] for s in paired] == [s[1] for s in even]
+
+    hubbed = rtraffic.schedule(names, 7, 3600, 5.0, "G", hub="n01", hub_share=0.5)
+    others = [s for s in hubbed if s[2] != "n01"]
+    share = sum(1 for s in others if s[3] == "n01") / len(others)
+    assert 0.45 < share < 0.62 and all(s[2] != s[3] for s in hubbed)
+    assert [(s[4], s[5]) for s in hubbed] == texts
+
+    for bad in ({"arrivals": "bursty"}, {"hub": "nobody"}, {"hub_share": 2}, {"pairs": -1}):
+        with pytest.raises(ValueError):
+            rtraffic.schedule(names, 7, 60, 5.0, "G", **bad)

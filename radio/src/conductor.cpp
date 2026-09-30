@@ -48,6 +48,8 @@ std::atomic<int64_t> s_until{kNever};
 std::atomic<int64_t> s_lastUntil{kNever};
 void               (*s_sendIdle)(uint64_t, int64_t) = nullptr;
 std::atomic<void (*)(void)> s_onAdvance{nullptr};
+std::atomic<bool>    s_holding{false};  /* a datagram is being applied (hold) */
+bool                 s_hookOwed = false; /* T moved during it; under B()->lock() */
 int                  s_tfd = -1;
 
 /* The real wall clock, past the time shim. */
@@ -87,6 +89,12 @@ const std::vector<Point>& profile()
     return points;
 }
 
+/* Forward, from T to node time, rounds down; back, from node time to T,
+ * rounds up, so a wake the host asks for at node time n comes back as the
+ * first T whose node time has reached n. Rounded down both ways, a slope that
+ * is not a whole ratio — a crystal a few ppm off — handed the host its wake a
+ * microsecond early: it found its deadline not reached, asked for the same
+ * instant again, and moved on only by the ether's 10 ms guard. */
 int64_t mapThrough(const std::vector<Point>& p, int64_t x, bool forward)
 {
     auto from = [&](const Point& q) { return forward ? q.t : q.n; };
@@ -98,7 +106,8 @@ int64_t mapThrough(const std::vector<Point>& p, int64_t x, bool forward)
         if (x <= from(p[i])) {
             int64_t dx = from(p[i]) - from(p[i - 1]);
             int64_t dy = to(p[i]) - to(p[i - 1]);
-            return to(p[i - 1]) + (int64_t)((__int128)(x - from(p[i - 1])) * dy / dx);
+            __int128 num = (__int128)(x - from(p[i - 1])) * dy;     /* > 0 here */
+            return to(p[i - 1]) + (int64_t)(forward ? num / dx : (num + dx - 1) / dx);
         }
     }
     return to(p.back()) + (x - from(p.back()));
@@ -321,6 +330,15 @@ const struct simradio_services* modelServices()
 int64_t nodeOf(int64_t t)       { return mapThrough(profile(), t, true); }
 int64_t conductorOf(int64_t n)  { return mapThrough(profile(), n, false); }
 
+int64_t firstNodeAt(int64_t t)
+{
+    /* nodeOf rounds down, so its answer can be a microsecond or two past the
+     * first node time that maps back to `t` or later; step back to it. */
+    int64_t n = nodeOf(t);
+    while (n > 0 && conductorOf(n - 1) >= t) n--;
+    return n;
+}
+
 int64_t nodeNowUs()
 {
     return isVirtual() ? nodeOf(s_T.load()) : B()->now_us();
@@ -333,15 +351,10 @@ int64_t epochUs()
     return e;
 }
 
-void advanceTo(int64_t t)
+/* Everything due by T, in time order: the chip's timers, and the host's waits
+ * unless a datagram is being applied (hold), whose waits wait for release. */
+void runDue()
 {
-    if (!isVirtual()) return;
-    B()->lock();
-    bool moved = t > s_T.load();
-    if (moved) s_T.store(t);
-    B()->unlock();
-    void (*hook)(void) = s_onAdvance.load();
-    if (moved && hook) hook();
     B()->lock();
     for (;;) {
         int64_t now = s_T.load();
@@ -350,7 +363,7 @@ void advanceTo(int64_t t)
         int wake = -1;
         for (Timer* tm : timers())
             if (tm->armed && tm->at <= now && tm->at < best) { best = tm->at; timer = tm; }
-        for (size_t i = 0; i < wakes().size(); i++) {
+        for (size_t i = 0; i < wakes().size() && !s_holding.load(); i++) {
             Wake& w = wakes()[i];
             if (w.atNode == kNever) continue;
             int64_t at = conductorOf(w.atNode);
@@ -376,6 +389,37 @@ void advanceTo(int64_t t)
     }
     computeUntil();
     B()->unlock();
+}
+
+void advanceTo(int64_t t)
+{
+    if (!isVirtual()) return;
+    B()->lock();
+    bool moved = t > s_T.load();
+    if (moved) s_T.store(t);
+    bool holding = s_holding.load();
+    if (moved && holding) s_hookOwed = true;
+    B()->unlock();
+    void (*hook)(void) = s_onAdvance.load();
+    if (moved && hook && !holding) hook();
+    runDue();
+}
+
+void hold()
+{
+    s_holding.store(true);
+}
+
+void release()
+{
+    s_holding.store(false);
+    B()->lock();
+    bool owed = s_hookOwed;
+    s_hookOwed = false;
+    B()->unlock();
+    void (*hook)(void) = s_onAdvance.load();
+    if (owed && hook) hook();
+    runDue();
 }
 
 void welcome(bool isVirtualRun, int64_t t, int64_t epoch, uint64_t seq)

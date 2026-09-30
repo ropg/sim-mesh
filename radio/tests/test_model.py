@@ -304,6 +304,21 @@ def test_set_tx_publishes_a_frame_timed_by_the_toa_formula(chip):
     assert base64.b64decode(tx["payload"]) == payload
 
 
+def test_in_real_time_a_chip_is_never_said_to_be_quiet(chip):
+    """simradio_quiet_for_us is a virtual-time answer: -1 in a real-time run,
+    transmitting or not."""
+    quiet = chip.lib.simradio_quiet_for_us
+    quiet.argtypes = [ctypes.c_void_p]
+    quiet.restype = ctypes.c_int64
+    assert quiet(chip.handle) == -1
+    chip.configure(length=42)
+    chip.frame([WRITE_BUFFER, 0x00, *range(42)])
+    chip.ether.clear()
+    chip.write(SET_TX, 0x00, 0x00, 0x00)
+    chip.ether.expect("tx")
+    assert quiet(chip.handle) == -1
+
+
 def test_tx_done_lands_at_the_end_and_the_chip_falls_back(chip):
     chip.configure(length=10, dio1=TX_DONE)
     chip.write(SET_RXTX_FALLBACK, 0x40)          # FS after a transmission
@@ -340,8 +355,10 @@ def test_rx_begin_raises_preamble_and_header_then_rx_end_delivers(chip):
     # 10 ms), so lateness is only bounded here; the exact instants are
     # test_conductor's, on T.
     at = chip.wait_irq(PREAMBLE)
+    assert 4 * TSYM <= at - begun < 4 * TSYM + HOST_TIMER_LATE_S
+    assert chip.irq() & (SYNC | HEADER_VALID) == 0
+    at = chip.wait_irq(SYNC)
     assert 0.060 <= at - begun < 0.060 + HOST_TIMER_LATE_S
-    assert chip.irq() & (PREAMBLE | SYNC) == PREAMBLE | SYNC
     assert chip.irq() & HEADER_VALID == 0
     at = chip.wait_irq(HEADER_VALID)
     assert 0.100 <= at - begun < 0.100 + HOST_TIMER_LATE_S
@@ -391,6 +408,55 @@ def test_rx_end_with_a_crc_verdict_raises_crc_err(chip):
     chip.ether.rx_end(102, b"spoiled", verdict="crc")
     chip.wait_irq(RX_DONE)
     assert chip.irq() & (RX_DONE | CRC_ERR) == RX_DONE | CRC_ERR
+
+
+def test_snr_reads_no_more_than_a_lora_receiver_reports(chip):
+    chip.configure()
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+
+    # 50 m away at +14 dBm: -63 dBm, 54 dB over the noise. The estimate
+    # saturates a little above 10 dB, so the link reads +12 dB, where the
+    # signed byte x/4 would have wrapped 54 dB round to -10 dB.
+    chip.ether.rx_begin(111, -63, 10_000, 20_000, 50_000)
+    chip.wait_irq(HEADER_VALID)
+    chip.ether.rx_end(111, b"near", rssi=-63, snr=54)
+    chip.wait_irq(RX_DONE)
+    rssi, snr, signal = chip.read(GET_PACKET_STATUS, 3)
+    assert rssi == 126 and signal == 126          # -2 x -63
+    assert snr == 48                              # 4 x 12, not 216: -10 dB
+
+
+def test_packet_status_reads_a_faint_frame_at_its_registers_ends(chip):
+    chip.configure()
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+
+    # As faint as SF12 hears: -135 dBm, 18 dB under the noise. RSSI holds at
+    # the register's floor, and an SNR inside the register's range is kept.
+    chip.ether.rx_begin(112, -135, 10_000, 20_000, 50_000)
+    chip.wait_irq(HEADER_VALID)
+    chip.ether.rx_end(112, b"far", rssi=-135, snr=-18)
+    chip.wait_irq(RX_DONE)
+    rssi, snr, signal = chip.read(GET_PACKET_STATUS, 3)
+    assert rssi == 254 and signal == 254          # -127 dBm, not 270: -7 dBm
+    assert snr == (-18 * 4) & 0xFF                # under the ceiling, unchanged
+
+
+def test_a_long_preamble_is_found_long_before_its_sync_word(chip):
+    """PreambleDetected comes four symbols into a frame, however long the
+    preamble is. Firmware that senses the channel by asking the demodulator
+    waits on that bit."""
+    chip.configure()
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+    begun = time.monotonic()
+    chip.ether.rx_begin(103, -80, pre_us=150_000, hdr_us=170_000, end_us=300_000)
+    at = chip.wait_irq(PREAMBLE)
+    assert at - begun < 0.060                   # the sync word is 150 ms in
+    assert chip.irq() & SYNC == 0
+    chip.ether.rx_end(103, b"found early")
+    chip.wait_irq(RX_DONE)
 
 
 def test_the_receiver_follows_whichever_frame_the_ether_last_began(chip):
@@ -471,6 +537,28 @@ def test_rssi_inst_reads_the_air_then_the_floor_and_nothing_outside_rx(chip):
     assert chip.read(GET_RSSI_INST, 1)[0] == 220        # -2 x -110, the floor
     chip.write(SET_STANDBY, 0x00)
     assert chip.read(GET_RSSI_INST, 1)[0] == 0xFF
+
+
+def test_rssi_inst_reads_the_power_of_everything_on_the_air_summed(chip):
+    """Two frames at -80 dBm read -77, as the ether's busy test sums them;
+    a frame the ether tells of twice, as it does a slot that starts
+    listening again mid-frame, counts once."""
+    chip.configure()
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+    chip.ether.rx_begin(402, -80, 10_000, 20_000, 600_000, cad=True)
+    settle(0.03)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 160        # -2 x -80
+    chip.ether.rx_begin(402, -80, 10_000, 20_000, 570_000, cad=True)
+    settle(0.03)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 160        # the same frame, once
+    chip.ether.rx_begin(403, -80, 10_000, 20_000, 150_000, cad=True)
+    settle(0.03)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 154        # -2 x -77: both
+    settle(0.2)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 160        # the second has left
+    settle(0.45)
+    assert chip.read(GET_RSSI_INST, 1)[0] == 220        # and the first: the floor
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +665,8 @@ def test_clear_irq_clears_only_the_given_bits_and_reads_never_tear(chip):
     chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
     settle()
     chip.ether.rx_begin(801, -90, 900_000, 950_000, 2_000_000)
-    settle(0.02)
+    chip.wait_irq(PREAMBLE)         # found four symbols in; the rest is far off
+    chip.clear_irq()
     seen = set()
     stop = threading.Event()
 

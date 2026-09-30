@@ -35,17 +35,30 @@ What a node runs is not the nodeset's either: a script says it
 A nodeset names no geodata. It is offered on every geodata whose extent holds
 one of its nodes (`inside`); synthetic ground lies at 0°, 0°.
 
-A node's name is how everything refers to it: scripts, offsets, snapshots and
-the page. Its id is its network identity, stored and editable: the station's
-loopback address and MAC follow from it (`stations.bind_addr`), so changing
-it moves the station, and anything already set up with its old `{id}` or
-`{addr}` is stale. A new node takes the lowest id not in use.
+A node's name is how everything refers to it: scripts, offsets, links,
+snapshots and the page. Its id is its network identity, stored and
+editable: the station's loopback address and MAC follow from it
+(`stations.bind_addr`), so changing it moves the station, and anything
+already set up with its old `{id}` or `{addr}` is stale. A new node takes
+the lowest id not in use.
 
 **Offsets** are dB added to the computed loss of one pair, both ways, on any
 geodata: where a measurement says the model is wrong, and by how much. They
 are a layer over the loss table, applied when the medium is given it, so the
 table itself (`geometry_hash`: which nodes, where, how high) is cached
 without them and an offset never forces a recompute.
+
+**Links** state a pair's loss outright, where a better figure than the
+model's is known, measured or worked out elsewhere:
+
+    links:
+      - { between: [a, b], loss_db: 131.5, back_db: 133, note: measured }
+
+a→b is `loss_db` and b→a `back_db`, `loss_db` again when it has none, the
+same figure in every band with no correction between bands. A link is a
+layer too (`losses.with_links`): it stands in for the model's loss and the
+geodata's shadowing, and the antennas and any offset still go on top of it.
+A file without links has no `links:` key, and is written back without one.
 """
 
 import copy
@@ -54,6 +67,7 @@ import hashlib
 import json
 import math
 import os
+from array import array
 
 import yaml
 
@@ -70,6 +84,8 @@ DEFAULT_HEIGHT_M = 2.0
 MERGE_WITHIN_M = 5.0                # two layers' nodes this close are one node
 EARTH_RADIUS_M = 6371008.8
 KEEP = object()                     # set_node: a fact not given, left as it is
+LINK_KEYS = ("between", "loss_db", "back_db", "note")
+LINK_FORM = "{ between: [a, b], loss_db, back_db?, note? }"
 
 
 def nodeset_path(name):
@@ -117,12 +133,28 @@ def check_tags(tags):
     return list(dict.fromkeys(tags))
 
 
+def finite(value, key, where):
+    """A nodeset's number as a float, or a StoreError naming its key when it
+    is none: a word, or a NaN or an infinity, which YAML and JSON read as
+    numbers but no file could be written with (store.scalar)."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        out = math.nan
+    if not math.isfinite(out):
+        raise store.StoreError("%s: %s is a finite number, not %r" % (where, key, value))
+    return out
+
+
 def parse(data, where):
     """A nodeset file's mapping, checked and filled out.
 
     Two nodes under one id would be two processes answering the ether as
     one station and two sockets on one address, so that is refused here,
-    as is an offset naming a node the nodeset does not have.
+    as is an offset naming a node the nodeset does not have. So is a link
+    that is no figure: one without a loss, naming a node there is not,
+    from a node to itself, or stating a pair a second time, which leaves
+    the pair's loss to whichever came last.
     """
     if not isinstance(data, dict):
         raise store.StoreError("%s: not a nodeset" % where)
@@ -136,7 +168,7 @@ def parse(data, where):
         try:
             node_id = int(node["id"])
             lat, lon = float(node["lat"]), float(node["lon"])
-        except (KeyError, TypeError, ValueError) as err:
+        except (KeyError, TypeError, ValueError, OverflowError) as err:
             raise store.StoreError("%s: node %s needs id, lat and lon" % (where, name)) from err
         if node_id in ids:
             raise store.StoreError("%s: nodes %s and %s share id %d"
@@ -161,23 +193,90 @@ def parse(data, where):
             raise store.StoreError("%s: a node has no board: every node is an SX1262, and "
                                    "`max_dbm` is its maximum power" % here)
         out["nodes"][name] = node_record(
-            node_id, lat, lon, node.get("height_m", DEFAULT_HEIGHT_M), height_from,
+            node_id, finite(lat, "lat", here), finite(lon, "lon", here),
+            finite(node.get("height_m", DEFAULT_HEIGHT_M), "height_m", here), height_from,
             antennas_module.check(node.get("antenna"), here), check_tags(node.get("tags")),
             boards_module.check(node.get("max_dbm"), here))
-    for offset in data.get("offsets") or []:
+    offsets = data.get("offsets") or []
+    if not isinstance(offsets, list):
+        raise store.StoreError("%s: offsets is a list, each { between: [a, b], db, note? }"
+                               % where)
+    for offset in offsets:
         try:
-            a, b = (str(n) for n in list(offset["between"])[:2])
+            ends = offset["between"]
+            if not isinstance(ends, (list, tuple)):
+                raise TypeError("not a list of nodes")      # a string's letters are no nodes
+            if len(ends) != 2:
+                raise ValueError("not two nodes")
+            a, b = (str(n) for n in ends)
             db = float(offset.get("db", 0))
         except (KeyError, TypeError, ValueError) as err:
             raise store.StoreError("%s: an offset is { between: [a, b], db, note? }" % where) from err
         for end in (a, b):
             if end not in out["nodes"]:
                 raise store.StoreError("%s: offset names %s, which is not a node" % (where, end))
+        if not math.isfinite(db):
+            raise store.StoreError("%s: the offset between %s and %s states db %s: an offset "
+                                   "is a finite number of dB" % (where, a, b, db))
         entry = {"between": [a, b], "db": db}
         if offset.get("note"):
             entry["note"] = str(offset["note"])
         out["offsets"].append(entry)
+    stated = data.get("links") or []
+    if not isinstance(stated, list):
+        raise store.StoreError("%s: links is a list, each %s" % (where, LINK_FORM))
+    links = [check_link(link, out["nodes"], where) for link in stated]
+    pairs = set()
+    for link in links:
+        pair = frozenset(link["between"])
+        if pair in pairs:
+            raise store.StoreError("%s: the link between %s and %s is stated twice"
+                                   % ((where,) + tuple(link["between"])))
+        pairs.add(pair)
+    if links:
+        out["links"] = links
     return out
+
+
+def check_link(link, nodes, where):
+    """One link, checked: its two ends, its loss one way and, when it
+    states one, the other.
+
+    A key it does not know is refused rather than passed over: a
+    misspelt `back_db` would otherwise make the link the same both ways,
+    a wrong number with nothing to say so. A loss is 0 dB or more, and
+    one a table's float32 cell can hold, since a figure too large for it
+    would silently become never heard.
+    """
+    if not isinstance(link, dict):
+        raise store.StoreError("%s: a link is %s" % (where, LINK_FORM))
+    unknown = sorted(str(key) for key in link if key not in LINK_KEYS)
+    if unknown:
+        raise store.StoreError("%s: a link has no %s: it is %s"
+                               % (where, ", ".join(unknown), LINK_FORM))
+    try:
+        ends = link["between"]
+        if not isinstance(ends, (list, tuple)) or len(ends) != 2:
+            raise ValueError("not two nodes")
+        a, b = (str(n) for n in ends)
+        figures = {"loss_db": float(link["loss_db"])}
+        if "back_db" in link:
+            figures["back_db"] = float(link["back_db"])
+    except (KeyError, TypeError, ValueError) as err:
+        raise store.StoreError("%s: a link is %s" % (where, LINK_FORM)) from err
+    for end in (a, b):
+        if end not in nodes:
+            raise store.StoreError("%s: link names %s, which is not a node" % (where, end))
+    if a == b:
+        raise store.StoreError("%s: a link joins two nodes, not %s to itself" % (where, a))
+    for key, value in figures.items():
+        if not (value >= 0 and math.isfinite(array("f", [value])[0])):
+            raise store.StoreError("%s: the link between %s and %s states %s %s: a loss is "
+                                   "a finite number of dB, 0 or more" % (where, a, b, key, value))
+    entry = {"between": [a, b], **figures}
+    if link.get("note"):
+        entry["note"] = str(link["note"])
+    return entry
 
 
 def check_id(node_id):
@@ -190,7 +289,7 @@ def check_id(node_id):
 def read(path):
     try:
         with open(path, encoding="utf-8") as handle:
-            data = yaml.safe_load(handle) or {}
+            data = store.load_yaml(handle) or {}
     except (OSError, yaml.YAMLError) as err:
         raise store.StoreError("%s: %s" % (path, err)) from err
     return parse(data, path)
@@ -214,7 +313,7 @@ def dump_node(name, node):
         parts.append("max_dbm: %s" % store.scalar(node["max_dbm"]))
     parts.append("antenna: %s" % dump_antenna(node["antenna"]))
     parts.append("tags: %s" % store.flow(node["tags"]))
-    return "  %s: { %s }" % (name, ", ".join(parts))
+    return "  %s: { %s }" % (store.name_scalar(name), ", ".join(parts))
 
 
 def dump(data, comment=None):
@@ -234,7 +333,19 @@ def dump(data, comment=None):
     for offset in offsets:
         note = ", note: %s" % store.scalar(offset["note"]) if offset.get("note") else ""
         out.append("  - { between: [%s, %s], db: %s%s }"
-                   % (offset["between"][0], offset["between"][1], store.scalar(offset["db"]), note))
+                   % (store.name_scalar(offset["between"][0]),
+                      store.name_scalar(offset["between"][1]), store.scalar(offset["db"]), note))
+    links = data.get("links") or []
+    if links:
+        out.append("links:")
+    for link in links:
+        parts = ["between: %s" % store.flow(link["between"]),
+                 "loss_db: %s" % store.scalar(link["loss_db"])]
+        if "back_db" in link:
+            parts.append("back_db: %s" % store.scalar(link["back_db"]))
+        if link.get("note"):
+            parts.append("note: %s" % store.scalar(link["note"]))
+        out.append("  - { %s }" % ", ".join(parts))
     return "\n".join(out) + "\n"
 
 
@@ -295,6 +406,11 @@ class Nodeset:
     def offsets(self):
         return self.data["offsets"]
 
+    @property
+    def links(self):
+        """The pairs whose loss is stated, [] when the file states none."""
+        return self.data.get("links") or []
+
     def node(self, name):
         node = self.nodes.get(name)
         if node is None:
@@ -350,7 +466,9 @@ class Nodeset:
         store.check_name(name, "node")
         if name in self.nodes:
             raise store.StoreError("there is already a node called %r" % name)
-        self.nodes[name] = node_record(self.next_id(), lat, lon)
+        where = "node %s" % name
+        self.nodes[name] = node_record(self.next_id(), finite(lat, "lat", where),
+                                       finite(lon, "lon", where))
         try:
             self.set_node(name, **fields)
         except store.StoreError:
@@ -363,24 +481,31 @@ class Nodeset:
         self.node(name)
         del self.nodes[name]
         self.data["offsets"] = [o for o in self.offsets if name not in o["between"]]
+        if "links" in self.data:
+            links = [link for link in self.links if name not in link["between"]]
+            if links:
+                self.data["links"] = links
+            else:
+                del self.data["links"]
         self.dirty = True
 
     def rename_node(self, name, new):
-        """Give a node another name, and carry its offsets over."""
+        """Give a node another name, and carry its offsets and links over."""
         node = self.node(name)
         store.check_name(new, "node")
         if new in self.nodes:
             raise store.StoreError("there is already a node called %r" % new)
         self.data["nodes"] = {(new if key == name else key): value
                               for key, value in self.nodes.items()}
-        for offset in self.offsets:
-            offset["between"] = [new if end == name else end for end in offset["between"]]
+        for pair in self.offsets + self.links:
+            pair["between"] = [new if end == name else end for end in pair["between"]]
         self.dirty = True
         return node
 
     def move_node(self, name, lat, lon):
         node = self.node(name)
-        node["lat"], node["lon"] = float(lat), float(lon)
+        where = "node %s" % name
+        node["lat"], node["lon"] = finite(lat, "lat", where), finite(lon, "lon", where)
         self.dirty = True
 
     def set_node(self, name, id=None, lat=None, lon=None, height_m=None, height_from=None,
@@ -393,9 +518,10 @@ class Nodeset:
         and one with state must be restarted for it to take.
         """
         node = self.node(name)
+        where = "node %s" % name
         changed_id = False
-        if id is not None and int(id) != node["id"]:
-            node_id = int(id)
+        node_id = None if id is None else int(finite(id, "id", where))
+        if node_id is not None and node_id != node["id"]:
             check_id(node_id)
             other = self.by_id(node_id)
             if other is not None:
@@ -403,19 +529,19 @@ class Nodeset:
             node["id"] = node_id
             changed_id = True
         if lat is not None:
-            node["lat"] = float(lat)
+            node["lat"] = finite(lat, "lat", where)
         if lon is not None:
-            node["lon"] = float(lon)
+            node["lon"] = finite(lon, "lon", where)
         if height_m is not None:
-            node["height_m"] = float(height_m)
+            node["height_m"] = finite(height_m, "height_m", where)
         if height_from is not None:
             if height_from not in HEIGHT_FROM:
                 raise store.StoreError("height_from is one of %s" % ", ".join(HEIGHT_FROM))
             node["height_from"] = height_from
         if antenna is not None:
-            node["antenna"] = antennas_module.check(antenna, "node %s" % name)
+            node["antenna"] = antennas_module.check(antenna, where)
         if max_dbm is not KEEP:
-            max_dbm = boards_module.check(max_dbm, "node %s" % name)
+            max_dbm = boards_module.check(max_dbm, where)
             if max_dbm is None:
                 node.pop("max_dbm", None)
             else:
@@ -428,10 +554,11 @@ class Nodeset:
     def set_offset(self, a, b, db, note=None):
         """Set the dB added between two nodes; 0 removes it."""
         self.node(a), self.node(b)
+        db = finite(db, "db", "the offset between %s and %s" % (a, b))
         pair = {a, b}
         self.data["offsets"] = [o for o in self.offsets if set(o["between"]) != pair]
         if db:
-            entry = {"between": [a, b], "db": float(db)}
+            entry = {"between": [a, b], "db": db}
             if note:
                 entry["note"] = str(note)
             self.offsets.append(entry)
@@ -458,11 +585,15 @@ class Nodeset:
         return Nodeset(self.name, copy.deepcopy(self.data), path or self.path)
 
     def as_dict(self):
-        """What the page is told about the nodeset."""
-        return {"name": self.name, "dirty": self.dirty,
-                "geometry_hash": self.geometry_hash(),
-                "nodes": copy.deepcopy(self.nodes),
-                "offsets": copy.deepcopy(self.offsets)}
+        """What the page is told about the nodeset. Its links, when it has
+        any, go along for the page to hand back on a save; it edits none."""
+        out = {"name": self.name, "dirty": self.dirty,
+               "geometry_hash": self.geometry_hash(),
+               "nodes": copy.deepcopy(self.nodes),
+               "offsets": copy.deepcopy(self.offsets)}
+        if self.links:
+            out["links"] = copy.deepcopy(self.links)
+        return out
 
 
 def load(name):
@@ -543,7 +674,8 @@ def merge(layers):
     MERGE_WITHIN_M of a node of an earlier layer is that node, the earlier
     layer's, and is left out; a name an earlier layer took gets the layer's
     name appended (and a number, should that be taken too); an id taken gets
-    the lowest free one. An offset comes along where both its ends do.
+    the lowest free one. An offset or a link comes along where both its ends
+    do.
     """
     layers = [(layer, parse(data, "layer %s" % layer)) for layer, data in layers]
     if len(layers) == 1:
@@ -569,6 +701,11 @@ def merge(layers):
             a, b = offset["between"]
             if a in renamed and b in renamed:
                 out["offsets"].append(dict(copy.deepcopy(offset), between=[renamed[a], renamed[b]]))
+        for link in data.get("links") or []:
+            a, b = link["between"]
+            if a in renamed and b in renamed:
+                out.setdefault("links", []).append(
+                    dict(copy.deepcopy(link), between=[renamed[a], renamed[b]]))
     return out
 
 
@@ -641,6 +778,33 @@ def from_imported(rows, source, height_m=15.0):
             "measured" if height is not None else "assumed",
             tags=check_tags(t for t in tags if t))
     return data
+
+
+# What planner's height estimate rested on (`/height.json`'s `basis`), as a
+# node's `height_from`: a roof under it, or the rasters around it. An estimate
+# on no evidence is no better than the height already assumed.
+HEIGHT_FROM_BASIS = {"lod2-building": "roof", "clutter-neighbourhood": "raster",
+                     "class-typical": "raster"}
+
+
+def with_estimated_heights(data, estimates):
+    """In a nodeset file mapping, every node whose height is assumed given the
+    height planner's estimator found for it (`estimates`: {name: a
+    `/height.json` reply}), to the decimetre, and `roof` or `raster` for what
+    it rested on. A measured, roof or raster height is kept, and so is a node
+    with no estimate or one on no evidence. Returns the names changed."""
+    changed = []
+    for name, node in data["nodes"].items():
+        got = estimates.get(name)
+        if node.get("height_from", "assumed") != "assumed" or not got:
+            continue
+        source = HEIGHT_FROM_BASIS.get(got.get("basis"))
+        if source is None:
+            continue
+        node["height_m"] = round(float(got["h_agl_m"]), 1)
+        node["height_from"] = source
+        changed.append(name)
+    return changed
 
 
 def import_nodes_csv(path, height_m=15.0):

@@ -110,7 +110,7 @@ def snapshots(snapshots_dir=None):
 def _read_yaml(path):
     try:
         with open(path, encoding="utf-8") as handle:
-            return yaml.safe_load(handle) or {}
+            return store.load_yaml(handle) or {}
     except (OSError, yaml.YAMLError) as err:
         raise store.StoreError("%s: %s" % (path, err)) from err
 

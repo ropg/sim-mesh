@@ -125,6 +125,10 @@
             </q-item>
             <q-item clickable v-close-popup @click="openCommand"><q-item-section>Run command…</q-item-section></q-item>
           </template>
+          <q-item clickable v-close-popup :disable="!ground.isPack || !assumedSelected.length"
+                  @click="estimateHeights(assumedSelected)">
+            <q-item-section>Estimate heights from the pack</q-item-section>
+          </q-item>
           <q-separator v-if="nodes.attached" />
           <q-item clickable v-close-popup @click="askRemove(nodes.selection)">
             <q-item-section class="text-negative">
@@ -288,7 +292,7 @@ import { direction, gain, pairGain, specOf, type Antenna, type End } from '../li
 import { useGrounds } from '../stores/grounds'
 import { txDbm } from '../lib/boards'
 import { cell } from '../lib/slt'
-import { roofAt } from '../lib/roof'
+import { estimateAt, roofAt } from '../lib/roof'
 import { etaText, phaseText, realText, tText } from '../components/runtime'
 import type { GroundPoint, LinkMark, MapNode, Pick } from '../lib/marks'
 
@@ -657,13 +661,40 @@ async function putOnRoof(name: string, at: GroundPoint) {
   }
 }
 
+/* The selected nodes whose height nobody measured or placed: what an
+ * estimate may replace. */
+const assumedSelected = computed(() =>
+  nodes.selection.filter(n => nodes.byName[n]?.height_from === 'assumed'))
+
+/* planner's estimate for each of them, from the pack's roofs and rasters
+ * (lib/roof.ts estimateAt); a node it finds nothing for keeps its height. */
+async function estimateHeights(names: string[]) {
+  const base = ground.sidecar
+  if (!base) return
+  let done = 0
+  try {
+    for (const name of names) {
+      const n = nodes.byName[name]
+      if (!n || n.height_from !== 'assumed') continue
+      const [x, y] = ground.frame.toXY(n.lat, n.lon)
+      const e = await estimateAt(base, x, y)
+      if (!e) continue
+      nodes.setMany([name], { height_m: e.height_m, height_from: e.height_from })
+      done++
+    }
+    tell(null, `${done} of ${names.length} height${names.length === 1 ? '' : 's'} estimated from the pack`)
+  } catch (e) {
+    tell((e as Error).message)
+  }
+}
+
 function askRemove(names: string[]) {
   if (!names.length) return
   quasar.dialog({
     title: names.length === 1 ? `Remove ${names[0]}` : `Remove ${names.length} nodes`,
     message: nodes.attached
       ? 'Stop them, take them out of this run\'s nodeset and delete their state? This cannot be undone.'
-      : 'Take them out of the nodeset, with their offsets?',
+      : 'Take them out of the nodeset, with their offsets and links?',
     cancel: true, persistent: true,
   }).onOk(() => nodes.remove(names))
 }

@@ -25,6 +25,9 @@
  *     listening <port>         the port it listens on at SIM_MESH_BIND_ADDR,
  *                              given a second argument
  */
+/* sem_clockwait is a GNU extension: without this <semaphore.h> does not
+ * declare it, which gcc 14 refuses as an implicit declaration. */
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>

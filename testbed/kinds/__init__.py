@@ -30,6 +30,7 @@ station is given them (`expand`).
 """
 
 import asyncio
+import contextlib
 import os
 import re
 
@@ -130,6 +131,9 @@ class Kind:
                        LD_PRELOAD=SHIM)
         if getattr(station, "board", None):
             env["SIM_MESH_BOARD"] = station.board
+        profile = getattr(station, "clock_profile", None)
+        if station.clock is not None and profile:
+            env["SIM_MESH_CLOCK_PROFILE"] = profile
         env.update(self.extra_env)
         return env
 
@@ -220,6 +224,20 @@ class Kind:
     # role intents of its first-boot rules are then said at every boot.
     role_volatile = False
 
+    # Whether its console must be a terminal: a firmware that sets the line
+    # up, reads keys, or buffers its output unless it is on a tty. False
+    # gives the station a pipe each way instead, which holds none of the
+    # host's ptys; its output must then reach the pipe line by line.
+    console_tty = True
+
+    # Whether the testbed acts on what the station prints: framed-RPC replies,
+    # the capability marker. Then what a station printed at an instant is read
+    # before T moves on (simd's drain). False, for a kind whose console carries
+    # log lines alone, and its consoles are read as they come, off the barrier:
+    # nothing waits on them, and holding T for them at every instant is much of
+    # what a large run costs.
+    console_acted_on = True
+
     def describe(self):
         return "%s: %s (%s) %s" % (self.device.get("ref"), self.label, self.type_name,
                                    self.elf or "no binary")
@@ -288,18 +306,23 @@ def make_kinds(builds):
     return kinds
 
 
-async def run_tool(argv, timeout):
-    """Run a helper program to completion: its exit code and all it printed."""
+async def run_tool(argv, timeout, env=None):
+    """Run a helper program to completion: its exit code and all it printed.
+    `env` adds to the testbed's environment."""
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=dict(os.environ, **env) if env else None)
     except OSError as err:
         raise CommandError("%s: %s" % (argv[0], err)) from err
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
     except asyncio.TimeoutError as err:
-        proc.kill()
+        # It may have ended in the same instant the wait did: there is then
+        # nothing to kill, and it is still a tool that gave no answer in time.
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
         await proc.wait()
         raise CommandError("%s gave no answer in %.0fs" % (os.path.basename(argv[0]),
                                                           timeout)) from err
