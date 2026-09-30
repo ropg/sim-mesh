@@ -45,7 +45,8 @@
 #
 # Stations need Linux: each binds its own 127.x.y.z address and the virtual-time
 # shim is an LD_PRELOAD library. On Linux everything runs natively. Anywhere else,
-# or with SIMESH_DOCKER=1, the same command runs inside SIMesh's own image
+# or with SIMESH_DOCKER=1, the same command runs inside SIMesh's own image, under
+# docker, or podman where there is no docker (SIMESH_RUNTIME chooses)
 # (Dockerfile beside this script), built on first use and again whenever the
 # Dockerfile changes, with the directory holding SIMesh mounted at its own path
 # so a workspace beside it is where a workspace build expects it, and port 8800
@@ -64,6 +65,8 @@
 #     SIMESH_CATALOGUES  where bare catalogue names are fetched from
 #                        (default https://reticulous.net/builds/)
 #     SIMESH_DOCKER=1    use the container on Linux too
+#     SIMESH_RUNTIME     the container runtime, docker or podman (default: docker
+#                        when it is installed, else podman)
 
 set -euo pipefail
 
@@ -111,46 +114,70 @@ open_when_up() {
     ) &
 }
 
+# The container runtime: SIMESH_RUNTIME when set, else docker, else podman.
+runtime() {
+    local r=${SIMESH_RUNTIME:-}
+    if [ -z "$r" ]; then
+        if command -v docker >/dev/null; then r=docker
+        elif command -v podman >/dev/null; then r=podman
+        else die "stations need Linux; on $(uname -s) SIMesh runs in a container, and neither docker nor podman is installed"
+        fi
+    fi
+    command -v "$r" >/dev/null || die "SIMESH_RUNTIME is $r, which is not installed"
+    printf '%s\n' "$r"
+}
+
+# Whether the runtime is podman (a `docker` that is podman says so too).
+is_podman() { "$1" --version 2>/dev/null | grep -qi podman; }
+
 in_container() {
     local publish=$1; shift
-    command -v docker >/dev/null || die "stations need Linux; on $(uname -s) SIMesh runs in Docker, which is not installed"
-    local tag image
+    local rt tag image
+    rt=$(runtime)
     tag=$(cksum < "$ROOT/Dockerfile" | cut -d' ' -f1)
     image="simesh:$tag"
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
+    if ! "$rt" image inspect "$image" >/dev/null 2>&1; then
         say "building the SIMesh image ($image)…"
-        docker build -t "$image" "$ROOT"
+        "$rt" build -t "$image" "$ROOT"
     fi
     local outer
     outer=$(cd "$ROOT/.." && pwd)
+    # A station binds its web UI's port 80 and 443 as the caller's user: the
+    # container lets any user take a port under 1024, as Docker's do by
+    # default and podman's do not.
     local args=(run --rm --init -i
                 --user "$(id -u):$(id -g)"
+                --sysctl net.ipv4.ip_unprivileged_port_start=0
                 -v "$outer:$outer" -w "$ROOT"
                 -v simesh-home:/home/simesh -e HOME=/home/simesh
                 -e SIMESH_IN_CONTAINER=1)
+    # A rootless podman keeps the caller's id inside, or what the container
+    # writes in the mounted directory would belong to a subordinate id.
+    if is_podman "$rt" && [ "$(id -u)" != 0 ]; then args+=(--userns=keep-id); fi
     [ -t 0 ] && [ -t 1 ] && args+=(-t)
     [ -z "${SIMESH_CATALOGUES:-}" ] || args+=(-e "SIMESH_CATALOGUES=$SIMESH_CATALOGUES")
     if [ "$publish" = 1 ]; then
         # One front at a time: a running one is said so, and one left behind
         # stopped (--rm did not get to it) is cleared out of the name's way.
-        if [ -n "$(docker ps -q -f "name=^${FRONT_CONTAINER}\$")" ]; then
-            die "a front is already running ($FRONT_CONTAINER): to restart it, docker stop $FRONT_CONTAINER first"
+        if [ -n "$("$rt" ps -q -f "name=^${FRONT_CONTAINER}\$")" ]; then
+            die "a front is already running ($FRONT_CONTAINER): to restart it, $rt stop $FRONT_CONTAINER first"
         fi
-        if [ -n "$(docker ps -aq -f "name=^${FRONT_CONTAINER}\$")" ]; then
-            docker rm -f "$FRONT_CONTAINER" >/dev/null
+        if [ -n "$("$rt" ps -aq -f "name=^${FRONT_CONTAINER}\$")" ]; then
+            "$rt" rm -f "$FRONT_CONTAINER" >/dev/null
         fi
         args+=(--name "$FRONT_CONTAINER" -p "$PORT:$PORT/tcp" -p "$PORT:$PORT/udp")
         say "the page: $URL"
         open_when_up "$URL"
     fi
-    docker "${args[@]}" "$image" ./simesh "$@"
+    "$rt" "${args[@]}" "$image" "$ROOT/simesh" "$@"
 }
 
 # in_front VERB…: a simulation verb inside the running front's container,
 # where the front's port is its own.
 in_front() {
-    command -v docker >/dev/null || die "stations need Linux; on $(uname -s) SIMesh runs in Docker, which is not installed"
-    [ -n "$(docker ps -q -f "name=^${FRONT_CONTAINER}\$")" ] \
+    local rt
+    rt=$(runtime)
+    [ -n "$("$rt" ps -q -f "name=^${FRONT_CONTAINER}\$")" ] \
         || die "no front running: start it with simesh"
     # The shell's directory when the container has it, so a path given is the same path.
     local outer here=$ROOT
@@ -158,7 +185,10 @@ in_front() {
     case "$PWD/" in "$outer"/*) here=$PWD ;; esac
     local args=(exec -i -w "$here")
     [ -t 0 ] && [ -t 1 ] && args+=(-t)
-    docker "${args[@]}" "$FRONT_CONTAINER" ./simesh "$@"
+    # This script by its own path, which the container has as well: the
+    # shell's directory need not be the one it is in (the README's steps run
+    # it as SIMesh/simesh from the directory above).
+    "$rt" "${args[@]}" "$FRONT_CONTAINER" "$ROOT/simesh" "$@"
 }
 
 # ---- native -------------------------------------------------------------------
