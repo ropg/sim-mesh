@@ -816,6 +816,13 @@ in eight from there and always from 6.1 dB, and a frame arriving after the
 receiver has passed the first one's preamble never taking it
 ([`ether/INTERNALS.md`](ether/INTERNALS.md#bench-capture)).
 
+**No interference** (`--no-interference`) is an oracle, not a model: every
+frame is judged against noise alone and no receiver is taken off the frame it
+follows, while a receiver still follows one frame at a time, cannot hear while
+it sends, and senses the channel as before. A run's delivery with it, less its
+delivery without, is what overlapping frames cost that run
+([`docs/AIRTIME_2026-09-30.md`](docs/AIRTIME_2026-09-30.md)).
+
 ## Why the ether owns the lock
 
 A receiver follows one frame at a time, and which one is decided at the
