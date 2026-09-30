@@ -57,8 +57,8 @@ On **Linux** it runs natively, and needs `python3` with `aiohttp` and
 `npm` for the page, and `cmake` with a C and C++ compiler for the chip
 library; `cargo` too for real ground (below), and Reticulum and LXMF
 (`pip install rns lxmf`) for `standard_reticulum` stations. On a fresh
-Debian or Ubuntu, `simesh install` puts all of it in place, as SIMesh's
-image holds it (step 2). **Anywhere else** it needs
+Debian, Ubuntu or Fedora, `simesh install` puts all of it in place, as
+SIMesh's image holds it (step 2). **Anywhere else** it needs
 only `docker`: `simesh` builds its own small image on first use (a few
 minutes, once) and runs itself inside it, with port 8800 published; `podman`
 does as well where there is no `docker` (`SIMESH_RUNTIME` chooses).
@@ -90,8 +90,7 @@ environment beside the clone, `SIMesh/.venv`, which `simesh` puts first on
 the path for itself and every station it starts (Fedora's Node 24 is given
 its plain names there). A step whose result is there already is left out;
 `--dry-run` says what it would do. It is tried from a fresh clone on Debian
-12 and Ubuntu 24.04; on Fedora 41 it installs and builds, and four of the
-tests (three of the time shim's) do not pass there yet.
+12, Ubuntu 24.04 and Fedora 41, each passing every suite after it.
 
 **3. Start it:**
 
