@@ -89,7 +89,7 @@ def spec_of(antenna):
 
 def check(antenna, where):
     """A node's antenna mapping checked and filled out: its type one of the
-    catalogue's, the aim of a directional one numbers (0 by default)."""
+    catalogue's, the aim of a directional one finite numbers (0 by default)."""
     if antenna in (None, {}):
         antenna = {"type": DEFAULT_TYPE}
     if not isinstance(antenna, dict):
@@ -105,11 +105,19 @@ def check(antenna, where):
                                    "elevation_deg)" % (where, key))
     out = {"type": kind}
     if every[kind]["kind"] == "directional":
-        try:
-            out["azimuth_deg"] = float(antenna.get("azimuth_deg") or 0.0) % 360.0
-            out["elevation_deg"] = max(-90.0, min(90.0, float(antenna.get("elevation_deg") or 0.0)))
-        except (TypeError, ValueError) as err:
-            raise store.StoreError("%s: an antenna's aim is in degrees" % where) from err
+        aim = {}
+        for key in ("azimuth_deg", "elevation_deg"):
+            try:
+                aim[key] = float(antenna.get(key) or 0.0)
+            except (TypeError, ValueError):
+                aim[key] = math.nan
+            # Checked before the wrap and the clamp, which would take a NaN
+            # or an infinite elevation for straight up or down.
+            if not math.isfinite(aim[key]):
+                raise store.StoreError("%s: an antenna's %s is a finite number of degrees, "
+                                       "not %r" % (where, key, antenna.get(key)))
+        out["azimuth_deg"] = aim["azimuth_deg"] % 360.0
+        out["elevation_deg"] = max(-90.0, min(90.0, aim["elevation_deg"]))
     return out
 
 

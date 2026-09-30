@@ -157,6 +157,7 @@ class Runtime:
         self.loop = None
         self.thread = None
         self.lock = threading.Lock()
+        self.blocked = 0            # the script's thread is waiting on this many calls
 
     def configure(self, **world):
         self.world = {k: v for k, v in world.items() if v is not None}
@@ -171,13 +172,25 @@ class Runtime:
                                            daemon=True)
             self.thread.start()
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        return future.result() if wait else future
+        if not wait:
+            return future
+        # While the script's thread waits here, its simulation may yield the
+        # floor; between two calls the script is deciding what to do next, at
+        # the T of the answer it got, and T waits for it.
+        self.blocked += 1
+        if self.sim is not None:
+            self.loop.call_soon_threadsafe(self.sim.poke)
+        try:
+            return future.result()
+        finally:
+            self.blocked -= 1
 
     def held(self):
         """The simulation, started (or attached to) on first need."""
         with self.lock:
             if self.sim is None:
                 self.sim = self.call(self._begin())
+                self.sim.may_yield = lambda: self.blocked > 0
             return self.sim
 
     async def _begin(self):
@@ -201,10 +214,18 @@ class Runtime:
             raise ScriptError("this script says no firmware(), so no node would run anything: "
                               "a script that is included by others (startup.py) is run "
                               "through one of them")
-        return await sim_module.start(
+        # Started with no rules, a new simulation runs nothing, and T stands,
+        # until this script's driver has the floor; the rules then come as an
+        # attached script's do. Started with them, its stations would run for
+        # however long attaching took on the host, and the script would begin
+        # at a T the host had decided.
+        sim = await sim_module.start(
             world["geodata"], world["nodesets"], world.get("script"), self.time or "real",
-            world.get("name"), world.get("build"), self.firmware_rules, self.first_boot_rules,
-            port)
+            world.get("name"), world.get("build"), None, None, port)
+        await sim.firmware(self.firmware_rules)
+        if self.first_boot_rules:
+            await sim.first_boot(self.first_boot_rules)
+        return sim
 
     def close(self):
         if self.loop is None:

@@ -23,6 +23,7 @@ import argparse
 import base64
 import sys
 
+import referee
 from sim_mesh import record as record_module
 from sim_mesh import reticulum
 from sim_mesh.reticulum import frames as rframes
@@ -63,37 +64,33 @@ class Frame:
         return rframes.read_frame(self.payload, self.part)
 
 
-def read_record(path, reader=None):
-    """The record as a list of frames, in the order they went on the air."""
-    frames = []
-    sent = None                 # the transmission being told to its receivers
-    arriving = {}               # the ether's frame id -> that transmission
+def read_record(path, reader=None, level_at=None):
+    """The record as a list of frames, in the order they went on the air.
+
+    A reception is tied to its frame by the ether's number for it, as the
+    referee ties them (`referee.Record`, at the levels `level_at` gives when
+    a run is read), not to the `tx` recorded last: a virtual-time barrier
+    numbers one T's frames in station order, not in the order their `tx`
+    lines were recorded, and a slot that starts listening mid-frame is told
+    of a frame after its own `state`."""
+    frames = {}                 # a `tx`'s place among the record's lines -> its frame
     halves = rframes.Halves()
-    for stamp, direction, sid, msg in record_module.lines(path):
-        kind = msg.get("type")
-        if direction == "in" and kind == "tx":
-            frame = Frame(record_module.parse_time(stamp), sid, msg)
+    for line, (stamp, direction, sid, msg) in enumerate(record_module.lines(path)):
+        if direction == "in" and msg.get("type") == "tx":
+            # With its date: a real-time record's time of day wraps at midnight.
+            frame = Frame(referee.to_us(stamp) / 1e6, sid, msg)
             frame.reader = reader
             frame.part = halves.part(sid, frame.payload)
-            frames.append(frame)
-            sent = frame
-            continue
-        if direction != "out" or kind not in ("rx_begin", "rx_end"):
-            continue
-        # The ether tells a frame's receivers about it as it reads the
-        # transmission, so the frame a reception belongs to is the one
-        # just sent; its id, the ether's own, is what the end comes back
-        # under however many frames are in the air.
-        if kind == "rx_begin":
-            if sent is None:
-                continue        # a record that begins mid-frame
-            arriving[msg.get("id")] = sent
-            sent.heard[sid] = "cad" if msg.get("cad") else "lost"
-        else:
-            frame = arriving.get(msg.get("id"))
-            if frame is not None:
-                frame.heard[sid] = msg.get("verdict", "?")
-    return frames
+            frames[line] = frame
+    for tied in referee.Record(path, level_at).frames:
+        frame = frames.get(tied.line)
+        if frame is None:
+            continue            # recorded since the lines above were read: a run still going
+        for begin in tied.begins:
+            frame.heard[begin.rsid] = "lost" if begin.lock else "cad"
+        for rsid, _slot, verdict in tied.ends:
+            frame.heard[rsid] = verdict or "?"
+    return list(frames.values())
 
 
 def lifelines(columns):
@@ -165,16 +162,17 @@ def main(argv=None):
     if not args.run and not args.record:
         ap.error("give a run directory, or --record")
 
-    names, reader, path = {}, None, args.record
+    names, reader, path, level_at = {}, None, args.record, None
     if args.run:
         view = RunView(args.run)
         names = dict(view.names)
         path = path or view.record_path
         if reticulum not in view.protocols():
             reader = read_bytes
+        level_at = referee.Air(view.medium()).level
     names.update(parse_names(args.names))
 
-    frames = read_record(path, reader)
+    frames = read_record(path, reader, level_at)
     if args.only:
         wanted = [w.strip().lower() for w in args.only.split(",") if w.strip()]
         frames = [f for f in frames if any(w in f.label.lower() for w in wanted)]

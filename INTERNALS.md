@@ -357,11 +357,11 @@ to choose from.
 
 ```
 geodata ──┐
-          ├──► loss table (derived, per band, cached) ── + antennas + offsets ──┐
-nodeset ──┘  (positions, heights)                                               │
-nodeset: antenna, role, radio, tags ───────────────────────────────────────────┤
-script: firmware() rules, setup ───────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
-device files (by the rules' device names, fetched when used) ──────────────────┘
+          ├──► loss table (derived, per band, cached) ── + links + shadowing + antennas + offsets ──┐
+nodeset ──┘  (positions, heights)                                                                   │
+nodeset: antenna, role, radio, tags ───────────────────────────────────────────────────────────────┤
+script: firmware() rules, setup ───────────────────────────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
+device files (by the rules' device names, fetched when used) ──────────────────────────────────────┘
 snapshot = geodata + nodeset + script + tables + rules + every station's store
 ```
 
@@ -390,8 +390,11 @@ and each is its own file so that changing one leaves the others alone:
   nodeset serves scripts that differ by a few lines;
 - the **loss table** follows from the geodata and the nodeset's geometry and
   from nothing else, so it is derived and cached under a hash of exactly
-  those, and relabelling a node, changing its antenna, role, radio,
-  firmware or offsets, or changing the script, never recomputes it.
+  those: which nodes, by name, where and how high. Changing a node's
+  antenna, role, radio, firmware, offsets or links, the geodata's
+  shadowing, or the script never recomputes it. A table finds a node by its
+  name, so relabelling one does: its row and column are computed again, and
+  every other pair comes from the table cached before.
 
 **A firmware rule is a condition, kept.** `firmware(which, device)` holds
 its selection as a condition over each node's facts (`sim_mesh.select`), not
@@ -447,6 +450,36 @@ model, and they are added when the tables are handed to the ether
 (`losses.with_offsets`), in simd and in the analysis tools alike. The cached
 table stays the model's own, so an offset is changed without a recompute,
 and the model's error is the offsets themselves, to be driven towards zero.
+
+**Links are a layer too, and the first.** A nodeset's link states one
+pair's loss outright, a figure better than the model's (a measurement, or
+another model's), and it replaces the model's cell before anything else
+goes on (`losses.with_links`), so the antennas and the offsets still add
+to it. The figure is the pair's, not a frequency's, so it goes into every
+band's table as stated; within a band the ether moves it to the frame's
+own carrier as it does every cell, a few hundredths of a dB across the
+EU868 channels.
+
+**Shadowing is a layer, one draw per pair.** Log-distance gives every pair
+at one distance the same loss, and P.1812 sees only the ground it is given;
+real links differ by what else stands between them, and that difference is
+what makes a hidden node or a lucky long link.
+A geodata's `shadowing_db` adds to each pair's loss, both ways and in every
+band, that spread times a standard normal drawn from SHA-256 of
+`shadowing_seed` and the pair's two node names (`losses.with_shadowing`).
+The draw is fixed for the run and depends on nothing that happens in it, so
+two runs that differ only in their traffic or their firmware stand on the
+same ground: the common random numbers a paired comparison needs. Names,
+not station ids, because a node keeps its name from one run to the next. A
+loss drawn afresh per frame would be fading, a different thing that lets
+every retry through in the end; this is not that. A pair never heard stays
+so, a measured cell already holds its path's own shadowing, and a stated
+link is the figure as stated, so none of them is drawn on. On a pack the
+table it is laid over must be a median: P.1812 at 90 % of locations already
+adds up to 1.28 σ_L of location spread (about 2.5 dB, with σ_L ≈ 1.96 dB at
+868 MHz), and the draw on top would count that spread twice. So a pack
+geodata with shadowing states `loc_pct: 50`, and simd warns of one that does
+not.
 
 A node is referred to **by name** everywhere, and its **id** is stored and
 editable. The name is what a person means; the id is the station's network
@@ -547,21 +580,35 @@ front ── GET /loss/start, /loss/status, /loss.bin, one node at a time ──
   builds with no planner beside it.
 - **Every cell is one `link.json`**, the same request the pair inspector
   makes, so a cell of the table is what the inspector shows for the same two
-  nodes, near-field pairs included. `link.json` already composes
+  nodes, near-field pairs included. The table asks it `lean`, of a sidecar
+  that lists the option: the same reply without the profile the inspector
+  draws. `link.json` already composes
   everything a cell needs: the profile, the P.1812 call, a near-field model
   where the two are too close for P.1812, which model it used, and the
   Fresnel verdict. The planner's own pairwise sweep is not used: it drops
   every pair beyond a link budget and every pair under 250 m, and both are
   pairs the medium needs (below).
+- **Pairs are asked in parallel**, as many at once as the sidecar has
+  render slots, and the sidecar computes them in parallel: it reads the
+  layers a pair needs without their locks wherever the pack's layout allows
+  (an uncompressed strip TIFF, as the pack builder writes them), with the
+  same rows and the same decoder as through the lock, so the numbers are the
+  same. Both sides size themselves by the process's CPU affinity mask, as
+  simd places stations, so `taskset` bounds a table build too.
 - **What the sidecar decides, and what it does not.** `link.json` takes no
   carrier and judges at the planner's EU868 parameters, 869.525 MHz, 50 % of
   time and 90 % of locations; a pack therefore has an 868 table only,
-  and its header says so. A pair with an end off the pack is never heard
-  here rather than asked, because the sidecar would clamp the point onto the
-  pack's edge and answer for a place the node is not. A sidecar answers
-  from the clutter raster alone until it has indexed the pack's buildings, a
-  different number by tens of dB, so a table waits for the index before its
-  first pair and throws away a reply given before it.
+  and its header says so. The percentage of locations is the one parameter
+  a request may change (`loc_pct`, from the geodata), for both ways of the
+  both-way mean. sim-mesh's copy of the planner holds it to P.1812's range,
+  1 to 99, itself: a failed P.1812 call is answered with the near-field
+  model, which would turn a bad value into a confident number. A pair with
+  an end off the pack is never heard here rather than asked, because the
+  sidecar would clamp the point onto the pack's edge and answer for a place
+  the node is not. A sidecar answers from the clutter raster alone until it
+  has indexed the pack's buildings, a different number by tens of dB, so a
+  table waits for the index before its first pair and throws away a reply
+  given before it.
 - **Coverage is the planner's own sweep, one node at a time.** A node's
   coverage raster is `planner-coverage`'s point-to-area sweep from its
   antenna, cut to a square around it by `loss.bin` and cached by the
@@ -761,6 +808,20 @@ threshold, is there.
 **The pairwise rule** (`--pairwise`) rules on the same levels the simpler
 way, one interferer at a time against a 6 dB margin with nothing summed, so a
 run can be compared frame for frame with one ruled that way.
+
+**Bench capture** (`--bench-capture`) replaces the same-SF figure with what
+a bench measured of two frames meeting: equals within 1.2 dB (both lost about
+one time in four, otherwise one survives), the stronger surviving seven times
+in eight from there and always from 6.1 dB, and a frame arriving after the
+receiver has passed the first one's preamble never taking it
+([`ether/INTERNALS.md`](ether/INTERNALS.md#bench-capture)).
+
+**No interference** (`--no-interference`) is an oracle, not a model: every
+frame is judged against noise alone and no receiver is taken off the frame it
+follows, while a receiver still follows one frame at a time, cannot hear while
+it sends, and senses the channel as before. A run's delivery with it, less its
+delivery without, is what overlapping frames cost that run
+([`docs/AIRTIME_2026-09-30.md`](docs/AIRTIME_2026-09-30.md)).
 
 ## Why the ether owns the lock
 
@@ -1316,8 +1377,9 @@ tick drift a loaded host adds makes it unreproducible for reasons that have
 nothing to do with the protocol.
 
 In real time `esp_timer` is `CLOCK_MONOTONIC` in microseconds from the first
-reading, and every timed event in the model — the instant a preamble ends, a
-header lands, a frame finishes — is a one-shot on the backend's timer. The
+reading, and every timed event in the model — the instant a preamble is found,
+a sync word ends, a header lands, a frame finishes — is a one-shot on the
+backend's timer. The
 FreeRTOS tick is 100 Hz while a task runs and stops while every task is
 blocked, so nothing is accurate below ten milliseconds; the
 frames the driver sends take tens to hundreds of milliseconds, which is why
@@ -1350,7 +1412,11 @@ crystal — drift, an offset — goes. f is the identity unless the station's
 environment has `SIM_MESH_CLOCK_PROFILE`, a piecewise-linear map given as
 `T:node` pairs in microseconds, both increasing, slope 1 outside them
 ([STATION.md](STATION.md#the-environment)); `nodeOf` / `conductorOf` are the
-only place it is defined.
+only place it is defined. `simd --clock-ppm P` gives every station one: a
+straight line from T 0 whose slope is off by a draw uniform within ±P parts
+per million, hashed from the seed and the node's name, so each station keeps
+its own time and keeps it again in a run with the same seed. A crystal is
+typically within ±20 ppm, 72 ms an hour. The radio's timers stay on T.
 
 **The C library's time is answered by a preloaded shim**,
 `radio/build/libsimclock.so` (built from `radio/shim/simclock.c`), which every
@@ -1539,8 +1605,8 @@ linked by the interface that drives it rather than by the board that wires it.
   fails its CRC (cyclic redundancy check) at a probability, and no noise
   floor but the thermal one; a pair's loss is the table's and is the same
   for every frame between them. On real ground that loss is P.1812's
-  statistical figure at 50 % of time and 90 % of locations, not a
-  measurement of that path. See
+  statistical figure at 50 % of time and 90 % of locations (or the
+  geodata's `loc_pct`), not a measurement of that path. See
   [`ether/INTERNALS.md`](ether/INTERNALS.md) for what the medium does
   and does not decide.
 - Anything below the C: the compiler, the ABI and the word size are the
@@ -1587,15 +1653,21 @@ change.
   `below_threshold`, lost lock, `crc` from interference, `left_rx`, with a
   summary per station and per pair. A protocol claim ("`settling` cannot
   happen here") and a departure policy are judged by these.
-- **A referee over `record.tsv`**: it reads the channel plan and the `state`,
-  `tx`, `rx_begin` and `rx_end` lines and names the line that breaks a rule:
-  more than 100 s of transmission in any hour per 500 kHz channel, less than
-  100 ms off-time before returning to a frequency, radiated power over a
-  channel's cap, a `tx` without the sense window of RX or CAD before it on
-  that carrier, a `tx` from a slot that is inside a reception.
-- **The CRC band**: in the `crc_margin_db` (3 dB) above the demodulation
-  threshold, a locked frame ends as `crc` with a probability falling linearly
-  from 1 to 0, drawn from the run's seeded generator.
+- **A referee over `record.tsv`**, in part. After a run, `compliance.py`
+  holds each node to EN 300 220's duty cycle, polite spectrum access and
+  e.r.p., and `referee.py` audits the air: every `tx` that began over a frame
+  on its carrier its sender could decode, whether and when the ether had told
+  the slot of that frame (a slot told by a lock sent from inside a
+  reception) and in which window of it; the frames nobody was told of; and
+  every `crc`, by whether the overlapping senders could hear each other.
+  Still to build: holding a station to any of it during a run, and
+  listen-before-talk itself. That a slot was in RX or CAD before a `tx` is
+  in the record; whether its firmware read the channel, and what it found
+  there, is not: an RSSI read or a CAD's result never reaches the ether.
+- **The CRC band by default**: `--crc-margin-db` gives the band above the
+  demodulation threshold where a locked frame ends as `crc` with a
+  probability falling linearly from 1 to 0 (ether/INTERNALS.md). It is off
+  unless given; whether it should default to the 3 dB planned here is open.
 - **`next_instant()` from a heap**: the pending `until`s kept in a heap keyed
   by instant and station, updated on idle, retraction and leave, stale
   entries dropped when popped, instead of a scan of every station per

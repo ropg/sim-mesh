@@ -11,7 +11,9 @@ binary and how to talk to it. It gets:
   supervisor holds the master end and reads it on the pty thread (`Ptys`),
   which takes framed-RPC replies out of what the station writes (rpc.py) and
   hands them to the station's client, appends everything else to `log`, and
-  passes the same bytes to whoever is watching the console;
+  passes the same bytes to whoever is watching the console; or, for a kind
+  whose console need not be a terminal (`console_tty`), a pipe each way,
+  read the same way, which holds none of the host's ptys;
 - a **loopback address** its id fixes in the testbed's network (`bind_addr`),
   where its sockets bind;
 - a **supervisor** that starts it again when it exits, because a restart on
@@ -29,6 +31,7 @@ import functools
 import ipaddress
 import os
 import pty
+import select
 import sys
 import threading
 import tty
@@ -128,6 +131,43 @@ def catch_up(drains, main, done):
     main.call_soon_threadsafe(done)
 
 
+def printed(drains):
+    """Of `drains`, the ones with output the testbed may not have taken in:
+    bytes on the pty, or bytes the pty thread has read since its last
+    `catch_up` and handed to the main loop. On the main thread, before T moves.
+
+    Most barriers find none, and then cost no hand-off to the pty thread and
+    back. The ptys are polled first — a poll of a pty master that finds
+    nothing waits for the kernel to carry across what the station wrote, as
+    a read does — and the pty thread's marks after, so bytes it took off a
+    pty in between are still counted: `taking` is up before it reads, and
+    `taken` moves once what it read has been handed on. An ether with its
+    conductor in the core asks the same of the consoles it watches itself
+    (ether_core's State::printed), and asks this only when one shows some."""
+    live = {d.master: d for d in drains if d.marks.reading}
+    if not live:
+        return []
+    poller = select.poll()
+    for fd in live:
+        poller.register(fd, select.POLLIN)
+    hit = {fd for fd, _ in poller.poll(0)}
+    return [d for fd, d in live.items()
+            if fd in hit or d.marks.taking or d.marks.taken != d.marks.caught]
+
+
+class Marks:
+    """How far a Drain has got, for `printed`: written on the pty thread,
+    read on the main one. An ether with a core gives its own instead
+    (`console_marks`), which it reads without asking this process's loop."""
+
+    def __init__(self, fd):
+        self.master = fd
+        self.reading = False
+        self.taking = False     # inside a read and the handing on of what it got
+        self.taken = 0          # reads handed on, or that found the end
+        self.caught = 0         # `taken` when the last catch_up had read everything
+
+
 _ptys = None
 
 
@@ -146,7 +186,7 @@ class Drain:
     ever touched there.
     """
 
-    def __init__(self, station, master, rpc, main):
+    def __init__(self, station, master, rpc, main, marks=None):
         self.station = station
         self.master = master
         self.log_file = station.log_file
@@ -155,13 +195,14 @@ class Drain:
         self.demux = rpc_module.FrameDemux()
         self.marker = rpc_module.MarkerWatch()
         self.resync = None
-        self.reading = False
+        # Written on the pty thread, read on the main one (`printed`).
+        self.marks = marks if marks is not None else Marks(master)
 
     # ---- on the pty thread -------------------------------------------------
 
     def attach(self):
         asyncio.get_running_loop().add_reader(self.master, self.readable)
-        self.reading = True
+        self.marks.reading = True
 
     def readable(self):
         self.read_once()
@@ -173,32 +214,40 @@ class Drain:
         to carry across whatever the station had written, so when this returns
         everything the station wrote before it was called has been read and
         handed on."""
-        while self.reading and self.read_once():
+        while self.marks.reading and self.read_once():
             pass
+        self.marks.caught = self.marks.taken
 
     def read_once(self):
         """One read of the pty and what it delivers; False when it had
         nothing."""
+        marks = self.marks
+        marks.taking = True
         try:
-            data = os.read(self.master, 65536)
-        except BlockingIOError:
-            return False
-        except OSError:
-            data = b""          # the station let go of the far end
-        if not data:
-            self.stop_reading()
-            self.main.call_soon_threadsafe(self.station.pty_closed, self)
-            return False
-        loop = asyncio.get_running_loop()
-        text, frames = self.demux.feed(data, loop.time())
-        self.deliver(text, frames)
-        if self.demux.pending and self.resync is None:
-            self.resync = loop.call_later(rpc_module.RESYNC_S, self.resync_due)
-        return True
+            try:
+                data = os.read(self.master, 65536)
+            except BlockingIOError:
+                return False
+            except OSError:
+                data = b""          # the station let go of the far end
+            if not data:
+                self.stop_reading()
+                self.main.call_soon_threadsafe(self.station.pty_closed, self)
+                marks.taken += 1
+                return False
+            loop = asyncio.get_running_loop()
+            text, frames = self.demux.feed(data, loop.time())
+            self.deliver(text, frames)
+            if self.demux.pending and self.resync is None:
+                self.resync = loop.call_later(rpc_module.RESYNC_S, self.resync_due)
+            marks.taken += 1
+            return True
+        finally:
+            marks.taking = False
 
     def resync_due(self):
         self.resync = None
-        if not self.reading:
+        if not self.marks.reading:
             return
         loop = asyncio.get_running_loop()
         text, frames = self.demux.expire(loop.time())
@@ -220,14 +269,14 @@ class Drain:
         if self.resync is not None:
             self.resync.cancel()
             self.resync = None
-        if self.reading:
-            self.reading = False
+        if self.marks.reading:
+            self.marks.reading = False
             asyncio.get_running_loop().remove_reader(self.master)
 
     def close(self):
         """What the station wrote before it went is still read, then the pty
         is let go."""
-        while self.reading:
+        while self.marks.reading:
             try:
                 data = os.read(self.master, 65536)
             except OSError:
@@ -337,9 +386,14 @@ class Station:
         ptys().call(self.log_file.write, b"\n--- station %s starting ---\n"
                     % self.name.encode("utf-8"))
 
-        master, slave = pty.openpty()
-        tty.setraw(slave)       # a serial line has no echo and no translation
-        self.master = master
+        if getattr(self.kind, "console_tty", True):
+            master, slave = pty.openpty()
+            tty.setraw(slave)       # a serial line has no echo and no translation
+            reader, child_in, child_out = master, slave, slave
+        else:
+            reader, child_out = os.pipe()
+            child_in, master = os.pipe()
+        self.master = master        # what is typed at it goes here
         if self.rpc is not None:
             self.rpc.close()
         self.rpc = rpc_module.RpcClient(
@@ -356,15 +410,21 @@ class Station:
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 self.kind.elf, cwd=self.dir, env=self.env(),
-                stdin=slave, stdout=slave, stderr=slave,
+                stdin=child_in, stdout=child_out, stderr=child_out,
                 preexec_fn=functools.partial(os.sched_setaffinity, 0, (self.cpu,)))
         except OSError:
             if self.clock is not None:
                 self.leave()
             raise
-        os.close(slave)
+        finally:
+            for fd in {child_in, child_out}:
+                os.close(fd)
         os.set_blocking(master, False)
-        self.drain = Drain(self, master, self.rpc, asyncio.get_running_loop())
+        os.set_blocking(reader, False)
+        marks = self.clock.console_marks(reader) if self.clock is not None else None
+        self.drain = Drain(self, reader, self.rpc, asyncio.get_running_loop(), marks)
+        if self.clock is not None and self.kind.console_acted_on:
+            self.clock.watch(self.node_id, self.drain.marks)
         ptys().call(self.drain.attach)
         log("station %s (%d, %s) up as pid %d on %s" % (
             self.name, self.node_id, self.kind.name, self.proc.pid, self.addr))
@@ -389,8 +449,13 @@ class Station:
         except (OSError, ValueError):
             pass
         # The pty thread reads what is left, then closes the pty: from here on
-        # this loop neither reads nor writes it.
+        # this loop neither reads nor writes it. A console of pipes has an
+        # input end of its own, closed here.
         if self.drain is not None:
+            if self.clock is not None:
+                self.clock.unwatch(self.node_id, self.drain.marks)
+            if self.drain.master != self.master:
+                os.close(self.master)
             ptys().call(self.drain.close)
         else:
             os.close(self.master)

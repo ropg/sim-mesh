@@ -38,6 +38,10 @@ int64_t conductorOf(int64_t node);
 int64_t nodeNowUs();
 int64_t epochUs();
 
+/** The first node time whose conductor time has reached `t`: when a host
+ *  polling on its own clock can first see what happens at T = `t`. */
+int64_t firstNodeAt(int64_t t);
+
 /** Node time when the ether's welcome arrived, and whether it has. A host
  *  whose clock counts from its own boot counts from here. */
 int64_t nodeAtJoin();
@@ -48,6 +52,14 @@ bool    joined();
 /** A timed message from the ether: T moves to `t`, and whatever falls due is
  *  run, in time order. Called with no lock held. */
 void advanceTo(int64_t t);
+
+/** While a datagram from the ether is applied (every message in it, all for
+ *  one instant): the chip's own timers still run as T moves, but the host
+ *  is not told. Its waits that fall due, and the advance hook, wait for
+ *  `release`, which runs them, in time order, once the whole datagram is in.
+ *  So a host thread woken at T finds everything the ether said for T. */
+void hold();
+void release();
 
 /** The ether's welcome: the run's mode, T at join, the epoch. */
 void welcome(bool isVirtualRun, int64_t t, int64_t epochUs, uint64_t seq);

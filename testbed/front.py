@@ -118,6 +118,10 @@ nodeset_import {name, source: sites|nodes, text | path, height_m?}  → {nodeset
 nodeset_import {name, source: meshcore|potatomesh, geodata, url?, companions?, max_age_days?,
                 height_m?}   → {nodeset, report}   a public node map inside the
                                     geodata's extent, through planner-job nodes-import
+nodeset_heights {name, geodata}   → {nodeset, changed, estimates}   on a pack, every node
+                                    whose height is assumed given planner's estimate
+                                    (the sidecar's /height.json): `roof`, `raster`, or
+                                    kept where it found nothing
 nodeset_merge {name, layers: [{name, data}]}  → {nodeset}   the shown layers, top first, as
                                     they stand, merged into a new nodeset (nodeset.merge)
 nodeset_setup_open {name}         → {name, text, exists}   its own setup, nodesets/<name>.py;
@@ -280,6 +284,7 @@ EDITOR_VERBS = (
     "nodeset_list", "nodeset_open", "nodeset_new", "nodeset_save", "nodeset_save_as",
     "nodeset_delete",
     "nodeset_import", "nodeset_merge", "nodeset_setup_open", "nodeset_setup_save",
+    "nodeset_heights",
     "script_list", "script_open", "script_new", "script_save", "script_save_as",
     "script_run", "script_stop", "script_log",
     "snapshot_list", "losses_compute", "links", "coverage")
@@ -1377,6 +1382,30 @@ class Front:
                              None if new else nodeset_module.comment_of(path))
         return {"nodeset": nodeset_module.load(name).as_dict()}
 
+    async def estimate_heights(self, conn, name, msg):
+        """A nodeset's assumed heights given planner's estimate on a pack
+        (`losses.estimated_heights`), saved: a roof under a node with a mast
+        on it, else the clutter or land class around it, each marked `roof` or
+        `raster`. A measured, roof or raster height is kept, and so is a node
+        the estimator found no evidence for. Answers the nodeset, the nodes
+        changed and each one's estimate, its band and what it rested on."""
+        gd = load_geodata(msg.get("geodata") or "")
+        if not gd.is_pack:
+            raise store.StoreError("%s is synthetic ground: a height is estimated from a pack's "
+                                   "buildings and rasters" % gd.name)
+        path = self.old_path(nodeset_module.nodeset_path(name), "nodeset", name)
+        data = nodeset_module.read(path)
+        points = {n: (node["lat"], node["lon"]) for n, node in data["nodes"].items()
+                  if node.get("height_from") == "assumed"}
+        sidecar = await self.sidecars.hold(conn.holder, gd)
+        estimates = await losses_module.estimated_heights(gd, points, sidecar)
+        changed = nodeset_module.with_estimated_heights(data, estimates)
+        if changed:
+            nodeset_module.write(path, data, nodeset_module.comment_of(path))
+            log("estimated %d height(s) in nodeset %s on %s" % (len(changed), name, gd.name))
+        return {"nodeset": nodeset_module.load(name).as_dict(), "changed": changed,
+                "estimates": {n: estimates[n] for n in changed}}
+
     def write_geodata(self, name, data, new):
         path = geodata_module.geodata_path(name)
         (self.new_path if new else self.old_path)(path, "geodata", name)
@@ -1489,6 +1518,8 @@ class Front:
             if (msg.get("source") or msg.get("format") or "sites") in ("sites", "nodes"):
                 return self.import_nodeset(msg)
             return await self.import_node_map(msg)
+        if verb == "nodeset_heights":
+            return await self.estimate_heights(conn, store.check_name(name, "nodeset"), msg)
         if verb == "nodeset_merge":
             name = store.check_name(name, "nodeset")
             path = self.new_path(nodeset_module.nodeset_path(name), "nodeset", name)

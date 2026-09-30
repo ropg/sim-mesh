@@ -29,7 +29,7 @@ sim-mesh keeps, each on its own because each changes on its own:
 | a **device** | one station build: its executable, its `/fixed` tree, its tools | `devices/latest/`, `devices/saved/`, `devices/local/<project>_<catalogue>.yaml` |
 | an **antenna** | a kind of antenna and its radiation pattern | `testbed/antennas/` |
 | **geodata** | the ground: a pack built from public sources, or synthetic ground at 0°, 0° | `testbed/geodata/<name>/`: `geodata.yaml`, and the pack's files beside it |
-| a **nodeset** | which nodes stand where with what maximum power and antenna, their tags, and the offsets; its own setup script beside it | `testbed/nodesets/<name>.yaml`, `<name>.py` |
+| a **nodeset** | which nodes stand where with what maximum power and antenna, their tags, the offsets and any stated links; its own setup script beside it | `testbed/nodesets/<name>.yaml`, `<name>.py` |
 | a **loss table** | every ordered pair's path loss, derived from geodata and a nodeset | `testbed/losses/…`, a cache |
 | a **script** | plain Python against the sim-mesh library, top to end: the time, what each node runs and is given at first boot, and what is done | `testbed/scripts/<name>.py` |
 | a **run** | one simulation's output: its record, logs and state | `testbed/runs/<name>/` |
@@ -56,9 +56,12 @@ On **Linux** it runs natively, and needs `python3` with `aiohttp` and
 `pyyaml` (Debian and Ubuntu: `python3-aiohttp python3-yaml`), `node` and
 `npm` for the page, and `cmake` with a C and C++ compiler for the chip
 library; `cargo` too for real ground (below), and Reticulum and LXMF
-(`pip install rns lxmf`) for `standard_reticulum` stations. **Anywhere else** it needs
+(`pip install rns lxmf`) for `standard_reticulum` stations. On a fresh
+Debian, Ubuntu or Fedora, `sim-mesh install` puts all of it in place, as
+sim-mesh's image holds it (step 2). **Anywhere else** it needs
 only `docker`: `sim-mesh` builds its own small image on first use (a few
-minutes, once) and runs itself inside it, with port 8800 published.
+minutes, once) and runs itself inside it, with port 8800 published; `podman`
+does as well where there is no `docker` (`SIM_MESH_RUNTIME` chooses).
 
 **1. Clone it.** The directory you clone into is the one `sim-mesh` mounts
 into its image, so a workspace put beside sim-mesh later is where a local
@@ -69,13 +72,25 @@ mkdir mesh && cd mesh
 git clone https://github.com/sim-mesh/sim-mesh.git
 ```
 
-**2. Build** the page, the chip library and the planner (sim-mesh's own, in
-`planner/`; without cargo it is left out, sim-mesh says so, and synthetic
-ground works):
+**2. Build** the page, the chip library, the ether's conductor and the
+planner (sim-mesh's own, in `planner/`; without cargo the last two are left
+out, sim-mesh says so, synthetic ground works and the ether's Python conductor
+runs virtual time):
 
 ```sh
 sim-mesh/sim-mesh build
 ```
+
+On a fresh Linux, `sim-mesh/sim-mesh install` does this step with what it needs
+first: the system's packages through apt or dnf (with sudo); a Node the
+page's build takes (22.22 or later) where the system's is older, NodeSource's
+22 on Debian and Ubuntu, which ship 18, and on Fedora, whose default is 22.21,
+its own nodejs24; Rust through rustup; and Reticulum and LXMF in a Python
+environment beside the clone, `sim-mesh/.venv`, which `sim-mesh` puts first on
+the path for itself and every station it starts (Fedora's Node 24 is given
+its plain names there). A step whose result is there already is left out;
+`--dry-run` says what it would do. It is tried from a fresh clone on Debian
+12, Ubuntu 24.04 and Fedora 41, each passing every suite after it.
 
 **3. Start it:**
 
@@ -369,6 +384,37 @@ ground, roads and buildings, with the notices of the sources it was built
 from in its bottom corner, as OpenStreetMap's Open Database Licence (ODbL)
 and Copernicus's terms ask.
 
+**Shadowing** is two keys beside either kind, both absent by default:
+
+```yaml
+# testbed/geodata/plain-27-rough.yaml: the same ground, every pair shadowed
+synthetic:
+  terrain: flat
+  exponent: 2.7
+  extent_m: 150000
+shadowing_db: 7                     # the spread of each pair's draw, dB
+shadowing_seed: 3                   # which draws; 0 when absent
+```
+
+Every pair of nodes then gets a static draw of its own on top of its loss:
+one standard normal per unordered pair, hashed from the seed and the two
+node names, times the spread, the same both ways, in every band and for the
+whole run. Two pairs at one distance need not hear each other alike, which
+is what makes a hidden node or a lucky long link. It is a layer over the
+tables, like a nodeset's offsets, so a new spread or seed recomputes
+nothing; a pair never heard, a measured cell and a pair a nodeset states a
+link for are left as they are.
+
+**`loc_pct`**, on a pack only, is the percentage of locations its tables
+are asked for, 1 to 99, and the planner's own 90 when absent. P.1812's
+figure at 90 % of locations already holds the spread of losses between
+locations, and shadowing over it counts that spread twice, so a pack with
+shadowing wants `loc_pct: 50`, the median; the simulation's log warns of
+one left at 90, or at anything but 50. The percentage is the table's own:
+it is sent with every request and kept in the table's header, and a table
+at one percentage is cached apart from, and never used for, another. The
+coverage rasters stay the planner's own sweep at 90 %.
+
 There are three ways of getting ground, one button each on the Geodata tab:
 **New synthetic…**, **Build from sources…** and **Import zip…**. Nothing else
 makes or moves geodata.
@@ -551,7 +597,7 @@ on the Nodes tab opens it.
 (`firmware()`, [Scripts](#scripts)), so one nodeset is run on any firmware,
 or on a mix of them by tag.
 
-**A node's name is how everything refers to it**: scripts, offsets,
+**A node's name is how everything refers to it**: scripts, offsets, links,
 snapshots, the map, and the proxy's hostnames. **Its id is its network
 identity**: it fixes the station's loopback address in the simulation's
 network (node 1 is `127.16.0.5` in the front's first network) and the MAC
@@ -565,6 +611,21 @@ geodata: where a measurement says the model is wrong, and by how much, with a
 note of where the figure came from. They are a layer over the loss table,
 applied when the medium is given it, so the table stays the model's own and
 an offset never forces a recompute.
+
+**Links** state one pair's loss outright, where a better figure than the
+model's is known:
+
+```yaml
+links:                                # optional
+  - { between: [a, b], loss_db: 131.5, back_db: 133, note: measured }
+```
+
+`loss_db` is from the first node to the second, `back_db` the other way
+(`loss_db` again when absent), the same in every band. A link stands in for
+the model's loss and the geodata's shadowing; the antennas and any offset
+still go on top, so a pair with both has the offset added to the stated
+figure. It is a layer like the offsets, and a nodeset without links has no
+`links:` key and is written back without one.
 
 A nodeset is offered on every geodata whose extent holds one of its nodes,
 as a layer of the Nodes tab ([The Nodes tab](#the-nodes-tab)).
@@ -764,10 +825,13 @@ Its messages are the `send_msg` meta command, its identities the `address`
 one and its warm-up the `announce` one, so it runs on any firmware that says
 them. Its first-boot lines give each station what taking part needs, an
 LXMF identity. Its report is the delivery `delivery.py` counts from the
-senders' logs, as `reticulous` and `standard_reticulum` stations write
-them: overall, by route and radio
-hops and by size, the latency, and the undelivered by the sender's last
-line; it says so plainly when no station had an LXMF identity to send from.
+senders' logs, each sender by its own station's (`reticulous` and
+`standard_reticulum` stations by the message id its send answered; the
+reticulum project's station, configured with rncfg, by the first message its
+log shows to that recipient once the send was due, and the proof that closes
+it): overall, by route and radio hops and by size, the latency, and the
+undelivered by the sender's last line; it says so plainly when no station
+had an LXMF identity to send from.
 
 ## Loss tables
 
@@ -775,11 +839,13 @@ A loss table is every ordered pair's path loss for one nodeset on one
 geodata, in one band (433, 868 or 915 MHz), computed at one frequency in the
 band; the ether adds `20·log10(f/f0)` per frame to move it to the frame's own
 carrier. It is derived, never edited, and cached under
-`testbed/losses/<geodata>/<nodeset geometry>/<band>.bin`, keyed by what it
-depends on: the geodata's content and the nodeset's node set, positions and
-heights. Names, ids, antennas, firmware, radios, tags and offsets leave it
-alone: the antennas and the offsets are layers put on it when the medium is
-given it.
+`testbed/losses/<geodata>/<nodeset geometry>/<band>.bin` (`<band>-loc50.bin`
+for a pack at `loc_pct: 50`), keyed by what it depends on: the geodata's
+content and the nodeset's nodes by name, their positions and heights. A
+table finds a node by its name, so a renamed node's row and column are
+computed again, every other pair coming from the table cached before. Ids,
+antennas, firmware, radios, tags, offsets, links and a geodata's shadowing
+leave it alone: they are layers put on it when the medium is given it.
 [LOSSTABLE.md](LOSSTABLE.md) is the file format. A simulation computes a
 table for the band `globals.py`'s carrier falls in.
 
@@ -789,9 +855,9 @@ table for the band `globals.py`'s carrier falls in.
   request per ordered pair: P.1812 where the path allows, a near-field
   model where the two are too close for it, with the model used and whether
   the first Fresnel zone is clear kept per cell. The planner judges at
-  869.525 MHz, 50 % of time and 90 % of locations, so a pack has an 868
-  table only. The sidecar answers one request at a time, a few milliseconds
-  each: 169 nodes is a few minutes.
+  869.525 MHz, 50 % of time and 90 % of locations (or the geodata's
+  `loc_pct`), so a pack has an 868 table only. The sidecar answers one
+  request at a time, a few milliseconds each: 169 nodes is a few minutes.
 - **Every pair is computed**, not only pairs strong enough to carry a frame,
   because a pair far too weak to decode still adds to a receiver's
   interference. Pairs more than 30 km apart, or with an end off the pack,
@@ -817,8 +883,9 @@ prints progress as JSON lines and the cached table's path.
 
 ## Who can hear whom
 
-There are no stated links. Where a node stands, on its geodata, is the whole
-of it: the level a frame arrives at is
+Where a node stands, on its geodata, is the whole of it unless the nodeset
+states a pair's loss as a link, which then stands in for the table's: the
+level a frame arrives at is
 
 ```
 L = P_tx + G_tx + G_rx − loss(tx → rx) − offset − 20·log10(f / f0)
@@ -826,7 +893,8 @@ L = P_tx + G_tx + G_rx − loss(tx → rx) − offset − 20·log10(f / f0)
 
 with `P_tx` the power the frame went out at, `G_tx` and `G_rx` each antenna's
 gain toward the other end in three dimensions ([Antennas](#antennas)), the
-loss the table's and the offset the nodeset's. A frame that arrives below
+loss the table's (or the link's), with the geodata's shadowing draw on it
+when there is one, and the offset the nodeset's. A frame that arrives below
 the signal-to-noise ratio its spreading factor needs — −7.5 dB at SF7, down
 to −20 dB at SF12 — is not delivered at all, and that is what "out of range"
 means here. So a link is in range only if it is one the modem could actually
@@ -941,8 +1009,8 @@ changes: save them (a new one is asked a name), discard them, or stay.
   merge: nodes keep their tags and gain their layer's name as a tag; a name
   an earlier layer took gets the layer's name appended; an id taken gets the
   lowest free one; two nodes within 5 m of each other are one node, the
-  earlier layer's; offsets come along where both ends do. The new layer is
-  active and the layers it came from are hidden.
+  earlier layer's; offsets and links come along where both ends do. The new
+  layer is active and the layers it came from are hidden.
 
 **Save** writes the active layer back to its own file (amber while there is
 something to save; it keeps the file's leading comment); nodes placed with no
@@ -981,11 +1049,14 @@ ground up:
 - **links**, for the one selected node and no other: every other node it
   reaches, coloured by the level it would be heard at, green to amber where
   it decodes, red where it only interferes, dashed where the first Fresnel
-  zone is not clear; always drawn while one node is selected: from the run's
-  table, or standalone from that node's row and column, which the front
-  computes from the nodes as they stand, saved or not, keeping each pair
-  both ways by where its ends stand, so selecting the next node or moving
-  one asks only for the pairs that are new (`links`);
+  zone is not clear, by the table's own figures without the nodeset's
+  offsets and links or the geodata's shadowing (attached, the levels the
+  ether reports for the nodes that decode stand in for those); always drawn
+  while one node is selected: from the run's table, or standalone from that
+  node's row and column, which the front computes from the nodes as they
+  stand, saved or not, keeping each pair both ways by where its ends stand,
+  so selecting the next node or moving one asks only for the pairs that are
+  new (`links`);
 - **the other shown layers**' nodes, hollow rings in each layer's colour,
   named on hover;
 - **the nodes**: a dot each with its name, its antenna's height above the
@@ -1045,8 +1116,13 @@ one node's editor shows its status, live role and radio and who hears it at
 what level, with **Console**, **Web UI**, **Reset** and **Factory reset**.
 
 **Right-click** on a node: attached, **Console**, **Web UI**, **Reset**,
-**Factory reset**, **Announce** and **Run command…**; and **Remove this
-node…** (or these). On the ground: **New node here**, **New node on this roof**,
+**Factory reset**, **Announce** and **Run command…**; on a pack, **Estimate
+heights from the pack**; and **Remove this node…** (or these). The estimate
+is the planner's for a node whose height nobody measured, such as an
+imported map's: a roof within reach of an imprecise position with a mast on
+it (`roof`), else the clutter or land class around it (`raster`); it
+replaces only an `assumed` height, and a node it finds nothing for keeps its
+own. On the ground: **New node here**, **New node on this roof**,
 select all or none, and fit the view to the nodes. A new node takes the
 lowest free id, the default antenna (a quarter-wave SMA whip) and the
 default radio (869.525 MHz, SF8, 125 kHz, 14 dBm); attached, it runs what
@@ -1220,11 +1296,23 @@ foreground: Ctrl-C stops it, and everything it started. It takes `--bind`
 run directory, default `testbed/runs/simd/`; a run loaded later that would
 land on one there goes beside it as `-2`, `-3`…), `--build`, `--sidecar` (the
 planner-web a pack's moved rows are recomputed through), `--stagger`,
-`--net`, `--time`, `--noise-figure` and `--pairwise` (the ether's receivers
-and its rule), and `--seed` and `--epoch` (the seed the ether's welcome
+`--net`, `--time`, `--noise-figure`, `--pairwise` or `--bench-capture`,
+`--crc-margin-db` (the ether's receivers, its rule and its CRC band), and
+`--no-interference` (an oracle: every frame judged against noise alone),
+`--clock-ppm` (in virtual time, each station's crystal off by a draw within
+that many parts per million), and `--seed` and `--epoch` (the seed the ether's welcome
 carries, which in a virtual-time run also keys every station's randomness,
 and the wall clock T 0 stands for; two runs of one network given both draw the
 same random bytes and the same timestamps).
+
+simd places each station on one CPU, in turn over the CPUs it may use, and
+every station talks to the ether hundreds of thousands of times a run. On a
+machine whose cores do not all share one last-level cache (an AMD EPYC or a
+Ryzen with several core complexes), starting simd under `taskset` to CPUs that
+share one keeps that talk inside the cache: a 173-station run took a fifth
+less time and a seventh less CPU so, record for record the same. Whether a
+run's load fits in those CPUs is the operator's to judge, so simd does not
+choose them.
 
 A simd started beside the front, or beside another, needs its own port,
 ether, station addresses and run directory, because every station binds its
@@ -1429,7 +1517,7 @@ Every analysis tool reads a run directory, and takes names, positions, radio
 settings and levels from it — the run's nodeset (its tags: a role tag the
 node's role, none a `client`, and `no-radio`), the run's copy of
 `globals.py` (every other node's radio, at its maximum power), its geodata, the firmware each
-node ran and its own loss tables with the antennas and the offsets on them —
+node ran and its own loss tables with the links, shadowing, antennas and offsets on them —
 never the files as they stand now. What a frame means is a protocol's, under
 `testbed/sim_mesh/<protocol>/`, found by each node's firmware kind; the roles are
 what `airtime.py --roles` and the hop counts through forwarding stations use.
@@ -1442,6 +1530,7 @@ what `airtime.py --roles` and the hop counts through forwarding stations use.
 | `links.py RUN` | link geometry: distance of every usable one-way link, neighbours, hop diameter, beside what the run's loss table says would decode; with `--power`, traffic-channel power against distance |
 | `delivery.py TRAFFIC.json RUN` | an LXMF traffic run's delivery (the `traffic.json` `scripts/lxmf-traffic.py` writes) from the senders' logs: by route hops, radio hops (by the run's loss table), size, latency |
 | `compliance.py RUN` | which nodes went over their EN 300 220 budgets: per node and band entry, seconds on the air in the worst sliding hour against the entry's duty cycle (or polite spectrum access where the entry permits it: 100 s an hour per 200 kHz, frames up to 1 s, 100 ms apart on one carrier), and highest e.r.p. (power + antenna gain − 2.15 dB) against its limit; frames on spectrum no entry allows. The section every report ends with; `--json` for the figures |
+| `referee.py --run RUN` | how the stations behaved on the air: every transmission that began over a frame on its carrier its sender could decode, whether the ether had told the sender of that frame (at its start, mid-frame, never) and in which window of it (its first four symbols, its preamble, its payload); the frames nobody was told of, by sender and channel; every reception that ended `crc`, each overlap split by whether the two senders could hear each other. Run by hand, not part of `report.md`; `--detail` for every event, `--json` for all of it |
 
 `seq.py` draws a run's `record.tsv` — one lifeline per station, one arrow
 per station that heard a frame, the verdict at each arrow head, and the
@@ -1709,7 +1798,7 @@ None needs firmware, a planner or a network:
 
 ```sh
 cd sim-mesh/testbed && python3 -m pytest -q      # the stores, the devices, the front, simd, the kinds, the library, the tools
-cd sim-mesh/ether   && python3 -m pytest -q      # the medium, over real UDP and in-process
+cd sim-mesh/ether   && python3 -m pytest -q      # the medium and both conductors, over real UDP and in-process
 cd sim-mesh/radio   && python3 -m pytest -q tests  # the chip model, the conductor, the time shim
 cd sim-mesh/testbed/ui && npx vue-tsc --noEmit && npx quasar build
 ```
@@ -1777,11 +1866,11 @@ code lives in that component's `src/host/`.
 | `testbed/geodata.py` | geodata: packs and synthetic ground, the projections, the extent, a sim-mesh geodata pack's export and import |
 | `testbed/sources.py` | a build's sources: what a rectangle needs of each, the download cache and its fetches |
 | `testbed/packbuild.py` | one pack built from its sources: fetch, `planner-job pack-build`, the pack into place |
-| `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, edits, the geometry hash, the merge of shown layers, the imports |
+| `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, links, edits, the geometry hash, the merge of shown layers, the imports |
 | `planner/` | the Rust workspace: `planner-web` (the sidecar), `planner-job` (a pack's build, a node map's import), `planner-pack` (the compiler, OpenStreetMap from a PBF extract), `planner-buildings`, `planner-import`, and the ground, propagation and coverage crates |
 | `testbed/script.py` | scripts: listing, checking, loading, the `firmware()` rules at a script's top |
 | `testbed/sim_mesh/library.py`, `testbed/sim_mesh/select.py` | the script library, `firmware`, `exec`, `max_tx_pwr`, `send_msg`, and `nodes()` selections |
-| `testbed/losses.py` | a loss table, on synthetic ground or through the sidecar; the cache; antennas and offsets as layers, the ground under each node; one node's row |
+| `testbed/losses.py` | a loss table, on synthetic ground or through the sidecar; the cache; links, shadowing, antennas and offsets as layers, the ground under each node; one node's row |
 | `testbed/coverage.py` | a node's coverage raster on a pack, through the sidecar, cached |
 | `testbed/runs.py` | a run directory, and snapshots taken from and loaded into one |
 | `testbed/stations.py` | one firmware process, its pty, its log, its supervisor; the thread every station's pty is read on |
@@ -1790,7 +1879,7 @@ code lives in that component's `src/host/`.
 | `testbed/proxy.py` | the hostname proxy |
 | `testbed/webrtc.py` | the WebRTC relay: the signalling rewritten, and one UDP port in front of every station's DataChannel |
 | `testbed/ui/` | the page (Quasar 2 on Vue 3; Pinia stores `catalog`, `geodata`, `nodes`, `sim`, `coverage`, `display`, `socket`); `vendor/planner-wasm` is the planner's built planner-wasm, copied in by `vendor/update-planner-wasm.mjs` so the page builds with no planner beside it |
-| `testbed/seq.py`, `compare.py`, `airtime.py`, `links.py`, `delivery.py`, `compliance.py` | the analysis tools ([Reading a run](#reading-a-run)) |
+| `testbed/seq.py`, `compare.py`, `airtime.py`, `links.py`, `delivery.py`, `compliance.py`, `referee.py` | the analysis tools ([Reading a run](#reading-a-run)) |
 | `testbed/sim_mesh/` | the library: `library` (what a script says, synchronously), `select` (`nodes()`), `traffic` (the LXMF traffic driver), `sim` (the async hold on a simulation the library runs on), `runner` (a script run, its simulation started, its report), `view` (a run opened for analysis), `record`; `sim_mesh/reticulum/` holds Reticulum's parts: frame reading (Reticulum packets, SUPE), delivery analysis |
 | `testbed/boards.py` | the one board, an SX1262 with a GC1109 front end above 22 dBm; a node's maximum power; what a station is told of it |
 | `testbed/scripts/` | the scripts: `realtime.py`, `lxmf-traffic.py`; `startup.py`, which every script includes; `globals.py`, the settings they share and the page reads |

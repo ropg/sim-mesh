@@ -1,6 +1,8 @@
 """Geodata: the file, the projections between degrees and metres, the
 extent, and importing a pack."""
 
+import hashlib
+import io
 import json
 import os
 import pathlib
@@ -112,6 +114,32 @@ def test_a_geodata_file_must_say_what_it_is(tmp_path):
         geodata.read(str(path))
     with pytest.raises(store.StoreError):
         geodata.geodata_path("Not A Name")
+
+
+def test_a_ground_figure_no_file_could_hold_is_refused(tmp_path):
+    # NaN and infinity read as numbers, and store.scalar cannot write them;
+    # a NaN extent also passed the check that it is above 0.
+    path = tmp_path / "g.yaml"
+    for ground, match in (("{ exponent: .nan }", "exponent is a number, not nan"),
+                          ("{ exponent: -.inf }", "exponent is a number, not -inf"),
+                          ("{ extent_m: .nan }", "extent_m is a number, not nan"),
+                          ("{ extent_m: .inf }", "extent_m is a number, not inf")):
+        path.write_text("synthetic: %s\n" % ground)
+        with pytest.raises(store.StoreError, match=match):
+            geodata.read(str(path))
+
+
+def test_a_ground_figure_that_is_no_number_is_refused_by_its_key(tmp_path):
+    # float() of a word raised a ValueError, and of nothing a TypeError,
+    # where every other bad value is a StoreError naming its key.
+    path = tmp_path / "g.yaml"
+    for ground, match in (("{ extent_m: wide }", "extent_m is a number, not 'wide'"),
+                          ("{ exponent: steep }", "exponent is a number, not 'steep'"),
+                          ("{ extent_m: null }", "extent_m is a number, not None"),
+                          ("{ exponent: [2, 3] }", r"exponent is a number, not \[2, 3\]")):
+        path.write_text("synthetic: %s\n" % ground)
+        with pytest.raises(store.StoreError, match=match):
+            geodata.read(str(path))
 
 
 def test_a_copied_pack_still_names_its_pack(tmp_path, monkeypatch):
@@ -281,9 +309,163 @@ def test_geodata_a_snapshot_stands_on_is_neither_renamed_nor_deleted(tmp_path, m
     assert not pack.exists() and geodata.names() == []
 
 
+# ---- the keys beyond pack: and synthetic: ----------------------------------
+
+PLAIN = "synthetic:\n  terrain: flat\n  exponent: 2.7\n  extent_m: 150000\n"
+ROUGH = PLAIN + "shadowing_db: 6.5\nshadowing_seed: 3\n"
+
+
+def hash_before_the_keys(gd):
+    """The content hash as it was before a geodata could say more than its
+    ground: what every table cached until then is keyed by."""
+    text = json.dumps([gd.data, gd.pack_manifest_hash], sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def hand_written(name, text):
+    """A geodata file written by hand, in the geodata's own directory."""
+    path = pathlib.Path(geodata.geodata_path(name))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def test_geodata_without_the_keys_is_what_it_was_and_is_written_back_byte_for_byte(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
+    write_pack()
+    for name, text in (("flat", PLAIN), ("tiny", 'pack: "."\n')):
+        path = hand_written(name, text)
+        gd = geodata.load(name)
+        assert not set(geodata.STATED) & (set(gd.data) | set(gd.as_dict()))
+        assert gd.content_hash == hash_before_the_keys(gd)
+        assert (gd.shadowing_db, gd.shadowing_seed) == (0, 0)
+        geodata.write(str(path), gd.data)
+        assert path.read_text() == text
+
+
+def test_shadowing_round_trips_and_is_no_part_of_the_ground(tmp_path, monkeypatch):
+    own_store(tmp_path, monkeypatch)
+    rough_path = hand_written("rough", ROUGH)
+    hand_written("flat", PLAIN)
+    rough, flat = geodata.load("rough"), geodata.load("flat")
+    assert (rough.shadowing_db, rough.shadowing_seed) == (6.5, 3)
+    assert (rough.as_dict()["shadowing_db"], rough.as_dict()["shadowing_seed"]) == (6.5, 3)
+    # A layer over the tables, not the ground: a table cached for the one
+    # serves the other.
+    assert rough.content_hash == flat.content_hash
+    geodata.write(geodata.geodata_path("rough"), rough.data)
+    assert rough_path.read_text() == ROUGH
+    # And through everything else that writes a geodata file anew.
+    copy_path = tmp_path / "runs" / "r" / "geodata.yaml"
+    geodata.write_copy(rough, str(copy_path))
+    assert geodata.read(str(copy_path)).data == rough.data
+    assert geodata.rebase_text(ROUGH, str(tmp_path), str(tmp_path / "runs")) == ROUGH
+    geodata.rename("rough", "rougher")
+    assert geodata.load("rougher").data == rough.data
+
+
+def test_a_packs_keys_go_where_its_pack_goes(tmp_path, monkeypatch):
+    own_store(tmp_path, monkeypatch)
+    write_pack()
+    geodata.write(geodata.geodata_path("tiny"), {"pack": ".", "shadowing_db": 7})
+    geodata.rename("tiny", "small")                 # the directory, its pack and keys with it
+    small = geodata.load("small")
+    assert small.pack_dir == str(tmp_path / "geodata" / "small") and small.shadowing_db == 7
+    out = io.BytesIO()
+    geodata.export_zip(small, out)
+    with zipfile.ZipFile(io.BytesIO(out.getvalue())) as zf:
+        assert zf.read("geodata.yaml").decode() == "# geodata small\npack: pack\nshadowing_db: 7\n"
+    zipped = tmp_path / "small.zip"
+    zipped.write_bytes(out.getvalue())
+    back = geodata.import_zip(str(zipped), "again")
+    assert back.is_pack and back.shadowing_db == 7
+
+
+def test_shadowing_that_is_no_spread_or_no_seed_is_refused(tmp_path):
+    path = tmp_path / "g.yaml"
+    for extra, match in (("shadowing_db: -1\n", "0 or more"),
+                         ("shadowing_db: loud\n", "is a number"),
+                         ("shadowing_db: .nan\n", "is a number"),
+                         ("shadowing_seed: 1.5\n", "whole number"),
+                         ("shadowing_seed: yes\n", "whole number"),
+                         # Misspelt, the model would be silently off.
+                         ("shadowing_dB: 7\n", "did you mean shadowing_db"),
+                         ("shadow_db: 7\n", "did you mean shadowing_db"),
+                         ("Shadowing_Seed: 3\n", "did you mean shadowing_seed")):
+        path.write_text(PLAIN + extra)
+        with pytest.raises(store.StoreError, match=match):
+            geodata.read(str(path))
+    # A key unlike any of them is passed over, as it always was.
+    path.write_text(PLAIN + "colour: blue\n")
+    assert geodata.dump(geodata.read(str(path)).data) == PLAIN
+
+
+def test_a_spread_is_the_number_a_copy_of_the_file_reads_back(tmp_path):
+    path, copy_path = tmp_path / "g.yaml", tmp_path / "copy.yaml"
+    path.write_text(PLAIN + "shadowing_db: 6.1234567891234\n")
+    gd = geodata.read(str(path))
+    geodata.write_copy(gd, str(copy_path))
+    assert geodata.read(str(copy_path)).shadowing_db == gd.shadowing_db == 6.123456789
+
+
+def test_loc_pct_is_a_packs_round_trips_and_is_part_of_the_ground(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
+    # Two geodata on one pack's contents, at 90 % and at the median.
+    write_pack("tiny")
+    write_pack("median")
+    geodata.write(geodata.geodata_path("median"), {"pack": ".", "loc_pct": 50, "shadowing_db": 7})
+    assert (tmp_path / "geodata" / "median" / "geodata.yaml").read_text() == \
+        'pack: "."\nloc_pct: 50\nshadowing_db: 7\n'
+    at90, median = geodata.load("tiny"), geodata.load("median")
+    assert (at90.loc_pct, median.loc_pct) == (None, 50)
+    assert median.as_dict()["loc_pct"] == 50 and "loc_pct" not in at90.as_dict()
+    # The table's own, unlike the shadowing: another percentage, other tables.
+    assert median.content_hash != at90.content_hash
+    # It goes where the pack goes.
+    out = io.BytesIO()
+    geodata.export_zip(median, out)
+    zipped = tmp_path / "median.zip"
+    zipped.write_bytes(out.getvalue())
+    back = geodata.import_zip(str(zipped), "again")
+    assert (back.loc_pct, back.shadowing_db) == (50, 7)
+    path = tmp_path / "g.yaml"
+    for text, match in (("pack: x\nloc_pct: 0\n", "1 to 99"),
+                        ("pack: x\nloc_pct: 99.5\n", "1 to 99"),
+                        ("pack: x\nloc_pct: most\n", "is a number"),
+                        ("pack: x\nloc_pc: 50\n", "did you mean loc_pct"),
+                        (PLAIN + "loc_pct: 50\n", "a pack's")):
+        path.write_text(text)
+        with pytest.raises(store.StoreError, match=match):
+            geodata.read(str(path))
+
+
 def test_synthetic_ground_goes_whatever_stands_on_it(tmp_path, monkeypatch):
     own_store(tmp_path, monkeypatch)
     geodata.write(geodata.geodata_path("flat"), {"synthetic": {"exponent": 3.0}})
     geodata.write_copy(geodata.load("flat"), str(tmp_path / "runs" / "r1" / "geodata.yaml"))
     geodata.delete("flat")
     assert geodata.names() == [] and not (tmp_path / "geodata" / "flat").exists()
+
+
+def test_a_pack_another_geodata_stands_on_is_not_moved_from_under_it(tmp_path, monkeypatch):
+    own_store(tmp_path, monkeypatch)
+    pack = write_pack("berlin")
+    # The same pack at the median, without a second copy of it.
+    geodata.write(geodata.geodata_path("median"), {"pack": "../berlin", "loc_pct": 50})
+    median = geodata.load("median")
+    assert median.pack_dir == str(pack) and median.loc_pct == 50
+    for go, doing in ((lambda: geodata.delete("berlin"), "deleting"),
+                      (lambda: geodata.rename("berlin", "b2"), "renaming")):
+        with pytest.raises(store.StoreError,
+                           match="berlin is the ground of geodata median: delete it before %s it"
+                           % doing):
+            go()
+    # The one that only names the pack goes without it, a run on the pack or
+    # not: nothing the run needs is in its directory.
+    geodata.write_copy(median, str(tmp_path / "runs" / "r1" / "geodata.yaml"))
+    geodata.delete("median")
+    assert pack.is_dir() and geodata.names() == ["berlin"]
+    with pytest.raises(store.StoreError, match="ground of run r1"):
+        geodata.delete("berlin")
+

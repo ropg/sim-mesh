@@ -44,6 +44,8 @@ export interface GeodataInfo {
   exponent?: number
   terrain?: string
   extent_m?: number
+  /** A pack's percentage of locations, when the geodata states one. */
+  loc_pct?: number
   /** How many nodesets have a node inside its bbox. */
   nodesets?: number
   error?: string

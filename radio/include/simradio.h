@@ -25,7 +25,9 @@ typedef struct simradio simradio_t;
 enum { SIMRADIO_PIN_DIO1 = 1, SIMRADIO_PIN_BUSY = 2 };
 
 /* The station's one link to the ether. Idempotent. An empty `ether_addr`
- * means "no ether": models exist, transmissions go nowhere. */
+ * means "no ether": models exist, transmissions go nowhere. In a virtual-time
+ * run it returns once the ether's welcome has set T (or after a minute
+ * without one), so the host starts at the instant it joins. */
 int simradio_station_open(int sid, const char* bind_addr, const char* ether_addr);
 
 /* One chip per radio slot. `on_pin(ctx, pin, level)` runs on whatever
@@ -45,6 +47,13 @@ int simradio_pin(simradio_t*, int pin);
 /* Microseconds on the model's clock, for a host that wants to log against it.
  * In a virtual-time run this is conductor time, T. */
 int64_t simradio_now_us(void);
+
+/* Virtual time: how long, in µs of node time from now, nothing a driver can
+ * read of this chip will change — while it transmits, until TX_DONE lands,
+ * since a transmitting chip takes in nothing from the air — or -1 when it may
+ * change at any moment, and always in real time. A driver polling the chip
+ * may sleep that long in one go and see what its polls would have seen. */
+int64_t simradio_quiet_for_us(simradio_t*);
 
 void simradio_close(simradio_t*);
 
@@ -77,6 +86,17 @@ void simradio_wake_at(int wake, int64_t node_us);      /* INT64_MAX clears it */
 /* The host has nothing to do before its wakes. The first call after each
  * grant tells the ether; later ones only when the next wake has moved closer. */
 void simradio_idle(void);
+
+/* The station's host door changed hands (virtual time; nothing in real time):
+ * `station` nonzero once the station has read what a host wrote to it, zero
+ * once it has answered. A testbed tool talks to a station on the wall clock;
+ * the ether keeps T still while the tool has the floor, and lets it run while
+ * the station has, so the station reads each line and answers it at a T the
+ * run decides. Said before the bytes are handed on, and after the answer is
+ * written. The station owes an idle after it, as after anything it says.
+ * With `station` it returns once the ether has brought the station to the
+ * run's T (a `run` marked `floor`), which an idle station is behind. */
+void simradio_host_floor(int station);
 
 /* A host whose own clock is a function of node time — a kernel tick counted
  * from it — learns of every move: `moved()` runs each time a grant moves T, on

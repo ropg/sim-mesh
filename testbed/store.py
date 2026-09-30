@@ -6,7 +6,8 @@ live, and what a name for any of them may be.
     testbed/nodesets/<name>.yaml      which nodes stand where, with their device, role and radio
     testbed/scripts/<name>.py         Python against the sim-mesh library: setup and drivers
     testbed/losses/<geodata>/<nodeset geometry hash>/<band>.bin
-                                      derived loss tables, a cache (not kept in git)
+                                      derived loss tables, a cache (not kept in git);
+                                      <band>-loc<pct>.bin for a pack's stated loc_pct
     testbed/coverage/<geodata>/<key>.bin
                                       one node's coverage raster, a cache (not kept in git)
     testbed/runs/<name>/              one simulation's output (not kept in git)
@@ -21,6 +22,8 @@ import json
 import os
 import re
 
+import yaml
+
 SIM_DIR = os.path.dirname(os.path.abspath(__file__))
 GEODATA_DIR = os.path.join(SIM_DIR, "geodata")
 NODESETS_DIR = os.path.join(SIM_DIR, "nodesets")
@@ -31,11 +34,31 @@ RUNS_DIR = os.path.join(SIM_DIR, "runs")
 SNAPSHOTS_DIR = os.path.join(SIM_DIR, "snapshots")
 
 NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
+# What a plain scalar reads as, by the rules the readers' yaml.safe_load uses.
+PLAIN = yaml.resolver.Resolver()
+STR_TAG = "tag:yaml.org,2002:str"
 
 
 class StoreError(Exception):
     """Geodata, a nodeset, a script, a table, a run or a snapshot could not be
     read, written or changed as asked. The message is meant for the page as is."""
+
+
+def load_yaml(handle):
+    """yaml.safe_load of an open file, through libyaml where PyYAML has it.
+
+    The C loader builds with safe_load's own constructor and resolver; only
+    its scanner and parser are libyaml's. It reads a city's 840 KB nodeset in
+    0.5 s where safe_load takes 2.3. A document libyaml will not read is read
+    by safe_load, as before, so a refusal says what safe_load says."""
+    text = handle.read()
+    loader = getattr(yaml, "CSafeLoader", None)
+    if loader is not None:
+        try:
+            return yaml.load(text, Loader=loader)
+        except yaml.YAMLError:
+            pass
+    return yaml.safe_load(text)
 
 
 def check_name(name, what="name"):
@@ -86,6 +109,16 @@ def scalar(value):
     return json.dumps(text, ensure_ascii=False)
 
 
+def name_scalar(name):
+    """A name as a YAML scalar: bare, as a nodeset has always written one,
+    unless YAML would read it bare as something other than the name, and
+    then quoted. A name may be a YAML word or number: bare, `no` and `on`
+    read as booleans, `null` as nothing and `010` as the number 8."""
+    if NAME_RE.match(name) and PLAIN.resolve(yaml.ScalarNode, name, (True, False)) == STR_TAG:
+        return name
+    return json.dumps(name, ensure_ascii=False)
+
+
 def flow(value):
     """A value as one line of YAML: a flow mapping, a flow list or a scalar."""
     if isinstance(value, dict):
@@ -98,9 +131,10 @@ def flow(value):
 
 def write_text(path, text):
     """Write a file whole, through a temporary beside it, so a reader never
-    sees half of one."""
+    sees half of one; this process's own, so a writer in another does not
+    rename it away."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     with open(tmp, "w", encoding="utf-8") as handle:
         handle.write(text)
     os.replace(tmp, path)

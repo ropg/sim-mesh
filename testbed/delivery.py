@@ -8,7 +8,7 @@ RUN_DIR is the run the traffic went through: its stations' logs, its
 record's epoch, and its radio graph, which is the run's own loss tables at
 the calling channel with each node's declared SF, bandwidth and power,
 forwarding through the stations whose role forwards. What is counted is
-`sim_mesh.reticulum.delivery`'s.
+`sim_mesh.reticulum.delivery`'s, each sender by its own station's logs.
 """
 import argparse
 import json

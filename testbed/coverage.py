@@ -29,7 +29,11 @@ A raster depends on the pack and the node's position and height alone, so
 its key is those (`key`): moving a node or changing its height is a new
 raster, and changing its power, gain or radio is not. The sidecar computes
 one sweep at a time and a new one cancels the last, so the front asks for
-one node at a time per sidecar. Synthetic ground has no rasters: its
+one node at a time per sidecar, and for the whole radius at once (`whole`,
+where the sidecar lists it) rather than the ladder of growing bands its map
+paints while it waits: the last band is the same raster without the others.
+A sweep waits for the sidecar's building index, so no raster is computed
+without the buildings around its node. Synthetic ground has no rasters: its
 log-distance loss is a formula the page works out itself.
 """
 
@@ -78,6 +82,7 @@ class Sweeps:
         self.session = session
         self.locks = {}
         self.busy = set()               # (geodata, key) being computed or queued
+        self.options = {}               # sidecar -> what its /loss/start takes
 
     async def raster(self, sidecar, gd, node, rx_h=RX_HEIGHT_M, radius_km=RADIUS_KM):
         """The node's raster, computed through the sidecar into the cache
@@ -94,11 +99,21 @@ class Sweeps:
             data = await self.sweep(sidecar, gd, node, rx_h, radius_km)
             path = cache_path(gd.name, raster_key)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".tmp"
+            tmp = "%s.%d.tmp" % (path, os.getpid())
             with open(tmp, "wb") as handle:
                 handle.write(data)
             os.replace(tmp, path)
             return path
+
+    async def loss_options(self, sidecar, timeout):
+        """What the sidecar's /loss/start takes beyond the page's query, asked
+        once: only a sidecar that lists an option is sent it, since the query
+        refuses a name it does not know."""
+        if sidecar not in self.options:
+            async with self.session.get(sidecar + "/api/pack", timeout=timeout) as resp:
+                info = await resp.json(content_type=None) if resp.status == 200 else {}
+            self.options[sidecar] = frozenset(info.get("loss_options") or ())
+        return self.options[sidecar]
 
     async def sweep(self, sidecar, gd, node, rx_h, radius_km):
         import aiohttp
@@ -108,6 +123,11 @@ class Sweeps:
                  "rx_h": "%g" % rx_h, "radius_km": "%g" % radius_km}
         timeout = aiohttp.ClientTimeout(total=60)
         try:
+            # Only the whole radius is kept, so only it is swept: the inner
+            # bands a map paints while it waits are sweeps of their own, and
+            # the last band is the same raster without them.
+            if "whole" in await self.loss_options(sidecar, timeout):
+                where["whole"] = "true"
             async with self.session.get(sidecar + "/loss/start", params=where,
                                         timeout=timeout) as resp:
                 if resp.status != 200:

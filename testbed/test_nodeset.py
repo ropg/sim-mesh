@@ -80,6 +80,67 @@ def test_names_ids_and_heights_are_checked_and_nodes_declare_nothing(tmp_path):
             nodeset.read(str(path))
 
 
+def test_a_number_no_file_could_hold_is_refused_where_it_is_read(tmp_path):
+    """NaN and infinity read as numbers, and store.scalar cannot write them:
+    a nodeset holding one loaded, and could then not be saved."""
+    node = ("nodes:\n  a: { id: 1, lat: %s, lon: %s, height_m: %s%s }\n"
+            "  b: { id: 2, lat: 0, lon: 1 }\n")
+    aimed = ", antenna: { type: panel_directional, azimuth_deg: .inf }"
+    for text, match in (
+            (node % (".nan", 0, 2, ""), "node a: lat is a finite number, not nan"),
+            (node % (0, "-.inf", 2, ""), "node a: lon is a finite number, not -inf"),
+            (node % (0, 0, ".inf", ""), "node a: height_m is a finite number, not inf"),
+            (node % (0, 0, 2, aimed), "node a: an antenna's azimuth_deg is a finite number"),
+            (node % (0, 0, 2, "") + "offsets:\n  - { between: [a, b], db: .nan }\n",
+             "offset between a and b states db nan")):
+        path = tmp_path / "f.yaml"
+        path.write_text(text)
+        with pytest.raises(store.StoreError, match=match):
+            nodeset.read(str(path))
+
+
+def test_a_node_figure_that_is_no_number_is_refused_by_its_key(tmp_path):
+    """A word where a node's height goes raised float()'s ValueError, none a
+    TypeError, and an infinite id int()'s OverflowError, where every other
+    bad value is a StoreError."""
+    node = "nodes:\n  a: { id: %s, lat: %s, lon: 0%s }\n"
+    for text, match in (
+            (node % (1, 0, ", height_m: tall"), "node a: height_m is a finite number, not 'tall'"),
+            (node % (1, 0, ", height_m: null"), "node a: height_m is a finite number, not None"),
+            (node % (".inf", 0, ""), "node a needs id, lat and lon"),
+            (node % (1, "north", ""), "node a needs id, lat and lon"),
+            (node % (1, 0, ", max_dbm: [27]"), "node a: max_dbm is a number")):
+        path = tmp_path / "f.yaml"
+        path.write_text(text)
+        with pytest.raises(store.StoreError, match=match):
+            nodeset.read(str(path))
+
+
+def test_offsets_are_a_list_and_an_offsets_ends_a_list_of_nodes(tmp_path):
+    # A string's letters were read as the ends: `ab` joined nodes a and b.
+    head = "nodes:\n  a: { id: 1, lat: 0, lon: 0 }\n  b: { id: 2, lat: 0, lon: 0.01 }\n"
+    for text, match in (("offsets:\n  - { between: ab, db: 3 }\n", "an offset is"),
+                        ("offsets: 5\n", "offsets is a list")):
+        path = tmp_path / "f.yaml"
+        path.write_text(head + text)
+        with pytest.raises(store.StoreError, match=match):
+            nodeset.read(str(path))
+
+
+def test_an_offset_is_between_two_nodes(tmp_path):
+    """A third name, and any after it, was passed over without a word: the
+    offset held between the first two. A link's is refused, and so is this."""
+    head = ("nodes:\n  a: { id: 1, lat: 0, lon: 0 }\n  b: { id: 2, lat: 0, lon: 0.01 }\n"
+            "  c: { id: 3, lat: 0, lon: 0.02 }\noffsets:\n  - { between: %s, db: 3 }\n")
+    for ends in ("[a, b, c]", "[a, b, zz]", "[a]", "[]"):
+        path = tmp_path / "f.yaml"
+        path.write_text(head % ends)
+        with pytest.raises(store.StoreError, match="an offset is { between: \\[a, b\\]"):
+            nodeset.read(str(path))
+    path.write_text(head % "[c, a]")
+    assert nodeset.read(str(path))["offsets"] == [{"between": ["c", "a"], "db": 3.0}]
+
+
 def test_edits_mark_it_dirty_and_ids_are_the_lowest_free(nodesets_dir):
     ns = nodeset.create("new")
     assert ns.add_node("a", 0.0, 0.0)["id"] == 1
@@ -135,6 +196,109 @@ def test_geometry_hash_follows_positions_and_heights_only(nodesets_dir):
         other = nodeset.load("ex")
         change(other)
         assert other.geometry_hash() != base
+
+
+# ---- links ---------------------------------------------------------------
+
+LINKED = """\
+nodes:
+  hub: { id: 1, lat: 0.01, lon: 0.02, height_m: 12, height_from: roof, antenna: { type: whip_sma_quarter_wave }, tags: [transport] }
+  n017: { id: 2, lat: 0.011, lon: 0.021, height_m: 2, height_from: assumed, antenna: { type: whip_sma_quarter_wave }, tags: [] }
+offsets: []
+links:
+  - { between: [hub, n017], loss_db: 131.5, back_db: 133, note: measured }
+"""
+
+
+def test_links_are_written_only_when_there_are_some_and_round_trip(nodesets_dir):
+    (nodesets_dir / "ex.yaml").write_text(SAMPLE)
+    ns = nodeset.load("ex")
+    # Without links nothing is new: not the data, not what the page is told,
+    # not the file.
+    assert ns.links == [] and "links" not in ns.data and "links" not in ns.as_dict()
+    assert nodeset.dump(ns.data) == SAMPLE
+    (nodesets_dir / "ex.yaml").write_text(LINKED)
+    ns = nodeset.load("ex")
+    assert ns.links == [{"between": ["hub", "n017"], "loss_db": 131.5, "back_db": 133,
+                         "note": "measured"}]
+    assert nodeset.dump(ns.data) == LINKED
+    assert ns.as_dict()["links"] == ns.links
+    ns.save_as("again")
+    assert nodeset.load("again").data == ns.data
+
+
+def test_removing_a_node_drops_its_links_and_a_rename_carries_them(nodesets_dir):
+    (nodesets_dir / "ex.yaml").write_text(LINKED)
+    ns = nodeset.load("ex")
+    ns.rename_node("n017", "n018")
+    assert ns.links[0]["between"] == ["hub", "n018"]
+    nodeset.parse(ns.data, "renamed")               # still names only nodes it has
+    ns.remove_node("n018")
+    assert ns.links == [] and "links" not in ns.data
+    assert "links" not in nodeset.dump(ns.data)
+
+
+def test_a_link_without_a_figure_is_refused(tmp_path):
+    head = "nodes:\n  a: { id: 1, lat: 0, lon: 0 }\n  b: { id: 2, lat: 0, lon: 0.01 }\nlinks:"
+    for text, match in (
+            ("\n  - { between: [a, b] }\n", "a link is"),
+            ("\n  - { between: [a, b], loss_db: loud }\n", "a link is"),
+            ("\n  - { between: [a], loss_db: 110 }\n", "a link is"),
+            ("\n  - { between: [a, b, c], loss_db: 110 }\n", "a link is"),
+            ("\n  - { between: ab, loss_db: 110 }\n", "a link is"),
+            ("\n  - between\n", "a link is"),
+            (" 110\n", "links is a list"),
+            ("\n  - { between: [a, z], loss_db: 110 }\n", "not a node"),
+            ("\n  - { between: [a, a], loss_db: 110 }\n", "itself"),
+            # A misspelt back_db would make the link the same both ways.
+            ("\n  - { between: [a, b], loss_db: 110, back_dB: 130 }\n", "has no back_dB"),
+            ("\n  - { between: [a, b], loss_db: .inf }\n", "finite"),
+            ("\n  - { between: [a, b], loss_db: 110, back_db: .nan }\n", "finite"),
+            ("\n  - { between: [a, b], loss_db: -3 }\n", "0 or more"),
+            ("\n  - { between: [a, b], loss_db: 1e39 }\n", "finite"),      # past float32
+            ("\n  - { between: [a, b], loss_db: 110 }\n  - { between: [b, a], loss_db: 120 }\n",
+             "stated twice")):
+        path = tmp_path / "f.yaml"
+        path.write_text(head + text)
+        with pytest.raises(store.StoreError, match=match):
+            nodeset.read(str(path))
+
+
+def test_a_name_yaml_would_read_as_something_else_is_quoted_and_reads_back(tmp_path):
+    """A name may be a YAML word or number. Bare, `no` and `on` read back as
+    booleans and `null` as nothing, none of which is a name, and `010` as
+    the number 8; as nodes, offsets and links they are quoted."""
+    data = nodeset.blank()
+    for i, name in enumerate(("no", "on", "null", "010", "0x1f", "123", "2026-09-29"), 1):
+        data["nodes"][name] = nodeset.node_record(i, i / 100, 0.02)
+    data["offsets"] = [{"between": ["no", "010"], "db": 3.0}]
+    data["links"] = [{"between": ["on", "null"], "loss_db": 120.0}]
+    path = tmp_path / "words.yaml"
+    nodeset.write(str(path), data)
+    assert nodeset.read(str(path)) == data
+    text = path.read_text()
+    assert '\n  "no": { id: 1,' in text and '{ between: ["no", "010"], db: 3 }' in text
+
+
+BARE = """\
+nodes:
+  1st-floor: { id: 1, lat: 0.01, lon: 0.02, height_m: 2, height_from: assumed, antenna: { type: whip_sma_quarter_wave }, tags: [] }
+  08: { id: 2, lat: 0.011, lon: 0.021, height_m: 2, height_from: assumed, antenna: { type: whip_sma_quarter_wave }, tags: [] }
+  nord: { id: 3, lat: 0.012, lon: 0.022, height_m: 2, height_from: assumed, antenna: { type: whip_sma_quarter_wave }, tags: [] }
+offsets:
+  - { between: [1st-floor, 08], db: 3 }
+links:
+  - { between: [nord, "08"], loss_db: 120 }
+"""
+
+
+def test_a_name_yaml_reads_as_itself_is_written_as_before(tmp_path):
+    """Bare, as it always was, however it starts: only a name YAML would
+    read as something else is quoted. (A link's ends were always written as
+    any other string.)"""
+    path = tmp_path / "bare.yaml"
+    path.write_text(BARE)
+    assert nodeset.dump(nodeset.read(str(path))) == BARE
 
 
 def test_a_nodeset_is_inside_an_extent_when_one_node_is(nodesets_dir):
@@ -232,6 +396,22 @@ def test_shown_layers_merge_top_first():
     assert sorted(got["nodes"]) == ["n", "n-b", "n-b-2"]
 
 
+def test_a_link_comes_along_where_both_its_ends_do():
+    town = dict(layer(("gw", 1, 0.0, 0.0, []), ("hill", 2, 0.01, 0.01, [])),
+                links=[{"between": ["gw", "hill"], "loss_db": 120}])
+    meshcore = dict(layer(("mast", 1, 0.000027, 0.0, []), ("gw", 2, 0.02, 0.02, []),
+                          ("far", 7, 0.03, 0.03, [])),
+                    links=[{"between": ["mast", "far"], "loss_db": 130},
+                           {"between": ["gw", "far"], "loss_db": 125, "back_db": 127}])
+    got = nodeset.merge([("town", town), ("meshcore", meshcore)])
+    # The mast is the town's gw, so its link stays behind; the other is renamed.
+    assert got["links"] == [{"between": ["gw", "hill"], "loss_db": 120},
+                            {"between": ["gw-meshcore", "far"], "loss_db": 125, "back_db": 127}]
+    nodeset.parse(got, "merged")
+    plain = nodeset.merge([("a", layer(("n", 1, 1, 1, []))), ("b", layer(("m", 2, 2, 2, [])))])
+    assert "links" not in plain
+
+
 def test_a_delete_takes_the_nodesets_own_setup_with_it(nodesets_dir):
     (nodesets_dir / "ex.yaml").write_text(SAMPLE)
     (nodesets_dir / "ex.py").write_text("# its own setup\n")
@@ -240,3 +420,23 @@ def test_a_delete_takes_the_nodesets_own_setup_with_it(nodesets_dir):
     assert nodeset.names() == [] and not (nodesets_dir / "ex.py").exists()
     with pytest.raises(store.StoreError, match="no nodeset"):
         nodeset.delete("ex")
+
+
+def test_an_estimate_replaces_only_an_assumed_height_and_says_what_it_rested_on():
+    data = nodeset.blank()
+    for i, source in enumerate(("assumed", "assumed", "assumed", "measured", "roof", "assumed")):
+        data["nodes"]["n%d" % i] = nodeset.node_record(i + 1, 52.5, 13.4 + i / 1000, 15.0, source)
+    reply = {"h_agl_m": 24.04, "low_m": 22.0, "high_m": 26.0}
+    estimates = {"n0": dict(reply, basis="lod2-building"),
+                 "n1": dict(reply, basis="clutter-neighbourhood"),
+                 "n2": dict(reply, basis="no-evidence"),
+                 "n3": dict(reply, basis="lod2-building"),
+                 "n4": dict(reply, basis="class-typical")}
+    assert nodeset.with_estimated_heights(data, estimates) == ["n0", "n1"]
+    nodes = data["nodes"]
+    assert (nodes["n0"]["height_m"], nodes["n0"]["height_from"]) == (24.0, "roof")
+    assert (nodes["n1"]["height_m"], nodes["n1"]["height_from"]) == (24.0, "raster")
+    # Nothing to go on, a measured or a roof height, and no estimate at all:
+    # each keeps its own.
+    for name, source in (("n2", "assumed"), ("n3", "measured"), ("n4", "roof"), ("n5", "assumed")):
+        assert (nodes[name]["height_m"], nodes[name]["height_from"]) == (15.0, source)

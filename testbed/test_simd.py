@@ -4,6 +4,7 @@ move recomputed into the run's copy, an id change, levels, commands and
 intents on chosen stations, snapshots."""
 
 import asyncio
+import copy
 import json
 import os
 import socket
@@ -202,6 +203,62 @@ def test_setup_is_the_name_then_the_first_boot_rules_in_order(stores):
     asyncio.run(go())
 
 
+def test_a_run_records_the_medium_it_was_started_on(stores):
+    """The noise figure, the rule and the seed go into the run, and the
+    analysis tools' medium takes its noise figure from there."""
+    async def go():
+        daemon = make_simd(stores, "--noise-figure", "4.5", "--seed", "77")
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three", **FAR})
+        run = daemon.run
+        assert run.meta["physics"] == {"noise_figure_db": 4.5, "pairwise": False}
+        assert run.meta["seed"] == 77
+        from sim_mesh import view
+        assert view.RunView(run.dir).medium().physics.noise_figure_db == 4.5
+        await daemon.stop_all(flush=False)
+        daemon.ether.close()
+    asyncio.run(go())
+
+
+def test_each_station_keeps_its_own_clock_within_the_ppm_given(stores):
+    """--clock-ppm: a station's crystal is off by a draw within the bound,
+    its own, the same for the same seed and name; the kind hands it over in
+    a virtual run, and a device's own profile still wins."""
+    import types
+    daemon = make_simd(stores, "--time", "max", "--clock-ppm", "20")
+    daemon.ether = types.SimpleNamespace(seed=5, clock=types.SimpleNamespace(virtual=True),
+                                         epoch=0)
+    slopes = {}
+    for name in "abc":
+        text = daemon.clock_profile(name)
+        (t0, n0), (t1, n1) = [tuple(map(int, point.split(":"))) for point in text.split(",")]
+        assert (t0, n0) == (0, 0) and t1 == simd.CLOCK_HORIZON_US
+        slopes[name] = (n1 - t1) / t1 * 1e6
+        assert abs(slopes[name]) <= 20
+        assert daemon.clock_profile(name) == text
+    assert len({round(ppm, 3) for ppm in slopes.values()}) == 3
+    assert simd.drift_profile(-20) == "0:0,%d:%d" % (simd.CLOCK_HORIZON_US,
+                                                      simd.CLOCK_HORIZON_US - 51_840_000)
+
+    station = types.SimpleNamespace(node_id=1, dir="d", addr="a", ether_addr="e",
+                                    clock=daemon.ether, board=None,
+                                    clock_profile=daemon.clock_profile("a"))
+    assert Stub({}).env(station)["SIM_MESH_CLOCK_PROFILE"] == daemon.clock_profile("a")
+    own = Stub({"env": {"SIM_MESH_CLOCK_PROFILE": "0:0,1:2"}}).env(station)
+    assert own["SIM_MESH_CLOCK_PROFILE"] == "0:0,1:2"
+    daemon.args.clock_ppm = 0
+    assert daemon.clock_profile("a") is None
+    station.clock_profile = None
+    assert "SIM_MESH_CLOCK_PROFILE" not in Stub({}).env(station)
+
+
+def test_a_drifting_clock_needs_virtual_time():
+    with pytest.raises(SystemExit):
+        simd.parse_args(["--clock-ppm", "20"])
+    with pytest.raises(SystemExit):
+        simd.parse_args(["--time", "max", "--clock-ppm", "-1"])
+
+
 def test_moves_offsets_ids_and_levels(stores):
     async def go():
         daemon = make_simd(stores)
@@ -250,6 +307,83 @@ def test_moves_offsets_ids_and_levels(stores):
         assert daemon.ether.names.get(9) == "c" and 3 not in daemon.ether.names
         assert any(m["type"] == "notice" and "id 9" in m["text"] for m in daemon.said)
         assert await until(lambda: daemon.stations["c"].node_id == 9)
+        await daemon.stop_all(flush=False)
+        daemon.ether.close()
+    asyncio.run(go())
+
+
+def test_an_edit_with_a_number_no_file_could_hold_is_refused(stores):
+    """JSON reads NaN, Infinity and 1e999 as numbers, and store.scalar cannot
+    write them. An edit carrying one went into the run's nodeset, which could
+    then not be saved, and an infinite id or height took the page's socket
+    down with an OverflowError. Each is refused as a bad edit is, with the
+    key it names, and leaves the nodeset as it was."""
+    async def go():
+        daemon = make_simd(stores)
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three"})    # nothing runs
+        before = copy.deepcopy(daemon.nodeset.data)
+        for text, match in (
+                ('{"type": "nodeset_move", "name": "b", "lat": NaN, "lon": 0.03}',
+                 "node b: lat is a finite number, not nan"),
+                ('{"type": "nodeset_move", "name": "b", "lat": 0, "lon": -Infinity, '
+                 '"settle": false}', "node b: lon is a finite number, not -inf"),
+                ('{"type": "nodeset_move", "name": "b", "lat": 0, "lon": 0.006, '
+                 '"height_m": 1e999}', "node b: height_m is a finite number, not inf"),
+                ('{"type": "nodeset_add", "name": "d", "lat": NaN, "lon": 0.001}',
+                 "node d: lat is a finite number, not nan"),
+                ('{"type": "nodeset_add", "name": "d", "lat": 0.001, "lon": 0.001, '
+                 '"height_m": Infinity}', "node d: height_m is a finite number, not inf"),
+                ('{"type": "nodeset_add", "name": "d", "lat": 0.001, "lon": 0.001, '
+                 '"id": Infinity}', "node d: id is a finite number, not inf"),
+                ('{"type": "nodeset_set", "name": "a", "lat": NaN}',
+                 "node a: lat is a finite number, not nan"),
+                ('{"type": "nodeset_set", "name": "a", "id": -Infinity}',
+                 "node a: id is a finite number, not -inf"),
+                ('{"type": "nodeset_set", "name": "a", "antenna": {"type": "yagi_directional", '
+                 '"elevation_deg": NaN}}', "node a: an antenna's elevation_deg is a finite"),
+                ('{"type": "nodeset_set", "name": "c", "max_dbm": Infinity}',
+                 "node c: max_dbm is -9 to 27 dBm, not inf"),
+                ('{"type": "nodeset_offset", "between": ["a", "b"], "db": NaN}',
+                 "the offset between a and b: db is a finite number, not nan")):
+            said = len(daemon.said)
+            await daemon.handle(json.loads(text))       # as the page's socket reads it
+            errors = [m["text"] for m in daemon.said[said:] if m["type"] == "error"]
+            assert len(errors) == 1 and match in errors[0], (text, errors)
+            assert daemon.nodeset.data == before, text
+        # Nothing no file could hold went in: the next edit is written.
+        await daemon.handle({"type": "nodeset_offset", "between": ["a", "b"], "db": 3})
+        assert daemon.run.nodeset().offsets == [{"between": ["a", "b"], "db": 3.0}]
+        await daemon.stop_all(flush=False)
+        daemon.ether.close()
+    asyncio.run(go())
+
+
+def test_a_request_that_fails_is_answered_with_its_error(stores):
+    """A script waits on each request's answer, by its id. One that cannot be
+    done is answered with the error, and the page told as before; left
+    unanswered, the script waited for ever, and T went on without it."""
+    async def go():
+        daemon = make_simd(stores)
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three", **STUBS})
+        assert await until(lambda: len(daemon.stations) == 3 and all(
+            s.status == "up" for s in daemon.stations.values()))
+        for msg in ({"type": "meta", "verb": "message", "name": "a",
+                     "args": {"to": "nobody", "text": "yo"}, "id": "f1"},
+                    {"type": "sequence", "names": ["a"], "id": "f2",
+                     "steps": [{"type": "meta", "verb": "path", "args": {"to": "nobody"}}]},
+                    # Put off to an instant, it fails on a task of its own.
+                    {"type": "meta", "verb": "message", "name": "a", "after": 0.001,
+                     "args": {"to": "nobody", "text": "yo"}, "id": "f3"}):
+            said = len(daemon.said)
+            await daemon.handle(msg)
+            assert await until(lambda: any(m.get("id") == msg["id"] for m in daemon.said[said:]))
+            answers = [m for m in daemon.said[said:] if m["type"] == "command_result"]
+            errors = [m["text"] for m in daemon.said[said:] if m["type"] == "error"]
+            assert [a["id"] for a in answers] == [msg["id"]], msg
+            assert answers[0]["error"] == errors[0] and answers[0]["results"] == {}, msg
+            assert "nobody is not up" in errors[0], msg
         await daemon.stop_all(flush=False)
         daemon.ether.close()
     asyncio.run(go())
@@ -353,6 +487,227 @@ def test_firmware_rules_start_restart_and_leave_idle(stores):
     asyncio.run(go())
 
 
+def test_roles_are_asked_only_for_a_page_that_draws_them(stores, monkeypatch):
+    """A role question runs a tool against the station's console: it is asked
+    only while a page that draws the map is open and a station is up. Until
+    then T does not move for it, so a virtual run's T stays where the load
+    left it until its stations start."""
+    asked = []
+
+    async def role(self, station):
+        asked.append(station.name)
+        return "client"
+    monkeypatch.setattr(Stub, "role", role)
+    monkeypatch.setattr(simd, "ROLE_POLL_S", 0.05)
+
+    async def unwatched_virtual():
+        daemon = make_simd(stores, "--time", "max")
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three"})
+        daemon.pages["page"] = False
+        daemon.poller = asyncio.ensure_future(daemon.poll_roles())
+        await asyncio.sleep(0.3)
+        assert daemon.ether.now() == 0
+        daemon.poller.cancel()
+        daemon.ether.close()
+    asyncio.run(unwatched_virtual())
+
+    async def watched_or_not():
+        daemon = make_simd(stores)
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three", **FAR})
+        assert await until(lambda: len(daemon.stations) == 3 and all(
+            s.status == "up" for s in daemon.stations.values()))
+        daemon.pages["driver"] = True
+        daemon.poller = asyncio.ensure_future(daemon.poll_roles())
+        await asyncio.sleep(0.3)
+        asked.clear()
+        await asyncio.sleep(0.3)
+        assert asked == []
+        daemon.pages["page"] = False
+        daemon.role_wake.set()
+        assert await until(lambda: set(asked) == {"a", "b", "c"})
+        del daemon.pages["page"]
+        await asyncio.sleep(0.2)
+        asked.clear()
+        await asyncio.sleep(0.3)
+        assert asked == []
+        daemon.poller.cancel()
+        await daemon.stop_all(flush=False)
+        daemon.ether.close()
+    asyncio.run(watched_or_not())
+
+
+def test_a_console_nothing_acts_on_is_not_waited_for(tmp_path, monkeypatch):
+    """The drain before T moves reads only the consoles of kinds that act on
+    what their stations print (console_acted_on): Sergeyculum's, log lines
+    alone, are read as they come, and a barrier where only it printed waits
+    for nothing."""
+    import stations
+    import types
+
+    daemon = make_simd(tmp_path)
+    from kinds import reticulous, sergeyculum
+    assert reticulous.Reticulous.console_acted_on
+    assert not sergeyculum.Sergeyculum.console_acted_on
+
+    pipes = []
+
+    def printing(node_id, acted_on):
+        reader, writer = os.pipe()
+        pipes.extend((reader, writer))
+        marks = stations.Marks(reader)
+        marks.reading, marks.taken = True, 1         # handed on reads not caught up with
+        drain = types.SimpleNamespace(master=reader, marks=marks)
+        kind = types.SimpleNamespace(console_acted_on=acted_on, sids=lambda station: (station.node_id,))
+        return types.SimpleNamespace(node_id=node_id, drain=drain, kind=kind)
+    daemon.stations = {"ours": printing(1, False), "theirs": printing(2, True)}
+    waited = []
+    monkeypatch.setattr(stations.ptys(), "call",
+                        lambda fn, drains, loop, done: waited.extend(drains))
+
+    async def go():
+        assert daemon.drain_consoles([1], lambda: None) is False
+        assert daemon.drain_consoles([1, 2], lambda: None) is True
+    try:
+        asyncio.run(go())
+    finally:
+        for fd in pipes:
+            os.close(fd)
+    assert waited == [daemon.stations["theirs"].drain]
+
+
+@pytest.mark.parametrize("marks", ["testbed", "core"])
+def test_only_a_station_that_printed_is_read_through_the_pty_thread(marks):
+    """stations.printed polls the ptys on the main thread: a station that
+    printed is found, one that did not is not, and bytes the pty thread has
+    taken and handed on count until a catch_up has seen them through. The
+    same with the marks an ether core keeps."""
+    import stations
+    import types
+
+    module = None
+    if marks == "core":
+        module = simd.ether_module.core_module()
+        if module is None:
+            pytest.skip("no ether core built (sim-mesh build ether)")
+
+    async def go():
+        main = asyncio.get_running_loop()
+        master, slave = os.openpty()
+        os.set_blocking(master, False)
+        got = []
+        station = types.SimpleNamespace(log_file=open(os.devnull, "wb"), watchers=0,
+                                        pty_closed=lambda drain: None,
+                                        console_out=lambda text: None)
+        rpc = types.SimpleNamespace(on_marker=lambda: None,
+                                    on_frame=lambda fid, payload: got.append(payload))
+        drain = stations.Drain(station, master, rpc, main,
+                               module.Marks(master) if module is not None else None)
+        drain.marks.reading = True              # read only when asked, below
+        try:
+            assert stations.printed([drain]) == []
+            os.write(slave, b"hello\n")
+            assert stations.printed([drain]) == [drain]
+            # The pty thread takes it on its own; until a catch_up has seen
+            # it through, it still counts.
+            done = main.create_future()
+            stations.ptys().call(lambda: (drain.read_once(),
+                                          main.call_soon_threadsafe(done.set_result, None)))
+            await done
+            assert drain.marks.taken == 1 and drain.marks.caught == 0
+            assert stations.printed([drain]) == [drain]
+            finished = main.create_future()
+            stations.ptys().call(stations.catch_up, [drain], main,
+                                 lambda: finished.set_result(None))
+            await finished
+            assert stations.printed([drain]) == []
+        finally:
+            os.close(slave)
+            os.close(master)
+            station.log_file.close()
+    asyncio.run(go())
+
+
+def test_a_console_that_need_not_be_a_terminal_is_a_pipe_each_way(tmp_path):
+    """A kind with console_tty False: the station's stdin and stdout are
+    pipes, not a pty; what it prints reaches its log, what is typed at it
+    reaches it."""
+    import stat as stat_module
+    import stations
+
+    script = tmp_path / "echo.sh"
+    script.write_text("#!/bin/sh\necho hello\nwhile read line; do echo \"got $line\"; done\n")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+    class Piped(Stub):
+        console_tty = False
+
+    kind = Piped({"elf": str(script)})
+    kind.elf = str(script)
+
+    async def go():
+        station = stations.Station("p", 7, str(tmp_path / "p"), kind, "127.0.0.1:9")
+        os.makedirs(station.dir, exist_ok=True)
+        await station.start()
+        try:
+            assert stat_module.S_ISFIFO(os.fstat(station.master).st_mode)
+            assert stat_module.S_ISFIFO(os.fstat(station.drain.master).st_mode)
+            station.write(b"ping\n")
+            text = lambda: open(station.log_path, "rb").read()
+            assert await until(lambda: b"got ping" in text())
+            assert b"hello" in text()
+        finally:
+            await station.stop()
+
+    asyncio.run(go())
+
+
+def test_a_driver_takes_turns_with_t(stores):
+    """A socket that says `drive` holds T while it has the floor: from then,
+    and from each answer to it, until it yields. Its waits are answered at
+    the instant they end, with the floor."""
+    import aiohttp
+    from aiohttp import web
+
+    async def go():
+        daemon = make_simd(stores, "--time", "max")
+        daemon.broadcast = simd.Simd.broadcast.__get__(daemon)     # the sockets hear it
+        await daemon.start_ether()
+        runner = web.AppRunner(daemon.app(), access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three"})
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect("http://127.0.0.1:%d/ws?quiet=1" % port) as ws:
+                await ws.receive()                          # the snapshot
+                daemon.ether.call_at(5_000_000, lambda: None)
+                await ws.send_json({"type": "drive"})
+                await asyncio.sleep(0.2)
+                assert daemon.ether.now() == 0              # the driver has the floor
+                await ws.send_json({"type": "wait", "until": 3_000_000, "id": "w1"})
+                await asyncio.sleep(0.2)
+                assert daemon.ether.now() == 0              # still: it has not yielded
+                await ws.send_json({"type": "yield"})
+                while True:
+                    msg = json.loads((await ws.receive()).data)
+                    if msg.get("type") == "command_result" and msg.get("id") == "w1":
+                        break
+                assert msg["t"] == 3_000_000
+                await asyncio.sleep(0.2)
+                assert daemon.ether.now() == 3_000_000      # answered: the floor is back
+                await ws.send_json({"type": "yield"})
+                await asyncio.sleep(0.2)
+                assert daemon.ether.now() == 5_000_000
+        await asyncio.sleep(0.1)
+        assert daemon.driver is None and not daemon.driver_floor
+        await runner.cleanup()
+        daemon.ether.close()
+    asyncio.run(go())
+
+
 def test_a_role_the_station_forgets_is_said_again_after_a_reset(stores, monkeypatch):
     monkeypatch.setattr(Stub, "role_volatile", True)
 
@@ -392,3 +747,28 @@ def test_a_snapshot_reloads_what_the_run_had(stores):
         await daemon.stop_all(flush=False)
         daemon.ether.close()
     asyncio.run(go())
+
+
+def test_a_tool_that_ends_as_its_wait_times_out_is_a_tool_that_gave_no_answer(monkeypatch):
+    """A tool's answer is waited for on the wall clock; when the wait times out
+    in the instant the tool itself ends, there is no process left to kill, and
+    that is the same failure as any other late answer, not another one."""
+    class Late:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(10)
+
+        def kill(self):
+            raise ProcessLookupError()
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+    async def spawn(*argv, **kw):
+        return Late()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(kinds.CommandError, match="gave no answer"):
+        asyncio.run(kinds.run_tool(["/bin/true"], 0.05))

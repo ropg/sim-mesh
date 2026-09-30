@@ -9,15 +9,18 @@ nodeset's geometry, and is cached as
 
     testbed/losses/<geodata>/<nodeset geometry hash>/<band>.bin
 
-in the SLT1 format (`ether/slt.py`). A run works on its own copy; a node
+(`<band>-loc<pct>.bin` for a pack whose geodata states `loc_pct`) in the
+SLT1 format (`ether/slt.py`). A run works on its own copy; a node
 moved during a run has its row and column recomputed into that copy, never
 into the cache.
 
-A nodeset's **antennas** and **offsets** are not in the table: they are
-layers over it, put on when the medium is given the tables
-(`medium_tables`), so the cached table is the model's own and neither a new
-antenna nor an offset forces a recompute. The antenna layer takes each
-pair's gains off its loss, each end's pattern toward the other in three
+A nodeset's **links**, **antennas** and **offsets** and the geodata's
+**shadowing** are not in the table: they are layers over it, put on when
+the medium is given the tables (`medium_tables`), so the cached table is
+the model's own and none of them forces a recompute. A link states a pair's
+loss in place of the model's. Shadowing adds each pair's own static draw,
+off unless the geodata asks for it. The antenna layer takes each pair's
+gains off its loss, each end's pattern toward the other in three
 dimensions, which needs the ground under each node (`grounds`: 0 on
 synthetic ground, the pack's terrain through the sidecar).
 
@@ -55,10 +58,16 @@ is never heard with the matching flag; "path too short for a §3.2 profile",
 which the sidecar says of pairs a few tens of metres apart whose profile
 decimates to fewer than three points, is free space at that distance,
 FLAG_NEAR_FIELD, as under 20 m; "renderer busy" (429) is retried after a
-growing pause. Requests run concurrently up to a bound near the sidecar's
-render slots, though the sidecar holds its raster locks for the whole of a
-`link.json`, so requests are answered one at a time whatever the bound:
-about 2.5 ms a request, two requests a pair.
+growing pause. Requests run concurrently, as many as the sidecar has render
+slots: both are sized by the process's CPU affinity mask, so `taskset`
+bounds a table as it bounds the stations. The sidecar answers them in
+parallel, reading its layers without their locks where the pack's layout
+allows (an uncompressed strip TIFF, which is what the pack builder writes),
+and each pair is asked both ways. A sidecar that lists `lean` among its
+`link_options` is asked for the reply without the profile drawn for the
+page, which a cell does not keep. 173 Berlin nodes, 14,878 pairs within
+the radius, took 200 s on 8 slots when the layers were read under their
+locks, and take 22-26 s.
 
 A sidecar indexes its pack's buildings in the background after it starts
 (a second for the berlin-city pack, half a minute for all of Berlin), and
@@ -78,12 +87,20 @@ The command prints JSON lines: `{"event": "progress", "done", "total"}`,
 `link.json` takes no carrier: it always judges at the planner's EU868 link
 parameters, 869.525 MHz, 50 % of time and 90 % of locations. So a pack
 has an 868 table only, its header's `f0_hz` is 869.525 MHz, the carrier the
-numbers are really for, and asking for another band is refused.
+numbers are really for, and asking for another band is refused. The
+percentage of locations is the one thing a request may change: a geodata's
+`loc_pct` goes to every request as `loc_pct` and into the header as
+`p_loc_pct`, and a geodata without one asks exactly as before, at 90 %. The
+key is in the geodata's content hash and in the cached file's name, so a
+table at 50 % never serves one at 90 %, from the cache or as another
+table's donor, and the two are cached side by side.
 """
 
 import argparse
 import asyncio
 import datetime
+import functools
+import hashlib
 import json
 import math
 import os
@@ -123,9 +140,13 @@ class LossError(store.StoreError):
     """A table could not be computed, for a reason the page can show."""
 
 
-def cache_path(geodata_name, geometry_hash, band):
+def cache_path(geodata_name, geometry_hash, band, loc_pct=None):
+    """Where a table is cached. One at a percentage of locations the
+    geodata states (`loc_pct`) is a file of its own beside the planner's
+    default, so switching a geodata between the two recomputes neither."""
+    leaf = band if loc_pct is None else "%s-loc%s" % (band, store.scalar(float(loc_pct)))
     return os.path.join(store.LOSSES_DIR, store.check_name(geodata_name, "geodata"),
-                        geometry_hash, "%s.bin" % band)
+                        geometry_hash, "%s.bin" % leaf)
 
 
 def _check_band(band):
@@ -151,13 +172,30 @@ def header_for(gd, ns, band, radius_m=DEFAULT_RADIUS_M, planner_version=None):
             "nodes": _nodes_header(ns), "computed_at": now}
     if gd.is_pack:
         head.update(pack_manifest_hash=gd.pack_manifest_hash, f0_hz=LINK_F0_HZ,
-                    model="P.1812-8", p_time_pct=LINK_P_TIME_PCT, p_loc_pct=LINK_P_LOC_PCT,
+                    model="P.1812-8", p_time_pct=LINK_P_TIME_PCT, p_loc_pct=loc_pct_of(gd),
                     radius_m=radius_m, planner_version=planner_version)
     else:
         head.update(pack_manifest_hash=None, f0_hz=slt.f0_of(band), model="log-distance",
                     exponent=gd.exponent, p_time_pct=None, p_loc_pct=None,
                     planner_version=None)
     return head
+
+
+def loc_pct_of(gd):
+    """The percentage of locations a pack's tables are judged at: the
+    geodata's `loc_pct`, else the planner's own."""
+    return LINK_P_LOC_PCT if gd.loc_pct is None else float(gd.loc_pct)
+
+
+def shadowing_warning(gd):
+    """A sentence when `gd` lays shadowing over pack tables that are not
+    medians, which counts the spread between locations twice; else None.
+    A warning, not a refusal, since it may be meant."""
+    if not (gd.is_pack and gd.shadowing_db) or loc_pct_of(gd) == 50.0:
+        return None
+    return ("geodata %s lays %g dB of shadowing over P.1812 tables at %g %% of locations, "
+            "which already hold the spread between locations: `loc_pct: 50` asks for "
+            "medians" % (gd.name, gd.shadowing_db, loc_pct_of(gd)))
 
 
 def free_space_db(f_hz, d_m):
@@ -185,7 +223,7 @@ def _pairs_to_do(table, names, only=None):
     return out
 
 
-# ---- offsets -------------------------------------------------------------
+# ---- layers --------------------------------------------------------------
 
 def with_antennas(tables, gd, ns, grounds=None):
     """Copies of `tables` (band -> slt.Table) with each pair's antenna gains
@@ -217,9 +255,85 @@ def with_antennas(tables, gd, ns, grounds=None):
 
 
 def medium_tables(tables, gd, ns, grounds=None):
-    """What the medium is given: the model's tables with the antennas and
-    the offsets on them."""
+    """What the medium is given: the model's tables with the nodeset's links
+    stated on them and the geodata's shadowing, then the antennas and the
+    offsets on top."""
+    tables = with_shadowing(with_links(tables, ns), gd, ns)
     return with_offsets(with_antennas(tables, gd, ns, grounds), ns)
+
+
+def with_links(tables, ns):
+    """Copies of `tables` (band -> slt.Table) with each of the nodeset's
+    links in place of the model's loss: a→b its `loss_db`, b→a its
+    `back_db`, `loss_db` again when it has none. The figure is the pair's
+    own, measured or worked out elsewhere, so it goes into every band's
+    table as stated, with no correction from one band to another, and into
+    a cell the model never heard too. The tables themselves when there are
+    none; a pair either table does not hold is left out."""
+    if not ns.links:
+        return dict(tables)
+    out = {}
+    for band, table in tables.items():
+        new = slt.Table(table.header, array("f", table.loss), array("B", table.flags),
+                        array("H", table.samples))
+        for link in ns.links:
+            a, b = link["between"]
+            if a in new.index and b in new.index and a != b:
+                new.loss[new.cell(a, b)] = link["loss_db"]
+                new.loss[new.cell(b, a)] = link.get("back_db", link["loss_db"])
+        out[band] = new
+    return out
+
+
+# Ported from this repository's feat/shadowing (cc1fd56, ether/ether.py:133-148),
+# where the pair was two station ids.
+@functools.lru_cache(maxsize=65536)
+def shadowing_unit(seed, a, b):
+    """One pair's shadowing in standard deviations, the same draw every time.
+
+    A standard normal, by Box–Muller, from SHA-256 of the seed and the
+    unordered pair's node names, so it depends on those three and nothing
+    else: not on the order nodes were added in, not on which end transmits,
+    not on traffic or event order, not on the platform. Names rather than
+    ids, because a node keeps its name from run to run where its id may
+    change. The geodata's `shadowing_db` scales it, so runs that differ only
+    in the spread stand on the same ground, one of it rougher, and paired
+    runs share every draw.
+    """
+    lo, hi = (a, b) if a <= b else (b, a)
+    digest = hashlib.sha256(("%d:%s:%s" % (seed, lo, hi)).encode()).digest()
+    u1 = (int.from_bytes(digest[:8], "big") + 1) / 2.0 ** 64     # (0, 1]
+    u2 = int.from_bytes(digest[8:16], "big") / 2.0 ** 64         # [0, 1)
+    return math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+
+
+def with_shadowing(tables, gd, ns):
+    """Copies of `tables` (band -> slt.Table) with the geodata's shadowing
+    added to both directions of each pair: `shadowing_db` times the pair's
+    own draw, one draw for every band. Left as they are: a cell never heard,
+    which stays so; a measured one, which already holds its path's
+    shadowing; and a pair the nodeset states a link for. The draw is fixed
+    for the run, since a loss drawn afresh for every frame would let every
+    retry through in the end. The tables themselves when there is none."""
+    spread, seed = gd.shadowing_db, gd.shadowing_seed
+    if not spread:
+        return dict(tables)
+    stated = {frozenset(link["between"]) for link in ns.links}
+    out = {}
+    for band, table in tables.items():
+        new = slt.Table(table.header, array("f", table.loss), array("B", table.flags),
+                        array("H", table.samples))
+        names = new.names
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                if stated and frozenset((a, b)) in stated:
+                    continue
+                shadow = spread * shadowing_unit(seed, a, b)
+                for cell in (new.cell(a, b), new.cell(b, a)):
+                    if math.isfinite(new.loss[cell]) and not new.flags[cell] & slt.FLAG_MEASURED:
+                        new.loss[cell] += shadow
+        out[band] = new
+    return out
 
 
 async def grounds(gd, ns, sidecar, names=None, session=None):
@@ -262,6 +376,46 @@ async def grounds(gd, ns, sidecar, names=None, session=None):
         if own:
             await session.close()
     return out
+
+
+async def estimated_heights(gd, points, base_url, session=None, notice=None):
+    """planner's estimate of an antenna's height at each point on the pack
+    `gd`, through the sidecar at `base_url`: {key: reply} for `points` ({key:
+    (lat, lon)}), a reply being `/height.json`'s (`h_agl_m`, `low_m`,
+    `high_m`, `basis`, `detail`). A point off the pack is left out. The
+    building index is waited for first, as a table waits for it, since until
+    it is in no roof is asked. A sidecar without the estimator is refused."""
+    import aiohttp
+
+    own = session is None
+    if own:
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+    try:
+        car = Sidecar(base_url, session, 1, notice)
+        out = {}
+        try:
+            await car.pack()
+            if points:
+                await car.wait_indexed()
+            for key, (lat, lon) in points.items():
+                x, y = gd.to_xy(lat, lon)
+                if not car.inside(x, y):
+                    continue
+                params = {"x": "%.3f" % x, "y": "%.3f" % y}
+                async with session.get(car.base + "/height.json", params=params) as resp:
+                    if resp.status == 404:
+                        raise LossError("the planner sidecar at %s has no height estimate: "
+                                        "sim-mesh build planner" % base_url)
+                    if resp.status != 200:
+                        raise LossError("height.json answered %d: %s"
+                                        % (resp.status, (await resp.text()).strip()[:200]))
+                    out[key] = await resp.json(content_type=None)
+        except aiohttp.ClientError as err:
+            raise LossError("planner sidecar at %s: %s" % (base_url, err)) from err
+        return out
+    finally:
+        if own:
+            await session.close()
 
 
 def terrain_of_tile(data):
@@ -321,22 +475,30 @@ def synthetic_table(gd, ns, band, progress=None):
 # ---- pack ----------------------------------------------------------------
 
 class Sidecar:
-    """The questions a table asks a running planner-web, over one session."""
+    """The questions a table asks a running planner-web, over one session.
+    `loc_pct` goes with every pair when it is not None."""
 
-    def __init__(self, base_url, session, concurrency, notice=None):
+    def __init__(self, base_url, session, concurrency, notice=None, loc_pct=None):
         self.base = base_url.rstrip("/")
         self.session = session
         self.gate = asyncio.Semaphore(concurrency)
         self.extent = None
         self.notice = notice
+        self.loc_pct = loc_pct
         self.indexed = False
         self.index_lock = asyncio.Lock()
+        # Whether /link.json may be asked `lean`, without the profile drawn
+        # for the page (~40 KB a reply, of which a cell keeps nothing). Only
+        # a sidecar that lists the option is asked it: the query refuses a
+        # name it does not know.
+        self.lean = False
 
     async def pack(self):
         async with self.session.get(self.base + "/api/pack") as resp:
             if resp.status != 200:
                 raise LossError("sidecar %s: /api/pack answered %d" % (self.base, resp.status))
             info = await resp.json(content_type=None)
+        self.lean = "lean" in (info.get("link_options") or ())
         ext = info["extent"]
         self.extent = (ext["minx"], ext["miny"], ext["maxx"], ext["maxy"])
         return info
@@ -350,6 +512,10 @@ class Sidecar:
         params = {"ax": "%.3f" % a_xy[0], "ay": "%.3f" % a_xy[1],
                   "bx": "%.3f" % b_xy[0], "by": "%.3f" % b_xy[1],
                   "tx_h": "%g" % tx_h, "rx_h": "%g" % rx_h}
+        if self.loc_pct is not None:
+            params["loc_pct"] = repr(float(self.loc_pct))     # the header's figure, exactly
+        if self.lean:
+            params["lean"] = "true"
         pause = RETRY_FIRST_S
         while True:
             async with self.gate:
@@ -439,18 +605,30 @@ def cell_from_reply(reply, f0_hz, d_m):
     return float(reply["lb_db"]), flags
 
 
+def usable_cpus():
+    """The CPUs this process may run on: its affinity mask, by which simd
+    places stations and the planner sidecar sizes its render slots, so that
+    under `taskset` the table asks as many pairs at once as the sidecar will
+    take. `os.cpu_count()` is the machine's, whatever the mask: on a shared
+    host that asked hundreds at once of a sidecar holding a dozen slots."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:          # no affinity masks on this platform
+        return os.cpu_count() or 4
+
+
 async def _fill_pack(table, gd, ns, pairs, base_url, progress=None,
                      radius_m=DEFAULT_RADIUS_M, concurrency=None, session=None, notice=None):
     import aiohttp
 
     xy = _xy(gd, ns)
     f0 = table.f0_hz
-    concurrency = concurrency or max(4, (os.cpu_count() or 4) - 2)
+    concurrency = concurrency or max(4, usable_cpus() - 2)
     own = session is None
     if own:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
     try:
-        car = Sidecar(base_url, session, concurrency, notice)
+        car = Sidecar(base_url, session, concurrency, notice, gd.loc_pct)
         try:
             await car.pack()
             if pairs:
@@ -555,7 +733,7 @@ def cached(gd, ns, band):
     """The cached table's path when there is a usable one, else None. A
     cached table counts only while its geodata is unchanged: the geodata
     file, and for a pack its manifest (`Geodata.content_hash`)."""
-    path = cache_path(gd.name, ns.geometry_hash(), _check_band(band))
+    path = cache_path(gd.name, ns.geometry_hash(), _check_band(band), gd.loc_pct)
     if not os.path.isfile(path):
         return None
     try:
@@ -587,8 +765,9 @@ def nearest_cached(gd, ns, band, radius_m=DEFAULT_RADIUS_M, planner_version=None
     root = os.path.join(store.LOSSES_DIR, store.check_name(gd.name, "geodata"))
     here = {name: _spot(node) for name, node in ns.nodes.items()}
     best, best_same = None, set()
+    leaf = os.path.basename(cache_path(gd.name, ns.geometry_hash(), band, gd.loc_pct))
     for entry in sorted(os.listdir(root)) if os.path.isdir(root) else ():
-        path = os.path.join(root, entry, "%s.bin" % band)
+        path = os.path.join(root, entry, leaf)
         if entry == ns.geometry_hash() or not os.path.isfile(path):
             continue
         try:
@@ -634,16 +813,18 @@ async def compute(gd, ns, band, base_url=None, progress=None, radius_m=DEFAULT_R
     else:
         table = await build(gd, ns, band, base_url, progress, radius_m, concurrency,
                             planner_version=planner_version, notice=notice)
-    path = cache_path(gd.name, ns.geometry_hash(), band)
+    path = cache_path(gd.name, ns.geometry_hash(), band, gd.loc_pct)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     write_table(table, path)
     return path, False
 
 
 def write_table(table, path):
-    """Write a table whole, through a temporary beside it."""
+    """Write a table whole, through a temporary beside it: this process's
+    own, since two runs of one checkout may write the same table at once, and
+    a shared temporary is one the other has already renamed away."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     table.write(tmp)
     os.replace(tmp, path)
 
@@ -676,8 +857,14 @@ async def update_nodes(table, gd, ns, names, base_url=None, progress=None,
     This is one node's row and column after a move, and equally a node
     added (its row is new) or removed (it is simply gone from the copy). A
     pair whose ends were both in the old table and neither is in `names`
-    keeps its old cell.
+    keeps its old cell, which is why a pack table judged at another
+    percentage of locations than the geodata's is refused: its cells would
+    sit beside new ones of another statistic.
     """
+    judged_at = table.header.get("p_loc_pct", LINK_P_LOC_PCT)
+    if gd.is_pack and judged_at != loc_pct_of(gd):
+        raise LossError("the table is at %s %% of locations and geodata %s at %g %%"
+                        % (judged_at, gd.name, loc_pct_of(gd)))
     names = set(names)
     head = dict(table.header)
     head["nodes"] = _nodes_header(ns)
