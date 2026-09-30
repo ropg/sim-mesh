@@ -514,5 +514,5 @@ Most consequential first. Each item is one topic, with tests, off by default unl
 
 ## Open questions
 
-- **Fixes and the off-by-default rule.** The chip fixes (`fix/preamble-found`, the SNR clamp, `fix/late-listeners`) change what existing scenarios do. That is their point, and upstream they are unconditional. Here they get switches, off by default, until Sergey decides otherwise.
+- **Fixes and the off-by-default rule.** The chip fixes (`fix/preamble-found`, the SNR clamp, `fix/late-listeners`) change what existing scenarios do. That is their point, and upstream they are unconditional. Here they get switches, off by default, until the fork's maintainer decides otherwise.
 - **The late stronger frame (row 10).** No measurement covers a late frame 6 dB or more stronger. That is a bench question for Rop and us.
