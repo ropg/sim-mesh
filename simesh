@@ -35,6 +35,10 @@
 #                                    build the page, the chip library, the ether's
 #                                    conductor and the planner (all four when none is
 #                                    named)
+#     simesh install [--dry-run]     on Linux, what running natively needs, as SIMesh's
+#                                    image holds it: the system's packages (sudo), Node
+#                                    22 where the system's is older, Rust, and Reticulum
+#                                    and LXMF in .venv beside this script; then the build
 #
 # The simulation verbs (new, stop, pause, resume, list, plan, run) take --port, the front's
 # (default 8800).
@@ -54,7 +58,9 @@
 #
 # Environment:
 #     SIMESH_PYTHON      the python3 to run (default: the first of python3,
-#                        /usr/bin/python3 that has aiohttp and yaml)
+#                        /usr/bin/python3 that has aiohttp and yaml); with a .venv
+#                        beside this script (simesh install), its python3 is first,
+#                        for simesh and every station it starts
 #     SIMESH_CATALOGUES  where bare catalogue names are fetched from
 #                        (default https://reticulous.net/builds/)
 #     SIMESH_DOCKER=1    use the container on Linux too
@@ -62,6 +68,10 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# The Python environment `simesh install` makes: first on the path, so the front,
+# the tools and a station that is a Python script (standard_reticulum's) all
+# find what it holds.
+if [ -x "$ROOT/.venv/bin/python3" ]; then PATH="$ROOT/.venv/bin:$PATH"; fi
 PORT=8800
 URL="http://localhost:$PORT/"
 PLANNER=$ROOT/planner
@@ -293,12 +303,115 @@ cmd_run() {
     PYTHONPATH="$ROOT/testbed${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m simesh.runner "$@"
 }
 
+# ---- installing on Linux --------------------------------------------------------
+# What running natively needs on a fresh Linux, as SIMesh's image holds it
+# (Dockerfile): the system's packages through its package manager, with sudo;
+# where the system's Node is older than the page's Vite and Quasar take,
+# NodeSource's on Debian and Ubuntu (which ship 18) and Fedora's own later one
+# on Fedora (which defaults to 22.21); Rust through rustup, in the
+# user's home; and a Python environment beside this script, .venv, over the
+# system's own packages, holding Reticulum and LXMF for standard_reticulum
+# stations. Then the build. A step whose result is already there is left out,
+# so running it again costs nothing. apt (Debian, Ubuntu) and dnf (Fedora);
+# elsewhere it says what to install. The two lists and the pins are the
+# Dockerfile's (testbed/test_install.py keeps them so).
+
+APT_PACKAGES=(ca-certificates curl gnupg git python3 python3-aiohttp python3-yaml
+              python3-pytest python3-venv python3-pip build-essential cmake pkg-config
+              libstdc++6 zlib1g libbsd0 procps)
+DNF_PACKAGES=(ca-certificates curl git python3 python3-aiohttp python3-pyyaml python3-pytest
+              python3-pip gcc gcc-c++ make cmake pkgconf-pkg-config libstdc++ zlib libbsd
+              procps-ng)
+NODE_MAJOR=22                       # NodeSource's, as the image's
+NODE_FEDORA=24                      # Fedora's own, beside its default
+PYPI_PINS=(rns==1.5.2 lxmf==1.1.1)
+
+# Whether the node on the path is one the page builds with: 22.22 or later.
+# Quasar's app-vite refuses anything older when it starts
+# (lib/node-version-check.js), whatever its package.json says; Fedora 41 ships
+# 22.21.
+node_fits() {
+    command -v node >/dev/null && node -e '
+        const [a, b] = process.versions.node.split(".").map(Number);
+        process.exit((a === 22 && b >= 22) || a > 22 ? 0 : 1)' 2>/dev/null
+}
+
+cmd_install() {
+    local dry=0
+    case "${1:-}" in
+        "") ;;
+        --dry-run) dry=1 ;;
+        *) die "install: the one option is --dry-run" ;;
+    esac
+    [ "$(uname -s)" = Linux ] || die "install: Linux only; anywhere else simesh runs in its image (docker)"
+    local sudo=()
+    [ "$(id -u)" = 0 ] || sudo=(sudo)
+    step() { say "$*"; [ "$dry" = 1 ] || "$@"; }
+    local manager
+    if command -v apt-get >/dev/null; then manager=apt
+    elif command -v dnf >/dev/null; then manager=dnf
+    else die "install: neither apt-get nor dnf here; install by hand what README.md's Getting started lists"
+    fi
+    if [ "$manager" = apt ]; then
+        step "${sudo[@]}" apt-get update
+        step "${sudo[@]}" env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
+    else
+        step "${sudo[@]}" dnf install -y "${DNF_PACKAGES[@]}"
+    fi
+    # The environment first: it is also where a Node the system names by its
+    # major is given its plain name.
+    if [ ! -x "$ROOT/.venv/bin/python3" ]; then
+        step python3 -m venv --system-site-packages "$ROOT/.venv"
+    fi
+    PATH="$ROOT/.venv/bin:$PATH"
+    if ! node_fits; then
+        if [ "$manager" = apt ]; then
+            say "Node $NODE_MAJOR from NodeSource: the system's is older than the page takes"
+            if [ "$dry" = 0 ]; then
+                "${sudo[@]}" mkdir -p /etc/apt/keyrings
+                curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+                    | "${sudo[@]}" gpg --batch --yes --dearmor -o /etc/apt/keyrings/nodesource.gpg
+                echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" \
+                    | "${sudo[@]}" tee /etc/apt/sources.list.d/nodesource.list >/dev/null
+            fi
+            step "${sudo[@]}" apt-get update
+            step "${sudo[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+        else
+            # Fedora ships a Node newer than its default under the major's
+            # name (nodejs24: node-24, npm-24), beside the default, which
+            # stays as it is: the plain names go into the environment.
+            say "Node $NODE_FEDORA, Fedora's own: its default is older than the page takes"
+            step "${sudo[@]}" dnf install -y "nodejs$NODE_FEDORA" "nodejs$NODE_FEDORA-npm"
+            local tool
+            for tool in node npm npx; do
+                step ln -sf "/usr/bin/$tool-$NODE_FEDORA" "$ROOT/.venv/bin/$tool"
+            done
+        fi
+    fi
+    [ "$dry" = 1 ] || node_fits || die "install: node $(node --version 2>/dev/null) is still older than the page takes"
+    if ! command -v cargo >/dev/null && [ -x "$HOME/.cargo/bin/cargo" ]; then PATH="$HOME/.cargo/bin:$PATH"; fi
+    if ! command -v cargo >/dev/null; then
+        say "Rust through rustup, into $HOME/.cargo"
+        if [ "$dry" = 0 ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            PATH="$HOME/.cargo/bin:$PATH"
+        fi
+    fi
+    if command -v rustup >/dev/null; then step rustup target add wasm32-unknown-unknown; fi
+    step "$ROOT/.venv/bin/python3" -m pip install --quiet "${PYPI_PINS[@]}"
+    [ "$dry" = 1 ] && return 0
+    cmd_build
+    say "installed: start it with $0"
+}
+
 # ---- dispatch -------------------------------------------------------------------
 
 verb=${1:-}
 case "$verb" in
     -h|--help|help) usage; exit 0 ;;
     ""|front|-*|build|devices|new|stop|pause|resume|list|plan|run) ;;
+    install) shift; cmd_install "$@"; exit $? ;;
     *) die "no verb '$verb' (simesh help lists them)" ;;
 esac
 

@@ -56,7 +56,9 @@ On **Linux** it runs natively, and needs `python3` with `aiohttp` and
 `pyyaml` (Debian and Ubuntu: `python3-aiohttp python3-yaml`), `node` and
 `npm` for the page, and `cmake` with a C and C++ compiler for the chip
 library; `cargo` too for real ground (below), and Reticulum and LXMF
-(`pip install rns lxmf`) for `standard_reticulum` stations. **Anywhere else** it needs
+(`pip install rns lxmf`) for `standard_reticulum` stations. On a fresh
+Debian or Ubuntu, `simesh install` puts all of it in place, as SIMesh's
+image holds it (step 2). **Anywhere else** it needs
 only `docker`: `simesh` builds its own small image on first use (a few
 minutes, once) and runs itself inside it, with port 8800 published.
 
@@ -77,6 +79,18 @@ runs virtual time):
 ```sh
 SIMesh/simesh build
 ```
+
+On a fresh Linux, `SIMesh/simesh install` does this step with what it needs
+first: the system's packages through apt or dnf (with sudo); a Node the
+page's build takes (22.22 or later) where the system's is older, NodeSource's
+22 on Debian and Ubuntu, which ship 18, and on Fedora, whose default is 22.21,
+its own nodejs24; Rust through rustup; and Reticulum and LXMF in a Python
+environment beside the clone, `SIMesh/.venv`, which `simesh` puts first on
+the path for itself and every station it starts (Fedora's Node 24 is given
+its plain names there). A step whose result is there already is left out;
+`--dry-run` says what it would do. It is tried from a fresh clone on Debian
+12 and Ubuntu 24.04; on Fedora 41 it installs and builds, and four of the
+tests (three of the time shim's) do not pass there yet.
 
 **3. Start it:**
 
