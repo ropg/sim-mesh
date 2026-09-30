@@ -446,3 +446,26 @@ def test_synthetic_ground_goes_whatever_stands_on_it(tmp_path, monkeypatch):
     geodata.write_copy(geodata.load("flat"), str(tmp_path / "runs" / "r1" / "geodata.yaml"))
     geodata.delete("flat")
     assert geodata.names() == [] and not (tmp_path / "geodata" / "flat").exists()
+
+
+def test_a_pack_another_geodata_stands_on_is_not_moved_from_under_it(tmp_path, monkeypatch):
+    own_store(tmp_path, monkeypatch)
+    pack = write_pack("berlin")
+    # The same pack at the median, without a second copy of it.
+    geodata.write(geodata.geodata_path("median"), {"pack": "../berlin", "loc_pct": 50})
+    median = geodata.load("median")
+    assert median.pack_dir == str(pack) and median.loc_pct == 50
+    for go, doing in ((lambda: geodata.delete("berlin"), "deleting"),
+                      (lambda: geodata.rename("berlin", "b2"), "renaming")):
+        with pytest.raises(store.StoreError,
+                           match="berlin is the ground of geodata median: delete it before %s it"
+                           % doing):
+            go()
+    # The one that only names the pack goes without it, a run on the pack or
+    # not: nothing the run needs is in its directory.
+    geodata.write_copy(median, str(tmp_path / "runs" / "r1" / "geodata.yaml"))
+    geodata.delete("median")
+    assert pack.is_dir() and geodata.names() == ["berlin"]
+    with pytest.raises(store.StoreError, match="ground of run r1"):
+        geodata.delete("berlin")
+

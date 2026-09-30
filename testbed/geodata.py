@@ -537,10 +537,12 @@ def pack_of(path):
     return os.path.normpath(os.path.join(base, os.path.expanduser(str(data[PACK]))))
 
 
-def pack_users(pack_dir):
-    """The runs and snapshots standing on a pack, as `run <name>` and
-    `snapshot <name>`."""
-    out = []
+def pack_users(pack_dir, but=None):
+    """What stands on a pack: other geodata that name it as their pack, as
+    `geodata <name>` (`but` is left out), and runs and snapshots, as `run
+    <name>` and `snapshot <name>`."""
+    out = ["geodata %s" % other for other in names()
+           if other != but and pack_of(geodata_path(other)) == pack_dir]
     for what, base in (("run", store.RUNS_DIR), ("snapshot", store.SNAPSHOTS_DIR)):
         if os.path.isdir(base):
             out += ["%s %s" % (what, entry) for entry in sorted(os.listdir(base))
@@ -549,13 +551,17 @@ def pack_users(pack_dir):
 
 
 def _unheld(name, doing):
-    """The geodata's directory, refused while a run or a snapshot stands on
-    its pack, whose copies name the directory."""
+    """The geodata's directory, refused while its own pack, the one in the
+    directory, has something else standing on it: a run or a snapshot, whose
+    copies name the directory, or another geodata that names it as its pack
+    (the same pack at another loc_pct or shadowing, not copied). A geodata
+    whose pack is another's holds none in its directory and goes freely."""
     src = geodata_path(name)
     if not os.path.isfile(src):
         raise store.StoreError("no geodata called %r" % name)
     pack = pack_of(src)
-    held = pack_users(pack) if pack else []
+    own = pack is not None and pack == os.path.dirname(os.path.abspath(src))
+    held = pack_users(pack, but=name) if own else []
     if held:
         raise store.StoreError("%s is the ground of %s: delete %s before %s it"
                                % (name, ", ".join(held),
