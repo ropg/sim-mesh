@@ -26,6 +26,7 @@ import antennas  # noqa: E402
 import compare  # noqa: E402
 import compliance  # noqa: E402
 import delivery  # noqa: E402
+import ledger  # noqa: E402
 import geodata  # noqa: E402
 import links  # noqa: E402
 import losses  # noqa: E402
@@ -623,6 +624,71 @@ def test_a_record_read_for_some_types_is_those_lines_of_it_read_whole(tmp_path):
     empty = tmp_path / "empty.tsv"
     empty.write_text("# nothing yet\n")
     assert record_module.first_stamp(str(empty)) is None
+
+
+def rns_packet(ptype, dest, data, hops=0, via=None, ctx=0):
+    """A Reticulum packet's bytes: flags, hops, [transport address,]
+    destination, context, data."""
+    flags = (0x40 if via else 0) | ptype
+    return bytes([flags, hops]) + (via or b"") + dest + bytes([ctx]) + data
+
+
+def tx_line(t_s, sid, frame, span_us=100_000):
+    t = int(t_s * 1e6)
+    return "%.6f\tin\t%d\t%s" % (t_s, sid, json.dumps(
+        {"type": "tx", "sid": sid, "t0": t, "t_end": t + span_us, "freq": 869525000,
+         "payload": base64.b64encode(frame).decode()}, separators=(",", ":"), sort_keys=True))
+
+
+def test_the_ledger_ties_every_copy_of_a_packet_to_it(tmp_path):
+    """A relayed copy (another hop count, a transport address) is the same
+    packet; a split packet is one; a path request's answers are its
+    responders', a station answering twice a repeat; a proof belongs to the
+    packet it proves."""
+    dest, other = bytes(range(16)), bytes(range(16, 32))
+    via1, via2 = b"\xaa" * 16, b"\xbb" * 16
+    data = rns_packet(0, dest, b"hello", hops=0)
+    relayed = rns_packet(0, dest, b"hello", hops=1, via=via1)
+    big = rns_packet(0, other, bytes(range(256)) * 2)
+    path_request = next(d for d, n in frames.PLAIN_DESTS.items()
+                        if n == "rnstransport.path.request")
+    request = rns_packet(0, path_request, other + b"\x01" * 16 + b"\x02" * 16)
+    answer = rns_packet(1, other, b"\x00" * 148, hops=1, via=via2, ctx=0x0B)
+    proof = rns_packet(3, ledger.packet_hash(data)[:16], b"\x03" * 64)
+    lines = ["# 2026-09-30T00:00:00+00:00\tether record: stamp\tdir\tsid\tjson",
+             tx_line(1.0, 1, b"\x00" + data),
+             tx_line(1.5, 2, b"\x00" + relayed),
+             tx_line(2.0, 3, b"\x01" + big[:250]),        # split: first half
+             tx_line(2.2, 3, b"\x01" + big[250:]),        # second half
+             tx_line(3.0, 4, b"\x00" + request),
+             tx_line(3.5, 5, b"\x00" + answer),
+             tx_line(3.9, 6, b"\x00" + rns_packet(1, other, b"\x00" * 148, hops=2, via=via1,
+                                                   ctx=0x0B)),
+             tx_line(4.3, 6, b"\x00" + rns_packet(1, other, b"\x00" * 148, hops=2, via=via1,
+                                                   ctx=0x0B)),
+             tx_line(5.0, 7, b"\x00" + proof),
+             tx_line(5.4, 8, b"\x00" + rns_packet(3, ledger.packet_hash(data)[:16],
+                                                   b"\x03" * 64, hops=1, via=via2)),
+             tx_line(6.0, 9, b"\xc2" + b"\x00" * 10)]  # SUPE HAIL: no Reticulum packet
+    path = tmp_path / "record.tsv"
+    path.write_text("\n".join(lines) + "\n")
+
+    out = ledger.analyse(str(path))
+    by = out["by_kind"]
+    assert by["data"]["packets"] == 2 and by["data"]["transmissions"] == 3
+    assert (by["data"]["first"], by["data"]["other_station"], by["data"]["repeat"]) == (2, 1, 0)
+    assert by["data"]["airtime_s"] == pytest.approx(0.4)     # the split packet is two frames' air
+    pr = out["path_requests"]
+    assert pr["requests"] == 1 and pr["answered"] == 1
+    assert pr["per_request"][0]["responders"] == [5, 6] and pr["per_request"][0]["responses"] == 3
+    assert by["path response"]["packets"] == 1
+    assert (by["path response"]["other_station"], by["path response"]["repeat"]) == (1, 1)
+    assert out["proofs"] == {"proven_packets": 1, "proofs": 1, "transmissions": 2,
+                             "proven_more_than_once": 0}
+    assert out["not_reticulum"] == {"SUPE HAIL": {"frames": 1, "airtime_s": pytest.approx(0.1)}}
+    assert out["airtime_s"] == pytest.approx(1.1)
+    later = ledger.analyse(str(path), lo=3_000_000)
+    assert "data" not in later["by_kind"] and later["path_requests"]["responses"] == 3
 
 
 # ---- the traffic driver, against a stand-in simd ------------------------
