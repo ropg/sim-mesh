@@ -43,6 +43,23 @@ class StoreError(Exception):
     read, written or changed as asked. The message is meant for the page as is."""
 
 
+def load_yaml(handle):
+    """yaml.safe_load of an open file, through libyaml where PyYAML has it.
+
+    The C loader builds with safe_load's own constructor and resolver; only
+    its scanner and parser are libyaml's. It reads a city's 840 KB nodeset in
+    0.5 s where safe_load takes 2.3. A document libyaml will not read is read
+    by safe_load, as before, so a refusal says what safe_load says."""
+    text = handle.read()
+    loader = getattr(yaml, "CSafeLoader", None)
+    if loader is not None:
+        try:
+            return yaml.load(text, Loader=loader)
+        except yaml.YAMLError:
+            pass
+    return yaml.safe_load(text)
+
+
 def check_name(name, what="name"):
     """A name that can be a directory, a hostname and a proxy label at once."""
     if not isinstance(name, str) or not NAME_RE.match(name):
