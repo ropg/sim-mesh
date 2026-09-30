@@ -373,6 +373,11 @@ struct BuildingIndex {
     /// approximated by an equal-area disc. Reported so an answer can say
     /// which it rested on rather than presenting the two alike.
     with_geometry: usize,
+    /// Each building's footprint area (m²) and height above its ground (m),
+    /// as its record gave them, by the same index as `items`: what planner's
+    /// height estimator takes of a building (`/height.json`), kept beside the
+    /// records a path reads rather than in them.
+    area_height: Vec<[f32; 2]>,
 }
 
 const BLDG_CELL_M: f32 = 100.0;
@@ -748,6 +753,42 @@ impl BuildingIndex {
         } else {
             dx * dx + dy * dy <= b.r * b.r
         }
+    }
+
+    /// The buildings whose centroid lies within `radius_m` of (x, y), as
+    /// planner's height estimator takes them: centroid, footprint area and
+    /// height above ground. The centroid is the index's own, good to a few
+    /// millimetres (see [`Bldg::x`]). A building indexed without an area and
+    /// height is left out.
+    fn hints_near(&self, x: f64, y: f64, radius_m: f64) -> Vec<planner_coverage::environment::BuildingHint> {
+        let (xf, yf) = ((x - self.origin.0) as f32, (y - self.origin.1) as f32);
+        let r = radius_m as f32;
+        let cell = |v: f32| (v / BLDG_CELL_M).floor() as i32;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for cx in cell(xf - r)..=cell(xf + r) {
+            for cy in cell(yf - r)..=cell(yf + r) {
+                for &i in self.cells.get(&(cx, cy)).map(Vec::as_slice).unwrap_or(&[]) {
+                    if !seen.insert(i) {
+                        continue;
+                    }
+                    let b = &self.items[i as usize];
+                    let (dx, dy) = ((b.x - xf) as f64, (b.y - yf) as f64);
+                    if dx.hypot(dy) > radius_m {
+                        continue;
+                    }
+                    let Some(&[area_m2, height_m]) = self.area_height.get(i as usize) else {
+                        continue;
+                    };
+                    out.push(planner_coverage::environment::BuildingHint {
+                        xy: Xy { x: self.origin.0 + b.x as f64, y: self.origin.1 + b.y as f64 },
+                        footprint_m2: area_m2,
+                        height_m,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// The building an antenna at (x, y), `antenna_masl` above sea level, is
@@ -2774,6 +2815,81 @@ fn resolve_budget(
 /// a 2 m-receiver map. Here both ends carry their own antenna height, and the
 /// terrain profile comes back with the answer so the margin is auditable
 /// rather than a single colour on a raster.
+/// `/height.json`'s query: a point in the pack's CRS, as `/link.json`'s ends.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeightQuery {
+    x: f64,
+    y: f64,
+}
+
+/// `/height.json`: the antenna height a node standing at (x, y) most
+/// plausibly has when nobody measured it. It is planner's estimator for a
+/// deployed node whose advert gave none
+/// (`planner_coverage::environment::estimate_height`), on this pack's
+/// evidence: a LoD2 roof under the node with a mast on it, else the clutter
+/// over its neighbourhood, else its land class's convention, else a
+/// documented fallback. Each answer carries the band it believes and what it
+/// rested on. While the building index is still loading no roof is asked,
+/// and the reply says so, as `/link.json`'s does.
+async fn height_json(State(st): State<Arc<AppState>>, Query(q): Query<HeightQuery>) -> Response {
+    let p = Xy { x: q.x, y: q.y };
+    if !(p.x.is_finite() && p.y.is_finite())
+        || p.x < st.extent.min_x
+        || p.x > st.extent.max_x
+        || p.y < st.extent.min_y
+        || p.y > st.extent.max_y
+    {
+        return (StatusCode::BAD_REQUEST, "the point is outside the pack").into_response();
+    }
+    match tokio::task::spawn_blocking(move || estimate_height_at(&st, p)).await {
+        Ok(body) => ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// The estimate at `p`, with the windows and buildings it needs read here.
+/// Blocking.
+fn estimate_height_at(st: &AppState, p: Xy) -> serde_json::Value {
+    use planner_coverage::environment as env;
+    let params = env::EstimateParams::default();
+    // The neighbourhood the clutter tier samples, and a cell to spare.
+    let reach = params.clutter_radius_m.max(params.building_search_radius_m) + 2.0 * terrain_res_hint(st);
+    let lo = st.clamp(Xy { x: p.x - reach, y: p.y - reach });
+    let hi = st.clamp(Xy { x: p.x + reach, y: p.y + reach });
+    let clutter = st.layers.clutter.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
+    let classes = st.layers.classes.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
+    let (index_state, hints) = {
+        let guard = st.buildings.read().unwrap_or_else(|e| e.into_inner());
+        let hints = guard
+            .get()
+            .map(|ix| ix.hints_near(p.x, p.y, params.building_search_radius_m))
+            .unwrap_or_default();
+        (guard.label(), hints)
+    };
+    let ev = env::SiteEvidence { clutter: clutter.as_ref(), classes: classes.as_ref(), buildings: &hints };
+    let e = env::estimate_height(p, None, &ev, &params);
+    let detail = match &e.basis {
+        env::HeightBasis::Lod2Building { footprint_m2, building_h_m, distance_m } => serde_json::json!({
+            "footprint_m2": footprint_m2, "building_h_m": building_h_m, "distance_m": distance_m,
+        }),
+        env::HeightBasis::ClutterNeighbourhood { radius_m, percentile, sampled_cells } => serde_json::json!({
+            "radius_m": radius_m, "percentile": percentile, "sampled_cells": sampled_cells,
+        }),
+        env::HeightBasis::ClassTypical(class) => serde_json::json!({ "class": format!("{class:?}") }),
+        env::HeightBasis::OperatorSupplied | env::HeightBasis::NoEvidence => serde_json::json!({}),
+    };
+    serde_json::json!({
+        "h_agl_m": e.h_agl_m,
+        "low_m": e.low_m,
+        "high_m": e.high_m,
+        "basis": e.basis.kind().label(),
+        "detail": detail,
+        "clamped_from_m": e.clamped_from_m,
+        "buildings_index": index_state,
+    })
+}
+
 async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) -> Response {
     // ---- the budget, and where every decibel of it comes from --------------
     //
@@ -4282,6 +4398,7 @@ async fn main() {
                 }) {
                     suspect += 1;
                 }
+                idx.area_height.push([r.area_m2 as f32, r.height_m as f32]);
             }
             // Say whether the footprints are REAL or approximated. A pack
             // built without --lod2-geometry answers every containment test
@@ -4386,6 +4503,7 @@ async fn main() {
         .route("/search", get(search))
         .route("/area.bin", get(area_bin))
         .route("/link.json", get(link_json))
+        .route("/height.json", get(height_json))
         .route("/api/presets", get(presets_json))
         .route("/nodes.json", get(nodes_json))
         .route("/network/start", get(network_start))
@@ -4759,6 +4877,38 @@ mod tests {
         assert_eq!(lens.len(), 2, "two footprints, one ring each");
         assert_eq!(ids, vec![0, 1]);
         assert_eq!(ids, from_outlines);
+    }
+
+    /// `/height.json`'s building evidence: the buildings whose centroid is
+    /// within the radius, each with its record's area and height, and none
+    /// from outside it — the estimator then stands the node on the roof it
+    /// picks, with planner's mast.
+    #[test]
+    fn a_node_by_a_roof_is_estimated_on_it() {
+        use planner_coverage::environment as env;
+        let mut ix = BuildingIndex::default();
+        ix.origin = (1000.0, 2000.0);
+        // A 400 m² block 22 m tall 10 m from the node, a shed of 9 m² 20 m
+        // tall 5 m from it, and a 30 m tower 60 m away.
+        for (x, y, area, h) in [(60.0f32, 50.0f32, 400.0f32, 22.0f32), (45.0, 50.0, 9.0, 20.0), (110.0, 50.0, 900.0, 30.0)] {
+            let r = (area / std::f32::consts::PI).sqrt();
+            assert!(!ix.insert(Bldg { x, y, r, br: r, top_masl: 34.0 + h, poly_start: 0, poly_end: 0 }));
+            ix.area_height.push([area, h]);
+        }
+        let at = (1050.0, 2050.0);
+        let mut hints = ix.hints_near(at.0, at.1, env::BUILDING_SEARCH_RADIUS_M);
+        hints.sort_by(|a, b| a.footprint_m2.total_cmp(&b.footprint_m2));
+        assert_eq!(hints.len(), 2, "the tower is beyond the radius");
+        assert_eq!((hints[0].footprint_m2, hints[0].height_m), (9.0, 20.0));
+        assert_eq!((hints[1].footprint_m2, hints[1].height_m), (400.0, 22.0));
+        assert!((hints[1].xy.x - 1060.0).abs() < 1e-3 && (hints[1].xy.y - 2050.0).abs() < 1e-3);
+        let ev = env::SiteEvidence { clutter: None, classes: None, buildings: &hints };
+        let e = env::estimate_height(Xy { x: at.0, y: at.1 }, None, &ev, &env::EstimateParams::default());
+        assert_eq!(e.basis.kind(), env::BasisKind::Lod2Building, "the shed is no roof to mount on");
+        assert!((e.h_agl_m - (22.0 + env::ROOF_MAST_TYPICAL_M)).abs() < 1e-6, "{}", e.h_agl_m);
+        // A building indexed without its area and height is not evidence.
+        ix.area_height.clear();
+        assert!(ix.hints_near(at.0, at.1, env::BUILDING_SEARCH_RADIUS_M).is_empty());
     }
 
     /// A raster whose value is its own x coordinate, so a shifted window is
