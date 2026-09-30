@@ -55,6 +55,11 @@ STOPPED, STARTING, SETUP, UP, RESTARTING = (
 
 
 def log(msg):
+    # The ether writes its lines a loop's turn at a time (ether.log): those
+    # logged before this one go first, so the log stays in order.
+    ether = sys.modules.get("ether")
+    if ether is not None:
+        ether.write_log()
     sys.stderr.write("sim: %s\n" % msg)
     sys.stderr.flush()
 
