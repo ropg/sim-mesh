@@ -525,7 +525,8 @@ class Simd:
         its console is read as it comes."""
         wanted = set(sids)
         drains = stations_module.printed([s.drain for s in self.stations.values()
-                                          if s.node_id in wanted and s.drain is not None
+                                          if wanted.intersection(s.kind.sids(s))
+                                          and s.drain is not None
                                           and s.kind.console_acted_on])
         if not drains:
             return False

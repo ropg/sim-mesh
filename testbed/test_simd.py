@@ -112,7 +112,8 @@ def stores(tmp_path, monkeypatch):
                                            "elf: %s\n" % elf)
     (local / "stubtwo_local.yaml").write_text("kind: stub\nproject: Stubtwo\nelf: %s\n" % elf)
     (local / "other_local.yaml").write_text("kind: other\nelf: %s\n" % elf)
-    (tmp_path / "geodata_dir" / "flat.yaml").write_text(
+    (tmp_path / "geodata_dir" / "flat").mkdir()
+    (tmp_path / "geodata_dir" / "flat" / "geodata.yaml").write_text(
         "synthetic:\n  exponent: 3.0\n")
     (tmp_path / "nodesets_dir" / "three.yaml").write_text(
         "nodes:\n"
@@ -558,7 +559,7 @@ def test_a_console_nothing_acts_on_is_not_waited_for(tmp_path, monkeypatch):
         marks = stations.Marks(reader)
         marks.reading, marks.taken = True, 1         # handed on reads not caught up with
         drain = types.SimpleNamespace(master=reader, marks=marks)
-        kind = types.SimpleNamespace(console_acted_on=acted_on)
+        kind = types.SimpleNamespace(console_acted_on=acted_on, sids=lambda station: (station.node_id,))
         return types.SimpleNamespace(node_id=node_id, drain=drain, kind=kind)
     daemon.stations = {"ours": printing(1, False), "theirs": printing(2, True)}
     waited = []

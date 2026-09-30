@@ -28,7 +28,7 @@ SIMesh keeps, each on its own because each changes on its own:
 |---|---|---|
 | a **device** | one station build: its executable, its `/fixed` tree, its tools | `devices/latest/`, `devices/saved/`, `devices/local/<project>_<catalogue>.yaml` |
 | an **antenna** | a kind of antenna and its radiation pattern | `testbed/antennas/` |
-| **geodata** | the ground: a pack built from public sources, or synthetic ground at 0°, 0° | `testbed/geodata/<name>.yaml`, `packs/<name>/` |
+| **geodata** | the ground: a pack built from public sources, or synthetic ground at 0°, 0° | `testbed/geodata/<name>/`: `geodata.yaml`, and the pack's files beside it |
 | a **nodeset** | which nodes stand where with what maximum power and antenna, their tags, the offsets and any stated links; its own setup script beside it | `testbed/nodesets/<name>.yaml`, `<name>.py` |
 | a **loss table** | every ordered pair's path loss, derived from geodata and a nodeset | `testbed/losses/…`, a cache |
 | a **script** | plain Python against the simesh library, top to end: the time, what each node runs and is given at first boot, and what is done | `testbed/scripts/<name>.py` |
@@ -55,7 +55,8 @@ SIMesh needs no firmware tree: it runs prebuilt stations it fetches itself.
 On **Linux** it runs natively, and needs `python3` with `aiohttp` and
 `pyyaml` (Debian and Ubuntu: `python3-aiohttp python3-yaml`), `node` and
 `npm` for the page, and `cmake` with a C and C++ compiler for the chip
-library; `cargo` too for real ground (below). **Anywhere else** it needs
+library; `cargo` too for real ground (below), and Reticulum and LXMF
+(`pip install rns lxmf`) for `standard_reticulum` stations. **Anywhere else** it needs
 only `docker`: `simesh` builds its own small image on first use (a few
 minutes, once) and runs itself inside it, with port 8800 published.
 
@@ -83,7 +84,9 @@ SIMesh/simesh build
 SIMesh/simesh
 ```
 
-It starts the front and opens `http://localhost:8800/`. The terminal is the
+It builds whichever of the page, the chip library and the planner is not
+built yet, so a fresh clone may skip step 2, then starts the front and opens
+`http://localhost:8800/`. The terminal is the
 testbed's: Ctrl-C there stops every simulation and everything they started.
 
 **4. Stations.** A station is a device file: the firmware built for Linux
@@ -120,8 +123,10 @@ again.
 
 - **Click a station** for the editor: how it is doing, its **Console** (its
   serial console) and **Web UI** (its own web interface, as a board serves
-  it, with no login: a Reticulous station is built without credentials), and
-  every setting it has.
+  it, with no login: a Reticulous station is built without credentials),
+  each in a window over the map with **−** and **+** for its zoom (the
+  console's font; the web UI's page, as the browser's zoom, 75 % to start),
+  and every setting it has.
 - **Right-click the map ▸ New node here** puts down a station. It comes up
   and is set up on its own.
 - **Drag a station** and its links change once its row of the loss table is
@@ -143,13 +148,14 @@ simulations](#running-simulations) for the time modes.
 
 Stations of different firmwares share one ether and one map. Each firmware is
 a **kind**: how the testbed talks to it (`testbed/kinds/`). A device's
-`node.yaml` names its kind. Three exist:
+`node.yaml` names its kind. Four exist:
 
 | Kind | The firmware | Up when | A line is | Web UI |
 |---|---|---|---|---|
 | `reticulous` | Reticulous, built for `spangap/hw-linux` | it answers a framed RPC (remote procedure call) frame on its console (after printing the marker, or to one blind probe), and `s.sys.reset_reason` reads, which its boot writes once every service has initialised | a CLI (command line) command, one framed RPC frame over its console pty (pseudo-terminal) | port 80 |
 | `sergeyculum` | "Sergeyculum", the Rust Reticulum stack at [git.emcomm.cc/berlinmesh/reticulum](https://git.emcomm.cc/berlinmesh/reticulum), as its `fw/simesh` target | its `kiss` pty answers `rncfg detect` | `rncfg` without program and port: `name set {name}` runs `rncfg name <dir>/kiss set <name>` | none |
 | `microreticulum` | attermann's [microReticulum_Firmware](https://github.com/attermann/microReticulum_Firmware), the RNode firmware with the microReticulum stack in it, as its Portduino Linux daemon built with `[env:simesh]`: a LoRa transport node and nothing else | its log shows `RNS Transport is READY!` since its latest start | an edit to its `rnoded.conf`, `set <key> <value>`, `unset <key>` or `txp <dBm at the connector>`; a flush restarts it when a line changed the file | none |
+| `standard_reticulum` | a standard Reticulum node: the RNode firmware with Reticulum's Python reference implementation and an LXMF router behind it, as rnsd runs on a computer with an RNode on its USB port (`stations/standard_reticulum/station.py`, over microReticulum_Firmware's Linux daemon built with `[env:simesh-rnode]`, whose own stack is never started) | it answers a framed RPC frame, and its `status` says `state: up` | one of `station.py`'s commands, one framed RPC frame; a flush restarts it when a setting is pending | none |
 
 Sergeyculum is a working name; the project calls itself `reticulum` and the
 kind is named after its repository.
@@ -161,22 +167,23 @@ traffic, `client` for one that does not.
 A kind also says **intents** in its own lines, so that a script means the
 same thing on any firmware:
 
-| Intent | `reticulous` | `sergeyculum` | `microreticulum` |
-|---|---|---|---|
-| `name` | `hostname {name}` | `name set {name}` | nothing to say |
-| `role` | `set s.rnsd.transport_enabled 1` or `0` | `transport on` or `off` (kept in RAM only, so said again at every boot) | `transport` says nothing, since it always is one; `client` is refused |
-| `radio` | `lora 0 freq`, `sf`, `bw`, `cr`, `txp`, `sync`, `preamble` for each figure given | `set --freq-hz --sf --bw-hz --cr --txpower-dbm` for the figures given; sync word and preamble are the firmware's own | `set lora_freq_hz`, `lora_bw_hz`, `lora_sf`, `lora_cr`, and `txp`, for the figures given; sync word (0x12) and preamble are the firmware's own |
-| `radio_up` | `lora up` | nothing to say: the radio runs from the start | nothing to say: the radio runs from the start |
-| `tx_power` | `lora 0 txp <dBm>` | `set --txpower-dbm <dBm>` | `txp <dBm>` |
-| `announce` | `lora 0 a` | `announce now` | — |
-| `message` | `lxmf send <dest> <text>` | `send <dest> <text>` | — |
-| `path` | `rnpath -j <dest>` | — | — |
-| `peer_tcp` | `tcp peer add <addr>:<port>` | — | — |
+| Intent | `reticulous` | `sergeyculum` | `microreticulum` | `standard_reticulum` |
+|---|---|---|---|---|
+| `name` | `hostname {name}` | `name set {name}` | nothing to say | `set name {name}`, its LXMF display name |
+| `role` | `set s.rnsd.transport_enabled 1` or `0` | `transport on` or `off` (kept in RAM only, so said again at every boot) | `transport` says nothing, since it always is one; `client` is refused | `set transport 1` or `0` |
+| `radio` | `lora 0 freq`, `sf`, `bw`, `cr`, `txp`, `sync`, `preamble` for each figure given | `set --freq-hz --sf --bw-hz --cr --txpower-dbm` for the figures given; sync word and preamble are the firmware's own | `set lora_freq_hz`, `lora_bw_hz`, `lora_sf`, `lora_cr`, and `txp`, for the figures given; sync word (0x12) and preamble are the firmware's own | `set freq_hz`, `bw_hz`, `sf`, `cr`, and `txp`, for the figures given; sync word (0x12) and preamble are the RNode's own |
+| `radio_up` | `lora up` | nothing to say: the radio runs from the start | nothing to say: the radio runs from the start | nothing to say: Reticulum brings its RNode up when it starts |
+| `tx_power` | `lora 0 txp <dBm>` | `set --txpower-dbm <dBm>` | `txp <dBm>` | `txp <dBm>` |
+| `announce` | `lora 0 a` | `announce now` | — | `announce` |
+| `message` | `lxmf send <dest> <text>` | `send <dest> <text>` | — | `send <dest> <text>` |
+| `path` | `rnpath -j <dest>` | — | — | `path <dest>` |
+| `peer_tcp` | `tcp peer add <addr>:<port>` | — | — | — |
 
 An intent a kind has no line for is refused, naming the kind and the verb. A
 station's LXMF delivery address, which `message` and `path` need of the
-other end, is its `lxmf` listing's on `reticulous` and the `lxmf.delivery`
-line of `rncfg addr` on `sergeyculum`; a `microreticulum` station has none.
+other end, is its `lxmf` listing's on `reticulous`, the `lxmf.delivery`
+line of `rncfg addr` on `sergeyculum` and of `addr` on `standard_reticulum`;
+a `microreticulum` station has none.
 
 A `microreticulum` station's `lora_txp` is the SX1262's own power, which the
 chip model carries through the node's board to the connector, so its
@@ -191,6 +198,32 @@ one of them changed removes `state/eeprom` first. Its first boot runs on the
 firmware's default radio until setup is done and simd's flush restarts it,
 and may put an announce on air there, on a channel no other node shares. A
 Reticulous node in the same nodeset declares `sync: 0x12` to hear it.
+
+A `standard_reticulum` station is two processes, each a station of the
+ether's in a virtual-time run:
+
+```
+station.py ── starts ──► rnode          the RNode firmware, the node's own id: its radio
+station.py ── RNodeInterface, KISS on tcp://<its address>:7633 ──► rnode
+testbed ── framed RPC on the console ──► station.py     the node's id + 1000000, no radio
+```
+
+`station.py` is Reticulum (`rns`) and LXMF (`lxmf`) in a python3 that has
+them, which SIMesh's image does; natively, install both. The RNode is
+attermann's firmware with its own stack compiled in but never started
+(`STANDARD_RNODE`) and its EEPROM provisioned with no radio configuration,
+so it stays out of TNC mode and Reticulum sets its radio over KISS, as it
+does an RNode on USB. Its settings (`state/settings.json`: name, radio,
+transport) are read when `station.py` starts, so a line that changes one
+leaves it pending and the kind's flush restarts the station. Its `txp` is
+the power at the connector, turned into the chip's as on `microreticulum`.
+A send waits up to a minute for the recipient's identity, asking for a path,
+then hands LXMF a DIRECT message; the station logs `lxmf: queued mid=…`
+and then `lxmf: DIRECT delivered mid=…` (`DIRECT resource delivered`) or
+`lxmf: failed mid=…`, which is what the traffic report counts. Its device
+is the compiled build `standard-reticulum_local_latest`: the RNode as last
+compiled with `pio run -e simesh-rnode` in the clone under `competition/`
+beside SIMesh.
 
 ## Firmware
 
@@ -236,9 +269,13 @@ its `node.yaml`; it must be built for this machine.
 yet: `devices/local/<project>_<catalogue>.yaml`, a `node.yaml` that is not
 in an archive, its `elf`, `fixed` and `tools` paths relative to the file and
 free to point anywhere, run in place from wherever it was last compiled, and
-the latest of its catalogue. One comes with SIMesh:
+the latest of its catalogue. These come with SIMesh:
 `sergeyculum_local_latest`, Sergeyculum's `fw/simesh` with its `rncfg` as
-last compiled in `sergey/reticulum`. Saved, one is gathered into a package
+last compiled in `sergey/reticulum`; `microreticulum_local_latest` and
+`microreticulum-jrl290_local_latest`, attermann's firmware and a stand-in
+for jrl290's as last compiled under `competition/`; and
+`standard-reticulum_local_latest`, `stations/standard_reticulum/station.py`
+over the RNode from the same clone. Saved, one is gathered into a package
 like any other.
 
 From a shell:
@@ -293,10 +330,13 @@ one on the horizon, and a yagi hears what it faces.
 
 ## Geodata
 
-Geodata is the ground nodes stand on, one of two kinds:
+Geodata is the ground nodes stand on, one directory each,
+`testbed/geodata/<name>/`, holding everything it is: renaming or deleting
+the directory renames or deletes the geodata. Its `geodata.yaml` says which
+of two kinds it is:
 
 ```yaml
-# testbed/geodata/plain-27.yaml: synthetic ground, a flat plane at 0°, 0°
+# testbed/geodata/plain-27/geodata.yaml: synthetic ground, a flat plane at 0°, 0°
 synthetic:
   terrain: flat
   exponent: 2.7                     # log-distance path-loss exponent
@@ -304,8 +344,8 @@ synthetic:
 ```
 
 ```yaml
-# testbed/geodata/berlin-city.yaml: a pack, by path from this file
-pack: ../../packs/berlin-city
+# testbed/geodata/berlin/geodata.yaml: a pack, whose files are this directory's
+pack: .
 ```
 
 **Synthetic ground** lies at 0°, 0°, and its degrees are metres by one fixed
@@ -319,8 +359,8 @@ space, 2.7 suburban, and higher numbers bring the neighbourhoods in closer.
 
 **A pack** is ground data compiled from public sources: terrain, clutter,
 buildings, roads and places in a UTM (Universal Transverse Mercator) zone.
-Packs live in `SIMesh/packs/<name>/` (not committed). A pack's geodata says
-nothing its pack does not: its extent, projection and layers come from the
+A pack's files sit beside its `geodata.yaml` (not committed), which says
+nothing the pack does not: its extent, projection and layers come from the
 pack's `manifest.json`. On a pack, a pair's loss is ITU-R (International
 Telecommunication Union, radio sector) Recommendation P.1812-8 over the real
 profile, as SIMesh's planner computes it, and the map draws the pack's
@@ -389,15 +429,15 @@ and each source's notice.
 page ── GET /osm/<z>/<x>/<y>.png ─────────────────► front ── (cache miss) ──► tile.openstreetmap.org
 page ── GET /api/geodata/sources?bbox=&res_m= ─────► front         the grid, the sources chosen, the downloads
 page ── POST /api/geodata/build {name, bbox, res_m} ► front
-front ── fetch into packs/.cache/<source>/ ────────► the sources' hosts (below)
+front ── fetch into geodata/.cache/<source>/ ──────► the sources' hosts (below)
 front ── planner-job pack-build, JSON on stdin ────► planner-job
 planner-job ── one JSON line per step ─────────────► front ── geodata_progress ──► every page
-planner-job ── packs/.part-<name>/ ────────────────► front: packs/<name>/, geodata/<name>.yaml
+planner-job ── geodata/.part-<name>/ ──────────────► front: geodata/<name>/, with its geodata.yaml
 ```
 
 A view of its own, with **‹ Back**. The map is OpenStreetMap's standard
 tiles, fetched through the front and kept under `testbed/osmtiles/` a week
-at least, as the tile usage policy asks; the packs there are are outlined
+at least, as the tile usage policy asks; the packs there are outlined
 with their names, and the areas of the sources that do not cover the world
 (Berlin's own data, Germany's census grid) are tinted. A drag pans, the
 wheel zooms, Ctrl or Cmd and a drag draws the rectangle, and the place
@@ -429,9 +469,9 @@ part, and goes back to the list, where the build's row shows its step and
 progress and has **Cancel**; when it ends the row is geodata like any
 other, or says why it failed. One
 build runs at a time, as a child process the front never waits on; the
-compiler's diagnostics go to `packs/.cache/logs/<name>.log`.
+compiler's diagnostics go to `testbed/geodata/.cache/logs/<name>.log`.
 
-**The sources** are fetched into `packs/.cache/<source>/`, shared by every
+**The sources** are fetched into `testbed/geodata/.cache/<source>/`, shared by every
 build, so a second region beside the first fetches only what is new; a file
 is fetched once, resumed where it stopped, and one its host does not have
 (GLO-30 over open sea) is not asked for again:
@@ -446,7 +486,7 @@ is fetched once, resumed where it stopped, and one its host does not have
 | Zensus 2022 100 m grid | Germany | `destatis.de` |
 
 Geofabrik's index, Berlin's feeds and the MeshCore node list are kept in
-`packs/.cache/meta/` and asked again when a week old. A Berlin tile's name
+`testbed/geodata/.cache/meta/` and asked again when a week old. A Berlin tile's name
 is its south-west corner in kilometres of EPSG:25833, so a district costs
 megabytes rather than the city's gigabytes. OpenStreetMap is read from one
 protocol buffer file (PBF) extract, not from Overpass: one file serves roads,
@@ -769,12 +809,13 @@ Its messages are the `send_msg` meta command, its identities the `address`
 one and its warm-up the `announce` one, so it runs on any firmware that says
 them. Its first-boot lines give each station what taking part needs, an
 LXMF identity. Its report is the delivery `delivery.py` counts from the
-senders' logs, each sender by its own station's (Reticulous by the message
-id its send answered; the reticulum project's station, configured with
-rncfg, by the first message its log shows to that recipient once the send
-was due, and the proof that closes it): overall, by route and radio hops and
-by size, the latency, and the undelivered by the sender's last line; it says
-so plainly when no station had an LXMF identity to send from.
+senders' logs, each sender by its own station's (`reticulous` and
+`standard_reticulum` stations by the message id its send answered; the
+reticulum project's station, configured with rncfg, by the first message its
+log shows to that recipient once the send was due, and the proof that closes
+it): overall, by route and radio hops and by size, the latency, and the
+undelivered by the sender's last line; it says so plainly when no station
+had an LXMF identity to send from.
 
 ## Loss tables
 
@@ -883,10 +924,9 @@ it is shown on its own, with no nodes, scrollable and zoomable, with
 the view shared between the two; **‹ Back** returns to the list, where the
 chosen row is marked. Choosing another asks first when the nodeset being
 edited has unsaved changes: save them, discard them, or stay. Each row
-renames its geodata (its pack directory with it, when that is
-`packs/<name>` and nothing else names it) or deletes it, with its pack
-unless another geodata, a run or a snapshot names the pack, which the page
-then says; neither is allowed while a running simulation stands on it. **New synthetic…**
+renames its geodata or deletes it, its pack included; neither is allowed
+while a run or a snapshot stands on its pack, whose copy of the geodata
+names the pack's directory, and the page says which. **New synthetic…**
 makes flat synthetic ground at an exponent and an extent, **Build from
 sources…** opens the build view, and **Import zip…** takes a SIMesh geodata
 pack or a bare planner pack ([Geodata](#geodata)).
@@ -1752,10 +1792,10 @@ the way a driver does, and play the ether on a UDP socket of their own; the
 conductor's tests do the same in virtual time, and the shim's run a small C
 stand-in station (`radio/tests/standin.c`) under `libsimclock.so`. The
 testbed's pack tests run against a real `planner-web` when it is built in
-`planner/` and the `berlin-city` pack is in `packs/`, and are skipped otherwise.
+`planner/` and there is `berlin-city` geodata, and are skipped otherwise.
 The builds from sources and the node-map imports are tested against a host and
 a `planner-job` of the tests' own; the planner's tests of real data read the
-download cache, `packs/.cache/`, and skip what is not there, and two real builds
+download cache, `testbed/geodata/.cache/`, and skip what is not there, and two real builds
 of a few square kilometres of Berlin run through the binary with
 
 ```sh
@@ -1763,7 +1803,7 @@ cd SIMesh/planner && cargo test --release -p planner-job -- --ignored
 ```
 
 `SIMESH_MESHCORE_SNAPSHOT` names a saved MeshCore node list for the importer's
-tests, in place of `packs/.cache/meshcore/nodes.json`.
+tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 
 ## Where the code lives
 
@@ -1794,9 +1834,10 @@ code lives in that component's `src/host/`.
 | `simesh` | the one command: the front natively or in SIMesh's image, `new`, `stop`, `list`, `plan`, `run`, `devices`, `build` |
 | `Dockerfile` | SIMesh's image, for a machine that is not Linux |
 | `devices/local/` | the compiled builds, run in place, named `<project>_<catalogue>` |
+| `stations/standard_reticulum/` | a standard Reticulum node's station program: the RNode started, Reticulum and LXMF behind it, its console |
 | `radio/` | the chip and the station's UDP link to the ether, as a C library |
 | `radio/src/conductor.cpp` | the station's side of virtual time: T, node time, wakes, the idle |
-| `radio/shim/simclock.c` | `libsimclock.so`, the C library's time in node time, the seeded randomness, the console and TCP counts and the watchdog's hold; `radio/include/simclock.h` is what it is handed |
+| `radio/shim/simclock.c` | `libsimclock.so`, the C library's time in node time (its sleeps, descriptor waits, condition and semaphore waits), the seeded randomness, the console and TCP counts, the listening sockets and the watchdog's hold; `radio/include/simclock.h` is what it is handed |
 | [`radio/portduino/`](radio/portduino/README.md) | the chip library for a Portduino firmware: a PlatformIO library standing in for spidev and libgpiod, and the firmware's idle wait |
 | `iface-lora/esp-idf/src/host/virtual_hal.*` | RadioLib's HAL (hardware abstraction layer) over the GPIO shim and `radio/`, in place of the SPI bus |
 | [`ether/`](ether/README.md) | the medium: the loss tables, who hears a frame and how it comes out; `slt.py` reads and writes a table |
