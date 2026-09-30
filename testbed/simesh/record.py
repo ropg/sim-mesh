@@ -13,6 +13,7 @@ nothing about what the bytes mean.
 
 import json
 import os
+import re
 
 RECORD_FILE = "record.tsv"
 
@@ -31,20 +32,45 @@ def parse_time(stamp):
     return int(hour) * 3600 + int(minute) * 60 + float(second)
 
 
-def lines(path):
-    """(stamp, direction, station id, message) for every well-formed line."""
+def lines(path, types=None):
+    """(stamp, direction, station id, message) for every well-formed line.
+
+    With `types`, only the lines whose message is of one of them, and only
+    those are parsed: a tool after the 7,321 `tx` of a city run's 1.3 million
+    lines passes the rest over unread, which is most of what reading the
+    record cost it. A line is passed over only when its text cannot hold a
+    `type` of those at all; one that can is parsed and its message's own
+    `type` decides."""
+    wanted = None
+    if types is not None:
+        wanted = re.compile(r'"type"\s*:\s*"(?:%s)"' % "|".join(re.escape(t) for t in types))
     with open(path, encoding="utf-8") as handle:
         for line in handle:
             if line.startswith("#"):
+                continue
+            if wanted is not None and not wanted.search(line):
                 continue
             fields = line.rstrip("\n").split("\t")
             if len(fields) != 4:
                 continue
             stamp, direction, sid, blob = fields
             try:
-                yield stamp, direction, int(sid), json.loads(blob)
+                item = stamp, direction, int(sid), json.loads(blob)
             except ValueError:
                 continue
+            if wanted is not None and not (isinstance(item[3], dict)
+                                           and item[3].get("type") in types):
+                continue
+            yield item
+
+
+def first_stamp(path):
+    """The stamp of the record's first well-formed line, the one `lines`
+    gives first, which says whether the record is on T or the wall clock and
+    where its wall clock starts; None when it has none."""
+    for stamp, _direction, _sid, _msg in lines(path):
+        return stamp
+    return None
 
 
 def epoch_of(path):

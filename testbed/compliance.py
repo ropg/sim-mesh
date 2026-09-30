@@ -125,11 +125,10 @@ def frames_of(path):
     wall clock since the record's first line), which in a real-time run a
     station's own clock is not."""
     out = []
-    origin = None
-    for stamp, direction, sid, msg in record_module.lines(path):
-        if origin is None:
-            origin = 0 if ":" not in stamp else referee.to_us(stamp)
-        if direction != "in" or msg.get("type") != "tx":
+    first = record_module.first_stamp(path)
+    origin = None if first is None else 0 if ":" not in first else referee.to_us(first)
+    for stamp, direction, sid, msg in record_module.lines(path, types=("tx",)):
+        if direction != "in":
             continue
         t0, t_end = msg.get("t0"), msg.get("t_end")
         if t0 is None or t_end is None:

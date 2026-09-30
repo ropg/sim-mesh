@@ -595,6 +595,36 @@ def test_a_real_time_record_is_not_counted_for_rncfg_stations(tmp_path):
         rncfg_delivery.hellos(str(path))
 
 
+def test_a_record_read_for_some_types_is_those_lines_of_it_read_whole(tmp_path):
+    """`lines(path, types)` passes over the lines it cannot want unparsed:
+    what it gives is exactly what reading every line gives, of those types,
+    whatever the spacing, with a nested `type` of theirs not enough, and
+    the malformed lines skipped alike."""
+    from simesh import record as record_module
+    path = tmp_path / "record.tsv"
+    path.write_text("\n".join([
+        "# 2026-09-29T00:00:00+00:00\tether record: stamp\tdir\tsid\tjson",
+        '0.001000\tin\t1\t{"sid":1,"slots":[0],"t":0,"type":"hello"}',
+        '0.002000\tin\t1\t{"mode":"RX","nested":{"type":"tx"},"slot":0,"type":"state"}',
+        '0.003000\tin\t1\t{"t0": 3000, "t_end": 9000, "type": "tx"}',
+        '0.004000\tin\t2\t{"t0":4000,"t_end":9000,"type":"tx"',          # cut short
+        '0.005000\tin\t-\t{"t0":5000,"t_end":9000,"type":"tx"}',         # no station
+        '0.006000\tout\t2\t{"id":1,"type":"rx_begin"}',
+        '0.007000\tin\t2\t{"t0":7000,"t_end":9000,"type":"tx"}',
+        '0.008000\tin\t2\t["type", "tx"]',
+    ]) + "\n")
+    everything = list(record_module.lines(str(path)))
+    for types in (("tx",), ("hello",), ("tx", "rx_begin"), ("state",), ("nothing",)):
+        want = [item for item in everything
+                if isinstance(item[3], dict) and item[3].get("type") in types]
+        assert list(record_module.lines(str(path), types=types)) == want, types
+    assert [m["t0"] for _s, _d, _i, m in record_module.lines(str(path), ("tx",))] == [3000, 7000]
+    assert record_module.first_stamp(str(path)) == "0.001000"
+    empty = tmp_path / "empty.tsv"
+    empty.write_text("# nothing yet\n")
+    assert record_module.first_stamp(str(empty)) is None
+
+
 # ---- the traffic driver, against a stand-in simd ------------------------
 
 class FakeSim:

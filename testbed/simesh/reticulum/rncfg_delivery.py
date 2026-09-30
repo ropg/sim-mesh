@@ -58,11 +58,17 @@ def hellos(record_path):
     A virtual-time record's only: the driver's instants are T, and a real-time
     record's stamps are the wall clock, so ValueError for one of those."""
     out = collections.defaultdict(list)
-    for stamp, direction, sid, msg in record.lines(record_path):
+    # A record is stamped one way throughout (the ether's `stamp()`, fixed for
+    # its run), so its first line says which; only the hellos are read.
+    first = record.first_stamp(record_path)
+    if first is not None and ":" in first:
+        raise ValueError("%s is a real-time record; a station configured with rncfg is "
+                         "counted in virtual time only" % record_path)
+    for stamp, direction, sid, msg in record.lines(record_path, types=("hello",)):
         if ":" in stamp:
             raise ValueError("%s is a real-time record; a station configured with rncfg is "
                              "counted in virtual time only" % record_path)
-        if direction == "in" and msg.get("type") == "hello":
+        if direction == "in":
             out[sid].append(record.parse_time(stamp))
     return out
 
