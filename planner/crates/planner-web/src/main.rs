@@ -2106,6 +2106,29 @@ fn merge_building_tops(
     Some(c)
 }
 
+/// Until the building index has landed or is known to be absent.
+///
+/// A sweep reads the index once, for the terminal surroundings at the
+/// transmitter, and one begun while it loads read `Loading` and ran without
+/// them: measured on a 0.5 km sweep, 19,548 of 40,000 cells came out 27 dB
+/// lower to 8 dB higher in loss than the same sweep a second later, and
+/// nothing in the raster says which it was, so a caller that caches it kept
+/// the wrong one. A pair table waits for the index for the same reason (see
+/// `profile_evidence.buildings_index`); a sweep has no evidence to carry, so
+/// it waits here. A superseded sweep stops waiting.
+fn wait_for_index(
+    buildings: &std::sync::RwLock<BuildingsIndexState>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    while matches!(*buildings.read().expect("buildings lock"), BuildingsIndexState::Loading) {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("superseded by a newer request".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 /// One complete sweep out to `radius_m`. Blocking; call from a worker.
 ///
 /// Split out of the request handler so the same code can serve one shot or a
@@ -2117,6 +2140,7 @@ fn run_sweep(
     radius_m: f64,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<planner_terrain::Grid, String> {
+    wait_for_index(&st.buildings, &cancel)?;
     let tx = match (q.x, q.y) {
         (Some(x), Some(y)) => Xy { x, y },
         _ => st.to_xy(q.lat, q.lon),
@@ -4377,6 +4401,29 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// A sweep waits out a loading index and goes on once it lands; a
+    /// superseded one stops waiting, as a cancelled sweep, not a failure.
+    #[test]
+    fn a_sweep_waits_for_the_building_index() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, RwLock};
+        let index = Arc::new(RwLock::new(super::BuildingsIndexState::Loading));
+        let landed = Arc::new(AtomicBool::new(false));
+        let (i2, l2) = (Arc::clone(&index), Arc::clone(&landed));
+        let lander = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            l2.store(true, std::sync::atomic::Ordering::SeqCst);
+            *i2.write().unwrap() = super::BuildingsIndexState::Absent;
+        });
+        super::wait_for_index(&index, &AtomicBool::new(false)).unwrap();
+        assert!(landed.load(std::sync::atomic::Ordering::SeqCst), "returned before the index landed");
+        lander.join().unwrap();
+
+        let loading = RwLock::new(super::BuildingsIndexState::Loading);
+        let err = super::wait_for_index(&loading, &AtomicBool::new(true)).unwrap_err();
+        assert!(err.contains("superseded"), "{err}");
+    }
+
 
     /// The defect: `/link.json` had no way to state either antenna. The budget
     /// carried the shipped `GENERIC_SX1262` placeholder gain applied to BOTH
