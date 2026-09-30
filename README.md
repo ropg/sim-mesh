@@ -60,7 +60,8 @@ library; `cargo` too for real ground (below), and Reticulum and LXMF
 Debian or Ubuntu, `simesh install` puts all of it in place, as SIMesh's
 image holds it (step 2). **Anywhere else** it needs
 only `docker`: `simesh` builds its own small image on first use (a few
-minutes, once) and runs itself inside it, with port 8800 published.
+minutes, once) and runs itself inside it, with port 8800 published; `podman`
+does as well where there is no `docker` (`SIMESH_RUNTIME` chooses).
 
 **1. Clone it.** The directory you clone into is the one `simesh` mounts
 into its image, so a workspace put beside SIMesh later is where a local
