@@ -25,6 +25,7 @@ import coverage  # noqa: E402
 import devices  # noqa: E402
 import front  # noqa: E402
 import geodata  # noqa: E402
+import nodeset  # noqa: E402
 import proxy  # noqa: E402
 import sources  # noqa: E402
 import store  # noqa: E402
@@ -642,6 +643,54 @@ def test_a_sidecar_that_offers_whole_sweeps_is_asked_for_them(tmp_path, monkeypa
     starts = [q for what, q in calls if what == "start"]
     assert [q.get("whole") for q in starts] == ["true", "true"]
     assert [what for what, _ in calls].count("pack") == 1
+
+
+# ---- heights from a pack's evidence -------------------------------------------
+
+def test_heights_are_estimated_only_on_a_pack(tmp_path, monkeypatch):
+    ground = tmp_path / "geodata"
+    ground.mkdir()
+    (ground / "flat.yaml").write_text("synthetic:\n  exponent: 3.0\n")
+    monkeypatch.setattr(store, "GEODATA_DIR", str(ground))
+    monkeypatch.setattr(store, "NODESETS_DIR", str(tmp_path / "nodesets"))
+    ns = nodeset.create("few")
+    ns.add_node("a", 0.001, 0.001, height_m=15)
+    ns.save()
+
+    async def check(f, session, base, ws):
+        reply = await ask(ws, "nodeset_heights", name="few", geodata="flat")
+        assert not reply["ok"] and "synthetic" in reply["error"]
+        assert nodeset.load("few").nodes["a"]["height_m"] == 15
+    running_front(check)
+
+
+def test_a_nodesets_assumed_heights_are_estimated_on_a_pack(tmp_path, monkeypatch):
+    if front.planner_web() is None or not os.path.isdir(BERLIN_PACK):
+        pytest.skip("no planner-web build in planner/ or no berlin-city pack in packs/")
+    ground = tmp_path / "geodata"
+    ground.mkdir()
+    (ground / "berlin.yaml").write_text("pack: %s\n" % BERLIN_PACK)
+    monkeypatch.setattr(store, "GEODATA_DIR", str(ground))
+    monkeypatch.setattr(store, "NODESETS_DIR", str(tmp_path / "nodesets"))
+    monkeypatch.setattr(store, "RUNS_DIR", str(tmp_path / "runs"))
+    ns = nodeset.create("kiez")
+    # A perimeter block in Kreuzberg, and the same place surveyed.
+    ns.add_node("guess", 52.4930, 13.4190, height_m=15)
+    ns.add_node("known", 52.4931, 13.4191, height_m=11, height_from="measured")
+    ns.save()
+
+    async def check(f, session, base, ws):
+        reply = await ask(ws, "nodeset_heights", name="kiez", geodata="berlin")
+        assert reply["ok"], reply
+        assert reply["changed"] == ["guess"]
+        guess = nodeset.load("kiez").nodes["guess"]
+        got = reply["estimates"]["guess"]
+        assert guess["height_from"] == nodeset.HEIGHT_FROM_BASIS[got["basis"]]
+        assert got["low_m"] <= guess["height_m"] <= got["high_m"]
+        assert got["buildings_index"] in ("ready", "absent")
+        known = nodeset.load("kiez").nodes["known"]
+        assert (known["height_m"], known["height_from"]) == (11, "measured")
+    running_front(check)
 
 
 # ---- the planner behind /planner/<geodata>/ ----------------------------------
