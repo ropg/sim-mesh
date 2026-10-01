@@ -43,13 +43,11 @@ each frame is already one transfer.
 
 ## Building with it
 
-`sim-mesh build radio` builds `radio/build/libsimradio.a`, which `link.py`
-links into the program by path. A firmware's environment lists the library
-with a `symlink://` entry in `lib_deps`. `casefold.py`, as a `pre:` extra
-script, lets Portduino build on a case-insensitive filesystem, where its
-`String.h` would otherwise answer `#include <string.h>`. The library is
-linked as objects, not as an archive, so its strong definitions win over the
-firmware's weak ones.
-
-attermann's microReticulum_Firmware is built with it as `[env:sim-mesh]`
-(the `microreticulum` kind).
+`sim` builds `radio/build/libsimradio-sx1262.so` as it starts, which
+`link.py` links the program with by name; the firmware's zip does not carry
+it, since sim-mesh provides it when it starts the station. A firmware's
+environment lists this library with a `symlink://` entry in `lib_deps`.
+`casefold.py`, as a `pre:` extra script, lets Portduino build on a
+case-insensitive filesystem, where its `String.h` would otherwise answer
+`#include <string.h>`. This library is linked as objects, not as an archive,
+so its strong definitions win over the firmware's weak ones.

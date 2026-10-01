@@ -49,8 +49,8 @@
  *
  * A process with no radio of its own joins the run the same way, as a
  * station without a slot: it opens its link (simradio_station_open) and
- * never opens a chip. A Python host behind a radio in another process of its
- * station is one (testbed/kinds/standard_reticulum.py).
+ * never opens a chip: a Python host talking to a radio in another process of
+ * its station, say.
  *
  * With SIM_MESH_SEED in the environment as well, the shim is also the station's
  * randomness: getentropy, getrandom and syscall(SYS_getrandom) — what ESP-IDF's

@@ -229,8 +229,8 @@ page_stale() {
 }
 
 radio_stale() {
-    stale "$ROOT/radio" "$ROOT/radio/build/libsimclock.so" "$ROOT/radio/build/libsimradio.so" \
-          "$ROOT/radio/build/libsimradio.a" -- build tests portduino
+    stale "$ROOT/radio" "$ROOT/radio/build/libsimclock.so" \
+          "$ROOT/radio/build/libsimradio-sx1262.so" -- build tests portduino
 }
 
 planner_stale() {
@@ -262,7 +262,7 @@ build_radio() {
     cmake "${fresh[@]}" -S "$ROOT/radio" -B "$ROOT/radio/build"
     cmake --build "$ROOT/radio/build" -j "$(nproc 2>/dev/null || echo 2)"
     # Up to date now, whichever sources the build found nothing to redo for.
-    touch "$ROOT/radio/build/libsimclock.so" "$ROOT/radio/build/libsimradio.so" "$ROOT/radio/build/libsimradio.a"
+    touch "$ROOT/radio/build/libsimclock.so" "$ROOT/radio/build/libsimradio-sx1262.so"
 }
 
 # The ether's conductor in Rust (ether/core), a Python extension module the

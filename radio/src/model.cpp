@@ -174,14 +174,13 @@ static int radiatedDbm(uint8_t dutyCycle, uint8_t hpMax, int8_t paVal)
     return dbm < -9 ? -9 : dbm > 22 ? 22 : dbm;
 }
 
-/* The front end between the chip and the connector, from SIM_MESH_BOARD
- * (STATION.md): what the medium hears is the connector's power, and what the
- * chip reads is the connector's level plus the LNA's gain. The transmit side is
- * the board's curve (fem_tx_cal, the LORAn_TX_CAL form: `<part> <grade>
- * <reg>:<ant>,…`, entries separated by `;`, the one named fem_part taken),
- * straight lines between its points and flat outside them, rounded — the same
- * arithmetic the firmware's rfCalAntenna does, so a firmware that converts
- * with that curve radiates what it asked for. With no curve it is the flat
+/* The front end between the chip and the connector, from SIM_MESH_BOARD (the
+ * firmware contract): what the medium hears is the connector's power, and what
+ * the chip reads is the connector's level plus the LNA's gain. The transmit
+ * side is the board's curve (fem_tx_cal: `<part> <grade> <reg>:<ant>,…`,
+ * entries separated by `;`, the one named fem_part taken), straight lines
+ * between its points and flat outside them, rounded, so a firmware that
+ * converts with that curve radiates what it asked for. With no curve it is the flat
  * fem_gain_db, and with no front end at all, identity. One front end serves
  * every slot of the station: a board with two radios behind two front ends is
  * not described by SIM_MESH_BOARD. */

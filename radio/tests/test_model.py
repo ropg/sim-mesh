@@ -28,7 +28,7 @@ import pytest
 HERE = os.path.dirname(os.path.abspath(__file__))
 RADIO = os.path.dirname(HERE)
 BUILD = os.path.join(RADIO, "build")
-LIBRARY = os.path.join(BUILD, "libsimradio.so")
+LIBRARY = os.path.join(BUILD, "libsimradio-sx1262.so")
 
 SID = 7
 PIN_DIO1, PIN_BUSY = 1, 2

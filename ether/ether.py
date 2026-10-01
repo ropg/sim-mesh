@@ -75,7 +75,10 @@ from datetime import datetime, timezone
 import slt
 
 # What a receiver's state must share with a frame for the frame to be decoded.
-MATCH_KEYS = ("bw", "sf", "sync")
+MATCH_KEYS = ("mod", "bw", "sf", "sync")
+# The modulations this ether models: a state or a frame saying another is
+# refused, since nothing here knows what it would take to hear it.
+MODULATIONS = ("lora",)
 
 DEFAULT_POWER_DBM = 14      # a `tx` that did not say what it was sent at
 
@@ -274,18 +277,19 @@ def wall_stamp():
 
 
 class RealClock:
-    """The event loop's own clock, in microseconds."""
+    """The event loop's own clock, in microseconds from the ether's start."""
 
     virtual = False
 
     def __init__(self, loop):
         self.loop = loop
+        self.origin = loop.time()
 
     def now(self):
-        return int(self.loop.time() * 1_000_000)
+        return int((self.loop.time() - self.origin) * 1_000_000)
 
     def call_at(self, t_us, callback, *args, key=0):
-        return self.loop.call_at(t_us / 1_000_000.0, callback, *args)
+        return self.loop.call_at(self.origin + t_us / 1_000_000.0, callback, *args)
 
 
 class VirtualClock:
@@ -1593,7 +1597,17 @@ class Ether(asyncio.DatagramProtocol):
         self.send(sid, {"type": "welcome", "t": self.now(), "mode": self.mode,
                         "rate": self.rate, "epoch": self.epoch, "seed": self.seed})
 
+    def modelled(self, sid, msg):
+        """True when the message states a modulation this ether models."""
+        if msg.get("mod") in MODULATIONS:
+            return True
+        log("station %d: %s refused: modulation %r is not one this ether models (%s)" % (
+            sid, msg.get("type"), msg.get("mod"), ", ".join(MODULATIONS)))
+        return False
+
     def recv_state(self, sid, addr, msg):
+        if not self.modelled(sid, msg):
+            return
         station = self.station_for(sid, addr)
         slot = msg.get("slot", 0)
         before = station.state(slot) or {}
@@ -1644,6 +1658,8 @@ class Ether(asyncio.DatagramProtocol):
                 self.arrive(frame, frame.radio, rstation, slot, level, now)
 
     def recv_tx(self, sid, addr, msg):
+        if not self.modelled(sid, msg):
+            return
         station = self.station_for(sid, addr)
         start = self.now()
         t0 = msg.get("t0", 0)

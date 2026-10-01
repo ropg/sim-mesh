@@ -307,7 +307,8 @@ def written_by_the_ether(path, medium):
             ether.datagram_received(json.dumps(dict(msg, sid=sid)).encode(), ("127.0.0.1", sid))
 
         def send(sid, t, span_ms):
-            say(sid, {"type": "tx", "slot": 0, "id": 1, "freq": CALLING, "bw": 125000, "sf": 8,
+            say(sid, {"type": "tx", "slot": 0, "id": 1, "mod": "lora", "freq": CALLING,
+                      "bw": 125000, "sf": 8,
                       "sync": 18, "power_dbm": 14, "payload": "AAAA", "t0": t,
                       "t_pre": t + 25088, "t_hdr": t + 41472, "t_end": t + span_ms * 1000})
 
@@ -321,7 +322,8 @@ def written_by_the_ether(path, medium):
             for sid, msg in sent:
                 t = msg["t"]
                 if msg["type"] == "welcome":
-                    say(sid, {"type": "state", "slot": 0, "mode": "RX", "freq": CALLING,
+                    say(sid, {"type": "state", "slot": 0, "mode": "RX", "mod": "lora",
+                              "freq": CALLING,
                               "bw": 125000, "sf": 8, "sync": 18})
                 while plan[sid] and plan[sid][0][0] * 1000 <= t:
                     send(sid, t, plan[sid].pop(0)[1])

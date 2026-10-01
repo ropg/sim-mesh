@@ -40,7 +40,8 @@ Three clocks meet here and only one of them is authoritative.
 A station stamps its messages with its own clock, which starts at zero when
 its process first reads it. Those numbers mean nothing between stations. So on every
 `tx` the ether reads only the **offsets** — `t_pre − t0`, `t_hdr − t0`,
-`t_end − t0` — and rebases them onto its own monotonic clock at the instant the
+`t_end − t0` — and rebases them onto its own monotonic clock, zero when the
+ether starts, so a real-time run's T counts from 00:00:00, at the instant the
 datagram arrived. The `rx_begin` it sends carries ether microseconds; the
 receiver, in turn, cares only about the gaps between them and schedules from its
 own clock. Each hop keeps what it can trust and discards what it cannot.
@@ -236,8 +237,8 @@ medium learns to care about coding rate, header type or preamble length.
 
 The carrier is matched within a tolerance, not exactly, because the
 synthesizer steps in 32 MHz / 2^25: two drivers asked for 869.525 MHz round it
-to register values tens of hertz apart (RadioLib lands on 869 524 963 Hz, the
-Sergeyculum driver on 869 524 999), and an exact match makes two stations on
+to register values tens of hertz apart (RadioLib lands on 869 524 963 Hz,
+another driver on 869 524 999), and an exact match makes two stations on
 one channel deaf to each other. A quarter of the bandwidth is what a LoRa
 demodulator tolerates.
 

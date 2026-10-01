@@ -268,7 +268,7 @@ const struct simradio_services kServices = {
 
 }  // namespace
 
-extern "C" const struct simradio_services* simradio_services(void)
+extern "C" const struct simradio_services* simradio_posix_services(void)
 {
     return &kServices;
 }

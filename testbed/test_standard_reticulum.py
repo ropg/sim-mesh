@@ -86,7 +86,7 @@ def test_a_station_is_two_processes_of_the_run_and_the_second_reads_the_console(
     assert env["SIM_MESH_NODE_ID"] == str(3 + standard_reticulum.COMPANION)
     assert env["SR_RNODE_ID"] == "3"
     assert env["SR_RNODE"] == "/rnode"
-    assert env["SR_SIMRADIO"].endswith(os.path.join("radio", "build", "libsimradio.so"))
+    assert env["SR_SIMRADIO"].endswith(os.path.join("radio", "build", "libsimradio-sx1262.so"))
     assert env["SIM_MESH_IDLE"] == "threads"
 
 
