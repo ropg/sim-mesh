@@ -1999,7 +1999,7 @@ class Ether(asyncio.DatagramProtocol):
 #
 # In a virtual-time run most of the ether's work is the barrier: an idle in, T
 # moved, the stations due sent a `run`. ether_core, built from ether/core
-# (`sim-mesh build ether`), does that in Rust on the ether's socket, in the
+# (built by `sim` when it starts), does that in Rust on the ether's socket, in the
 # event loop's thread; CoreEther is Ether with that conductor and everything
 # else as Ether has it, called at the same points. Ether's own conductor stays
 # the reference, and SIM_MESH_ETHER_CORE picks: `python` for it, `rust` for the
@@ -2022,7 +2022,7 @@ def core_module():
         if not os.path.exists(CORE_PATH):
             if wanted == "rust":
                 raise RuntimeError("SIM_MESH_ETHER_CORE=rust, and there is no %s "
-                                   "(sim-mesh build ether)" % CORE_PATH)
+                                   "(sim builds it when it starts)" % CORE_PATH)
             return None
         import importlib.util
         spec = importlib.util.spec_from_file_location("ether_core", CORE_PATH)

@@ -74,6 +74,7 @@ export interface NodeView extends NodeRecord {
   status?: string
   liveRole?: string | null
   stale?: boolean
+  /** Attached: its firmware's base. */
   kind?: string | null
   web?: boolean
   /** Attached: the firmware its script's rules give it, and what that build is called. */
@@ -163,7 +164,7 @@ export const useNodes = defineStore('nodes', {
           id: n.id, lat: n.lat, lon: n.lon, height_m: n.height_m,
           antenna: n.antenna ?? { type: DEFAULT_ANTENNA },
           tags: n.tags ?? [], name: n.name, live: true, status: n.status, liveRole: n.role,
-          stale: n.stale, kind: n.kind, web: n.web, firmware: n.firmware,
+          stale: n.stale, kind: n.base, web: n.web, firmware: n.firmware,
           deviceName: n.device_name,
           freq: n.freq, sf: n.sf, bw: n.bw,
         }))

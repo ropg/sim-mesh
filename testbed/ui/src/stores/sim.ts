@@ -32,10 +32,11 @@ export type Status = 'stopped' | 'starting' | 'setup' | 'up' | 'restarting'
 export interface Node {
   name: string
   id: number
-  /** Its kind's type: reticulous, sergeyculum, … */
-  kind: string | null
-  /** The firmware a script's rules give it (a device name), or null while
-   *  none does, and what that build is called. */
+  /** Its firmware's base and category (reticulum, meshcore, …). */
+  base: string | null
+  category: string | null
+  /** The firmware a script's rules give it (a name or `<base>_latest`), or
+   *  null while none does, and what that firmware is called. */
   firmware: string | null
   device_name: string | null
   /** Whether it has a web UI the proxy can reach. */
@@ -162,7 +163,7 @@ export interface SimSpec {
   build?: string
 }
 
-export type Tab = 'devices' | 'antennas' | 'geodata' | 'nodes' | 'scripts' | 'sims'
+export type Tab = 'firmware' | 'antennas' | 'geodata' | 'nodes' | 'scripts' | 'sims'
 
 const FLASH_MS = 400
 const MAX_PULSES = 400       // a busy network, bounded
@@ -198,6 +199,8 @@ export const useSim = defineStore('sim', {
     lastNew: null as { ok: boolean; name?: string; error?: string } | null,
     /** The live map should frame the nodes once they arrive (a script's Run). */
     fitWanted: false,
+    /** Counts clicks on the Geodata tab, each of which goes back to its list. */
+    geodataList: 0,
     /** A simulation a script is starting, attached to before it exists. */
     awaiting: null as string | null,
     /** Loss tables being computed for a simulation, by its name: before its
@@ -214,11 +217,11 @@ export const useSim = defineStore('sim', {
     dirty: (s): boolean => s.nodeset?.dirty ?? false,
     running: (s): number =>
       Object.values(s.nodes).filter(n => n.status === 'up').length,
-    /** Whether any station is a Reticulous one, which is what shows the
+    /** Whether any station runs Reticulum firmware, which is what shows the
      *  page's Reticulum verbs. */
-    reticulum: (s): boolean => Object.values(s.nodes).some(n => n.kind === 'reticulous'),
-    /** The run's station kinds. */
-    kinds: (s): string[] => [...new Set(Object.values(s.nodes).map(n => n.kind ?? '?'))].sort(),
+    reticulum: (s): boolean => Object.values(s.nodes).some(n => n.category === 'reticulum'),
+    /** The run's firmware bases. */
+    kinds: (s): string[] => [...new Set(Object.values(s.nodes).map(n => n.base ?? '?'))].sort(),
     /** Seconds of the run's time per second of the browser's: 1 in real
      *  time, the pace of a paced run, or what an unpaced one lately did. */
     speed: (s): number => {
@@ -341,12 +344,15 @@ export const useSim = defineStore('sim', {
             this.progress[''] = { band: msg.band as string, done, total, running: done < total }
           }
           break
-        case 'command_result':
-          this.command = {
-            what: (msg.line ?? msg.verb) as string,
-            results: msg.results as Record<string, string>,
-          }
+        case 'command_result': {
+          // A line's reply is what it printed; a verb's is what the driver
+          // returned, shown as text.
+          const results = Object.fromEntries(
+            Object.entries((msg.results ?? {}) as Record<string, unknown>).map(([node, reply]) =>
+              [node, typeof reply === 'string' ? reply : reply == null ? 'done' : JSON.stringify(reply)]))
+          this.command = { what: (msg.line ?? msg.verb) as string, results }
           break
+        }
         case 'radio': {
           const node = this.nodes[msg.name as string]
           if (node) Object.assign(node, {
@@ -500,11 +506,11 @@ export const useSim = defineStore('sim', {
      *  friends expanded. `stagger` spreads the stations over that many
      *  seconds — 0 fires them together, which is wrong for anything that
      *  transmits. */
-    runCommand(line: string, stagger = 0, kind: string | null = null, names: string[] | null = null) {
+    runCommand(line: string, stagger = 0, base: string | null = null, names: string[] | null = null) {
       this.command = null
-      this.send({ type: 'command', line, stagger, ...(kind ? { kind } : {}), ...(names ? { names } : {}) })
+      this.send({ type: 'command', line, stagger, ...(base ? { base } : {}), ...(names ? { names } : {}) })
     },
-    /** An intent on the stations named, each in its own kind's lines. */
+    /** A verb on the stations named, each through its own firmware's driver. */
     runIntent(verb: string, args: Record<string, unknown> = {}, stagger = 0, names: string[] | null = null) {
       this.command = null
       this.send({ type: 'meta', verb, args, stagger, ...(names ? { names } : {}) })

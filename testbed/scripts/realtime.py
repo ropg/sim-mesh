@@ -1,12 +1,15 @@
-"""Real time: every node on the dev build, set up by the startup script, and left running.
+"""Real time: every node on the chosen firmware, set up by the startup script, and left running.
 
 The simulation runs on the wall clock and keeps running when this script
 ends, for the page, the consoles and the stations' web UIs.
 """
 from sim_mesh import *
 
-time("real")
-firmware("all", "reticulous_dev_latest")
-include("scripts/startup.py")
+firmware = script_input("firmware", type=Firmware,
+                        label="Firmware for nodes not otherwise configured")
 
-up("all")
+sim_speed("real")
+nodes().firmware(firmware)
+script_include("scripts/startup.py")
+
+nodes().up()

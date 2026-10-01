@@ -1,55 +1,53 @@
 """The LXMF traffic driver: a whole run, on the run's own clock, on any
-firmware whose kind can say an address, an announce and a message.
+firmware of category `reticulum` (sim_mesh.reticulum.driver).
 
     from sim_mesh import *
     from sim_mesh import traffic
 
-    time("max")
-    firmware("all", "reticulous_dev_latest")
-    on_first_boot("all", "lxmf create {name}")
+    firmware = script_input("firmware", type=Firmware, category="reticulum")
+    sim_speed("max")
+    nodes().firmware(firmware)
+    nodes().on_first_boot(Node.reticulum.lxmf.create())
     traffic.run(OPTIONS)                    # into the run directory as traffic.json
-    pause()
+    sim_pause()
 
 Phases, each skipped when its option says so:
 
   up        wait until every station is up.
-  identity  each station's LXMF delivery address (the `address` meta
-            command), asked until every station has one.
-  warm      rounds of announces across the stations (the `announce` meta
-            command; warm_rounds, each spread over warm_spread seconds with
-            warm_gap between rounds), then, on the stations whose kind can
-            count its paths (`reticulous`: `rnpath -s`;
-            `standard_reticulum`: `paths`), a sample every
-            settle_every seconds until their total does not rise between
-            two samples (or settle_max has passed). With no such station,
-            two settle_every waits. warm_rounds 0 skips the phase.
+  identity  each station's LXMF delivery address (the first the
+            `lxmf.identities` verb lists), asked until every station has one.
+  warm      rounds of announces across the stations (the `lxmf.announce` verb;
+            warm_rounds, each spread over warm_spread seconds with warm_gap
+            between rounds), then, on the stations whose firmware can list
+            its paths (the `path` verb), a sample every settle_every seconds
+            until their total does not rise between two samples (or
+            settle_max has passed). With no such station, two settle_every
+            waits. warm_rounds 0 skips the phase.
   snapshot  a snapshot, warm_snapshot, when given.
   traffic   one message every `every` seconds for `traffic` seconds (the
-            `message` meta command, `send_msg`), the sender, recipient,
-            size class and text all drawn from `seed`, so two runs with one
-            seed and one set of station names send the same messages at the
-            same instants after the traffic starts. `arrivals`
-            "poisson", `pairs` and `hub` vary when the messages go and
-            between whom, keeping the messages themselves (`schedule`).
-            Each send is preceded
-            by the `path` meta command at the sender, the route length at
-            send time where the kind can say it. Size classes: short 20-55
+            `lxmf.send` verb), the sender, recipient, size class
+            and text all drawn from `seed`, so two runs with one seed and
+            one set of station names send the same messages at the same
+            instants after the traffic starts. `arrivals` "poisson", `pairs`
+            and `hub` vary when the messages go and between whom, keeping
+            the messages themselves (`schedule`). Each send is preceded by
+            the `path` verb at the sender, the route length at send time
+            where the firmware can say it. Size classes: short 20-55
             characters, two-frame 115-300, and 420-650 (over 500 B on the
             wire: a link and a resource), weighted 167 : 76 : 39. Every text
             starts with its marker, `marker` and a four-digit number.
   drain     `drain` seconds after the last send slot.
-  gather    every `gather` line on the stations of each kind it names.
+  gather    with `gather`, every station's `diagnostics`.
   snapshot  end_snapshot, when given.
 
 Once every station is up the driver says the run's phases (warm-up,
 traffic and drain, each with the T it ends at), and again whenever warm-up
 runs longer, so the page can say which phase the run is in and when it will
 be done. The result holds the phases (wall and T at each boundary), every
-clock message, the warm-up samples, every send with its route and reply,
-and the gathered output. How much of it was delivered is counted from the
-stations' logs afterwards, each sender by its own station's: the lines
-`reticulous` and `standard_reticulum` stations log, and a station configured
-with rncfg (`sergeyculum`) by its own (sim_mesh.reticulum.delivery, `report`).
+clock message, the warm-up samples, every send with its route, message id
+and reply, and the gathered output. How much of it was delivered is counted
+afterwards from the run's events, what each sender's driver reported of
+each message (sim_mesh.reticulum.delivery, `report`).
 """
 
 import asyncio
@@ -65,20 +63,13 @@ from sim_mesh.sim import SimError
 OPTIONS = {"warm_rounds": 3, "warm_spread": 300.0, "warm_gap": 120.0,
            "settle_every": 180.0, "settle_max": 3600.0, "warm_snapshot": None,
            "traffic": 3600.0, "every": 5.0, "seed": 17, "marker": "G", "drain": 600.0,
-           "gather": None, "end_snapshot": None,
+           "gather": True, "end_snapshot": None,
            "arrivals": "even", "hub": None, "hub_share": 0.5, "pairs": 0}
 ARRIVALS = ("even", "poisson")
 
 WORDS = ("mesh relay gateway lora packet announce proof link path hop station "
          "field city river bridge north south east west signal").split()
 CLASSES = ["short"] * 167 + ["two"] * 76 + ["big"] * 39
-# What each kind is asked at the end, by kind.
-DEFAULT_GATHER = {"reticulous": ["rnpath -s", "lxmf unfinished", "lxmf msgs received",
-                                 "lxmf msgs delivered", "lora 0", "lora 0 supe"],
-                  "standard_reticulum": ["paths"]}
-# The kinds that can count the paths they know, and how.
-PATH_COUNT = {"reticulous": "rnpath -s", "standard_reticulum": "paths"}
-QUEUED = re.compile(r"queued (\S+)")
 RESULT_FILE = "traffic.json"
 
 
@@ -146,21 +137,6 @@ def schedule(names, seed, duration, every, marker, arrivals="even", hub=None,
     return out
 
 
-def paths_total(text):
-    m = re.search(r"(\d+) paths total", text or "")
-    return int(m.group(1)) if m else None
-
-
-def route_hops(text):
-    """The hop count out of a `path` answer (`rnpath -j`'s JSON): (hops or
-    None, whether it could be read)."""
-    try:
-        paths = json.loads(text[text.index("{"):]).get("paths") or []
-    except ValueError:
-        return None, False
-    return (paths[0]["hops"] if paths else None), True
-
-
 class Options:
     """The phase options, `OPTIONS` with whatever a script gives over them."""
 
@@ -209,27 +185,39 @@ async def run_on(sim, opts, out_path):
     return result
 
 
-def meta(verb, **args):
-    return {"type": "meta", "verb": verb, "args": args}
+def meta(verb, category=None, **args):
+    """A verb as simd takes it: a category's (only on its stations), or with
+    none, every firmware's."""
+    out = {"type": "meta", "verb": verb, "args": args}
+    if category is not None:
+        out["category"] = category
+    return out
 
 
 async def run_phases(opts, sim, result, phase, dump):
-    stations = sorted(n for n, s in sim.stations.items() if s.firmware or s.kind)
-    by_kind = {}
-    for name in stations:
-        by_kind.setdefault(sim.stations[name].kind, []).append(name)
+    stations = sorted(n for n, s in sim.stations.items() if s.firmware)
     # A station is up before its first-boot lines have all landed, so its
     # identity may not exist yet: ask until every station has one.
     dests = {}
+    answers = {}
     for attempt in range(60):
-        got = await sim.ask(meta("address"), [n for n in stations if n not in dests],
+        got = await sim.ask(meta("lxmf.identities", "reticulum"),
+                            [n for n in stations if n not in dests],
                             after=2.0 if attempt else 0.0)
-        for name, addr in got.items():
-            if re.fullmatch(r"[0-9a-f]{32}", addr or ""):
+        for name, held in got.items():
+            answers[name] = held
+            # The identity it sends from, which is first.
+            addr = held[0][1] if isinstance(held, list) and held else None
+            if isinstance(addr, str) and re.fullmatch(r"[0-9a-f]{32}", addr):
                 dests[name] = addr
         if len(dests) >= len(stations):
             break
     result["dests"] = dests
+    # What a station with no destination last said, and what it runs: what
+    # the report tells the reader of why.
+    result["no_dest"] = {n: {"firmware": sim.stations[n].firmware,
+                             "answer": str(answers.get(n, "nothing"))[:200]}
+                         for n in stations if n not in dests}
     # Every station, whether or not it has shown its identity: the schedule
     # is drawn over them, so one seed sends the same messages.
     senders = stations
@@ -256,23 +244,24 @@ async def run_phases(opts, sim, result, phase, dump):
     if opts.warm_rounds > 0:
         result["warm"] = {"rounds": [], "samples": []}
         for r in range(opts.warm_rounds):
-            await sim.ask(meta("announce"), senders, spread=opts.warm_spread,
+            await sim.ask(meta("lxmf.announce", "reticulum"), senders, spread=opts.warm_spread,
                           after=opts.warm_gap if r else 0.0)
             result["warm"]["rounds"].append([time.time(), sim.t])
             phase("warm_round_%d" % (r + 1))
-        counted = [(kind, names) for kind, names in by_kind.items() if kind in PATH_COUNT]
+        counted = list(senders)
         settle_from = sim.run_s
         prev = None
         while True:
             if not counted:
                 await sim.sleep(2 * opts.settle_every)
                 break
-            per = {}
-            for kind, names in counted:
-                reply = await sim.ask({"type": "command", "line": PATH_COUNT[kind]}, names,
-                                      after=opts.settle_every)
-                per.update({n: paths_total(t) for n, t in reply.items()})
-            total = sum(v for v in per.values() if v)
+            reply = await sim.ask(meta("path", "reticulum"), counted, after=opts.settle_every)
+            per = {n: len(v) for n, v in reply.items() if isinstance(v, list)}
+            # Only the stations whose firmware can list its paths are asked again.
+            counted = sorted(per)
+            if not counted:
+                continue
+            total = sum(per.values())
             result["warm"]["samples"].append({"t": sim.t, "wall": time.time(),
                                               "total": total, "per": per})
             print("  paths %d at run %.0f s" % (total, sim.run_s), flush=True)
@@ -311,21 +300,23 @@ async def run_phases(opts, sim, result, phase, dump):
             # socket's reader, which holds every later message behind it.
             try:
                 results, t = await sim.sequence(
-                    [meta("path", to=dst), meta("message", to=dst, text=text)], [src],
+                    [meta("path", "reticulum", to=dst),
+                     meta("lxmf.send", "reticulum", to=dst, text=text)], [src],
                     after=max(0.001, start + at - sim.run_s))
             except SimError as err:
                 # This message, not the run: the rest go on at their instants.
                 rec["error"] = str(err)[:300]
                 return
-            path_out, out = (r.get(src, "") for r in results)
+            path_out, out = (r.get(src) for r in results)
             rec["t_sent"] = rec["t_path"] = t if t is not None else sim.t
-            rec["hops"], parsed = route_hops(path_out)
-            if not parsed:
-                rec["path_reply"] = path_out[:200]
-            m = QUEUED.search(out)
-            rec["mid"] = m.group(1) if m else None
-            if not m:
-                rec["reply"] = out[:300]
+            rec["hops"] = path_out[0].get("hops") if isinstance(path_out, list) and path_out \
+                else None
+            if not isinstance(path_out, list):
+                rec["path_reply"] = str(path_out)[:200]
+            good = isinstance(out, str) and out and not out.startswith("! ")
+            rec["mid"] = out if good else None
+            if not good:
+                rec["reply"] = str(out)[:300]
 
         phase("traffic_start")
         jobs = [asyncio.ensure_future(one(*p)) for p in plan]
@@ -339,20 +330,18 @@ async def run_phases(opts, sim, result, phase, dump):
                 await asyncio.sleep(5)
                 dump()
         keeping = asyncio.ensure_future(progress())
-        await sim.until(t_end)
-        await asyncio.gather(*jobs)
-        keeping.cancel()
+        try:
+            await sim.until(t_end)
+            await asyncio.gather(*jobs)
+        finally:
+            keeping.cancel()
         phase("traffic_end")
         await sim.until(t_end + opts.drain)
         phase("drain_end")
 
-    gathered = result["gathered"] = {}
-    for kind, lines in (opts.gather or DEFAULT_GATHER).items():
-        for line in lines:
-            names = by_kind.get(kind) or []
-            if names:
-                reply = await sim.ask({"type": "command", "line": line}, names)
-                gathered["%s: %s" % (kind, line)] = {"t": sim.t, "results": reply}
+    if opts.gather:
+        reply = await sim.ask(meta("diagnostics"), stations)
+        result["gathered"] = {"t": sim.t, "results": reply}
     phase("gathered")
     if opts.end_snapshot:
         await sim.snapshot(opts.end_snapshot)
@@ -399,8 +388,18 @@ def report(run_dir, traffic_path=None):
                                              if stations else ""),
               ""]
     if not dests:
-        lines += ["**No station showed an LXMF identity**, so nothing could be sent: "
-                  "the stations' first-boot lines create them (`lxmf create {name}`).", ""]
+        lines += ["**No station showed an LXMF identity**, so nothing could be sent.", ""]
+    no_dest = drive.get("no_dest") or {}
+    if no_dest:
+        lines += ["Stations with no LXMF identity send nothing and receive nothing. An "
+                  "identity is made at first boot (`Node.reticulum.lxmf.create()`); a "
+                  "firmware with no LXMF destination of its own, a transport-only node "
+                  "such as microReticulum, has none to show, and takes part only by "
+                  "forwarding among stations that do.", "",
+                  "| station | firmware | its answer |", "|---|---|---|"]
+        lines += ["| %s | %s | `%s` |" % (n, row.get("firmware") or "?", row.get("answer"))
+                  for n, row in sorted(no_dest.items())]
+        lines.append("")
     lines += ["## Phases", "", "| phase | T |", "|---|---|"]
     lines += ["| %s | %s |" % (p[0], t_text(p[2])) for p in drive.get("phases") or []]
     lines.append("")

@@ -100,7 +100,7 @@ class WallRecord(Record):
                                                  json.dumps(msg, separators=(",", ":"))))
 
 
-def lay_out(tmp_path, kind="reticulous", bare=False, name="run"):
+def lay_out(tmp_path, category="reticulum", bare=False, name="run"):
     gd, ns = geodata.read(PLAIN, "plain-27"), nodeset.open_path(FOUR, "four")
     if bare:
         for each, node in ns.nodes.items():
@@ -109,11 +109,12 @@ def lay_out(tmp_path, kind="reticulous", bare=False, name="run"):
     if not table.exists():
         losses.synthetic_table(gd, ns, "868").write(str(table))
     run = runs.create_run(str(tmp_path / name), gd, ns, None, "max", {"868": str(table)},
-                          builds={"reticulous_dev_latest": {"kind_type": kind}})
+                          builds={"alpha_latest": {"firmware": "alpha_x86_64_1.0.0",
+                                                   "category": category}})
     # The tests' own radio, whatever the store's globals.py says today.
     with open(os.path.join(run.dir, runs.GLOBALS_FILE), "w", encoding="utf-8") as handle:
         handle.write(GLOBALS)
-    run.set(firmware={n: "reticulous_dev_latest" for n in ns.nodes})
+    run.set(firmware={n: "alpha_latest" for n in ns.nodes})
 
     rec = Record()
     rec.add(0, "in", 1, {"type": "hello", "sid": 1, "slots": [0], "t": 0})
@@ -131,12 +132,15 @@ def lay_out(tmp_path, kind="reticulous", bare=False, name="run"):
     rec.tx(6.0, 4, announce(0)[:-1] + b"\x33", {})
     rec.write(os.path.join(run.dir, "record.tsv"))
 
-    for dev, lines in (("n01", ["Sep 25 10:00:07.000 I [lxmf] id 0: DIRECT delivered mid=o_1_ab"]),
-                       ("n02", ["Sep 25 10:00:08.000 W [lxmf] id 0: DIRECT failed mid=o_2_cd "
-                                "tag=lxmf.id0.4502915b (no_path)"])):
-        os.makedirs(run.node_dir(dev), exist_ok=True)
-        with open(os.path.join(run.node_dir(dev), "log"), "w") as handle:
-            handle.write("\n".join(lines) + "\n")
+    # What the senders' drivers reported, as simd writes it.
+    with open(os.path.join(run.dir, "events.jsonl"), "w") as handle:
+        for event in ({"t": 6_000_000, "node": "n01", "event": "lxmf.message.status",
+                       "mid": "o_1_ab", "status": "sent"},
+                      {"t": 7_000_000, "node": "n01", "event": "lxmf.message.status",
+                       "mid": "o_1_ab", "status": "delivered"},
+                      {"t": 8_000_000, "node": "n02", "event": "lxmf.message.status",
+                       "mid": "o_2_cd", "status": "failed", "why": "no_path"}):
+            handle.write(json.dumps(event) + "\n")
     return run
 
 
@@ -174,7 +178,7 @@ def test_a_run_view_takes_everything_from_the_run(run):
     n1, n2 = view.nodes["n01"], view.nodes["n02"]
     assert view.distance(1, 2) == pytest.approx(geodata.read(PLAIN, "plain-27").distance_m(
         (n1["lat"], n1["lon"]), (n2["lat"], n2["lon"])))
-    assert view.protocols() == [reticulum] and view.kind_type("n01") == "reticulous"
+    assert view.protocols() == [reticulum] and view.category("n01") == "reticulum"
 
 
 def test_offsets_reach_the_medium_the_tools_read(tmp_path):
@@ -205,13 +209,13 @@ def test_shadowing_reaches_the_medium_the_tools_read(tmp_path):
     assert after == pytest.approx(before - 7 * losses.shadowing_unit(3, "n01", "n02"), abs=0.01)
 
 
-def test_a_run_with_no_reticulous_station_reads_no_protocol(tmp_path):
-    other = lay_out(tmp_path, kind="sergeyculum", bare=True, name="bm")
+def test_a_run_with_no_reticulum_station_reads_no_protocol(tmp_path):
+    other = lay_out(tmp_path, category="meshcore", bare=True, name="mc")
     view = RunView(other.dir)
     assert set(view.roles().values()) == {"client"} and view.forwarders() == set()
     assert view.protocols() == []
     assert view.radio("n01")["sf"] == 8                  # the run's globals.py
-    assert sim_mesh.protocol_for("sergeyculum") is None
+    assert sim_mesh.protocol_for("meshcore") is None
     code, text = call(airtime.main, [other.dir, "--roles"])
     out = json.loads(text)
     assert out["roles"]["client"]["stations"] == 4
@@ -495,107 +499,6 @@ def test_delivery(run, tmp_path):
     assert [r["radio_hops"] for r in rows] == [1, 1, 2]
 
 
-def test_delivery_counts_each_sender_by_its_own_stations_logs(tmp_path):
-    """A station configured with rncfg logs no message id: a send is the first
-    message its sender logged to that recipient from when it was due, a proof
-    closes it, and a log is placed in T at the station's hello, a restart's
-    section at its own. When a send was due is the driver's schedule, not when
-    its tool answered."""
-    run = lay_out(tmp_path, kind="sergeyculum")
-    with open(os.path.join(run.dir, "record.tsv"), "a", encoding="utf-8") as handle:
-        handle.write("30.000000\tin\t4\t%s\n" % json.dumps(
-            {"type": "hello", "sid": 4, "slots": [0], "t": 0}, separators=(",", ":")))
-    boot = "  0.000000 [INFO] sim-mesh 0.1: station %d in d, bound to a, ether e"
-    logs = {
-        "n01": [boot % 1,
-                "  5.100000 [INFO] [lxmf] sent 42 B to 02020202 iface0 — waiting for its proof",
-                "  7.300000 [INFO] [lxmf] the message to 02020202 was delivered (proof ok)",
-                " 20.500000 [INFO] [lxmf] sent 42 B to 02020202 iface0 — waiting for its proof",
-                " 50.000000 [WARN] [lxmf] no proof for the message to 02020202 after 3 attempt(s)"
-                " — giving up on it"],
-        "n02": [boot % 2,
-                "  5.900000 [INFO] [lxmf] nobody answered for 01010101 — the held message is "
-                "dropped"],
-        "n04": [boot % 4,
-                "  1.000000 [INFO] [lxmf] sent 42 B to 03030303 iface0 — waiting for its proof",
-                boot % 4,
-                "  2.000000 [INFO] [lxmf] sent 42 B to 03030303 iface0 — waiting for its proof",
-                "  4.000000 [INFO] [lxmf] the message to 03030303 was delivered (proof ok)"]}
-    for name, lines in logs.items():
-        os.makedirs(run.node_dir(name), exist_ok=True)
-        with open(os.path.join(run.node_dir(name), "log"), "w") as handle:
-            handle.write("\n".join(lines) + "\n")
-    dests = {"n01": "01" * 16, "n02": "02" * 16, "n03": "03" * 16, "n04": "04" * 16}
-    # Traffic starts at T 3 s, so a send is due at 4 s + its `at`. The first
-    # one's tool answered only when the proof was in, at 7.4 s.
-    drive = {"dests": dests, "phases": [["traffic_start", 0.0, 3_000_000]], "sends": [
-        {"marker": "G0001", "src": "n01", "dst": "n02", "cls": "short", "hops": 1,
-         "at": 1.0, "t_sent": 7_400_000},
-        {"marker": "G0002", "src": "n02", "dst": "n01", "cls": "two", "hops": None,
-         "at": 2.0, "t_sent": 6_000_000},
-        {"marker": "G0003", "src": "n03", "dst": "n04", "cls": "big", "at": 3.0,
-         "t_sent": 7_000_000, "reply": "error: send: this board has heard no announce"},
-        {"marker": "G0004", "src": "n01", "dst": "n02", "cls": "short", "hops": 1,
-         "at": 16.0, "t_sent": 20_000_000},
-        {"marker": "G0005", "src": "n04", "dst": "n03", "cls": "short", "hops": 1,
-         "at": 27.5, "t_sent": 31_500_000}]}
-    path = tmp_path / "traffic.json"
-    path.write_text(json.dumps(drive))
-    code, text = call(delivery.main, [str(path), run.dir])
-    out = json.loads(text)
-    assert code == 0 and out["sent"] == 5 and out["delivered"] == 2
-    assert out["latency_s"]["min"] == pytest.approx(2.3)        # 7.3 after it was due at 5.0
-    assert out["latency_s"]["max"] == pytest.approx(2.5)        # the restart's: 30 + 4 - 31.5
-    words = dict(out["undelivered_last_word"])
-    assert words.get("gave up") == 1
-    assert words.get("no path: nobody answered") == 1
-    assert any(w.startswith("not sent: error: send") for w in words)
-
-
-def test_a_send_is_its_own_outcome_however_late_and_a_refused_one_takes_none(tmp_path):
-    """A message held for a path, or behind a tool waiting on another's proof,
-    goes out long after it was due and is still that send's; a send the tool
-    refused takes nothing, so the next one keeps its own outcome."""
-    run = lay_out(tmp_path, kind="sergeyculum")
-    boot = "  0.000000 [INFO] sim-mesh 0.1: station %d in d, bound to a, ether e"
-    os.makedirs(run.node_dir("n01"), exist_ok=True)
-    with open(os.path.join(run.node_dir("n01"), "log"), "w") as handle:
-        handle.write("\n".join([
-            boot % 1,
-            "300.000000 [INFO] [lxmf] sent 42 B to 02020202 iface0 — waiting for its proof",
-            "303.000000 [INFO] [lxmf] the message to 02020202 was delivered (proof ok)",
-            "400.000000 [INFO] [lxmf] nobody answered for 02020202 — the held message is dropped",
-        ]) + "\n")
-    dests = {"n01": "01" * 16, "n02": "02" * 16, "n03": "03" * 16, "n04": "04" * 16}
-    drive = {"dests": dests, "phases": [["traffic_start", 0.0, 3_000_000]], "sends": [
-        {"marker": "G0001", "src": "n01", "dst": "n02", "cls": "short", "at": 1.0},
-        {"marker": "G0002", "src": "n01", "dst": "n02", "cls": "short", "at": 2.0,
-         "reply": "! error: send: the board is already holding as many messages as it can"},
-        {"marker": "G0003", "src": "n01", "dst": "n02", "cls": "short", "at": 3.0,
-         "reply": "asking  : the board has no path yet and is asking for one"}]}
-    path = tmp_path / "traffic.json"
-    path.write_text(json.dumps(drive))
-    code, text = call(delivery.main, [str(path), run.dir])
-    out = json.loads(text)
-    assert code == 0 and out["sent"] == 3 and out["delivered"] == 1
-    assert out["latency_s"]["min"] == pytest.approx(298.0)     # due at 5, proved at 303
-    words = dict(out["undelivered_last_word"])
-    assert words.get("no path: nobody answered") == 1
-    assert any(w.startswith("not sent: ! error: send: the board is already holding") for w in words)
-
-
-def test_a_real_time_record_is_not_counted_for_rncfg_stations(tmp_path):
-    """Their logs are placed in T at the hellos, which a real-time record
-    stamps with the wall clock: refused rather than miscounted."""
-    from sim_mesh.reticulum import rncfg_delivery
-    path = tmp_path / "record.tsv"
-    path.write_text("# 2026-09-29T00:00:00+00:00\tether record: stamp\tdir\tsid\tjson\n"
-                    "2026-09-29T23:59:59.000000+00:00\tin\t1\t"
-                    '{"sid":1,"slots":[0],"t":0,"type":"hello"}\n')
-    with pytest.raises(ValueError, match="virtual time only"):
-        rncfg_delivery.hellos(str(path))
-
-
 def test_a_record_read_for_some_types_is_those_lines_of_it_read_whole(tmp_path):
     """`lines(path, types)` passes over the lines it cannot want unparsed:
     what it gives is exactly what reading every line gives, of those types,
@@ -698,8 +601,9 @@ class FakeSim:
     snapshot with the stations up, and commands and intents answered by the
     stations chosen, each answer carrying the asker's id."""
 
-    def __init__(self, names, failing_sequences=0):
+    def __init__(self, names, categories=None, failing_sequences=0):
         self.names = names
+        self.categories = categories or {}      # name -> category, reticulum unless said
         self.got = []
         self.turns = []                 # drive and yield, as they came
         # The first this many sequences (a message's route and send) fail on
@@ -707,15 +611,27 @@ class FakeSim:
         self.failing_sequences = failing_sequences
         self.sequences = 0
 
+    @staticmethod
+    def reply(m, i):
+        """A line's printed answer, or what a verb returns."""
+        if m["type"] == "command":
+            return "did %s" % m["line"]
+        table = [{"dest": ("%02d" % k) * 16, "next_hop": ("%02d" % k) * 16, "iface": "lora/0",
+                  "hops": 1} for k in range(3)]
+        return {"lxmf.identities": [["n%02d" % i, ("%02d" % i) * 16]], "path": table,
+                "lxmf.announce": None, "lxmf.send": "mid-%d" % i,
+                "diagnostics": {"paths": "3"}}.get(m["verb"])
+
     async def handle(self, request):
         from aiohttp import web
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         await ws.send_json({"type": "snapshot", "clock": {"t": 1_000_000},
                             "run": {"dir": "/runs/fake"},
-                            "nodes": [{"name": n, "id": i + 1, "status": "up", "kind": "reticulous",
-                                       "firmware": "reticulous_dev_latest", "max_dbm": 22,
-                                       "tags": ["even"] if i % 2 else []}
+                            "nodes": [{"name": n, "id": i + 1, "status": "up", "base": "alpha",
+                                       "category": self.categories.get(n, "reticulum"),
+                                       "firmware": "alpha_latest",
+                                       "max_dbm": 22, "tags": ["even"] if i % 2 else []}
                                       for i, n in enumerate(self.names)]})
         async for msg in ws:
             m = json.loads(msg.data)
@@ -737,13 +653,11 @@ class FakeSim:
                                         "error": "rncfg gave no answer in 10s", "t": 2_000_000})
                 else:
                     await ws.send_json({"type": "command_result", "id": m.get("id"), "t": 2_000_000,
-                                        "results": [{n: "no route" for n in who},
-                                                    {n: "queued %032x" % 7 for n in who}]})
+                                        "results": [{n: [] for n in who},
+                                                    {n: "%032x" % 7 for n in who}]})
             if m["type"] in ("command", "meta"):
                 who = [m["name"]] if m.get("name") else m.get("names") or self.names
-                line = m.get("line") or m.get("verb")
-                results = {n: (("%02d" % i) * 16 if line == "address" else "3 paths total")
-                           for i, n in enumerate(who)}
+                results = {n: self.reply(m, i) for i, n in enumerate(who)}
                 await ws.send_json({"type": "command_result", "id": m.get("id"),
                                     "name": m.get("name"), "t": 2_000_000, "results": results})
         return ws
@@ -778,9 +692,9 @@ def test_a_driver_chooses_stations_and_asks_them(tmp_path):
         assert sim.run_dir == "/runs/fake" and sim.run_s == 0
         await sim.all_up()
         evens = sim.nodes(tag="even")
-        assert evens.names == ["n02"] and len(sim.nodes(kind="reticulous")) == 3
-        assert await evens.announce(spread=30) == {"n02": "3 paths total"}
-        assert await sim.node("n01").run("x", after=2) == {"n01": "3 paths total"}
+        assert evens.names == ["n02"] and len(sim.nodes(category="reticulum")) == 3
+        assert await evens.verb("lxmf.announce", "reticulum", spread=30) == {"n02": None}
+        assert await sim.node("n01").run("x", after=2) == {"n01": "did x"}
         assert sim.pairs(sample=2, seed=1) == sim.pairs(sample=2, seed=1)
         assert len(sim.pairs()) == 6
         with pytest.raises(sim_mesh.SimError):
@@ -790,24 +704,64 @@ def test_a_driver_chooses_stations_and_asks_them(tmp_path):
     with_fake_sim(fake, drive)
     assert fake.turns[0] == "drive"
     meta = [m for m in fake.got if m["type"] == "meta"][0]
-    assert meta["verb"] == "announce" and meta["names"] == ["n02"] and meta["stagger"] == 30
+    assert meta["verb"] == "lxmf.announce" and meta["names"] == ["n02"] and meta["stagger"] == 30
+    assert meta["category"] == "reticulum"
     command = [m for m in fake.got if m["type"] == "command"][0]
     assert command["names"] == ["n01"] and command["after"] == 2
     assert [m for m in fake.got if m["type"] == "plan"][0]["phases"] == [
         {"name": "warm", "until": 11_000_000}]
 
 
+class GoneSim(FakeSim):
+    """A simulation the front stops under a driver: the registry lists it
+    running, then, when the driver asks anything, no longer running, while
+    the socket to the front stays open and nothing is answered."""
+
+    async def handle(self, request):
+        from aiohttp import web
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_json({"type": "snapshot", "clock": {"t": 1_000_000},
+                            "run": {"dir": "/runs/fake"},
+                            "nodes": [{"name": n, "status": "up"} for n in self.names]})
+        await ws.send_json({"type": "sims", "sims": [{"name": "fake", "state": "running"}]})
+        async for msg in ws:
+            m = json.loads(msg.data)
+            if m["type"] in ("drive", "yield"):
+                continue
+            self.got.append(m)
+            await ws.send_json({"type": "sims", "sims": [{"name": "fake", "state": "exited"},
+                                                         {"name": "other", "state": "running"}]})
+        return ws
+
+
+def test_a_driver_hears_its_simulation_go_while_the_front_stays():
+    fake = GoneSim(["n01"])
+
+    async def drive(sim):
+        await asyncio.sleep(0.2)
+        sim.check()                 # listed running: still there
+        with pytest.raises(sim_mesh.SimError, match="went away"):
+            await asyncio.wait_for(sim.node("n01").run("x"), 5)
+        with pytest.raises(sim_mesh.SimError, match="went away"):
+            await asyncio.wait_for(sim.until(3600), 5)
+        with pytest.raises(sim_mesh.SimError, match="went away"):
+            await sim.node("n01").run("y")
+
+    with_fake_sim(fake, drive)
+    assert [m.get("line") for m in fake.got] == ["x"]
+
+
 def test_the_traffic_driver_runs_on_a_sim(tmp_path):
     fake = FakeSim(["n01", "n02"])
     out = tmp_path / "out.json"
-    opts = {"warm_rounds": 1, "warm_spread": 0, "settle_every": 1, "traffic": 0, "drain": 0,
-            "gather": {"reticulous": ["rnpath -s"]}}
+    opts = {"warm_rounds": 1, "warm_spread": 0, "settle_every": 1, "traffic": 0, "drain": 0}
     result = with_fake_sim(fake, lambda sim: rtraffic.run_on(sim, opts, str(out)))
     metas = [m["verb"] for m in fake.got if m["type"] == "meta"]
-    assert metas[:2] == ["address", "announce"]
+    assert metas[:3] == ["lxmf.identities", "lxmf.announce", "path"]
     assert sorted(result["dests"]) == ["n01", "n02"]
     assert result["warm"]["samples"][-1]["total"] == 6
-    assert result["gathered"]["reticulous: rnpath -s"]["results"]["n01"] == "3 paths total"
+    assert result["gathered"]["results"]["n01"] == {"paths": "3"}
     assert json.loads(out.read_text())["phases"][-1][0] == "gathered"
     with pytest.raises(ValueError, match="no traffic option"):
         rtraffic.Options(colour="blue")
@@ -826,14 +780,15 @@ def test_a_message_whose_send_fails_is_recorded_so_and_the_rest_go_on(tmp_path):
     assert all("error" not in s and s["mid"] == "%032x" % 7 for s in sends[1:])
 
 
-def test_a_script_says_it_synchronously(monkeypatch):
+def test_a_script_says_it_synchronously(monkeypatch, tmp_path):
     """The library as a script uses it: plain calls, on a simulation held
-    on a loop of its own, its rules said once it is attached."""
+    on a loop of its own, its rules said once it is attached, its commands
+    in the run's scripts.log at that level."""
     from aiohttp import web
 
     from sim_mesh import library
 
-    fake = FakeSim(["n01", "n02", "n03"])
+    fake = FakeSim(["n01", "n02", "n03", "m04"], {"m04": "meshcore"})
     loop = asyncio.new_event_loop()
     started = threading.Event()
     port = []
@@ -854,32 +809,51 @@ def test_a_script_says_it_synchronously(monkeypatch):
     started.wait(10)
     fresh = library.Runtime()
     monkeypatch.setattr(library, "runtime", fresh)
-    fresh.configure(sim="fake", port=port[0])
+    fresh.configure(script_name="smoke", sim="fake", port=port[0])
+    Node, nodes, node = library.Node, library.nodes, library.node
+    reticulum = ["n01", "n02", "n03"]
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            library.firmware("all", "reticulous_dev_latest")
-            library.on_first_boot(library.nodes(tag="even"), "lxmf create {name}")
-            assert library.up("all") == ["n01", "n02", "n03"]
-            assert library.exec(library.nodes(tag="even"), "one\ntwo") == {
-                "n02": "3 paths total\n3 paths total"}
-            assert library.announce("all", spread=30) == {n: "3 paths total"
-                                                           for n in ("n01", "n02", "n03")}
-            later = library.send_msg("n01", "n03", "hi", after=5, wait=False)
-            assert later.result(10) == {"n01": "3 paths total"}
-            library.max_tx_pwr("n01")
-            assert library.station("n02")["max_dbm"] == 22
+            nodes().firmware("alpha_latest")
+            nodes(tag="even").on_first_boot(Node.radio(sf=9), "log rnsd debug",
+                                            Node.reticulum.lxmf.create())
+            assert nodes().up() == reticulum + ["m04"]
+            fresh.open_log(str(tmp_path))
+            library.script_loglevel("commands")
+            assert nodes(tag="even").exec("one\ntwo") == {"n02": "did one\ndid two",
+                                                          "m04": "did one\ndid two"}
+            # A Reticulum command is nothing to the meshcore node.
+            assert nodes().reticulum.lxmf.announce(spread=30) == {n: None for n in reticulum}
+            later = node("n01").reticulum.lxmf.send("n03", "hi", after=5, wait=False)
+            assert library.script_results([later]) == [{"n01": "mid-0"}]
+            assert node("n02").reticulum.path(to="n03")["n02"][0]["hops"] == 1
+            nodes().radio(tx_dbm="max")
+            assert node("n02").facts()["n02"]["max_dbm"] == 22
+            with pytest.raises(library.ScriptError, match="no reticulum node"):
+                node("m04").reticulum.role("client")
+            with pytest.raises(library.ScriptError, match="no spread, after or wait"):
+                Node.radio_up(after=3)
             with pytest.raises(library.ScriptError, match="comes before"):
-                library.time("max")
+                library.sim_speed("max")
     finally:
         fresh.close()
         loop.call_soon_threadsafe(loop.stop)
     kinds = [m["type"] for m in fake.got]
     assert kinds[:2] == ["firmware", "first_boot"]
-    metas = [(m["verb"], m.get("args")) for m in fake.got if m["type"] == "meta"]
-    assert ("message", {"to": "n03", "text": "hi"}) in metas
-    assert ("tx_power", {"dbm": 22.0}) in metas
-    sent = [m for m in fake.got if m["type"] == "meta" and m["verb"] == "message"][0]
-    assert sent["after"] == 5 and sent["names"] == ["n01"]
+    assert fake.got[1]["rules"][0]["lines"] == [
+        {"verb": "radio", "args": {"sf": 9}}, "log rnsd debug",
+        {"verb": "lxmf.create", "args": {}, "category": "reticulum"}]
+    metas = [m for m in fake.got if m["type"] == "meta"]
+    announce = [m for m in metas if m["verb"] == "lxmf.announce"][0]
+    assert announce["names"] == reticulum and announce["category"] == "reticulum"
+    sent = [m for m in metas if m["verb"] == "lxmf.send"][0]
+    assert sent["args"] == {"to": "n03", "text": "hi"} and sent["after"] == 5
+    assert sent["names"] == ["n01"]
+    radio = [m for m in metas if m["verb"] == "radio"][0]
+    assert radio["args"] == {"tx_dbm": "max"} and "category" not in radio
+    logged = (tmp_path / "scripts.log").read_text()
+    assert " smoke node('n01').reticulum.lxmf.send(to='n03', text='hi') → " in logged
+    assert "exec(['one', 'two'])" in logged
 
 
 def test_the_schedule_is_the_seed_s():

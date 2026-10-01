@@ -10,9 +10,9 @@ testbed/ui/dist/
 testbed/ui/node_modules/
 testbed/ui/.quasar/
 radio/build/
+ether/build/
 planner/target/
-/devices/*
-!/devices/local/
+/firmware/
 __pycache__/
 .pytest_cache/
 ether/build/

@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+# sim — sim-mesh, the simulated testbed, from a shell.
+#
+#     sim [front] [FRONT-ARGS…]        start the front on port 8800 and open the page,
+#                                      first building whichever of the page, the chip
+#                                      library, the ether's conductor and the planner
+#                                      is missing or older than a file of its sources
+#     sim dev [FRONT-ARGS…]            the same, for working on the page: the page
+#                                      served live from its sources, on the same
+#                                      port, each edit in the browser at once; the
+#                                      front's own Python is read when it starts,
+#                                      so a change to it wants a restart
+#     sim new [NAME] (--geodata G --nodeset N | --snapshot S)
+#             [--time max|<k>x|real] [--stagger N] [--build B] [--pairwise]
+#                                      start a simulation (and the front, when none runs);
+#                                      prints its name, sockets and run directory as JSON
+#     sim stop NAME                    stop a simulation; a paused one's state is deleted
+#     sim pause NAME                   stop one with its state kept, to be resumed
+#     sim resume NAME [--time T]       start a paused one again as it ended, in real time
+#                                      unless --time says otherwise
+#     sim list [--json]                the simulations, with their clocks and plans
+#     sim plan NAME PHASE=UNTIL…       tell a simulation its phases (UNTIL in seconds
+#                                      of T; +N is N after now)
+#     sim run SCRIPT (--sim NAME | --resume NAME
+#                     | --geodata G --nodeset N [--nodeset N2…] [--name S]) [--set INPUT=VALUE…]
+#                                      a script, top to end, on a simulation of its own
+#                                      (several nodesets merged), a running one or a
+#                                      paused one it resumes, then its report; --set
+#                                      gives its inputs. SCRIPT is a path or one of
+#                                      testbed/scripts/ by name
+#     sim run SCRIPT --report RUN_DIR  only the script's report of an ended run
+#     sim firmware add ZIP|URL…        install firmware zips into firmware/
+#     sim firmware list [SUBSTRING]    the installed firmware whose name holds SUBSTRING
+#     sim firmware delete [-f] SUBSTRING
+#                                      remove the installed firmware whose name holds
+#                                      SUBSTRING, after listing it for confirmation
+#                                      (-f: none); a paused run's or a snapshot's is kept
+#     sim firmware prebuilt            what sim-mesh.net offers for this machine
+#     sim firmware resolve NAME        what a firmware name runs, as JSON
+#
+# The simulation verbs (new, stop, pause, resume, list, plan, run) take --port, the front's
+# (default 8800).
+#
+# `sim run` and `sim new` start the front in the background when none answers
+# (its log in testbed/runs/front.log, or the container's), and `sim run` opens
+# the page on the run's live map, or on the Scripts tab with the script open
+# when it lacks an input or a simulation to run on, unless --no-browser.
+#
+# Everything runs inside sim-mesh's own image (Dockerfile beside this script),
+# in Podman, or in Docker when Podman is not installed: the image is the system a firmware
+# may count on. It is built on first use and again whenever the Dockerfile
+# changes; the directory holding sim-mesh is mounted at its own path, so a
+# workspace beside it is where a workspace build expects it, and port 8800 is
+# published for TCP and UDP. The front's container is called sim-mesh-front,
+# and the simulation verbs run inside it. SIM_MESH_NATIVE=1 runs everything on
+# this machine instead, for working on sim-mesh itself on Linux.
+#
+# Ctrl-C stops everything this started in the foreground: the front is asked
+# to stop (it stops its simulations, and every child dies with it), and
+# anything still in this script's process group when it exits is terminated.
+#
+# Environment:
+#     SIM_MESH_ENGINE      podman or docker (default: podman when it is
+#                          installed, else docker)
+#     SIM_MESH_NATIVE=1    no container: run on this machine, Linux only
+#     SIM_MESH_PYTHON      natively, the python3 to run (default: the first of
+#                          python3, /usr/bin/python3 that has aiohttp and yaml)
+#     SIM_MESH_FIRMWARE_INDEX
+#                          where pre-built firmware is listed
+#                          (default https://sim-mesh.net/firmware/)
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PORT=8800
+URL="http://localhost:$PORT/"
+DEV_PORT=9000                       # `sim dev`: the page's development server, inside only
+PLANNER=$ROOT/planner
+FRONT_CONTAINER=sim-mesh-front
+
+say() { printf 'sim: %s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
+
+usage() { sed -n '2,/^$/{s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
+
+# ---- the container ------------------------------------------------------------
+
+want_container() {
+    [ -z "${SIM_MESH_IN_CONTAINER:-}" ] && [ -z "${SIM_MESH_NATIVE:-}" ]
+}
+
+# The container engine, in ENGINE: SIM_MESH_ENGINE, else podman when it is
+# installed, else docker. The one chosen must answer: a Podman machine not
+# started, or a Docker daemon down, is said, and nothing else is tried.
+ENGINE=
+resolve_engine() {
+    [ -z "$ENGINE" ] || return 0
+    local e=${SIM_MESH_ENGINE:-}
+    if [ -z "$e" ]; then
+        if command -v podman >/dev/null; then e=podman
+        elif command -v docker >/dev/null; then e=docker
+        else die "sim-mesh runs in a container, and neither podman nor docker is installed (SIM_MESH_NATIVE=1 runs it on this machine, Linux only)"
+        fi
+    fi
+    command -v "$e" >/dev/null || die "SIM_MESH_ENGINE is $e, which is not installed"
+    "$e" info >/dev/null 2>&1 || die "$e does not answer: is it running? (podman: podman machine start; docker: start Docker)"
+    ENGINE=$e
+}
+
+# Whether something answers on the front's port, or on PORT when given.
+front_up() {
+    (exec 3<>"/dev/tcp/127.0.0.1/${1:-$PORT}") 2>/dev/null
+}
+
+# The command that opens a URL in this machine's browser, or nothing.
+opener() {
+    case "$(uname -s)" in
+        Darwin) echo open ;;
+        *) if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v xdg-open >/dev/null; then
+               echo xdg-open
+           fi ;;
+    esac
+}
+
+# open_when_up URL: open the page in a browser once the front answers, from a
+# background subshell, so the caller goes straight on to supervising it.
+open_when_up() {
+    local o
+    o=$(opener)
+    [ -n "$o" ] || return 0
+    (
+        for _ in $(seq 1 1200); do
+            if front_up; then
+                "$o" "$1" >/dev/null 2>&1 || true
+                exit 0
+            fi
+            sleep 0.5
+        done
+    ) &
+}
+
+# in_container MODE ARGS…: `./sim ARGS…` in sim-mesh's image. MODE is tools (a
+# verb of its own, nothing published), front (the front, in the foreground),
+# daemon (the front, in the background) or dev (`sim dev`, in the foreground).
+in_container() {
+    local mode=$1; shift
+    local e tag image
+    resolve_engine
+    e=$ENGINE
+    tag=$(cksum < "$ROOT/Dockerfile" | cut -d' ' -f1)
+    image="sim-mesh:$tag"
+    if ! "$e" image inspect "$image" >/dev/null 2>&1; then
+        say "building the sim-mesh image ($image) with ${e}…"
+        "$e" build -t "$image" "$ROOT"
+    fi
+    local outer
+    outer=$(cd "$ROOT/.." && pwd)
+    local args=(run --rm --init
+                -v "$outer:$outer" -w "$ROOT"
+                -v sim-mesh-home:/home/sim-mesh -e HOME=/home/sim-mesh
+                -e SIM_MESH_IN_CONTAINER=1)
+    # What it writes in the mounted tree is the host user's: Docker runs as
+    # that uid; rootless Podman maps it so.
+    if [ "$e" = podman ]; then args+=(--userns=keep-id); else args+=(--user "$(id -u):$(id -g)"); fi
+    [ -z "${SIM_MESH_FIRMWARE_INDEX:-}" ] \
+        || args+=(-e "SIM_MESH_FIRMWARE_INDEX=$SIM_MESH_FIRMWARE_INDEX")
+    if [ "$mode" = tools ]; then
+        args+=(-i)
+        [ -t 0 ] && [ -t 1 ] && args+=(-t)
+    else
+        # One front at a time: a running one is said so, and one left behind
+        # stopped (--rm did not get to it) is cleared out of the name's way.
+        if [ -n "$("$e" ps -q -f "name=^${FRONT_CONTAINER}\$")" ]; then
+            die "a front is already running ($FRONT_CONTAINER): to restart it, $e stop $FRONT_CONTAINER first"
+        fi
+        if [ -n "$("$e" ps -aq -f "name=^${FRONT_CONTAINER}\$")" ]; then
+            "$e" rm -f "$FRONT_CONTAINER" >/dev/null
+        fi
+        args+=(--name "$FRONT_CONTAINER" -p "$PORT:$PORT/tcp" -p "$PORT:$PORT/udp")
+        if [ "$mode" = daemon ]; then
+            args+=(-d)
+        else
+            args+=(-i)
+            [ -t 0 ] && [ -t 1 ] && args+=(-t)
+            # Edits on a Mac or Windows reach a container as no file events:
+            # `sim dev`'s server looks for them itself.
+            [ "$mode" != dev ] || args+=(-e CHOKIDAR_USEPOLLING=1)
+            say "the page: $URL"
+            open_when_up "$URL"
+        fi
+    fi
+    "$e" "${args[@]}" "$image" ./sim "$@"
+}
+
+# in_front VERB…: a simulation verb inside the running front's container,
+# where the front's port is its own.
+in_front() {
+    local e
+    resolve_engine
+    e=$ENGINE
+    [ -n "$("$e" ps -q -f "name=^${FRONT_CONTAINER}\$")" ] \
+        || die "no front running: start it with sim"
+    # The shell's directory when the container has it, so a path given is the same path.
+    local outer here=$ROOT
+    outer=$(cd "$ROOT/.." && pwd)
+    case "$PWD/" in "$outer"/*) here=$PWD ;; esac
+    local args=(exec -i -w "$here") kv
+    [ -t 0 ] && [ -t 1 ] && args+=(-t)
+    # An empty array is unbound to bash before 4.4 (a Mac's), hence the guard.
+    for kv in ${EXEC_ENV[@]+"${EXEC_ENV[@]}"}; do args+=(-e "$kv"); done
+    "$e" "${args[@]}" "$FRONT_CONTAINER" ./sim "$@"
+}
+
+# ensure_front: a front answering on the port, started in the background when
+# none does, building what it needs first (natively), or in its container.
+ensure_front() {
+    front_up && return 0
+    if want_container; then
+        say "starting the front in the background ($FRONT_CONTAINER)"
+        in_container daemon front >/dev/null
+    else
+        build_stale
+        local py log="$ROOT/testbed/runs/front.log"
+        py=$(pick_python)
+        mkdir -p "$ROOT/testbed/runs"
+        say "starting the front in the background (log: $log)"
+        setsid -f "$py" "$ROOT/testbed/front.py" --bind "0.0.0.0:$PORT" >>"$log" 2>&1 </dev/null
+    fi
+    say "waiting for the front (a first start builds the page, the radio, the ether's conductor and the planner)"
+    local waited=0
+    until front_up; do
+        sleep 1
+        waited=$((waited + 1))
+        [ "$waited" -lt 1800 ] || die "the front did not come up: see its log"
+    done
+}
+
+# relay_pages: the runner's output as it comes, and each page it says
+# (`page: <url>`) opened in this machine's browser, unless NO_BROWSER.
+relay_pages() {
+    local line o
+    o=$(opener)
+    while IFS= read -r line; do
+        printf '%s\n' "$line"
+        case "$line" in
+            "page: "*) [ -n "$NO_BROWSER" ] || [ -z "$o" ] || "$o" "${line#page: }" >/dev/null 2>&1 || true ;;
+        esac
+    done
+}
+
+# ---- native -------------------------------------------------------------------
+
+pick_python() {
+    local p
+    for p in "${SIM_MESH_PYTHON:-}" python3 /usr/bin/python3; do
+        [ -n "$p" ] && command -v "$p" >/dev/null || continue
+        if "$p" -c 'import aiohttp, yaml' 2>/dev/null; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
+    die "no python3 with aiohttp and pyyaml (set SIM_MESH_PYTHON, or install python3-aiohttp python3-yaml)"
+}
+
+# stale DIR OUT… [-- SKIP…]: true when an OUT is missing or a file under DIR,
+# outside the SKIP directories (relative to DIR), hidden directories and
+# __pycache__, is newer than it.
+stale() {
+    local dir=$1; shift
+    local outs=() prune=(-type d \( -name '.?*' -o -name __pycache__ \) -prune -o)
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do outs+=("$1"); shift; done
+    [ $# -eq 0 ] || shift
+    local s
+    for s in "$@"; do prune+=(-path "$dir/$s" -prune -o); done
+    local out
+    for out in "${outs[@]}"; do
+        [ -e "$out" ] || return 0
+        [ -z "$(find "$dir" "${prune[@]}" -type f -newer "$out" -print -quit)" ] || return 0
+    done
+    return 1
+}
+
+page_stale() {
+    stale "$ROOT/testbed/ui" "$ROOT/testbed/ui/dist/spa/index.html" -- node_modules dist
+}
+
+radio_stale() {
+    stale "$ROOT/radio" "$ROOT/radio/build/libsimclock.so" \
+          "$ROOT/radio/build/libsimradio-sx1262.so" -- build tests portduino
+}
+
+planner_stale() {
+    stale "$PLANNER" "$PLANNER/target/release/planner-web" "$PLANNER/target/release/planner-job" -- target
+}
+
+ether_stale() {
+    stale "$ROOT/ether/core" "$ROOT/ether/build/ether_core.abi3.so" -- target
+}
+
+build_page() {
+    local ui="$ROOT/testbed/ui"
+    command -v npm >/dev/null || die "the page needs node and npm"
+    say "the page: npm install"
+    (cd "$ui" && npm install --no-fund --no-audit)
+    say "the page: quasar build"
+    (cd "$ui" && npx quasar build)
+}
+
+build_radio() {
+    command -v cmake >/dev/null || die "the chip library needs cmake and a C compiler"
+    say "the chip library and the time shim: cmake"
+    # A cache configured for the tree at another path (moved, or mounted
+    # elsewhere in the image) is configured again from scratch.
+    local cache="$ROOT/radio/build/CMakeCache.txt" fresh=()
+    if [ -f "$cache" ] && ! grep -qxF "CMAKE_HOME_DIRECTORY:INTERNAL=$ROOT/radio" "$cache"; then
+        fresh=(--fresh)
+    fi
+    cmake ${fresh[@]+"${fresh[@]}"} -S "$ROOT/radio" -B "$ROOT/radio/build"
+    cmake --build "$ROOT/radio/build" -j "$(nproc 2>/dev/null || echo 2)"
+    # Up to date now, whichever sources the build found nothing to redo for.
+    touch "$ROOT/radio/build/libsimclock.so" "$ROOT/radio/build/libsimradio-sx1262.so"
+}
+
+# The ether's conductor in Rust (ether/core), a Python extension module the
+# ether loads from ether/build/; without it the ether's own conductor, in
+# Python, runs a virtual-time run, and gives the same run.
+build_ether() {
+    command -v cargo >/dev/null || die "the ether's conductor needs cargo"
+    say "the ether's conductor: ether_core (cargo build --release)"
+    (cd "$ROOT/ether/core" && PYO3_PYTHON="$(pick_python)" \
+        cargo build --release --target-dir "$ROOT/ether/build/target")
+    cp "$ROOT/ether/build/target/release/libether_core.so" "$ROOT/ether/build/ether_core.abi3.so"
+}
+
+# planner-web embeds planner-wasm's output (crates/planner-web/static), so the
+# wasm goes first when wasm-pack is there; without it, planner-web embeds the
+# output already in the tree.
+build_planner() {
+    command -v cargo >/dev/null || die "the planner needs cargo"
+    local static="$PLANNER/crates/planner-web/static"
+    if command -v wasm-pack >/dev/null; then
+        say "the planner: planner-wasm (wasm-pack)"
+        local out
+        out=$(mktemp -d)
+        if ! (cd "$PLANNER" && wasm-pack build crates/planner-wasm --release --target web \
+                  --out-dir "$out" --out-name planner_wasm); then
+            rm -rf -- "$out"
+            die "planner-wasm did not build"
+        fi
+        cp "$out/planner_wasm.js" "$out/planner_wasm_bg.wasm" \
+           "$out/planner_wasm.d.ts" "$out/planner_wasm_bg.wasm.d.ts" "$static/"
+        rm -rf -- "$out"
+        # The page renders the base map with the same build, from its own copy.
+        if command -v node >/dev/null; then
+            node "$ROOT/testbed/ui/vendor/update-planner-wasm.mjs" "$PLANNER"
+        fi
+    else
+        say "the planner: no wasm-pack, so planner-web embeds the planner-wasm output already in $static"
+    fi
+    say "the planner: planner-web and planner-job (cargo build --release)"
+    (cd "$PLANNER" && cargo build --release -p planner-web -p planner-job)
+    touch "$PLANNER/target/release/planner-web" "$PLANNER/target/release/planner-job"
+}
+
+# Terminate whatever is still in this script's process group, the browser
+# opener included, ignoring the TERM this shell sends itself.
+sweep_group() {
+    local pgid
+    pgid=$(awk '{print $5}' "/proc/$$/stat" 2>/dev/null || true)
+    # Only a group this script leads is ours to sweep; started from inside
+    # another program, the group is that program's.
+    [ "$pgid" = "$$" ] || return 0
+    trap '' TERM
+    kill -TERM -- "-$$" 2>/dev/null || true
+}
+
+# Whichever of the radio, the ether's conductor, the planner and the page is
+# missing or older than its sources, built.
+build_stale() {
+    ! radio_stale || build_radio
+    stale_ether
+    # The planner first: its wasm lands in the page's vendor/, which the page
+    # then builds from.
+    ! planner_stale || (build_planner) \
+        || say "the planner did not build; synthetic ground works, and a pack is refused saying so"
+    ! page_stale || build_page \
+        || say "the page did not build; the front will say so when it is opened"
+}
+
+# The ether's conductor built when stale and cargo is there; without it the
+# Python one runs.
+stale_ether() {
+    ! ether_stale || { command -v cargo >/dev/null && build_ether; } \
+        || say "the ether's conductor in Rust is not built; its Python one runs"
+}
+
+cmd_front() {
+    local py
+    py=$(pick_python)
+    build_stale
+    say "the page: $URL"
+    [ -n "${SIM_MESH_IN_CONTAINER:-}" ] || open_when_up "$URL"
+    "$py" "$ROOT/testbed/front.py" --bind "0.0.0.0:$PORT" "$@" &
+    local front=$!
+    trap 'kill -TERM "$front" 2>/dev/null || true' INT TERM
+    trap 'sweep_group' EXIT
+    local status=0
+    while kill -0 "$front" 2>/dev/null; do
+        wait "$front" && status=0 || status=$?
+    done
+    return "$status"
+}
+
+# cmd_dev: the front with the page from its development server (`quasar dev`,
+# on DEV_PORT inside), which it passes through on its own port; Ctrl-C stops
+# both.
+cmd_dev() {
+    local py ui="$ROOT/testbed/ui"
+    py=$(pick_python)
+    ! radio_stale || build_radio
+    stale_ether
+    ! planner_stale || (build_planner) \
+        || say "the planner did not build; synthetic ground works, and a pack is refused saying so"
+    command -v npm >/dev/null || die "the page needs node and npm"
+    [ -d "$ui/node_modules" ] || (cd "$ui" && npm install --no-fund --no-audit)
+    (cd "$ui" && exec npx quasar dev --hostname 127.0.0.1 --port "$DEV_PORT") &
+    local page=$!
+    say "the page, live from its sources: $URL"
+    [ -n "${SIM_MESH_IN_CONTAINER:-}" ] || open_when_up "$URL"
+    "$py" "$ROOT/testbed/front.py" --bind "0.0.0.0:$PORT" \
+        --page-dev "http://127.0.0.1:$DEV_PORT" "$@" &
+    local front=$!
+    trap 'kill -TERM "$front" "$page" 2>/dev/null || true' INT TERM
+    trap 'sweep_group' EXIT
+    local status=0
+    while kill -0 "$front" 2>/dev/null; do
+        wait "$front" && status=0 || status=$?
+    done
+    kill -TERM "$page" 2>/dev/null || true
+    return "$status"
+}
+
+cmd_firmware() {
+    local py
+    py=$(pick_python)
+    exec "$py" "$ROOT/testbed/firmware.py" "$@"
+}
+
+cmd_sims() {
+    local py
+    py=$(pick_python)
+    exec "$py" "$ROOT/testbed/simctl.py" "$@"
+}
+
+# The script's own directory stays the working one, so a SCRIPT path is the
+# shell's.
+cmd_run() {
+    local py
+    py=$(pick_python)
+    PYTHONPATH="$ROOT/testbed${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m sim_mesh.runner "$@"
+}
+
+# run_script `run` ARGS…: a script, from this machine's shell. The front is
+# started when none answers, and the pages the runner says are opened here,
+# unless --no-browser; `--report` only writes a report, and needs neither.
+run_script() {
+    local args=() a report=
+    NO_BROWSER=
+    for a in "$@"; do
+        case "$a" in
+            --no-browser) NO_BROWSER=1 ;;
+            --report) report=1; args+=("$a") ;;
+            *) args+=("$a") ;;
+        esac
+    done
+    if [ -z "$report" ]; then
+        ensure_front
+    fi
+    local status
+    set +e +o pipefail
+    if want_container; then
+        EXEC_ENV=(SIM_MESH_SAY_PAGES=1)
+        in_front "${args[@]}" | relay_pages
+        status=${PIPESTATUS[0]}
+    else
+        SIM_MESH_SAY_PAGES=1 cmd_run "${args[@]:1}" | relay_pages
+        status=${PIPESTATUS[0]}
+    fi
+    set -e -o pipefail
+    return "$status"
+}
+
+# ---- dispatch -------------------------------------------------------------------
+
+EXEC_ENV=()
+verb=${1:-}
+case "$verb" in
+    -h|--help|help) usage; exit 0 ;;
+    ""|front|dev|-*|firmware|new|stop|pause|resume|list|plan|run) ;;
+    *) die "no verb '$verb' (sim help lists them)" ;;
+esac
+
+if [ -z "${SIM_MESH_IN_CONTAINER:-}" ]; then
+    case "$verb" in
+        run) run_script "$@"; exit $? ;;
+        new) ensure_front ;;
+    esac
+fi
+
+if want_container; then
+    case "$verb" in
+        firmware) in_container tools "$@" ;;
+        new|stop|pause|resume|list|plan) in_front "$@" ;;
+        front) shift; in_container front "$@" ;;
+        dev) in_container dev "$@" ;;
+        *) in_container front "$@" ;;
+    esac
+    exit $?
+fi
+
+case "$verb" in
+    firmware) shift; [ $# -gt 0 ] || die "firmware: add, list, delete, prebuilt or resolve"; cmd_firmware "$@" ;;
+    new|stop|pause|resume|list|plan) cmd_sims "$@" ;;
+    run) shift; cmd_run "$@" ;;
+    front) shift; cmd_front "$@" ;;
+    dev) shift; cmd_dev "$@" ;;
+    *) cmd_front "$@" ;;
+esac

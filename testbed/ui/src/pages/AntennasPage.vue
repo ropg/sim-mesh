@@ -24,14 +24,14 @@
           <div class="ap-title">{{ chosen.label }}</div>
           <div class="ap-type mono">{{ chosen.type }}</div>
           <div class="ap-desc">{{ chosen.description }}</div>
-          <table class="ap-figs">
+          <table class="ap-figs"><tbody>
             <tr><td>peak gain</td><td>{{ fmt(chosen.peak_dbi) }} dBi</td></tr>
             <tr><td>vertical beamwidth</td><td>{{ chosen.vbw_deg }}°</td></tr>
             <tr v-if="chosen.hbw_deg"><td>horizontal beamwidth</td><td>{{ chosen.hbw_deg }}°</td></tr>
             <tr><td>main lobe</td><td>{{ chosen.tilt_deg ? `${chosen.tilt_deg}° above the horizon` : 'on the horizon' }}</td></tr>
             <tr><td>floor</td><td>{{ chosen.floor_db }} dB below the peak</td></tr>
             <tr><td>kind</td><td>{{ chosen.kind === 'directional' ? 'directional, aimed by its node' : 'omnidirectional' }}</td></tr>
-          </table>
+          </tbody></table>
         </div>
       </div>
       <div class="ap-plots">

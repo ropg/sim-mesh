@@ -21,7 +21,7 @@
       <div class="ed-live">
         <div><span>status</span><b :class="'st-' + one.status">{{ one.status }}</b></div>
         <div><span>firmware</span><b :class="{ 'ed-none': !one.firmware }">{{
-          one.firmware ? (one.deviceName ?? one.firmware) : 'none: no firmware() rule names it' }}</b></div>
+          one.firmware ? (one.deviceName ?? one.firmware) : 'none: no .firmware(…) names it' }}</b></div>
         <div><span>role</span><b>{{ one.liveRole ?? '—' }}</b></div>
         <div><span>radio</span><b>{{ liveRadio }}</b></div>
         <div v-if="one.stale"><span>losses</span><b class="ed-stale">moved: its row is being recomputed</b></div>

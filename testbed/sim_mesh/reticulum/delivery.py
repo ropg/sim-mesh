@@ -1,95 +1,70 @@
-"""Delivery of LXMF messages, from the senders' logs.
+"""Delivery of LXMF messages, from what the senders' drivers reported.
 
-Each sender is counted by its own station's logs. A station configured with
-rncfg, the reticulum project's, logs no message id and is read by
-`rncfg_delivery`; what follows is Reticulous's.
+A message is delivered when its sender's driver reports it so, the event
+`lxmf.message.status` with `status: delivered` in the run's `events.jsonl`,
+for the id simd gave the `lxmf.send` (sim_mesh.reticulum.driver). `analyse` counts a
+traffic driver's sends by:
 
-A message is proven delivered when its sender logs `delivered mid=<mid>`
-(`DIRECT delivered`, `DIRECT resource delivered`, …) for the mid its `lxmf
-send` answered with. `analyse` counts a traffic driver's sends by:
-
-- route hops at send time: the `rnpath -j` the sender answered just before
-  the send (`no path` where it held none);
+- route hops at send time: what the sender's `path` verb answered just
+  before the send (`no path` where it held none);
 - radio hops: the shortest path in the run's radio graph (the pairs the
   ether delivers at each sender's declared carrier, SF, bandwidth and
   power, by the run's loss tables) whose intermediate stations forward;
 - size class (the driver's short, two-frame, over 500 B);
-- latency: from the instant the send was answered to the sender's
-  `delivered` line.
+- latency: from the instant the send was answered to the delivered event.
 
-Log stamps are node time, which in a virtual-time run is the ether's epoch
-(its `welcome` line in the run's record) plus T, and in a real run the wall
-clock. Undelivered messages are tallied by the sender's last lxmf line for
-the mid.
+An event's `t` is the run's T, in microseconds, when simd took it in.
+Undelivered messages are tallied by the last status the sender's driver
+reported for them.
 """
 
-import calendar
 import collections
-import datetime
+import json
 import os
 import re
 
-ANSI = re.compile(r"\x1b\[[0-9;]*m")
-STAMP = re.compile(r"^(\w{3} +\d+ \d\d:\d\d:\d\d\.\d{3}) ")
-MID = re.compile(r"mid=(o_\S+)")
-LOG_STAMP = re.compile(r"(\w{3}) +(\d+) (\d\d):(\d\d):(\d\d\.\d+)")
-MONTHS = {m: i for i, m in enumerate(
-    "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), 1)}
+EVENTS_FILE = "events.jsonl"
+STATUS_EVENT = "lxmf.message.status"
 
 
-def station_logs(run_dir):
-    """(node name, log path) for every station log in the run."""
-    nodes = os.path.join(run_dir, "nodes")
-    if not os.path.isdir(nodes):
-        return
-    for name in sorted(os.listdir(nodes)):
-        path = os.path.join(nodes, name, "log")
-        if os.path.isfile(path):
-            yield name, path
-
-
-def read_logs(run_dir, epoch, year):
-    """(sender, mid) -> {'delivered': T or None, 'last': last lxmf line}."""
-    out = {}
-    for name, path in station_logs(run_dir):
-        with open(path, errors="replace") as handle:
-            for raw in handle:
-                if "mid=o_" not in raw:
-                    continue
-                line = ANSI.sub("", raw).rstrip()
-                m = MID.search(line)
-                s = STAMP.match(line)
-                if not m or not s:
-                    continue
-                t = datetime.datetime.strptime("%d %s" % (year, s.group(1)), "%Y %b %d %H:%M:%S.%f")
-                t = t.replace(tzinfo=datetime.timezone.utc).timestamp() - epoch
-                rec = out.setdefault((name, m.group(1)), {"delivered": None, "last": None})
-                rec["last"] = line[s.end():]
-                if "delivered mid=" in line and rec["delivered"] is None:
-                    rec["delivered"] = t
-    return out
-
-
-def log_deliveries(run_dir, zero_wall, year):
-    """Each sender's `DIRECT delivered` instants, in seconds after `zero_wall`
-    (the wall-clock instant the caller's clock starts at): name -> [s, ...]."""
-    out = {}
-    for name, path in station_logs(run_dir):
-        times = []
-        with open(path, encoding="utf-8", errors="replace") as handle:
+def events(run_dir):
+    """Every event the run's drivers reported, in order."""
+    path = os.path.join(run_dir, EVENTS_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
             for line in handle:
-                if "DIRECT delivered" not in line and "DIRECT resource delivered" not in line:
+                try:
+                    got = json.loads(line)
+                except ValueError:
                     continue
-                m = LOG_STAMP.search(line)
-                if not m:
-                    continue
-                mon, day, hh, mm, ss = m.groups()
-                wall = calendar.timegm((year, MONTHS.get(mon, 1), int(day), int(hh), int(mm), 0)) \
-                    + float(ss)
-                times.append(wall - zero_wall)
-        if times:
-            out[name] = times
+                if isinstance(got, dict):
+                    yield got
+    except FileNotFoundError:
+        return
+
+
+def read_messages(run_dir):
+    """(sender, mid) -> {'delivered': T in seconds or None, 'last': its
+    last reported status, with why when there is one}."""
+    out = {}
+    for ev in events(run_dir):
+        if ev.get("event") != STATUS_EVENT or not ev.get("mid"):
+            continue
+        rec = out.setdefault((ev.get("node"), str(ev["mid"])), {"delivered": None, "last": None})
+        status = str(ev.get("status") or "")
+        rec["last"] = status + (": %s" % ev["why"] if ev.get("why") else "")
+        if status == "delivered" and rec["delivered"] is None:
+            rec["delivered"] = (ev.get("t") or 0) / 1e6
     return out
+
+
+def event_deliveries(run_dir):
+    """Each sender's delivered instants, in seconds of T: name -> [s, ...]."""
+    out = {}
+    for (name, _), rec in read_messages(run_dir).items():
+        if rec["delivered"] is not None:
+            out.setdefault(name, []).append(rec["delivered"])
+    return {name: sorted(times) for name, times in out.items()}
 
 
 def radio_hops(adj, forwarders, src, dst):
@@ -126,8 +101,8 @@ def quantiles(v):
 def analyse(drive, logs, adj, forwarders):
     """The figures, and one row per message.
 
-    `drive` is the traffic driver's result, `logs` what `read_logs` found,
-    `adj` the radio graph by name, `forwarders` the names that forward.
+    `drive` is the traffic driver's result, `logs` what `read_messages`
+    found, `adj` the radio graph by name, `forwarders` the names that forward.
     """
     total = [0, 0]
     by_route = collections.defaultdict(lambda: [0, 0])
@@ -157,7 +132,7 @@ def analyse(drive, logs, adj, forwarders):
             lat_cls[s["cls"]].append(d)
             lat_route[route].append(d)
         else:
-            w = rec.get("last") or ("no mid" if not s.get("mid") else "no log line")
+            w = rec.get("last") or ("no mid" if not s.get("mid") else "nothing reported")
             w = re.sub(r"\b(o_\S+|[0-9a-f]{8,}|lxmf\.id\d\.\S+)", "…", w)
             w = re.sub(r"\d+", "N", w)
             last_words[w] += 1
@@ -179,36 +154,15 @@ def analyse(drive, logs, adj, forwarders):
 
 def analyse_run(traffic_path, run_dir):
     """A traffic run's figures: (the driver's result, figures, rows), counted
-    against the run's own record, logs and radio graph, each sender by its
-    own station's logs: Reticulous's by the mid its send answered, a station
-    configured with rncfg by `rncfg_delivery`, its sends keyed by their
-    marker and timed from when they were due. Raises ValueError when a
-    Reticulous sender's logs cannot be placed in T, the record holding no
-    epoch (a run not in virtual time)."""
-    import json
-
-    from sim_mesh import record
-    from sim_mesh.reticulum import rncfg_delivery
+    against the run's own events and radio graph."""
     from sim_mesh.view import RunView
 
     with open(traffic_path, encoding="utf-8") as handle:
         drive = json.load(handle)
     view = RunView(run_dir)
-    rncfg = {name for name in view.nodes if view.kind_type(name) in rncfg_delivery.KIND_TYPES}
-    sends = [dict(s, mid=s["marker"], t_sent=round(rncfg_delivery.due(drive, s) * 1e6))
-             if s["src"] in rncfg else s for s in drive.get("sends", [])]
-    logs = {}
-    if any(s["src"] not in rncfg for s in sends):
-        epoch = record.epoch_of(view.record_path)
-        if epoch is None:
-            raise ValueError("%s has no welcome line: not a virtual-time record"
-                             % view.record_path)
-        year = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).year
-        logs.update(read_logs(view.dir, epoch, year))
-    logs.update(rncfg_delivery.read_logs(view.dir, [s for s in sends if s["src"] in rncfg],
-                                         drive, view.ids))
+    logs = read_messages(view.dir)
     graph = view.radio_graph(view.calling_hz())
     adj = {view.names[a]: {view.names[b] for b in bs} for a, bs in graph.items()}
     forwarders = {view.names[s] for s in view.forwarders()}
-    out, rows = analyse(dict(drive, sends=sends), logs, adj, forwarders)
+    out, rows = analyse(drive, logs, adj, forwarders)
     return drive, out, rows

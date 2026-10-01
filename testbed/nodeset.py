@@ -30,7 +30,7 @@ Two tags mean something to the page and the analysis as well:
   links for those alone.
 
 What a node runs is not the nodeset's either: a script says it
-(`firmware()`), so one nodeset is run on any firmware.
+(`.firmware(…)`), so one nodeset is run on any firmware.
 
 A nodeset names no geodata. It is offered on every geodata whose extent holds
 one of its nodes (`inside`); synthetic ground lies at 0°, 0°.
@@ -181,7 +181,7 @@ def parse(data, where):
                                    % (where, name, ", ".join(HEIGHT_FROM), height_from))
         here = "%s: node %s" % (where, name)
         if "device" in node:
-            raise store.StoreError("%s: a node names no device: a script's firmware() says "
+            raise store.StoreError("%s: a node names no device: a script's .firmware(…) says "
                                    "what each node runs" % here)
         for key in ("radio", "role"):
             if key in node:

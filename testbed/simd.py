@@ -11,7 +11,7 @@ simd ── GET <sidecar>/link.json × (n-1) ───────────�
 simd: the node's row and column into runs/<run>/losses/<band>.bin, then into the ether
 simd ── node {name, …, stale: false} ───────────────► page
 script ── meta {verb: announce, tag: lora, stagger: 300, id} ► simd
-simd: each station's kind turns the intent into its own lines, spread over 300 s of T
+simd: each station's driver does the verb its own way, spread over 300 s of T
 simd ── command_result {id, verb, results: {name: reply}, t} ► every page
 page ── ws /ws/console/<name> ◄────────────────────► the station's pty
 browser ── http <name>.sim.localhost:<port> ────────► the station's own web UI
@@ -36,23 +36,27 @@ Several of these run at once as the children of front.py, each on its own
 ports, network and run directory, with the front in front of all of them.
 
 **Firmware.** What each node runs is said by firmware rules, `{which,
-firmware}`: a selection of nodes (sim_mesh.select) and a device name. A run
-is made with its script's rules (`sim_load`'s `firmware_rules`, which the
-front has from the script's runner) and takes more from a `firmware`
-message; they are kept in the run (`firmware_rules`), and each node runs
-what the last rule matching it names (`firmware`), fetched when it is a
-`_latest` not here yet. A node no rule matches runs nothing and is not
-started; a node placed later is matched as it lands. A node whose firmware
-a new rule changes is restarted on it, its state kept.
+firmware}`: a selection of nodes (sim_mesh.select) and an installed
+firmware's name or `<base>_latest` (firmware.py). A run is made with its
+script's rules (`sim_load`'s `firmware_rules`, which the front has from the
+script's runner) and takes more from a `firmware` message; they are kept in
+the run (`firmware_rules`), and each node runs what the last rule matching
+it names (`firmware`), resolved once and kept in the run (`builds`). A node
+no rule matches runs nothing and is not started; a node placed later is
+matched as it lands. A node whose firmware a new rule changes is restarted
+on it, its state kept. The firmware's driver (drivers.py) is how simd starts
+and talks to its stations.
 
-**First boot.** A station that boots with no state is set up: its name in
-its kind's own lines, then what its first-boot rules give it (`{which,
-lines}`, the script's `on_first_boot()`, kept in the run as
+**First boot.** A station that boots with no state is set up: its name
+(the `name` verb), then what its first-boot rules give it (`{which,
+lines}`, the script's `.on_first_boot(…)`, kept in the run as
 `first_boot_rules` and added to by a `first_boot` message), in order: a
-line as written, an intent (`{intent, args}`: its role, its radio) in the
-kind's lines, a transmit power of "max" or above the node's maximum held to
-that maximum. Nothing else is said: the nodeset declares no settings, and a
-radio starts when a rule says so. No script code runs here: the rules are
+line as written, typed in the firmware's own language, a verb (`{verb, args,
+category?}`: its radio, its role) as the driver's verb of that name, and
+nothing on a station of another category than the verb's, a transmit power
+of "max" or above the node's maximum held to that maximum; then the
+driver's flush. Nothing else is said: the nodeset declares no settings, and
+a radio starts when a rule says so. No script code runs here: the rules are
 data. A station with state is left alone. Lines have `{max_dbm}`, the
 node's maximum power, among their macros.
 
@@ -69,7 +73,8 @@ synthetic ground here. Until a row lands the ether keeps the old one, and the
 node's `node` message says `stale: true`. The cache in `losses/` is never
 written by an edit.
 
-Messages, page → simd (anything else is ignored, as on the wire):
+Messages, page → simd (anything else is ignored, as on the wire). Any of
+them may carry `after`, seconds on the run's clock before it is acted on:
 
 ```
 sim_load {geodata, nodeset, script?, build?, sidecar?, firmware_rules?, first_boot_rules?}
@@ -83,37 +88,43 @@ nodeset_remove {name}
 nodeset_set {name, id?, lat?, lon?, height_m?, height_from?, max_dbm?, antenna?, tags?}
                                                     max_dbm null: the node states none (22 dBm)
 firmware {rules: [{which, firmware}], id?}          more firmware rules, from a script
-first_boot {rules: [{which, lines: [line | {intent, args}]}], id?}
+first_boot {rules: [{which, lines: [line | {verb, args, category?}]}], id?}
                                                     more first-boot rules, from a script
 nodeset_offset {between: [a, b], db, note?}         db 0 removes it
 levels {name, freq?}                                what the others would hear from it
-command {line, name? | names? | tag?, kind?, stagger?, after?, id?}
-                                                    one line on the stations chosen, all of one kind
-meta {verb, args?, name? | names? | tag?, kind?, stagger?, after?, id?}
-                                                    an intent, in each station's own lines
-sequence {steps: [command | meta], name? | names? | tag?, kind?, after?, id?}
+command {line, name? | names? | tag?, base?, stagger?, after?, id?}
+                                                    one line on the stations chosen, all of one base
+meta {verb, args?, category?, name? | names? | tag?, base?, stagger?, after?, id?}
+                                                    a verb, by each driver; with a category, only on
+                                                    those stations of it
+sequence {steps: [command | meta], name? | names? | tag?, base?, after?, id?}
                                                     those one after another at one T, answered
                                                     once with a list of results
 node_reset {name} · node_factory_reset {name} · reset_all · factory_reset_all
 start_all · stop_all
 plan {phases: [{name, until}]}                      a driver's phases, T in µs
+script_loglevel {level}                             how much the scripts on it log, unless
+                                                    one says otherwise: output, commands, debug
 ```
 
 Messages, simd → page:
 
 ```
 snapshot {run, geodata, nodeset, script, bands, nodes: [node…], port, clock,
-          geodata_names, nodesets, scripts, snapshots, medium, antennas}
-node {name, id, kind, firmware, device_name, web, lat, lon, height_m, height_from,
-      max_dbm, antenna, tags, role, status, stale, mode?, freq?, sf?, bw?}
+          geodata_names, nodesets, scripts, snapshots, medium, antennas, script_loglevel}
+node {name, id, base, category, firmware, device_name, web, lat, lon, height_m,
+      height_from, max_dbm, antenna, tags, role, status, stale, mode?, freq?, sf?, bw?}
 node_gone {name}
 nodeset {name, dirty, geometry_hash, nodes, offsets, links?}
 store {geodata_names, nodesets, scripts, snapshots}   after a snapshot is saved
 losses_progress {band, done, total}                 while a sim_load computes
 levels {name, freq, heard: {name: dBm}}
-command_result {id?, line | verb, name, results: {name: text} | [{name: text}], t}
-                                                    a list for a sequence, one per step
+command_result {id?, line | verb, name, results: {name: reply} | [{name: reply}], t, error?}
+                                                    a list for a sequence, one per step; a reply
+                                                    is what the line printed or the verb returned;
+                                                    `error` when a meta could not be begun
 clock {mode, rate, t, observed, barriers, slow_idles, plan}
+script_loglevel {level}                             the scripts' log level, changed
 tx {name, eid, freq, t_start, t_end} · rx {name, from, eid, verdict, level}
 radio {name, mode, freq, sf, bw}
 notice {text}                                       something done that a person should know
@@ -122,15 +133,20 @@ error {text}
 
 **Choosing stations.** `command` and `meta` go to the stations that are up
 (or in setup) among the ones named: `name`, a list of `names`, every one
-carrying `tag`, or all of them. A line is in one kind's language, so the
-chosen stations must all be of one kind, or `kind` must narrow them to one;
-an intent goes to every kind, each in its own lines. `meta`'s verbs are the
-intents (kinds.INTENTS) and `address`, each station's LXMF delivery address;
-`message` and `path` take `to`, a node's name, whose address is asked of it
-first, and `peer_tcp` takes `to` and `port`.
+carrying `tag`, or all of them. A line is in one firmware's language, so
+the chosen stations must all run one base, or `base` must narrow them to
+one; a verb goes to every station, each through its own driver. `meta`'s
+verbs are every firmware's (`sim_mesh.driver`) and a category's
+(`sim_mesh.reticulum.driver`); with `category`, a meta is only for the
+chosen stations of that category, and one that leaves none of them is an
+error. `lxmf.send` takes `to`, a node or an LXMF identity, whose address is
+asked of its station first, and `path` may (or `dest_hash` and `iface`,
+or nothing for the whole table); `lxmf.send` may take `from`, its sender
+the same way, in place of a choice of stations, and is answered with each
+message's id, which simd gives it; `peer_tcp` takes `to` and `port`.
 
-`role` is what the station's kind reads from it (kinds.ROLES), polled; None
-when the kind cannot say. `?quiet=1` on the websocket leaves out tx, rx, radio and levels,
+`role` is what the station's driver reads from it (`current_role`), polled;
+None when it cannot say. `?quiet=1` on the websocket leaves out tx, rx, radio and levels,
 which is most of the traffic on a busy network and nothing a driver or the
 front's registry reads. See INTERNALS.md for why it is shaped this way.
 
@@ -159,7 +175,7 @@ import boards as boards_module     # noqa: E402
 import ether as ether_module       # noqa: E402
 import slt                         # noqa: E402
 import geodata as geodata_module   # noqa: E402
-import kinds as kinds_module       # noqa: E402
+import drivers as drivers_module   # noqa: E402
 import losses as losses_module     # noqa: E402
 import nodeset as nodeset_module   # noqa: E402
 import proxy                       # noqa: E402
@@ -184,7 +200,9 @@ LOUD = ("tx", "rx", "radio", "levels")  # what a `quiet` control socket is not s
 NODE_FIELDS = ("id", "lat", "lon", "height_m", "height_from", "max_dbm", "antenna", "tags")
 # The fields whose null a node message means: clear it.
 CLEARABLE_FIELDS = ("max_dbm",)
-ADDRESS = "address"         # meta's one verb that is not an intent: each station's address
+EVENTS_FILE = "events.jsonl"  # what drivers report, a JSON object a line
+NAMED_VERBS = ("name", "lxmf.create")  # verbs whose `name` is the node's own unless given
+SCRIPT_LOGLEVELS = ("output", "commands", "debug")  # what a script's scripts.log holds
 
 log = stations_module.log
 
@@ -284,8 +302,8 @@ class Simd:
         self.run = None                     # a runs.Run, or None until one is loaded
         self.geodata = None
         self.nodeset = None                 # the run's own copy, as edited
-        self.kinds = {}                     # firmware -> Kind
-        self.builds = {}                    # firmware -> what it resolved to
+        self.drivers = {}                   # firmware name -> its driver
+        self.builds = {}                    # firmware name -> what it resolved to
         self.rules = []                     # firmware rules, [{which, firmware}], in order
         self.first_boot = []                # first-boot rules, [{which, lines}], in order
         self.firmware = {}                  # node name -> the firmware it runs
@@ -296,6 +314,8 @@ class Simd:
         self.pending_rows = set()           # of those, the ones still to compute
         self.rows_task = None
         self.stations = {}                  # node name -> Station
+        self.identities = {}                # LXMF identity name -> the node holding it
+        self.mids = {}                      # message id -> how many share its stem
         self.pages = {}                     # the control websockets -> quiet
         self.consoles = {}                  # node name -> set of websockets
         self.poller = None
@@ -340,14 +360,14 @@ class Simd:
             return self.nodeset.by_id(int(label))
         return None
 
-    def kind_of(self, name):
+    def driver_of(self, name):
         ref = self.firmware.get(name)
-        return self.kinds.get(ref) if ref else None
+        return self.drivers.get(ref) if ref else None
 
     @property
     def build_override(self):
-        """A build the simulation was started with, in place of every
-        firmware of its kind: the run's, else this process's --build."""
+        """A firmware the simulation was started with, in place of every
+        firmware of its base: the run's, else this process's --build."""
         return (self.run.meta.get("build") if self.run else None) or self.args.build
 
     def ids(self):
@@ -370,12 +390,12 @@ class Simd:
         name = self.node_for_label(label)
         if name is None:
             return None
-        kind = self.kind_of(name)
-        port = kind.web_port() if kind else None
+        driver = self.driver_of(name)
+        port = driver.web_port() if driver else None
         if port is None:
             return proxy.Refusal(
-                "404 Not Found", "%s is a %s station, which has no web UI.\n"
-                % (name, kind.name if kind else "kindless"))
+                "404 Not Found", "%s runs %s, which has no web UI.\n"
+                % (name, driver.firmware["firmware"] if driver else "nothing"))
         if path.split("?", 1)[0] == SIGNAL_PATH:
             return ("127.0.0.1", self.control_port)
         return (stations_module.bind_addr(self.nodeset.nodes[name]["id"]), port)
@@ -415,9 +435,9 @@ class Simd:
                 ether_module.describe_time(self.ether.mode, self.ether.rate),
                 physics.describe(),
                 ether_module.rule_name(self.args.pairwise, self.args.bench_capture)))
-        if self.ether.clock.virtual and not os.path.exists(kinds_module.SHIM):
+        if self.ether.clock.virtual and not os.path.exists(drivers_module.SHIM):
             log("error: no time shim at %s: a virtual-time run needs it "
-                "(see sim-mesh/README.md)" % kinds_module.SHIM)
+                "(see sim-mesh/README.md)" % drivers_module.SHIM)
 
     @property
     def virtual(self):
@@ -525,9 +545,9 @@ class Simd:
         its console is read as it comes."""
         wanted = set(sids)
         drains = stations_module.printed([s.drain for s in self.stations.values()
-                                          if wanted.intersection(s.kind.sids(s))
+                                          if wanted.intersection(s.driver.sids(s))
                                           and s.drain is not None
-                                          and s.kind.console_acted_on])
+                                          and s.driver.console_acted_on])
         if not drains:
             return False
         stations_module.ptys().call(stations_module.catch_up, drains,
@@ -618,9 +638,9 @@ class Simd:
     def make_station(self, name):
         node = self.nodeset.node(name)
         station = stations_module.Station(
-            name, node["id"], self.run.node_dir(name), self.kind_of(name), self.ether_addr,
+            name, node["id"], self.run.node_dir(name), self.driver_of(name), self.ether_addr,
             on_status=self.station_status, on_output=self.station_output,
-            clock=self.ether if self.virtual else None)
+            clock=self.ether if self.virtual else None, on_event=self.station_event)
         station.watchers = len(self.consoles.get(name, ()))
         station.board = boards_module.environment(node.get("max_dbm"))
         station.clock_profile = self.clock_profile(name)
@@ -629,12 +649,25 @@ class Simd:
     def clock_profile(self, name):
         """A station's crystal, off by a draw uniform within ±`--clock-ppm`
         parts per million, from the seed and its name: its node time as a
-        function of T (STATION.md, `SIM_MESH_CLOCK_PROFILE`), or None for a
-        true clock. A kind's own profile in its `env:` still wins."""
+        function of T (`SIM_MESH_CLOCK_PROFILE`, INTERNALS.md's *Time*), or
+        None for a true clock. A firmware's own profile in its node.yaml
+        `env` still wins."""
         if not self.args.clock_ppm or not self.virtual:
             return None
         draw = ether_module.seeded_draw(self.ether.seed, name, "clock")
         return drift_profile(self.args.clock_ppm * (2.0 * draw - 1.0))
+
+    def station_event(self, station, event, fields):
+        """An event a station's driver reported, into the run's events.jsonl
+        at this T: what a category's analysis counts (a message delivered)."""
+        if self.run is None or self.stations.get(station.name) is not station:
+            return
+        line = dict(fields, t=self.ether.now(), node=station.name, event=event)
+        try:
+            with open(os.path.join(self.run.dir, EVENTS_FILE), "a", encoding="utf-8") as f:
+                f.write(json.dumps(line, default=str) + "\n")
+        except OSError as err:
+            log("events.jsonl: %s" % err)
 
     def watched(self, name):
         """The console windows open on a station, as the pty thread sees it:
@@ -670,14 +703,15 @@ class Simd:
         map, and it should be a working station rather than a dot waiting for
         someone to type.
         """
-        if not await station.kind.wait_up(station, SETUP_TIMEOUT_S):
-            log("station %s never came up (%s)" % (station.name, station.kind.name))
+        if not await station.driver.wait_up(station, SETUP_TIMEOUT_S):
+            log("station %s never came up (%s)" % (station.name,
+                                                   station.driver.firmware["firmware"]))
             return
         if not station.was_configured:
             station.set_status(stations_module.SETUP)
             try:
                 await self.send_setup(station)
-            except kinds_module.CommandError as err:
+            except drivers_module.CommandError as err:
                 self.error("setting up %s: %s" % (station.name, err))
         else:
             await self.restate_role(station)
@@ -694,41 +728,43 @@ class Simd:
             await self.flush_station(station)
 
     def expanded(self, name, lines):
-        return kinds_module.expand_all(lines, name, self.nodeset.nodes[name]["id"], self.ids(),
-                                       {"max_dbm": "%g" % self.max_dbm(name)})
+        return drivers_module.expand_all(lines, name, self.nodeset.nodes[name]["id"],
+                                         self.ids(), {"max_dbm": "%g" % self.max_dbm(name)})
 
     async def restate_role(self, station):
-        """A station of a kind that forgets its role when it restarts comes
-        back up with its state but not its role: the role intents its
+        """A station whose firmware forgets its role when it restarts comes
+        back up with its state but not its role: the role verbs its
         first-boot rules gave it are said again, so a reset does not turn a
         transport into a client."""
-        if not station.kind.role_volatile:
+        if not station.driver.role_volatile:
             return
-        lines = self.first_boot_lines(station.name, station.kind, verbs=("role",))
-        if not lines:
+        entries = self.first_boot_entries(station.name, verbs=("role",))
+        if not entries:
             return
         try:
-            await station.kind.setup(station, self.expanded(station.name, lines))
-        except kinds_module.CommandError as err:
+            await self.setup_entries(station, entries)
+        except drivers_module.CommandError as err:
             self.error("telling %s its role again: %s" % (station.name, err))
 
     def max_dbm(self, name):
         """A node's maximum power at the connector (boards.max_dbm)."""
         return boards_module.max_dbm(self.nodeset.nodes[name].get("max_dbm"))
 
-    def intent_lines(self, name, kind, intent):
-        """One first-boot intent in a kind's lines. A transmit power of
+    def entry_args(self, name, entry):
+        """One first-boot verb's arguments for one node. A transmit power of
         "max", or above the node's maximum, is the node's maximum."""
-        args = dict(intent.get("args") or {})
+        args = dict(entry.get("args") or {})
         if "tx_dbm" in args:
             top = self.max_dbm(name)
             args["tx_dbm"] = top if args["tx_dbm"] == "max" else min(float(args["tx_dbm"]), top)
-        return kind.lines(intent["intent"], **args)
+        if entry["verb"] in NAMED_VERBS and "name" not in args:
+            args["name"] = name
+        return args
 
-    def first_boot_lines(self, name, kind, verbs=None):
-        """What the first-boot rules give a station, in the rules' order, as
-        its kind's lines: a line as it is, an intent in the kind's words.
-        `verbs` keeps only those intents, and no plain lines."""
+    def first_boot_entries(self, name, verbs=None):
+        """What the first-boot rules give a station, in the rules' order: a
+        line (a string) or a verb ({verb, args, category?}). `verbs` keeps
+        only those verbs, and no plain lines."""
         facts = self.facts(name)
         out = []
         for rule in self.first_boot:
@@ -736,43 +772,64 @@ class Simd:
                 continue
             for entry in rule["lines"]:
                 if isinstance(entry, dict):
-                    if verbs is None or entry.get("intent") in verbs:
-                        out += self.intent_lines(name, kind, entry)
+                    if verbs is None or entry.get("verb") in verbs:
+                        out.append(entry)
                 elif verbs is None:
                     out.append(entry)
         return out
 
+    async def setup_entries(self, station, entries):
+        """Lines and verbs for a station, in order, then its driver's flush.
+        A verb of another category than the station's is nothing to it. Every
+        one is tried; the ones that failed are reported together."""
+        driver = station.driver
+        failed = []
+        for entry in entries:
+            try:
+                if isinstance(entry, dict):
+                    if entry.get("category") not in (None, driver.category):
+                        continue
+                    await self.do_verb(station, entry["verb"],
+                                       self.entry_args(station.name, entry))
+                else:
+                    for line in self.expanded(station.name, [entry]):
+                        await driver.run(station, line)
+            except drivers_module.CommandError as err:
+                failed.append("%s: %s" % (entry.get("verb") if isinstance(entry, dict)
+                                          else entry, err))
+        with contextlib.suppress(drivers_module.CommandError):
+            await driver.flush(station)
+        if failed:
+            raise drivers_module.CommandError("; ".join(failed))
+
     async def send_setup(self, station):
-        """The station's name in its kind's lines, then what its first-boot
-        rules give it, in their order, then a flush.
+        """The station's name, then what its first-boot rules give it, in
+        their order, then a flush.
 
         The rules are the whole of what a station is told beyond its name:
         simd adds no settings of its own, and a radio is started by the rule
-        that says so. Its kind does flush once they are in. A store that
+        that says so. Its driver flushes once they are in. A store that
         coalesces writes would otherwise come back from a Reset pressed the
         moment a node came up with none of it, and a testbed that lost its
         own setup that way would be lying about what it had configured.
         """
-        kind = station.kind
-        await kind.setup(station, self.expanded(station.name, kind.lines("name")))
-        rules = self.expanded(station.name, self.first_boot_lines(station.name, kind))
-        if rules:
-            try:
-                await kind.setup(station, rules)
-            except kinds_module.CommandError as err:
-                raise kinds_module.CommandError("first-boot lines: %s" % err) from err
+        entries = [{"verb": "name", "args": {"name": station.name}}]
+        try:
+            await self.setup_entries(station, entries + self.first_boot_entries(station.name))
+        except drivers_module.CommandError as err:
+            raise drivers_module.CommandError("first-boot lines: %s" % err) from err
 
     async def start_station(self, name):
         if self.run is None or name not in self.nodeset.nodes or name in self.stations:
             return
         if not self.firmware.get(name):
             return                          # it runs nothing until a rule says what
-        kind = self.kind_of(name)
-        if kind is None:
+        driver = self.driver_of(name)
+        if driver is None:
             self.error("%s: its firmware %s was not resolved" % (name, self.firmware[name]))
             return
-        if not kind.elf or not os.path.exists(kind.elf):
-            self.error("%s: device %s has no binary at %s" % (name, kind.label, kind.elf))
+        if not drivers_module.build_present(driver.firmware):
+            self.error("%s: firmware %s is not installed" % (name, driver.firmware["firmware"]))
             return
         station = self.make_station(name)
         self.stations[name] = station
@@ -795,21 +852,21 @@ class Simd:
     async def flush_station(self, station):
         """Ask a station to commit its store before we take it away from it.
 
-        A store may coalesce writes (reticulous holds them for a minute by
-        default), and some of what a station records — an LXMF identity among
+        A store may coalesce writes (a firmware may hold them for a minute),
+        and some of what a station records — an LXMF identity among
         them — lands there a little after the command that asked for it. So
         anything that stops or resets a station flushes it first, and so does
         taking a snapshot: a snapshot copied out of a store with a minute of
         writes still in RAM would be a picture of a moment that never quite
-        existed. What a flush is, and whether there is one, is the kind's.
+        existed. What a flush is, and whether there is one, is the driver's.
 
         Best effort. A station that will not answer is one whose store we
         cannot flush, and refusing to stop it over that would be worse.
         """
         if station.status not in (stations_module.UP, stations_module.SETUP):
             return
-        with contextlib.suppress(kinds_module.CommandError):
-            await station.kind.flush(station)
+        with contextlib.suppress(drivers_module.CommandError):
+            await station.driver.flush(station)
 
     async def flush_all(self):
         await asyncio.gather(*(self.flush_station(s) for s in self.stations.values()),
@@ -878,12 +935,15 @@ class Simd:
 
         Read live rather than taken from the nodeset, because the setting is
         live: a person can flip it on the station itself, and the map should
-        show it without the nodeset knowing. A kind that cannot be asked
-        answers None, and the map shows the node's role tag.
+        show it without the nodeset knowing. A driver that cannot ask answers
+        None, and the map shows the node's role tag.
         """
+        reader = getattr(station.driver, "current_role", None)
+        if reader is None:
+            return
         try:
-            role = await station.kind.role(station)
-        except kinds_module.CommandError:
+            role = await reader(station)
+        except drivers_module.CommandError:
             return
         if role != station.role:
             station.role = role
@@ -942,12 +1002,13 @@ class Simd:
         if node is None:
             return {"type": "node_gone", "name": name}
         station = self.stations.get(name)
-        kind = self.kind_of(name)
+        driver = self.driver_of(name)
+        build = driver.firmware if driver else {}
         return {"type": "node", "name": name, "id": node["id"],
-                "kind": kind.name if kind else None,
+                "base": build.get("base"), "category": build.get("category"),
                 "firmware": self.firmware.get(name),
-                "device_name": kind.label if kind else None,
-                "web": kind is not None and kind.web_port() is not None,
+                "device_name": drivers_module.label(build) if driver else None,
+                "web": driver is not None and driver.web_port() is not None,
                 "lat": node["lat"], "lon": node["lon"], "height_m": node["height_m"],
                 "height_from": node["height_from"], "antenna": dict(node["antenna"]),
                 "max_dbm": self.max_dbm(name), "tags": list(node["tags"]),
@@ -983,7 +1044,22 @@ class Simd:
                 "medium": {"noise_figure_db": self.args.noise_figure,
                            "pairwise": self.args.pairwise},
                 "antennas": antennas_module.listing(),
+                "script_loglevel": self.script_loglevel(),
                 **store_lists()}
+
+    def script_loglevel(self):
+        """How much the scripts on this simulation log unless one says
+        otherwise (its run's `script_loglevel`)."""
+        return (self.run.meta.get("script_loglevel") if self.run else None) or SCRIPT_LOGLEVELS[0]
+
+    async def do_script_loglevel(self, msg):
+        """The scripts' log level for this simulation, kept in its run; every
+        script on it is told."""
+        level = msg.get("level")
+        if level not in SCRIPT_LOGLEVELS:
+            raise ValueError("a script log level is one of %s" % ", ".join(SCRIPT_LOGLEVELS))
+        self.need_run().set(script_loglevel=level)
+        self.broadcast({"type": "script_loglevel", "level": level})
 
     def broadcast(self, message):
         if message.get("type") == "command_result" and message.get("id") in self.driver_ids:
@@ -1036,8 +1112,10 @@ class Simd:
         if handler is None:
             return
         try:
+            if self.run is not None and self.later(msg):
+                return
             await handler(msg)
-        except (store.StoreError, kinds_module.CommandError) as err:
+        except (store.StoreError, drivers_module.CommandError) as err:
             self.refused(msg, str(err))
         except OSError as err:
             self.refused(msg, "%s: %s" % (kind, err))
@@ -1133,9 +1211,11 @@ class Simd:
         """What a firmware rule's selection (sim_mesh.select) asks of a node."""
         node = self.nodeset.nodes[name]
         station = self.stations.get(name)
-        kind = self.kind_of(name)
+        driver = self.driver_of(name)
+        build = driver.firmware if driver else {}
         return {"name": name, "id": node["id"], "tags": list(node["tags"]),
-                "firmware": self.firmware.get(name), "kind": kind.name if kind else None,
+                "firmware": self.firmware.get(name), "base": build.get("base"),
+                "category": build.get("category"),
                 "role": (station.role if station else None) or nodeset_module.tag_role(node["tags"]),
                 "antenna": node["antenna"]["type"], "max_dbm": self.max_dbm(name), "lat": node["lat"], "lon": node["lon"],
                 "height_m": node["height_m"],
@@ -1161,23 +1241,24 @@ class Simd:
         return out
 
     async def settle_firmware(self):
-        """Each node's firmware as the rules say, every one resolved (a
-        `_latest` fetched when it is not here); one that cannot be is said,
-        and its nodes run nothing. Returns the nodes whose firmware changed."""
+        """Each node's firmware as the rules say, every name resolved to an
+        installed firmware once and its driver loaded; one that cannot be is
+        said, and its nodes run nothing. Returns the nodes whose firmware
+        changed."""
         wanted = self.assigned()
         failed = set()
         for ref in sorted(set(wanted.values())):
-            if kinds_module.build_present(self.builds.get(ref)) and ref in self.kinds:
+            if drivers_module.build_present(self.builds.get(ref)) and ref in self.drivers:
                 continue
             try:
-                builds = await kinds_module.ensure_builds([ref], self.build_override, say=log)
-                self.kinds.update(kinds_module.make_kinds(builds))
-            except kinds_module.CommandError as err:
+                builds = drivers_module.resolve_builds([ref], self.build_override)
+                self.drivers.update(drivers_module.load_all(builds))
+            except drivers_module.CommandError as err:
                 self.error("firmware %s: %s" % (ref, err))
                 failed.add(ref)
                 continue
             self.builds.update(builds)
-            log("firmware %s" % self.kinds[ref].describe())
+            log("firmware %s: %s" % (ref, drivers_module.label(builds[ref])))
         wanted = {n: ref for n, ref in wanted.items() if ref not in failed}
         changed = [n for n in self.nodeset.nodes if wanted.get(n) != self.firmware.get(n)]
         self.firmware = wanted
@@ -1198,10 +1279,10 @@ class Simd:
             had_state = station.configured
             await self.stop_station(name)
             await self.start_station(name)
-            kind = self.kind_of(name)
+            driver = self.driver_of(name)
             self.notice("%s now runs %s; its station was restarted%s" % (
-                name, kind.label if kind else "nothing",
-                ", keeping its state" if had_state and kind else ""))
+                name, drivers_module.label(driver.firmware) if driver else "nothing",
+                ", keeping its state" if had_state and driver else ""))
         if idle:
             self.begin_start_all()
 
@@ -1216,7 +1297,7 @@ class Simd:
                     self.rules.append(rule)
             changed = await self.settle_firmware()
             await self.restart_on_firmware(changed)
-        except (ValueError, TypeError, store.StoreError, kinds_module.CommandError) as err:
+        except (ValueError, TypeError, store.StoreError, drivers_module.CommandError) as err:
             self.answered(msg, {}, verb="firmware", error=str(err))
             return
         self.answered(msg, {n: self.firmware.get(n) for n in changed}, verb="firmware")
@@ -1225,15 +1306,23 @@ class Simd:
     @staticmethod
     def check_first_boot(rule):
         """A first-boot rule as it came, checked: {which, lines}, each line
-        a string or an intent {intent, args} of kinds.INTENTS."""
+        a string or a verb {verb, args, category?}: one of that category's,
+        or without one, one every firmware has."""
         if not isinstance(rule, dict) or not isinstance(rule.get("lines"), list):
             raise ValueError("a first-boot rule is {which, lines}")
         lines = []
         for line in rule["lines"]:
             if isinstance(line, dict):
-                if line.get("intent") not in kinds_module.INTENTS:
-                    raise ValueError("no such intent %r" % line.get("intent"))
-                lines.append({"intent": line["intent"], "args": dict(line.get("args") or {})})
+                category = line.get("category")
+                if category is not None and category not in drivers_module.CATEGORY_CLASSES:
+                    raise ValueError("no firmware category %r" % category)
+                if line.get("verb") not in drivers_module.verbs(category):
+                    raise ValueError("no such verb %r%s" % (
+                        line.get("verb"), " for %s firmware" % category if category else ""))
+                entry = {"verb": line["verb"], "args": dict(line.get("args") or {})}
+                if category is not None:
+                    entry["category"] = category
+                lines.append(entry)
             else:
                 lines.append(str(line))
         return {"which": select_module.Nodes.from_json(rule.get("which")).to_json(),
@@ -1409,7 +1498,7 @@ class Simd:
 
     def chosen(self, msg):
         """The stations a `command` or `meta` goes to: up or in setup, among
-        `name`, `names`, those carrying `tag`, or all; of `kind` when given.
+        `name`, `names`, those carrying `tag`, or all; of firmware `base` when given.
         A list of (name, station) in id order."""
         wanted = None
         if msg.get("name"):
@@ -1427,7 +1516,7 @@ class Simd:
                 continue
             if tag and tag not in node["tags"]:
                 continue
-            if msg.get("kind") and station.kind.name != msg["kind"]:
+            if msg.get("base") and station.driver.firmware.get("base") != msg["base"]:
                 continue
             out.append((name, station))
         return out
@@ -1449,9 +1538,10 @@ class Simd:
             if gap:
                 await self.sleep(index * gap)
             try:
-                return name, (await one(name, station)).rstrip("\n")
-            except (kinds_module.CommandError, store.StoreError, KeyError) as err:
+                reply = await one(name, station)
+            except (drivers_module.CommandError, store.StoreError, KeyError) as err:
                 return name, "! %s" % err
+            return name, reply.rstrip("\n") if isinstance(reply, str) else reply
 
         return dict(await asyncio.gather(
             *(run(i, n, s) for i, (n, s) in enumerate(targets))))
@@ -1478,10 +1568,10 @@ class Simd:
     async def do_command(self, msg):
         """Run one line on the stations chosen and report what each said.
 
-        The macros are expanded per station, so `lxmf create {name}` or
-        `hostname {name}` does the right thing across the whole testbed in one
-        go. A line is in one kind's language, so it goes only to stations of
-        one kind: the chosen ones must be of one, or `kind` must say which.
+        The macros are expanded per station, so a line with `{name}` or
+        `{addr}` in it does the right thing across the whole testbed in one
+        go. A line is in one firmware's language, so it goes only to stations
+        of one base: the chosen ones must run one, or `base` must say which.
         """
         self.need_run()
         line = (msg.get("line") or "").strip()
@@ -1493,14 +1583,14 @@ class Simd:
         """`command`'s work, at once: {name: what it said}."""
         line = (msg.get("line") or "").strip()
         targets = self.chosen(msg)
-        types = sorted({station.kind.name for _, station in targets})
+        types = sorted({station.driver.firmware.get("base") for _, station in targets})
         if len(types) > 1:
-            raise kinds_module.CommandError(
-                "%r would go to %s stations, and a line is one kind's language: say which "
-                "kind" % (line, " and ".join(types)))
+            raise drivers_module.CommandError(
+                "%r would go to %s stations, and a line is one firmware's language: say "
+                "which base" % (line, " and ".join(types)))
 
         async def one(name, station):
-            return await station.kind.run(station, kinds_module.expand(
+            return await station.driver.run(station, drivers_module.expand(
                 line, name, self.nodeset.nodes[name]["id"], self.ids()))
 
         results = await self.spread(msg, targets, one)
@@ -1508,56 +1598,139 @@ class Simd:
             " over %.0fs" % float(msg.get("stagger") or 0) if msg.get("stagger") else ""))
         return results
 
-    async def address_of(self, name):
-        """A node's LXMF delivery address, asked of its station."""
-        station = self.stations.get(name)
-        if station is None or station.status != stations_module.UP:
-            raise kinds_module.CommandError("%s is not up" % name)
-        found = await station.kind.address(station)
-        if not found:
-            raise kinds_module.CommandError("%s has no address yet" % name)
+    async def do_verb(self, station, verb, args):
+        """One verb through the station's driver. `lxmf.create` names an
+        identity, which no other node's identity and no other node may be
+        named: the name is how a message's sender and recipient are found."""
+        if verb != "lxmf.create":
+            return await station.driver.do(station, verb, **args)
+        name = args.get("name")
+        holder = self.identities.get(name)
+        if (holder not in (None, station.name)
+                or (name in self.nodeset.nodes and name != station.name)):
+            raise drivers_module.CommandError("an LXMF identity named %s would not be unique: "
+                                              "%s has that name" % (name, holder or "a node"))
+        found = await station.driver.do(station, verb, **args)
+        if found:
+            # Not known until it has an address, nor when the firmware made
+            # none: lxmf_holder looks for it among the stations' identities.
+            self.identities[name] = station.name
         return found
 
-    async def do_meta(self, msg):
-        """An intent on the stations chosen, each in its own kind's lines.
+    async def lxmf_holder(self, name):
+        """The node holding the LXMF identity `name`, and that identity's name
+        there (None for a node named, whose identity is the one it sends
+        from). An identity named in this run is known; one a station had
+        before (a resumed run) is looked for among the stations up, once."""
+        if name in self.identities:
+            return self.identities[name], name
+        if name not in self.nodeset.nodes:
+            for node, station in self.chosen({}):
+                if "lxmf.identities" not in station.driver.VERBS:
+                    continue
+                with contextlib.suppress(drivers_module.CommandError):
+                    held = await station.driver.do(station, "lxmf.identities")
+                    if any(ident == name for ident, _ in held):
+                        self.identities[name] = node
+                        return node, name
+            raise drivers_module.CommandError("no node and no LXMF identity is named %s" % name)
+        return name, None
 
-        `message` and `path` name the other end by node (`to`), whose address
-        is asked of it once; `peer_tcp` names it too, for its address in this
-        run's network. `address` answers each station's own address.
+    async def address_of(self, name):
+        """The LXMF delivery address of the identity or node `name`, asked of
+        the station holding it."""
+        node, ident = await self.lxmf_holder(name)
+        station = self.stations.get(node)
+        if station is None or station.status != stations_module.UP:
+            raise drivers_module.CommandError("%s is not up" % node)
+        held = await station.driver.do(station, "lxmf.identities")
+        found = held[0][1] if held and ident is None else \
+            next((addr for each, addr in held if each == ident), None)
+        if not found:
+            raise drivers_module.CommandError("%s has no address yet" % name)
+        return found
+
+    def new_mid(self, node):
+        """A message's id, sim-mesh's: the sender and the T it was sent at,
+        and a count when more than one is sent at that T."""
+        stem = "%s.%d" % (node, self.ether.now())
+        n = self.mids.get(stem, 0)
+        self.mids[stem] = n + 1
+        return stem if n == 0 else "%s.%d" % (stem, n)
+
+    async def do_meta(self, msg):
+        """A verb on the stations chosen, each through its own driver.
+
+        `lxmf.send` and `path` name the other end (`to`) by node or LXMF
+        identity, whose address is asked of its station once (`path` may
+        name none, for the whole table); `lxmf.send`
+        may name its sender (`from`) the same way, which then chooses the
+        station, and answers with the message's id, given here. `peer_tcp`
+        names its other end by node, for its address in this run's network.
+        Any other verb's reply is what the driver returned.
         """
         self.need_run()
         verb = msg.get("verb")
         if not verb or self.later(msg):
             return
-        self.answered(msg, await self.meta_results(msg), verb=verb)
+        try:
+            results = await self.meta_results(msg)
+        except (drivers_module.CommandError, store.StoreError, KeyError) as err:
+            # Answered, not only said: whoever asked is waiting on its id.
+            self.refused(msg, str(err))
+            return
+        self.answered(msg, results, verb=verb)
 
     async def meta_results(self, msg):
         """`meta`'s work, at once: {name: what it said}."""
         verb = msg.get("verb")
         args = dict(msg.get("args") or {})
         to = args.pop("to", None)
-        if verb in ("message", "path"):
-            if not to:
-                raise kinds_module.CommandError("%s needs `to`, a node's name" % verb)
+        sender = args.pop("from", None)
+        if "dest_hash" in args:
+            args["dest"] = args.pop("dest_hash")
+        if verb == "lxmf.send" and not to:
+            raise drivers_module.CommandError("lxmf.send needs `to`, a node or an LXMF identity")
+        if verb in ("lxmf.send", "path") and to:
             args["dest"] = await self.address_of(to)
         elif verb == "peer_tcp":
             args["addr"] = stations_module.bind_addr(self.nodeset.node(to)["id"])
-        targets = self.chosen(msg)
+        if verb == "lxmf.send" and sender:
+            node, args["sender"] = await self.lxmf_holder(sender)
+            targets = [(n, s) for n, s in self.chosen({}) if n == node]
+            if not targets:
+                raise drivers_module.CommandError("%s is not up" % node)
+        else:
+            targets = self.chosen(msg)
+        category = msg.get("category")
+        if category is not None:
+            # A category's verb is nothing to a station of another; one that
+            # leaves none of those chosen is a mistake, said.
+            mine = [(n, s) for n, s in targets if s.driver.category == category]
+            if targets and not mine:
+                raise drivers_module.CommandError("none of the %d station(s) chosen runs %s "
+                                                  "firmware" % (len(targets), category))
+            targets = mine
 
         async def one(name, station):
-            if verb == ADDRESS:
-                return await station.kind.address(station) or ""
-            replies = []
-            for line in self.expanded(name, station.kind.lines(verb, **args)):
-                replies.append((await station.kind.run(station, line)).rstrip("\n"))
-            return "\n".join(replies)
+            mine = dict(args)
+            for key in ("tx_dbm", "dbm"):
+                if mine.get(key) == "max":
+                    mine[key] = self.max_dbm(name)
+            if verb in NAMED_VERBS and "name" not in mine:
+                mine["name"] = name
+            if verb == "lxmf.send":
+                mine["mid"] = self.new_mid(name)
+                await self.do_verb(station, verb, mine)
+                return mine["mid"]
+            return await self.do_verb(station, verb, mine)
 
         results = await self.spread(msg, targets, one)
         log("%s on %d station(s)" % (verb, len(results)))
         return results
 
     async def do_sequence(self, msg):
-        """Several commands and intents, each a `command` or `meta` without
+        """Several commands and verbs, each a `command` or `meta` without
         its own choice of stations or time, one after the other on the
         stations `msg` chooses, answered once: `results` is a list, one
         {name: reply} per step.
@@ -1572,14 +1745,17 @@ class Simd:
         steps = list(msg.get("steps") or ())
         if not steps or self.later(msg):
             return
-        chosen = {k: msg[k] for k in ("name", "names", "tag", "kind", "stagger") if k in msg}
+        chosen = {k: msg[k] for k in ("name", "names", "tag", "base", "stagger") if k in msg}
         out = []
         for step in steps:
             step = dict(step, **chosen)
             if step.get("type") == "command":
                 out.append(await self.command_results(step))
             elif step.get("type") == "meta":
-                out.append(await self.meta_results(step))
+                try:
+                    out.append(await self.meta_results(step))
+                except (drivers_module.CommandError, store.StoreError, KeyError) as err:
+                    out.append({n: "! %s" % err for n, _ in self.chosen(step)})
             else:
                 raise ValueError("a sequence's step is a command or a meta")
         self.answered(msg, out)
@@ -1634,14 +1810,14 @@ class Simd:
 
         The geodata, the nodeset, the script and the tables are all the run's
         own copies, and so are its firmware and first-boot rules, which the
-        script's runner gave it; each firmware's build is the one the run
-        kept while its executable is still there, and resolved now (fetched,
-        for a `_latest` one) when it is not.
+        script's runner gave it; each firmware name runs what the run kept
+        for it while that is still installed, and is resolved again when it
+        is not.
         """
         gd, ns = run.geodata(), run.nodeset()
         builds = {ref: b for ref, b in (run.meta.get("builds") or {}).items()
-                  if kinds_module.build_present(b)}
-        kinds = kinds_module.make_kinds(builds)
+                  if drivers_module.build_present(b)}
+        drivers = drivers_module.load_all(builds)
         rules = run.meta.get("firmware_rules") or []
         first_boot = run.meta.get("first_boot_rules") or []
         tables = {band: slt.Table.read(run.table_path(band)) for band in run.bands()}
@@ -1651,7 +1827,7 @@ class Simd:
             self.rows_task.cancel()
             self.rows_task = None
         self.run, self.geodata, self.nodeset = run, gd, ns
-        self.kinds, self.builds, self.tables = kinds, builds, tables
+        self.drivers, self.builds, self.tables = drivers, builds, tables
         self.rules = [self.check_rule(r) for r in rules]
         self.first_boot = [self.check_first_boot(r) for r in first_boot]
         self.firmware = {}
@@ -1837,12 +2013,12 @@ class Simd:
         name = self.node_for_label(label)
         if name is None:
             return web.Response(status=404, text="no such station\n")
-        kind = self.kind_of(name)
-        if kind is None or kind.web_port() is None:
+        driver = self.driver_of(name)
+        if driver is None or driver.web_port() is None:
             return web.Response(status=404, text="no web UI on this station\n")
         addr = stations_module.bind_addr(self.nodeset.nodes[name]["id"])
         return await webrtc_module.bridge(
-            request, "http://%s:%d%s" % (addr, kind.web_port(), SIGNAL_PATH),
+            request, "http://%s:%d%s" % (addr, driver.web_port(), SIGNAL_PATH),
             self.relay, addr, WEBRTC_PORT, label)
 
     async def api_store(self, request):
@@ -1898,7 +2074,7 @@ class Simd:
         if os.path.isfile(os.path.join(self.args.run, runs_module.RUN_FILE)):
             try:
                 await self.adopt(runs_module.open_run(self.args.run))
-            except (store.StoreError, kinds_module.CommandError, OSError) as err:
+            except (store.StoreError, drivers_module.CommandError, OSError) as err:
                 log("error: cannot load the run in %s: %s" % (self.args.run, err))
         await self.start_http()
         self.poller = asyncio.ensure_future(self.poll_roles())
@@ -1961,8 +2137,8 @@ def parse_args(argv):
                          "(run.yaml), and where a run loaded later goes, or beside "
                          "it as <dir>-2, -3… (default %s)" % os.path.relpath(DEFAULT_RUN))
     ap.add_argument("--build",
-                    help="a device (<project>_<catalogue>_latest, a saved one, or a path) "
-                         "every node whose firmware is of its kind runs instead")
+                    help="an installed firmware (<name> or <base>_latest) every node "
+                         "whose firmware has its base runs instead")
     ap.add_argument("--sidecar",
                     help="the planner-web base URL a pack's rows are recomputed "
                          "through after a move")

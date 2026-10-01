@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Delivery of an LXMF traffic run, from its output and the stations' logs.
+"""Delivery of an LXMF traffic run, from its output and the run's events.
 
     delivery.py TRAFFIC.json RUN_DIR [--json OUT]
 
 TRAFFIC.json is what the traffic driver (scripts/lxmf-traffic.py) wrote.
-RUN_DIR is the run the traffic went through: its stations' logs, its
-record's epoch, and its radio graph, which is the run's own loss tables at
-the calling channel with each node's declared SF, bandwidth and power,
-forwarding through the stations whose role forwards. What is counted is
-`sim_mesh.reticulum.delivery`'s, each sender by its own station's logs.
+RUN_DIR is the run the traffic went through: the events its stations'
+drivers reported (events.jsonl), and its radio graph, which is the run's own
+loss tables at the calling channel with each node's declared SF, bandwidth
+and power, forwarding through the stations whose role forwards. What is
+counted is `sim_mesh.reticulum.delivery`'s.
 """
 import argparse
 import json

@@ -1,7 +1,7 @@
-"""simd on synthetic ground with a stand-in station kind: loading, first boot
-(declared settings, the first-boot rules, the radio last), the tables and offsets, a
-move recomputed into the run's copy, an id change, levels, commands and
-intents on chosen stations, snapshots."""
+"""simd on synthetic ground with stand-in firmware: loading, first boot (the
+first-boot rules in order, the radio last), the tables and offsets, a move
+recomputed into the run's copy, an id change, levels, commands and verbs on
+chosen stations, events, snapshots."""
 
 import asyncio
 import copy
@@ -15,54 +15,13 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import devices  # noqa: E402
-import kinds  # noqa: E402
+import drivers  # noqa: E402
+import firmware  # noqa: E402
 import simd  # noqa: E402
 import slt  # noqa: E402
 import store  # noqa: E402
-
-
-class Stub(kinds.Kind):
-    """A kind whose station is a shell script that sleeps, is up at once and
-    writes down every line it is given."""
-
-    type_name = "stub"
-
-    async def wait_up(self, station, timeout):
-        return True
-
-    async def run(self, station, line, timeout=None):
-        with open(os.path.join(station.dir, "lines"), "a") as out:
-            out.write(line + "\n")
-        return "did %s" % line
-
-    async def role(self, station):
-        return "client"
-
-    async def address(self, station):
-        return "%032x" % station.node_id
-
-    def configured(self, station):
-        return os.path.exists(os.path.join(station.dir, "lines"))
-
-    def lines(self, verb, **args):
-        if verb == "name":
-            return ["name {name} {id}"]
-        if verb == "radio":
-            return ["radio %s" % " ".join("%s=%s" % kv for kv in sorted(args.items()))]
-        if verb == "radio_up":
-            return ["radio up"]
-        if verb == "role":
-            return ["role %s" % args["role"]]
-        if verb == "announce":
-            return ["announce"]
-        if verb == "message":
-            return ["send %s %s" % (args["dest"], args["text"])]
-        return super().lines(verb, **args)
-
-
-class Other(Stub):
-    type_name = "other"
+import stub_firmware  # noqa: E402
+from sim_mesh.reticulum.driver import ReticulumDriver  # noqa: E402
 
 
 def free_port(kind=socket.SOCK_STREAM):
@@ -71,20 +30,20 @@ def free_port(kind=socket.SOCK_STREAM):
         return probe.getsockname()[1]
 
 
-STUB = "stub_local_latest"
+STUB = "stub_latest"
 ALL_STUB = {"which": {"all": True}, "firmware": STUB}
 # What a script's runner hands a new simulation: its firmware and first-boot rules.
 FAR = {"script": "far", "firmware_rules": [ALL_STUB], "first_boot_rules": [
-    {"which": {"where": {"tag": "transport"}}, "lines": [{"intent": "role",
-                                                           "args": {"role": "transport"}}]},
+    {"which": {"where": {"tag": "transport"}}, "lines": [
+        {"verb": "role", "args": {"role": "transport"}, "category": "reticulum"}]},
     {"which": {"not": {"where": {"tag": "no-radio"}}},
-     "lines": [{"intent": "radio", "args": {"freq_mhz": 869.525, "sf": 8, "tx_dbm": "max"}}]},
+     "lines": [{"verb": "radio", "args": {"freq_mhz": 869.525, "sf": 8, "tx_dbm": "max"}}]},
     {"which": {"where": {"tag": "far"}}, "lines": ["far {addr}", "role transport"]},
     {"which": {"names": ["c"]}, "lines": ["txp {max_dbm}"]},
-    {"which": {"not": {"where": {"tag": "no-radio"}}}, "lines": [{"intent": "radio_up",
+    {"which": {"not": {"where": {"tag": "no-radio"}}}, "lines": [{"verb": "radio_up",
                                                                   "args": {}}]}]}
 STUBS = {"firmware_rules": [ALL_STUB, {"which": {"where": {"tag": "odd"}},
-                                       "firmware": "other_local_latest"}]}
+                                       "firmware": "other_latest"}]}
 
 
 def horizon_pair_gain():
@@ -100,18 +59,12 @@ def stores(tmp_path, monkeypatch):
         path = tmp_path / attr.lower()
         path.mkdir()
         monkeypatch.setattr(store, attr, str(path))
-    real = kinds.kind_types
-    monkeypatch.setattr(kinds, "kind_types", lambda: {**real(), "stub": Stub, "other": Other})
-    local = tmp_path / "devices" / "local"
-    local.mkdir(parents=True)
-    monkeypatch.setattr(devices, "DEVICES_DIR", str(tmp_path / "devices"))
-    elf = tmp_path / "station.sh"
-    elf.write_text("#!/bin/sh\nexec sleep 60\n")
-    elf.chmod(elf.stat().st_mode | stat.S_IEXEC)
-    (local / "stub_local.yaml").write_text("kind: stub\nproject: Stub\nvirtual_hardware: ESP32\n"
-                                           "elf: %s\n" % elf)
-    (local / "stubtwo_local.yaml").write_text("kind: stub\nproject: Stubtwo\nelf: %s\n" % elf)
-    (local / "other_local.yaml").write_text("kind: other\nelf: %s\n" % elf)
+    fw = tmp_path / "firmware"
+    fw.mkdir()
+    monkeypatch.setattr(firmware, "FIRMWARE_DIR", str(fw))
+    stub_firmware.install(fw, "stub", "20260101000000", title="Stub", hardware="ESP32")
+    stub_firmware.install(fw, "stub", "20260102000000", title="Stub two", hardware="ESP32")
+    stub_firmware.install(fw, "other", "1.0.0", title="Other")
     (tmp_path / "geodata_dir" / "flat").mkdir()
     (tmp_path / "geodata_dir" / "flat" / "geodata.yaml").write_text(
         "synthetic:\n  exponent: 3.0\n")
@@ -158,17 +111,17 @@ def test_a_run_never_lands_on_another(tmp_path):
     assert simd.free_run_dir(str(base)) == str(base) + "-2"
 
 
-def test_an_override_replaces_every_firmware_of_its_kind(stores):
-    refs = [STUB, "other_local_latest"]
-    got = asyncio.run(kinds.ensure_builds(refs))
-    assert got[STUB]["name"].startswith("Stub local ")
-    assert got["other_local_latest"]["kind_type"] == "other"
-    got = asyncio.run(kinds.ensure_builds(refs, override="stubtwo_local_latest"))
-    assert got[STUB]["name"].startswith("Stubtwo local ")
-    assert got[STUB]["asked"] == "stubtwo_local_latest"
-    assert got["other_local_latest"]["kind_type"] == "other"
-    with pytest.raises(kinds.CommandError, match="nothere"):
-        asyncio.run(kinds.ensure_builds(["nothere_local_1"]))
+def test_an_override_replaces_every_firmware_of_its_base(stores):
+    refs = [STUB, "other_latest"]
+    got = drivers.resolve_builds(refs)
+    assert got[STUB]["title"] == "Stub two" and got[STUB]["version"] == "20260102000000"
+    assert got["other_latest"]["base"] == "other"
+    older = "stub_%s_20260101000000" % firmware.machine_arch()
+    got = drivers.resolve_builds(refs, override=older)
+    assert got[STUB]["firmware"] == older and got[STUB]["asked"] == older
+    assert got["other_latest"]["base"] == "other"
+    with pytest.raises(drivers.CommandError, match="nothere"):
+        drivers.resolve_builds(["nothere_latest"])
 
 
 def test_setup_is_the_name_then_the_first_boot_rules_in_order(stores):
@@ -181,8 +134,9 @@ def test_setup_is_the_name_then_the_first_boot_rules_in_order(stores):
         assert sorted(daemon.ether.names.values()) == ["a", "b", "c"]
         assert await until(lambda: all(
             daemon.stations.get(n) and daemon.stations[n].status == "up" for n in "abc"))
-        # The name, then the rules in order: intents in the kind's lines, a
-        # transmit power of "max" and {max_dbm} the node's maximum.
+        # The name, then the rules in order: verbs through the driver, lines
+        # typed as written, a transmit power of "max" and {max_dbm} the
+        # node's maximum.
         radio = "radio freq_mhz=869.525 sf=8 tx_dbm=22.0"
         assert lines_of(run, "a")[:4] == ["name a 1", "role transport", radio, "radio up"]
         assert lines_of(run, "b") == ["name b 2"]                 # no-radio, no role
@@ -190,8 +144,11 @@ def test_setup_is_the_name_then_the_first_boot_rules_in_order(stores):
                                           "role transport", "txp 22", "radio up"]
         assert run.meta["first_boot_rules"] == FAR["first_boot_rules"]
         node = [m for m in daemon.said if m["type"] == "node" and m["name"] == "c"][-1]
-        assert node["firmware"] == STUB and node["device_name"].endswith("(virtual ESP32)")
-        assert node["kind"] == "stub" and node["antenna"] == {"type": "whip_sma_quarter_wave"}
+        assert node["firmware"] == STUB and node["device_name"] == "Stub two (virtual ESP32)"
+        assert node["base"] == "stub" and node["category"] == "reticulum"
+        assert node["antenna"] == {"type": "whip_sma_quarter_wave"}
+        assert run.meta["builds"][STUB]["firmware"] == \
+            "stub_%s_20260102000000" % firmware.machine_arch()
         assert daemon.run.meta["firmware"] == {n: STUB for n in "abc"}
         for key in ("lat", "lon", "height_m", "height_from", "antenna", "tags", "role", "stale"):
             assert key in node
@@ -222,8 +179,8 @@ def test_a_run_records_the_medium_it_was_started_on(stores):
 
 def test_each_station_keeps_its_own_clock_within_the_ppm_given(stores):
     """--clock-ppm: a station's crystal is off by a draw within the bound,
-    its own, the same for the same seed and name; the kind hands it over in
-    a virtual run, and a device's own profile still wins."""
+    its own, the same for the same seed and name; the station's environment
+    carries it in a virtual run, and a firmware's own profile still wins."""
     import types
     daemon = make_simd(stores, "--time", "max", "--clock-ppm", "20")
     daemon.ether = types.SimpleNamespace(seed=5, clock=types.SimpleNamespace(virtual=True),
@@ -243,13 +200,13 @@ def test_each_station_keeps_its_own_clock_within_the_ppm_given(stores):
     station = types.SimpleNamespace(node_id=1, dir="d", addr="a", ether_addr="e",
                                     clock=daemon.ether, board=None,
                                     clock_profile=daemon.clock_profile("a"))
-    assert Stub({}).env(station)["SIM_MESH_CLOCK_PROFILE"] == daemon.clock_profile("a")
-    own = Stub({"env": {"SIM_MESH_CLOCK_PROFILE": "0:0,1:2"}}).env(station)
+    assert drivers.env(station, {})["SIM_MESH_CLOCK_PROFILE"] == daemon.clock_profile("a")
+    own = drivers.env(station, {"env": {"SIM_MESH_CLOCK_PROFILE": "0:0,1:2"}})
     assert own["SIM_MESH_CLOCK_PROFILE"] == "0:0,1:2"
     daemon.args.clock_ppm = 0
     assert daemon.clock_profile("a") is None
     station.clock_profile = None
-    assert "SIM_MESH_CLOCK_PROFILE" not in Stub({}).env(station)
+    assert "SIM_MESH_CLOCK_PROFILE" not in drivers.env(station, {})
 
 
 def test_a_drifting_clock_needs_virtual_time():
@@ -369,12 +326,10 @@ def test_a_request_that_fails_is_answered_with_its_error(stores):
         await daemon.do_sim_load({"geodata": "flat", "nodeset": "three", **STUBS})
         assert await until(lambda: len(daemon.stations) == 3 and all(
             s.status == "up" for s in daemon.stations.values()))
-        for msg in ({"type": "meta", "verb": "message", "name": "a",
+        for msg in ({"type": "meta", "verb": "lxmf.send", "name": "a",
                      "args": {"to": "nobody", "text": "yo"}, "id": "f1"},
-                    {"type": "sequence", "names": ["a"], "id": "f2",
-                     "steps": [{"type": "meta", "verb": "path", "args": {"to": "nobody"}}]},
                     # Put off to an instant, it fails on a task of its own.
-                    {"type": "meta", "verb": "message", "name": "a", "after": 0.001,
+                    {"type": "meta", "verb": "lxmf.send", "name": "a", "after": 0.001,
                      "args": {"to": "nobody", "text": "yo"}, "id": "f3"}):
             said = len(daemon.said)
             await daemon.handle(msg)
@@ -383,13 +338,13 @@ def test_a_request_that_fails_is_answered_with_its_error(stores):
             errors = [m["text"] for m in daemon.said[said:] if m["type"] == "error"]
             assert [a["id"] for a in answers] == [msg["id"]], msg
             assert answers[0]["error"] == errors[0] and answers[0]["results"] == {}, msg
-            assert "nobody is not up" in errors[0], msg
+            assert "named nobody" in errors[0], msg
         await daemon.stop_all(flush=False)
         daemon.ether.close()
     asyncio.run(go())
 
 
-def test_commands_and_intents_go_to_the_stations_chosen(stores):
+def test_commands_and_verbs_go_to_the_stations_chosen(stores):
     async def go():
         daemon = make_simd(stores)
         await daemon.start_ether()
@@ -405,44 +360,98 @@ def test_commands_and_intents_go_to_the_stations_chosen(stores):
         got = [m for m in daemon.said if m["type"] == "command_result"][-1]
         assert sorted(got["results"]) == ["a", "b"]
 
-        await daemon.do_meta({"verb": "announce", "id": "x3"})
+        await daemon.do_meta({"verb": "lxmf.announce", "id": "x3"})
         got = [m for m in daemon.said if m["type"] == "command_result"][-1]
-        assert got["verb"] == "announce" and got["results"] == {
+        assert got["verb"] == "lxmf.announce" and got["results"] == {
             n: "did announce" for n in "abc"}
 
-        await daemon.do_meta({"verb": "message", "name": "a", "args": {"to": "b", "text": "yo"},
-                              "id": "x4"})
+        await daemon.do_meta({"verb": "lxmf.send", "name": "a",
+                              "args": {"to": "b", "text": "yo"}, "id": "x4"})
         got = [m for m in daemon.said if m["type"] == "command_result"][-1]
-        assert got["results"] == {"a": "did send %032x yo" % 2}
+        mid = got["results"]["a"]
+        assert mid.startswith("a.")         # sim-mesh's id: the sender and T
+        # What the station said under its own id, before it was coupled to
+        # sim-mesh's, is in the run's events under sim-mesh's, at T.
+        with open(os.path.join(daemon.run.dir, "events.jsonl")) as handle:
+            events = [json.loads(line) for line in handle]
+        assert events[-1]["node"] == "a" and events[-1]["mid"] == mid
+        assert events[-1]["event"] == "lxmf.message.status"
+        assert events[-1]["status"] == "delivered"
+        assert isinstance(events[-1]["t"], int)
 
         await daemon.do_meta({"verb": "path", "name": "a", "args": {"to": "b"}, "id": "x5"})
         got = [m for m in daemon.said if m["type"] == "command_result"][-1]
-        assert got["results"]["a"].startswith("! a stub station has no way to path")
+        assert got["results"]["a"] == "! Stub two has no way to path"
 
-        await daemon.do_meta({"verb": "address", "id": "x6"})
+        await daemon.do_meta({"verb": "lxmf.identities", "id": "x6"})
         got = [m for m in daemon.said if m["type"] == "command_result"][-1]
-        assert got["results"]["c"] == "%032x" % 3
+        assert got["results"]["c"] == [["c", "%032x" % 3]]
+
+        # An identity named: a sender and a recipient by that name, and a
+        # name no other identity or node may take.
+        await daemon.do_meta({"verb": "lxmf.create", "name": "c", "args": {"name": "carol"},
+                              "id": "x6a"})
+        got = [m for m in daemon.said if m["type"] == "command_result"][-1]
+        carol = got["results"]["c"]
+        await daemon.do_meta({"verb": "lxmf.send", "args": {"from": "carol", "to": "a",
+                                                           "text": "hey"}, "id": "x6b"})
+        got = [m for m in daemon.said if m["type"] == "command_result"][-1]
+        assert list(got["results"]) == ["c"] and got["results"]["c"].startswith("c.")
+        assert lines_of(daemon.run, "c")[-1] == "send carol %032x hey" % 1
+        await daemon.do_meta({"verb": "lxmf.send", "name": "a",
+                              "args": {"to": "carol", "text": "ho"}, "id": "x6c"})
+        assert lines_of(daemon.run, "a")[-1] == "send - %s ho" % carol
+        for who, name in (("b", "carol"), ("a", "b")):
+            await daemon.do_meta({"verb": "lxmf.create", "name": who, "args": {"name": name},
+                                  "id": "x6d"})
+            got = [m for m in daemon.said if m["type"] == "command_result"][-1]
+            assert "would not be unique" in got["results"][who]
 
         # A sequence: its steps one after the other at one T, answered once.
         await daemon.do_sequence({"steps": [{"type": "command", "line": "first {name}"},
-                                            {"type": "meta", "verb": "message",
+                                            {"type": "meta", "verb": "lxmf.send",
                                              "args": {"to": "b", "text": "then"}}],
                                   "names": ["a"], "id": "x8"})
         got = [m for m in daemon.said if m["type"] == "command_result"][-1]
-        assert got["id"] == "x8" and got["results"] == [{"a": "did first a"},
-                                                         {"a": "did send %032x then" % 2}]
-        assert lines_of(daemon.run, "a")[-2:] == ["first a", "send %032x then" % 2]
+        assert got["id"] == "x8" and got["results"][0] == {"a": "did first a"}
+        assert got["results"][1]["a"].startswith("a.")
+        assert lines_of(daemon.run, "a")[-2:] == ["first a", "send - %032x then" % 2]
 
-        # A line is one kind's language: a mixed choice is refused unless narrowed.
+        # A category's verb is for its stations; one that leaves none of those
+        # chosen is answered as an error, so whoever asked does not wait on it.
+        await daemon.do_meta({"verb": "lxmf.announce", "category": "reticulum",
+                              "names": ["a"], "id": "x9"})
+        got = [m for m in daemon.said if m["type"] == "command_result"][-1]
+        assert got["results"] == {"a": "did announce"}
+        await daemon.do_meta({"verb": "lxmf.announce", "category": "meshcore",
+                              "names": ["a"], "id": "x10"})
+        got = [m for m in daemon.said if m["type"] == "command_result"][-1]
+        assert got["id"] == "x10" and "runs meshcore firmware" in got["error"]
+        with pytest.raises(ValueError, match="no such verb 'lxmf.send'"):
+            daemon.check_first_boot({"which": {"all": True}, "lines": [
+                {"verb": "lxmf.send", "args": {}}]})
+        with pytest.raises(ValueError, match="no firmware category"):
+            daemon.check_first_boot({"which": {"all": True}, "lines": [
+                {"verb": "role", "args": {}, "category": "meshcore"}]})
+
+        # The scripts' log level: kept in the run, in the snapshot, said to all.
+        assert daemon.snapshot()["script_loglevel"] == "output"
+        await daemon.do_script_loglevel({"level": "commands"})
+        assert daemon.run.meta["script_loglevel"] == "commands"
+        assert daemon.said[-1] == {"type": "script_loglevel", "level": "commands"}
+        with pytest.raises(ValueError, match="one of output"):
+            await daemon.do_script_loglevel({"level": "loud"})
+
+        # A line is one firmware's language: a mixed choice is refused unless narrowed.
         await daemon.do_nodeset_add({"name": "d", "lat": 0.001, "lon": 0.001, "tags": ["odd"]})
         assert await until(lambda: daemon.stations.get("d") and
                            daemon.stations["d"].status == "up")
-        with pytest.raises(kinds.CommandError, match="say which kind"):
+        with pytest.raises(drivers.CommandError, match="say which base"):
             await daemon.do_command({"line": "x"})
-        await daemon.do_command({"line": "only", "kind": "other", "id": "x7"})
+        await daemon.do_command({"line": "only", "base": "other", "id": "x7"})
         got = [m for m in daemon.said if m["type"] == "command_result"][-1]
         assert got["results"] == {"d": "did only"}
-        assert daemon.run.meta["builds"]["other_local_latest"]["kind_type"] == "other"
+        assert daemon.run.meta["builds"]["other_latest"]["base"] == "other"
         await daemon.stop_all(flush=False)
         daemon.ether.close()
     asyncio.run(go())
@@ -469,12 +478,12 @@ def test_firmware_rules_start_restart_and_leave_idle(stores):
 
         await daemon.do_firmware({"id": "f2", "rules": [
             {"which": {"all": True}, "firmware": STUB},
-            {"which": {"names": ["c"]}, "firmware": "other_local_latest"}]})
+            {"which": {"names": ["c"]}, "firmware": "other_latest"}]})
         got = [m for m in daemon.said if m["type"] == "command_result"][-1]
-        assert got["results"] == {"a": STUB, "b": STUB, "c": "other_local_latest"}
+        assert got["results"] == {"a": STUB, "b": STUB, "c": "other_latest"}
         assert await until(lambda: len(daemon.stations) == 3 and all(
             s.status == "up" for s in daemon.stations.values()))
-        assert daemon.kind_of("c").name == "other"
+        assert daemon.driver_of("c").firmware["base"] == "other"
         assert any(m["type"] == "notice" and "c now runs" in m["text"] for m in daemon.said)
         assert daemon.run.meta["firmware_rules"][0]["firmware"] == STUB
 
@@ -494,10 +503,9 @@ def test_roles_are_asked_only_for_a_page_that_draws_them(stores, monkeypatch):
     left it until its stations start."""
     asked = []
 
-    async def role(self, station):
+    async def read_role(self, station):
         asked.append(station.name)
-        return "client"
-    monkeypatch.setattr(Stub, "role", role)
+    monkeypatch.setattr(simd.Simd, "read_role", read_role)
     monkeypatch.setattr(simd, "ROLE_POLL_S", 0.05)
 
     async def unwatched_virtual():
@@ -539,17 +547,15 @@ def test_roles_are_asked_only_for_a_page_that_draws_them(stores, monkeypatch):
 
 
 def test_a_console_nothing_acts_on_is_not_waited_for(tmp_path, monkeypatch):
-    """The drain before T moves reads only the consoles of kinds that act on
-    what their stations print (console_acted_on): Sergeyculum's, log lines
-    alone, are read as they come, and a barrier where only it printed waits
-    for nothing."""
+    """The drain before T moves reads only the consoles of firmwares whose
+    drivers act on what their stations print (console_acted_on, by
+    default): one whose console is log lines alone is read as it comes, and
+    a barrier where only it printed waits for nothing."""
     import stations
     import types
 
     daemon = make_simd(tmp_path)
-    from kinds import reticulous, sergeyculum
-    assert reticulous.Reticulous.console_acted_on
-    assert not sergeyculum.Sergeyculum.console_acted_on
+    assert ReticulumDriver.console_acted_on
 
     pipes = []
 
@@ -559,8 +565,9 @@ def test_a_console_nothing_acts_on_is_not_waited_for(tmp_path, monkeypatch):
         marks = stations.Marks(reader)
         marks.reading, marks.taken = True, 1         # handed on reads not caught up with
         drain = types.SimpleNamespace(master=reader, marks=marks)
-        kind = types.SimpleNamespace(console_acted_on=acted_on, sids=lambda station: (station.node_id,))
-        return types.SimpleNamespace(node_id=node_id, drain=drain, kind=kind)
+        driver = types.SimpleNamespace(console_acted_on=acted_on,
+                                       sids=lambda station: (station.node_id,))
+        return types.SimpleNamespace(node_id=node_id, drain=drain, driver=driver)
     daemon.stations = {"ours": printing(1, False), "theirs": printing(2, True)}
     waited = []
     monkeypatch.setattr(stations.ptys(), "call",
@@ -590,7 +597,7 @@ def test_only_a_station_that_printed_is_read_through_the_pty_thread(marks):
     if marks == "core":
         module = simd.ether_module.core_module()
         if module is None:
-            pytest.skip("no ether core built (sim-mesh build ether)")
+            pytest.skip("no ether core built (sim builds it when it starts)")
 
     async def go():
         main = asyncio.get_running_loop()
@@ -598,6 +605,7 @@ def test_only_a_station_that_printed_is_read_through_the_pty_thread(marks):
         os.set_blocking(master, False)
         got = []
         station = types.SimpleNamespace(log_file=open(os.devnull, "wb"), watchers=0,
+                                        hears_lines=False,
                                         pty_closed=lambda drain: None,
                                         console_out=lambda text: None)
         rpc = types.SimpleNamespace(on_marker=lambda: None,
@@ -630,7 +638,7 @@ def test_only_a_station_that_printed_is_read_through_the_pty_thread(marks):
 
 
 def test_a_console_that_need_not_be_a_terminal_is_a_pipe_each_way(tmp_path):
-    """A kind with console_tty False: the station's stdin and stdout are
+    """A driver with console_tty False: the station's stdin and stdout are
     pipes, not a pty; what it prints reaches its log, what is typed at it
     reaches it."""
     import stat as stat_module
@@ -640,14 +648,16 @@ def test_a_console_that_need_not_be_a_terminal_is_a_pipe_each_way(tmp_path):
     script.write_text("#!/bin/sh\necho hello\nwhile read line; do echo \"got $line\"; done\n")
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
 
-    class Piped(Stub):
+    class Piped(ReticulumDriver):
         console_tty = False
 
-    kind = Piped({"elf": str(script)})
-    kind.elf = str(script)
+        def configured(self, station):
+            return False
+
+    driver = Piped({"firmware": "piped", "exec": str(script), "env": {}})
 
     async def go():
-        station = stations.Station("p", 7, str(tmp_path / "p"), kind, "127.0.0.1:9")
+        station = stations.Station("p", 7, str(tmp_path / "p"), driver, "127.0.0.1:9")
         os.makedirs(station.dir, exist_ok=True)
         await station.start()
         try:
@@ -709,7 +719,7 @@ def test_a_driver_takes_turns_with_t(stores):
 
 
 def test_a_role_the_station_forgets_is_said_again_after_a_reset(stores, monkeypatch):
-    monkeypatch.setattr(Stub, "role_volatile", True)
+    monkeypatch.setattr(ReticulumDriver, "role_volatile", True)
 
     async def go():
         daemon = make_simd(stores)
@@ -719,7 +729,7 @@ def test_a_role_the_station_forgets_is_said_again_after_a_reset(stores, monkeypa
         run = daemon.run
         assert lines_of(run, "a").count("role transport") == 1
         await daemon.do_node_reset({"name": "a"})
-        # The role intent of its first-boot rules again, and nothing else of them.
+        # The role verb of its first-boot rules again, and nothing else of them.
         assert await until(lambda: lines_of(run, "a").count("role transport") == 2)
         assert lines_of(run, "a").count("name a 1") == 1          # not set up again
         assert lines_of(run, "a").count("radio up") == 1
@@ -770,5 +780,6 @@ def test_a_tool_that_ends_as_its_wait_times_out_is_a_tool_that_gave_no_answer(mo
         return Late()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    with pytest.raises(kinds.CommandError, match="gave no answer"):
-        asyncio.run(kinds.run_tool(["/bin/true"], 0.05))
+    from sim_mesh import driver
+    with pytest.raises(driver.CommandError, match="gave no answer"):
+        asyncio.run(driver.run_tool(["/bin/true"], 0.05))

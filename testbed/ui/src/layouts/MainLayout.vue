@@ -5,9 +5,10 @@
         <q-tabs v-model="tab" dense no-caps inline-label align="left" class="sim-tabs"
                 active-color="white" indicator-color="primary">
           <template v-if="socket.front">
-            <q-tab name="devices" label="Firmware" />
+            <q-tab name="firmware" label="Firmware" />
             <q-tab name="antennas" label="Antennas" />
-            <q-tab name="geodata" label="Geodata" />
+            <!-- A click goes to the list of geodata, from a preview's map too. -->
+            <q-tab name="geodata" label="Geodata" @click="sim.geodataList++" />
           </template>
           <q-tab name="nodes" label="Nodes" />
           <template v-if="socket.front">
@@ -28,7 +29,7 @@
       <!-- Each kept mounted while another is on show, so a console left open,
            a nodeset half-built or a script half-written is still there on the
            way back. -->
-      <DevicesPage v-if="socket.front" v-show="sim.view === 'devices'" />
+      <FirmwarePage v-if="socket.front" v-show="sim.view === 'firmware'" />
       <AntennasPage v-if="socket.front" v-show="sim.view === 'antennas'" />
       <GeodataPage v-if="socket.front" v-show="sim.view === 'geodata'" />
       <!-- One map for both: the nodeset being edited on the Nodes tab, and an
@@ -58,10 +59,11 @@
  * and only the Nodes tab, attached to it. */
 import { computed, watch } from 'vue'
 import { useQuasar } from 'quasar'
+import { useRoute, useRouter } from 'vue-router'
 import { useSim, type SimSummary, type Tab } from '../stores/sim'
 import { useSocket } from '../stores/socket'
 import { useCatalog } from '../stores/catalog'
-import DevicesPage from '../pages/DevicesPage.vue'
+import FirmwarePage from '../pages/FirmwarePage.vue'
 import AntennasPage from '../pages/AntennasPage.vue'
 import GeodataPage from '../pages/GeodataPage.vue'
 import NodesPage from '../pages/NodesPage.vue'
@@ -96,6 +98,19 @@ socket.connect()
 // With the front, the page starts where work starts: choosing a geodata.
 watch(() => socket.front, (front, was) => {
   if (front && !was && sim.view === 'nodes' && !sim.attached) sim.show('geodata')
+}, { immediate: true })
+
+// `?sim=<name>`, as `sim run` opens the page: that simulation's live map, once
+// the front lists it running.
+const route = useRoute()
+const router = useRouter()
+watch(() => [route.query.sim, sim.sims.map(s => `${s.name}:${s.state}`).join()], () => {
+  const name = route.query.sim
+  if (typeof name !== 'string' || !name) return
+  if (!sim.sims.some(s => s.name === name && s.state === 'running')) return
+  void router.replace({ query: {} })
+  sim.fitWanted = true
+  sim.attach(name)
 }, { immediate: true })
 
 // simd and the front report what they could not do; the page says so and moves on.

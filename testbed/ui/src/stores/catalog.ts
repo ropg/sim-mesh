@@ -3,28 +3,25 @@ import { request } from '../lib/front'
 import type { AntennaSpec } from '../lib/antennas'
 import { useSocket } from './socket'
 
-/* What the store holds, for every picker and list on the page: devices,
+/* What the store holds, for every picker and list on the page: firmware,
  * antennas, geodata, nodesets, scripts, snapshots, and the script runs the front keeps
  * with their output. The registry the front sends every second names what
  * there is; the *_list verbs describe it, and a name alone keeps what a
  * description already said. */
 
-/** A build, as the Firmware tab lists it: a latest one, named
- *  `<project>_<catalogue>_latest` and fetched when used, or a saved one,
- *  named `<project>_<catalogue>_<stamp>`. What it plays and its kind are
- *  known once it is here. */
-export interface DeviceRow {
-  ref: string
-  project?: string
-  catalogue?: string
-  stamp?: string
-  name?: string
-  virtual_hardware?: string | null
-  virtual_radio?: string | null
-  kind?: string
-  /** A latest one: whether it has been fetched, and from where it comes. */
-  fetched?: boolean
-  source?: 'web' | 'builds' | 'compiled'
+/** An installed firmware, as the Firmware tab lists it, named
+ *  `<base>_<arch>_<version>`. `users` are the paused runs and snapshots that
+ *  hold it. */
+export interface FirmwareRow {
+  name: string
+  base: string
+  arch: string
+  version: string
+  category?: string
+  radio?: string | null
+  title?: string
+  hardware?: string | null
+  users?: string[]
   error?: string
 }
 
@@ -63,8 +60,17 @@ export interface NodesetRow {
  *  here) or another script's. */
 export interface ScriptReference { name: string; path: string; library: boolean }
 
+/** Something a script asks for before it runs (`script_input(…)`): a number,
+ *  text, yes or no, a run's name, or for type `firmware` an installed
+ *  firmware, of `category` when it names one. */
+export interface ScriptInput {
+  name: string; type: 'int' | 'float' | 'str' | 'bool' | 'firmware' | 'run'; label: string
+  category?: string; default?: string | number | boolean
+}
+
 export interface ScriptRow {
   name: string; doc?: string; report?: boolean; references?: ScriptReference[]; error?: string
+  inputs?: ScriptInput[]
   /** The scripts that include or import this one: it is part of them, not run on its own. */
   included_by?: string[]
 }
@@ -106,8 +112,7 @@ const LINES_KEPT = 2000
 
 export const useCatalog = defineStore('catalog', {
   state: () => ({
-    latest: [] as DeviceRow[],
-    saved: [] as DeviceRow[],
+    firmware: [] as FirmwareRow[],
     arch: '' as string,
     antennas: [] as AntennaSpec[],
     geodata: [] as GeodataInfo[],
@@ -136,8 +141,8 @@ export const useCatalog = defineStore('catalog', {
         if (msg.type === 'store') this.names(msg)
         return
       }
-      if (msg.type === 'devices_changed') {
-        void this.refreshDevices()
+      if (msg.type === 'firmware_changed') {
+        void this.refreshFirmware()
       } else if (msg.type === 'geodata_progress') {
         const row = msg.build as BuildRow | null
         this.build = row && row.state !== 'done' && row.state !== 'cancelled' ? row : null
@@ -182,22 +187,21 @@ export const useCatalog = defineStore('catalog', {
     },
 
     async refresh() {
-      const [g, n, s, p, d, a] = await Promise.all([
+      const [g, n, s, p, f, a] = await Promise.all([
         request('geodata_list'), request('nodeset_list'), request('script_list'),
-        request('snapshot_list'), request('device_list'), request('antenna_list'),
+        request('snapshot_list'), request('firmware_list'), request('antenna_list'),
       ])
       if (g.ok) { this.geodata = g.geodata as GeodataInfo[]; this.build = g.build as BuildRow | null }
       if (n.ok) this.nodesets = n.nodesets as NodesetRow[]
       if (s.ok) this.scripts = s.scripts as ScriptRow[]
       if (p.ok) this.snapshots = p.snapshots as Listing[]
-      if (d.ok) this.takeDevices(d)
+      if (f.ok) this.takeFirmware(f)
       if (a.ok) this.antennas = a.antennas as AntennaSpec[]
     },
 
-    takeDevices(d: Record<string, unknown>) {
-      this.latest = d.latest as DeviceRow[]
-      this.saved = d.saved as DeviceRow[]
-      this.arch = d.arch as string
+    takeFirmware(f: Record<string, unknown>) {
+      this.firmware = f.firmware as FirmwareRow[]
+      this.arch = f.arch as string
     },
 
     /** The antennas, once: the catalogue is a file and does not change. A
@@ -213,9 +217,9 @@ export const useCatalog = defineStore('catalog', {
       if (g.ok) { this.geodata = g.geodata as GeodataInfo[]; this.build = g.build as BuildRow | null }
     },
 
-    async refreshDevices() {
-      const d = await request('device_list')
-      if (d.ok) this.takeDevices(d)
+    async refreshFirmware() {
+      const f = await request('firmware_list')
+      if (f.ok) this.takeFirmware(f)
     },
 
     /** A script run's output so far, for a page opened after it began. */

@@ -435,6 +435,14 @@ def pause_run(run, simulation, t):
     run.set(paused={"simulation": simulation, "t": t, "at": now_iso()})
 
 
+def stop_paused(run):
+    """A paused run stopped for good: the state it was paused with gone, so
+    it can no longer be resumed and holds no firmware, and the run ended
+    where it paused (its pause's T and time stay in `run.yaml`)."""
+    shutil.rmtree(os.path.join(run.dir, PAUSED), ignore_errors=True)
+    run.set(stopped=now_iso())
+
+
 def paused_runs(runs_dir=None):
     """Every run waiting in a pause, oldest first."""
     base = runs_dir or store.RUNS_DIR

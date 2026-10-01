@@ -9,25 +9,27 @@ lives; this is the reasoning underneath.
 A station is a whole firmware, compiled for Linux and run as an ordinary
 process. The cut between the real code and the simulated part is the **SPI
 (serial peripheral interface) bus**: everything above it — the LoRa driver,
-its carrier sense and airtime accounting, the Reticulum stack above that — is
-the same source that runs on a board, and what sits below it is a model of an
+its carrier sense and airtime accounting, the mesh stack above that — is the
+same source that runs on a board, and what sits below it is a model of an
 SX1262 that hands its transmissions to a medium instead of to an antenna. The
 medium rules on every frame at every receiver from a table of every pair's
-path loss, which follows from where the nodes stand on their geodata. Two
-firmwares meet on one medium this way, each above its own driver:
+path loss, which follows from where the nodes stand on their geodata. Any
+number of firmwares meet on one medium this way, each above its own driver:
 
 ```
-reticulous (ESP-IDF host target)            sergeyculum (Rust, std)
-Reticulum / LXMF / web UI                   Node, LoRaIface
+firmware A (ESP-IDF host target)            firmware B (Rust, std)
+its stack, its web UI                       its stack
         │                                           │
-   iface-lora, RadioLib                        Sx1262Radio
-        │  RadioLibHal                              │  embedded-hal
-   VirtualHal ── GPIO shim                     sim-mesh-hal
+   its LoRa driver (RadioLib)                  its LoRa driver
+        │  a HAL over a GPIO shim                   │  embedded-hal
         │                                           │
-        └──────────── the chip model (radio/), linked by each
-                            │  UDP, JSON
+        └──── the virtual radio, libsimradio-sx1262.so, provided by sim-mesh
+                            │  UDP, JSON: the ether's protocol
                         the ether                   who hears what, and when
 ```
+
+sim-mesh knows each firmware only through its **driver**, a Python module in
+the firmware's own zip, so nothing in sim-mesh is any one project's.
 
 ## Why a host port and not an emulator
 
@@ -50,78 +52,79 @@ virtual time.
 
 ## Its own launcher, and its own container
 
-sim-mesh simulates whatever firmware has a station kind. Reticulous is one;
-Sergeyculum is another, and a Meshtastic or MeshCore node would be as much
-its business. So it is not a verb of the tool that builds one of those
-firmwares: it has its own launcher (`sim-mesh`), its own image and its own
-supply of prebuilt stations, and a clone runs with no firmware tree beside
-it. A workspace is for building a station of one's own, into a catalogue of
-its `builds/` like any other build; everything else about sim-mesh is the same
-without one.
+sim-mesh simulates whatever firmware brings a driver, Reticulum firmwares
+today and Meshtastic or MeshCore nodes as much its business tomorrow. So it
+is no verb of the tool that builds any one of them: it has its own launcher
+(`sim`), its own image and its own site of pre-built firmware, and a
+clone runs with no firmware tree beside it.
 
-**A build is a stamped device file, not a build tree.** What was last
-compiled in a tree is anyone's guess, so a firmware that publishes sim-mesh
-builds is only run from a catalogue, where each build has a stamp and a
-name. A compiled build (`devices/local/<project>_<catalogue>.yaml`, run in
-place from its tree) stands in only for a project that publishes none yet,
-Sergeyculum today, until it does.
+**A firmware is a zip, installed, never a build tree.** What was last
+compiled in a tree is anyone's guess, so a station only ever runs installed
+firmware, each under a name that says its version. The zip is the whole
+hand-over between a project and sim-mesh: the project's own script makes it,
+`sim firmware add` or the page installs it, and nothing in sim-mesh
+reaches into a project's tree or a project into sim-mesh's.
 
-**Stations need Linux.** Each binds a `127.x.y.z` address of its own and
-the virtual-time shim is an `LD_PRELOAD` library, and neither exists on
-another kernel. On Linux `sim-mesh` runs natively; anywhere else it runs
-itself inside its own image. That image is small on purpose and is not the
-firmware build container: Ubuntu 24.04, because a device package's ELF
-(executable and linkable format) binary is
-dynamically linked against that release's C library, C++ runtime, zlib and
-libbsd; the host's own architecture, because a package runs only on the one
-it was built for; python3 with aiohttp and pyyaml, Node for the page, a C
-toolchain and cmake for the chip library, cargo for the planner and the
-`sergeyculum` kind. It copies nothing from the tree. `sim-mesh` mounts the
-directory holding sim-mesh at its own path, so a compiled build's `../../../sergey`
-resolves to the same files inside the image as outside it, and runs as the host's user, so what it writes is theirs. The
-image is tagged by the Dockerfile's checksum and rebuilt when it changes.
+**The driver travels with the firmware.** What sim-mesh must know of a
+firmware to run it — how it is started, when it is up, how a script's verb
+is done on it, what its console says about a message — changes with the
+firmware, so it lives in the firmware's zip, as a Python module implementing
+its category's interface (`sim_mesh.reticulum.driver` for `reticulum`). A
+driver imports from sim-mesh only `sim_mesh.driver` and its category's
+module; everything else in sim-mesh may change under it. Cross-protocol
+layers (a `messages` layer comparing delivery across Reticulum, MeshCore and
+Meshtastic) belong to sim-mesh's scripting library, above the categories.
 
-**Stations come as device files** ([NODE.md](NODE.md)): the ELF, its
-`/fixed` tree, any tools its kind needs and a `node.yaml`, zipped under the
-catalogue's own naming with `hw-sim-mesh-<arch>` as the board, and published by
-the same catalogue build that publishes board images. A catalogue is already
-how a build reaches people, with a stamp per build and a listing a program
-can read; a second channel for the same firmware would be a second thing to
-keep in step. The listing marks each link with its target, so a flasher
-leaves the packages out, and sim-mesh finds them by the entry's prefix. One
-file format serves every firmware, so a kind knows nothing of where its
-binary came from: a device imported on the page, fetched from a catalogue or
-described by a compiled build's `node.yaml` resolves to the same executable,
-`/fixed`, tools and environment.
+**The radio is provided at run time.** A firmware links the virtual radio's
+shared library by name and never carries it; sim-mesh puts its own on the
+station's `LD_LIBRARY_PATH`. The chip model, the conductor and the ether's
+protocol then change without a firmware being rebuilt: only a change to the
+C interface itself (`simradio.h`) does that. A firmware compiled with the
+model inside it carried whatever version it was built against, and a
+renamed environment variable left such a build waiting forever at T 0. The
+host's glue (its timers, its lock, its reader thread) is the firmware's
+code, handed to the library with `simradio_set_services`.
 
-**A device's name carries its catalogue.** One `make-builds` run stamps every
-catalogue it builds with the same datetime, so `stable` and `dev` packages
-of one run share a filename and differ only in where they came from. A
-build is therefore named `<project>_<catalogue>_<stamp>`, and what a script
-usually wants is `<project>_<catalogue>_latest`: the newest in that
-catalogue, whichever that is when it is used.
+**Everything runs in sim-mesh's image.** Stations need Linux: each binds a
+`127.x.y.z` address of its own and the virtual-time shim is an `LD_PRELOAD`
+library, and neither exists on another kernel. And a firmware needs a
+system it can count on, the same on every machine, or a zip that works on
+one fails on the next for a library or a Python it found there. So `sim`
+runs itself inside its own image on every OS, in Docker or Podman, and the
+image is that system: Ubuntu 24.04 (its C library and C++ runtime; a zip
+brings everything else); the host's own architecture, because a firmware
+runs only on the one it was built for; CPython 3.12 with aiohttp and
+pyyaml, for sim-mesh, every driver, and a firmware written in Python that
+brings its packages but not an interpreter; Node for the page, a C
+toolchain and cmake for the virtual radios, cargo for the planner. Running
+natively (`SIM_MESH_NATIVE=1`) is for working on sim-mesh itself. The image
+is small on purpose and is not a firmware build container.
+It copies nothing from the tree. `sim` mounts the directory holding
+sim-mesh at its own path, and runs as the host's user, so what it writes is
+theirs. The image is tagged by the Dockerfile's checksum and rebuilt when it
+changes.
 
-**Latest is surveyed, and fetched only when used.** A catalogue publishes a
-build a day or more; downloading each one ahead of need would fill a disk
-with builds nobody ran, and keeping several per catalogue made every listing
-a question of which one a name meant. So a survey reads the listings only
-and notes the newest build per project and catalogue, with its `node.yaml`
-read out of the zip (by range requests on the web: the central directory at
-its end, then that one member) so a listing says what it plays without the
-catalogue having to carry it; a `_latest` build is
-downloaded the first time a simulation uses it, and removed as soon as a
-survey sees a newer one, fetched or not, so there is never more than one per
-catalogue and never a question of which. A build worth keeping is saved,
-which is a copy under its stamped name that nothing removes. A run keeps
-where each build was and, when that has been removed, resolves the name
-again on resume.
+**A firmware's name is its base, its architecture and its version**, and
+nothing else is read from it. `<base>_latest` is the newest of exactly that
+base, so a project's loop is add, run, and a run started tomorrow gets
+today's build without a script changing; a base keeps to one versioning
+scheme, since a build stamp and a semantic version cannot be ordered against
+each other. A run keeps what each name resolved to, and a paused run or a
+snapshot holds its firmware against deletion: their state was written by it
+and can only be resumed on it.
+
+**Pre-built firmware is a release, served by the site.** A zip is too big for
+the site's own history, so it is an asset of sim-mesh's `firmware` release,
+which the site's deploy unpacks under `/firmware/` beside a generated
+`index.html` whose links carry each zip's `node.yaml` facts: the page lists
+what is offered without opening a zip.
 
 **The port is 8800.** Round, and clear of everything else that runs beside
 it: spangap's 9000–9011, the planner's 8787, the front's per-simulation
 control and ether ports counting up from 9100 and 7100, a station's CLI
 (command line) on 8081 and Reticulum's TCP (Transmission Control Protocol)
 interface on 4242. It lives in
-`sim-mesh`, `front.py`, `proxy.py`, `test_front.py` and the docs, and nowhere
+`sim`, `front.py`, `proxy.py`, `test_front.py` and the docs, and nowhere
 else.
 
 ## One process per simulation
@@ -254,11 +257,11 @@ attaches to one, over the front's port like any other driver; its output is
 read line by line and sent to every page. A script that loops, blocks or
 dies takes nothing else with it. What a station must be given at its first
 boot, which happens inside simd whenever a station comes up with no state,
-travels there as data (`on_first_boot()`'s rules: a selection and lines),
-not as the script's code, so no script code ever runs in simd's loop.
+travels there as data (`.on_first_boot()`'s rules: a selection, lines and
+verbs), not as the script's code, so no script code ever runs in simd's loop.
 
-**A script is synchronous.** It reads as it runs: `firmware(...)`, then
-`exec(...)`, then `wait(60)`, each returning when it is done, with no
+**A script is synchronous.** It reads as it runs: `.firmware(...)`, then
+`.exec(...)`, then `sim_wait(60)`, each returning when it is done, with no
 `await` to forget (a forgotten one silently does nothing) and no `async
 def main` to wrap it in. The library holds the simulation on an event loop
 of its own in a thread beside the script's and hands each call to it. What
@@ -276,11 +279,24 @@ bursts. So steps that belong together travel as one `sequence`
 (`Sim.sequence`), which simd runs back to back at the T the first is due:
 the traffic driver's route and send are one.
 
-**Declarations start the simulation.** `time()`, `firmware()` and
-`on_first_boot()` are collected until the script first does something, and
+**Declarations start the simulation.** `sim_speed()`, `.firmware()` and
+`.on_first_boot()` are collected until the script first does something, and
 that starts its simulation with them, so a simulation is always started
-knowing what its nodes run and in what time; `time()` after that is
+knowing what its nodes run and in what time; `sim_speed()` after that is
 refused, because the ether keeps one clock for its whole run.
+
+**What is done is a method of what it is done to.** A script's commands to
+nodes are methods of a selection (`nodes(tag="gw").reset()`), written once
+and done to every node of it, with `after=` and `wait=False` handled once
+for all of them; a single node is a selection of one, not a type of its
+own. A firmware category's commands are a layer reached from a selection
+(`.reticulum`, and `.reticulum.lxmf` within it), the pandas way of grouping
+methods, so a verb's place in the script mirrors its name in the driver
+(`lxmf.send` in category `reticulum`), and a layer is for its category's
+nodes only: one command serves a mixed network. Said on the class, `Node`,
+a firmware's command is the same command as data, a first-boot rule, so
+there is one spelling for doing a thing now and for doing it at every first
+boot.
 
 **The estimate.** simd knows T and the pace but not what the run is for; only
 the driver knows when its traffic hour ends. So a driver sends `plan`, its
@@ -353,23 +369,23 @@ first to the station. A bare `alpha.sim.localhost` goes to the one running
 simulation when there is exactly one, and otherwise is refused with the names
 to choose from.
 
-## Device, geodata, nodeset, script: split along what changes on its own
+## Firmware, geodata, nodeset, script: split along what changes on its own
 
 ```
 geodata ──┐
           ├──► loss table (derived, per band, cached) ── + links + shadowing + antennas + offsets ──┐
 nodeset ──┘  (positions, heights)                                                                   │
 nodeset: antenna, role, radio, tags ───────────────────────────────────────────────────────────────┤
-script: firmware() rules, setup ───────────────────────────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
-device files (by the rules' device names, fetched when used) ──────────────────────────────────────┘
+script: inputs, firmware() rules, setup ───────────────────────────────────────────────────────────┼──► simd ──► ether + stations ──► run
+installed firmware (by the rules' names) and its drivers ──────────────────────────────────────────┘
 snapshot = geodata + nodeset + script + tables + rules + every station's store
 ```
 
 A simulated network is several things that change for different reasons,
 and each is its own file so that changing one leaves the others alone:
 
-- a **device** is a station build. It changes when somebody builds one, and
-  never because of where it runs;
+- a **firmware** is a station build and its driver. It changes when somebody
+  builds one, and never because of where it runs;
 - the **geodata** is the ground. It changes when the ground data does, and
   never because of a node. It names no node, and a nodeset names no geodata:
   a nodeset stands on any geodata whose extent holds one of its nodes, and
@@ -383,11 +399,11 @@ and each is its own file so that changing one leaves the others alone:
   and the bands for every other node;
 - the **script** is everything else the software is told, as Python,
   starting with what each node runs (`firmware()`): which firmware a
-  network runs is the experiment, not the network, and the same nodeset run
-  on Reticulous, on Sergeyculum and on a mix is three scripts of a line
-  each, not three copies of every node. Its rules name nodes through tags
-  and, as an escape hatch, by name, so one script fits any nodeset, and one
-  nodeset serves scripts that differ by a few lines;
+  network runs is the experiment, not the network, so the same nodeset run
+  on one firmware, on another and on a mix is one script whose inputs are
+  chosen three ways, not three copies of every node. Its rules name nodes
+  through tags and, as an escape hatch, by name, so one script fits any
+  nodeset, and one nodeset serves scripts that differ by a few lines;
 - the **loss table** follows from the geodata and the nodeset's geometry and
   from nothing else, so it is derived and cached under a hash of exactly
   those: which nodes, by name, where and how high. Changing a node's
@@ -396,7 +412,14 @@ and each is its own file so that changing one leaves the others alone:
   name, so relabelling one does: its row and column are computed again, and
   every other pair comes from the table cached before.
 
-**A firmware rule is a condition, kept.** `firmware(which, device)` holds
+**A script names no firmware of its own.** Which firmware is the experiment,
+so a system script asks for it as an input (`script_input("firmware", type=Firmware)`)
+and the person running it chooses, from those installed, filtered by the
+category the script needs; the run keeps the choice. A script written for a
+firmware's own lines can still name one, but the scripts sim-mesh carries
+name none, which is what keeps sim-mesh free of any one project.
+
+**A firmware rule is a condition, kept.** `firmware(which, name)` holds
 its selection as a condition over each node's facts (`sim_mesh.select`), not
 as the list of names it matches today, and the run keeps its rules. So a
 node placed later or retagged runs what the rules say of it, and a rule
@@ -408,7 +431,7 @@ is that condition as plain data, which is why a function in it is refused.
 
 **There is one board, and a node's maximum power says which way it is
 built.** What sits between the firmware and the antenna connector is an
-SX1262, and it is a node's property and not a build's: one device serves
+SX1262, and it is a node's property and not a build's: one firmware serves
 every node. A node's `max_dbm` is its maximum power at the connector, 22 dBm
 when it states none. At 22 dBm or below the node is a bare SX1262, whose
 chip puts out that maximum itself; above it, up to 27 dBm, the node is an
@@ -426,13 +449,15 @@ Heltec V4 board straddle's own.
 (`radio/src/model.cpp`) puts the board's transmit curve between what the
 chip radiates and what the medium is handed, and adds its receive gain to
 every level the chip reads, so the medium only ever deals in connector
-power. Reticulous on `hw-linux` takes the same figures (`SPANGAP_BOARD`,
-which the kind copies from `SIM_MESH_BOARD`) in place of its build's Kconfig
-and converts the other way, antenna dBm to chip drive and chip RSSI to
-connector RSSI, as it does on the board. Both round the curve the same way,
-so a station asked for 27 dBm behind the GC1109 drives the chip at 18 and
-the medium carries 27; a station told no front end is a bare SX1262, 22 dBm
-at most. The node's maximum is the firmware's ceiling too, so a station left at its default power sends at its node's maximum.
+power. A firmware that drives a front end takes the same figures
+(`SIM_MESH_BOARD`) in place of its build's own and converts the other way,
+antenna dBm to chip drive and chip RSSI to connector RSSI, as it does on the
+board; rounded the same way, a station asked for 27 dBm behind the GC1109
+drives the chip at 18 and the medium carries 27, and a station told no front
+end is a bare SX1262, 22 dBm at most. A driver whose firmware takes the
+chip's own power converts with `chip_dbm`, the same curve. The node's
+maximum is the firmware's ceiling too, so a station left at its default
+power sends at its node's maximum.
 
 **Antennas are a layer, like offsets.** A pattern's gain depends on the
 direction to the other end, so a pair's gains are not one figure per node
@@ -485,7 +510,7 @@ A node is referred to **by name** everywhere, and its **id** is stored and
 editable. The name is what a person means; the id is the station's network
 identity, which its loopback address and MAC (media access control) address
 follow from, so it has to be stable across saves and loads and unique across
-kinds — two processes answering under one id are one station to the medium
+firmwares — two processes answering under one id are one station to the medium
 and two sockets on one address. Changing it moves the station, which is why
 the editor restarts a station with state when its id changes.
 
@@ -508,8 +533,7 @@ simulation from scratch.
 Half of a network is its identities, keys, paths and message history, which is
 why snapshots exist at all and why they are a directory rather than a file.
 A snapshot is the stores, so what it brings back is what each firmware
-reloads from its store at boot: a `reticulous` station's paths only when
-`s.rnsd.dir.persist_routes` is on, and only as of its last directory write
+reloads from its store at boot, as of its last write to it
 ([README.md](README.md#runs-and-snapshots)).
 
 ## A run is an output, and a snapshot is taken live
@@ -854,9 +878,10 @@ Two verbs, and the difference is exactly the difference a person expects:
 
 There is deliberately no verb that re-runs setup on a running station. "Re-apply" reads like a repair and behaves like one sometimes and not
 others: a line that is a setting takes effect, a line that is an action happens
-twice. What replaces it is **Run command**, which types one CLI line at the
-stations chosen and shows what each said, and a script's intents, which say
-one thing to every kind in its own lines. That is more versatile — retune
+twice. What replaces it is **Run command**, which types one line at the
+stations chosen and shows what each said, and a script's verbs, which mean
+one thing to every firmware of a category, each driver doing them its own
+way. That is more versatile — retune
 the whole testbed, survey it, create something on all of it — and it is
 honest about being a thing you did rather than a state you restored. A
 node's tags changed on a running simulation are no exception: what they
@@ -865,19 +890,17 @@ factory reset.
 
 ## Why the store is flushed before anything is taken away
 
-What follows is the `reticulous` kind's; a kind whose store writes through
-(`sergeyculum`) has nothing to flush, and its `flush` does nothing.
-
-`s.storage.flash_delay` is 60 seconds by default: a write sits in RAM for up to
-a minute before the store commits. On a board that is a power-cut window and
-entirely fair. Here it would make two things lie.
+A firmware's store may hold writes in RAM before it commits them — for a
+minute, say. On a board that is a power-cut window and entirely fair. Here
+it would make two things lie. A firmware whose store writes through has
+nothing to flush, and its driver's `flush` does nothing.
 
 A station **reset moments after its setup ran** would come back with none
 of it, and the testbed would be claiming a configuration it never made
-durable. So simd sends `save` at the end of setup, and again a few
+durable. So simd has the driver flush at the end of setup, and again a few
 seconds later — not everything setup asks for lands at once, and an LXMF
-(Lightweight Extensible Message Format) identity reaches the store some seconds after the command that created it has
-returned.
+(Lightweight Extensible Message Format) identity may reach the store some
+seconds after the verb that created it has returned.
 
 A **snapshot** copied out of a store with a minute of writes still in RAM would
 be a picture of a moment that never quite existed. So every running station is
@@ -887,28 +910,30 @@ All of it is best effort with a short timeout. A station that will not answer
 is one whose store cannot be flushed, and refusing to stop it over that would
 be worse than losing the last minute.
 
-`save` is simd's to send rather than the script's because it is not a
-setting. Everything a script says describes what a station *is*; `save` is
+The flush is simd's to ask for rather than the script's because it is not a
+setting. Everything a script says describes what a station *is*; a flush is
 about making that description stick.
 
 ## First boot: the name, then the first-boot rules in order
 
 ```
-simd ── framed RPC probe … s.sys.reset_reason answers ──► station   up: booted
-simd ── its name, in its kind's lines ─────────────────────────────────► station
+simd ── the driver's wait_up: booted, every service up ──────────────► station
+simd ── its name (the name verb) ───────────────────────────────────────► station
 simd ── what the first-boot rules give it, in the rules' order ────────► station
         startup.py's: role(…), radio(…), each nodeset's own lines, radio_up()
-        then the script's own lines
-simd ── save, and again once what setup asked for has landed ──────────► station
+        then the script's own lines and verbs
+simd ── the driver's flush, and again once what setup asked for has landed ► station
 ```
 
-A station is set up by typing at it. The alternative — a schema of settings
-the testbed knows the names of — would have to grow every time the firmware
-grew one, and would be a second place for a setting's name to live. So
-nothing is declared in the nodeset: every setting is a script's first-boot
-rule, a line typed as written or an **intent** (`role`, `radio`,
-`radio_up`) each kind says in its own lines, so one rule serves every
-firmware. What the page must know without a station running is read from
+A station is set up by its driver, verb by verb, and by lines typed as
+written. The alternative — a schema of settings the testbed knows the names
+of — would have to grow every time a firmware grew one, and would be a
+second place for a setting's name to live. So nothing is declared in the
+nodeset: every setting is a script's first-boot rule, a line typed as
+written or a **verb** (`Node.radio(…)`, `Node.radio_up()`,
+`Node.reticulum.role(…)`, `Node.reticulum.lxmf.create()`), which each
+driver does its own way and a station of another category than the verb's
+skips, so one rule serves every firmware. What the page must know without a station running is read from
 the same places the rules are written from: the tags the rules select on,
 and `scripts/globals.py`, whose radio the startup script sets. Per-node
 differences are selections (`nodes(tag=...)`) and macros, never code, which
@@ -916,34 +941,31 @@ is what lets the rules travel to simd as data.
 
 **Every world starts from one script.** `scripts/startup.py` says the
 roles, the radio from `globals.py`, then includes each nodeset's own
-`nodesets/<name>.py` (`for nodeset in nodesets(): include(...)`), then
+`nodesets/<name>.py` (`for nodeset in sim_nodesets(): script_include(...)`), then
 starts the radios. A script includes it among its declarations, so what a
 traffic study runs on any world is readable in three files the editor opens
 together, and a world's peculiarities (a TCP gateway, a sync word) live
 with the world, not in the study.
 
-**Up means booted, not answering.** A `reticulous` station answers framed
-RPC from early in boot, before its services' `onInit` has run, and a setting
-typed then can be undone by that init: a radio's frequency, set at the first
-instant, was gone by the time the radio started. So the kind counts a station
-up only once `s.sys.reset_reason` reads, which the boot writes after every
-service's init, and which on a first boot, the only one that is set up, is
-absent until then.
+**Up means booted, not answering.** A firmware may answer its console from
+early in boot, before its services have initialised, and a setting made then
+can be undone by that init: a radio's frequency, set at the first instant,
+gone by the time the radio started. So a driver's `wait_up` counts a station
+up only once the firmware shows that every service is up, whatever sign it
+gives of that.
 
-**The radio is started last.** A radio reads its settings when it starts —
-the community radius it hands to rnsd, whether SUPE is on — so a setting
-made after the radio is up waits for the next start. That is why starting
-it is an intent of its own (`radio_up`: `lora up` for a `reticulous`
-station, nothing for a kind whose radio needs no start), and why the
-startup script says it after each nodeset's own setup. A script's own
-first-boot lines come after the include, so what the radio reads belongs
-in a nodeset's setup or before the include.
+**The radio is started last.** A radio may read its settings when it starts,
+so a setting made after the radio is up waits for the next start. That is
+why starting it is a verb of its own (`radio_up`, nothing for a firmware
+whose radio needs no start), and why the startup script says it after each
+nodeset's own setup. A script's own first-boot lines come after the include,
+so what the radio reads belongs in a nodeset's setup or before the include.
 
 **A role the firmware forgets is said at every boot.** Setup runs once, on
-a station with no state; a `sergeyculum` station keeps `transport on|off` in
-RAM only, so a reset would bring it back a client while its node is tagged
-transport. A kind whose role does not survive a restart says so
-(`role_volatile`), and simd says the role intents of its first-boot rules
+a station with no state; a firmware that keeps its role in RAM only would
+come back a client after a reset while its node is tagged transport. A
+driver whose firmware does not keep its role across a restart says so
+(`role_volatile`), and simd says the role verbs of its first-boot rules
 again whenever such a station comes up with state.
 
 Lines are expanded per station: `{name}`, `{id}` and `{addr}`,
@@ -956,23 +978,22 @@ differs between two simulations of one nodeset.
 
 The name is the node's identity in three places at once —
 the map label, the proxy hostname and the station's own name — and must not
-drift; simd says the name itself, before any rule, in the kind's own line
-(`hostname {name}`),
+drift; simd gives the name itself, before any rule, with the `name` verb,
 so it cannot disagree per node.
 
-A macro the list does not define is left exactly as written. A CLI line is
+A macro the list does not define is left exactly as written. A line is
 somebody's text and may legitimately contain braces, and silently emptying
 something that only looked like a macro is worse than passing it through for
 the station to complain about.
 
 Setup runs only on an empty store, which is what makes it safe for it to
-contain `lxmf create {name}` — a line that is emphatically not idempotent.
-Nothing re-runs it against a configured station; a factory reset empties the
-store first.
+make an LXMF identity — something emphatically not idempotent. Nothing
+re-runs it against a configured station; a factory reset empties the store
+first.
 
-Whether a station has been set up is sampled **at the fork**, not when the CLI
-answers: the firmware writes `state/boot` moments after it starts, and the
-answer the setup step needs is the one from before it ran.
+Whether a station has been set up is sampled **at the fork**, not when it
+answers: a firmware marks its state as set up moments after it starts, and
+the answer the setup step needs is the one from before it ran.
 
 ## The WebRTC relay, and why it is a relay rather than a second transport
 
@@ -1036,36 +1057,68 @@ the second one to start finds the port taken.
 
 `stopped` → `starting` → `setup` → `up`, with `restarting` for the gap after an
 exit nobody asked for. `up` is **the station booted and answering the door
-its kind talks through** — a `reticulous` station's framed RPC once its boot
-has written `s.sys.reset_reason`, a `sergeyculum` station's `rncfg detect` —
-not the process existing: a firmware process that has forked but not
-finished booting is not a station you can do anything with, and the map
-should not claim otherwise.
+its driver talks through**, as the driver's `wait_up` says — not the process
+existing: a firmware process that has forked but not finished booting is not
+a station you can do anything with, and the map should not claim otherwise.
 
 A station's **role** — `transport`, `router`, `repeater` or `client` — is not
 status. Its node's role tag names one, which the startup script says to it
 and the page draws before anything runs; once it runs, simd asks each
-station every few seconds, through its kind, because the setting is live
-and a person can flip it on the station itself — the map should show what
-the station thinks, not what it was told at its first boot. A kind that
-cannot be asked leaves the tag's on show. Roles are a kind's words for what a station does, so
-the map draws a forwarding ring for any firmware without knowing its
-protocol.
+station every few seconds, through its driver (`current_role`), because the
+setting is live and a person can flip it on the station itself — the map
+should show what the station thinks, not what it was told at its first
+boot. A driver that cannot ask leaves the tag's on show. Roles are the
+category's words for what a station does, so the map draws a forwarding
+ring for any firmware without knowing its protocol.
 
-## Kinds, and the rules that come with more than one firmware
+## Drivers, and the rules that come with more than one firmware
 
-Everything the testbed knows about one firmware lives in its kind
-(`testbed/kinds/`); simd, the supervisor and the page know only the kind's
-methods. The station contract ([STATION.md](STATION.md)) is what every kind
-shares, and it is small on purpose: an identity, a directory, an address and
-the ether, in `SIM_MESH_*`, and a console on stdin/stdout.
+Everything the testbed knows about one firmware lives in its driver, which
+comes in the firmware's zip; simd, the supervisor and the page know only the
+driver's methods. The firmware contract is what every firmware shares, and
+it is small on purpose: an identity, a directory, an address, the ether and
+the radio, in `SIM_MESH_*`, a console on stdin/stdout, and the driver
+interface of its category.
 
-**One chip model for every kind, below the driver.** Every kind links the
-same `radio/`, whatever its language. A rewrite per language would drift on
-exactly the details the testbed exists to hold constant, and a seam above
-the driver, at a `LoRaRadio`-style level, would skip BUSY, CAD, the sync-word
-register write and a CAD cutting off a reception, which are what break on
-boards.
+**A driver imports two modules of sim-mesh's and nothing else.**
+`sim_mesh.driver` (the base class, the station surface it is handed, framed
+RPC, `chip_dbm`, `run_tool`) and its category's (`sim_mesh.reticulum.driver`)
+are the contract; everything else in sim-mesh may change, and a driver that
+reached past them would break with it. A driver is imported from its
+firmware's own directory under a module name of its own, so two firmwares'
+drivers never meet.
+
+**Verbs return what they mean, not what a station printed.** `path`
+returns a hop count and `lxmf.identities` names and addresses, so the
+traffic driver and the delivery analysis read every firmware the same way,
+and no parser for any firmware's output lives in sim-mesh. What happens
+later — a message delivered — the driver hears on the console
+(`console_line`) and reports as an event at the run's T (`station.report`),
+which simd writes to the run's `events.jsonl`.
+
+**A message's id is sim-mesh's, given before the send.** simd names every
+`lxmf.send` (`<sender>.<T in µs>`) and the driver reports its status under
+that name. A firmware's own id cannot be the one: many give a message one
+only once it is built, and a message held while a path is asked for, then
+dropped, never gets one, yet what became of it is exactly what a run wants
+to know. So a driver couples the firmware's id to sim-mesh's when it learns
+it, holds what the station said under an id not coupled yet until it is, and
+reports what goes wrong before there is an id under sim-mesh's directly
+(`sim_mesh.reticulum.driver`).
+
+**Creating an identity is never refused.** `lxmf.create` with a name the
+node already has does nothing and answers its address, and a firmware with
+one identity that already has another name does nothing at all, so a script
+says it at every first boot without knowing what the node holds. The one
+refusal is simd's: a name another node or another node's identity has, since
+the name is how a sender and a recipient are found.
+
+**One chip model for every firmware, below the driver.** Every firmware
+links the same virtual radio, whatever its language. A rewrite per language
+would drift on exactly the details the testbed exists to hold constant, and
+a seam above the driver, at a `LoRaRadio`-style level, would skip BUSY, CAD,
+the sync-word register write and a CAD cutting off a reception, which are
+what break on boards.
 
 **Protocol parts sit behind their protocol.** The ether, the record, the
 map, airtime per carrier and link geometry know no protocol; LXMF traffic,
@@ -1073,45 +1126,37 @@ delivery analysis and SUPE frame classes live under `sim_mesh.reticulum`, so a
 firmware of another protocol gets everything generic and nothing that
 misreads it.
 
-**A mixed SUPE run builds `sergeyculum` without `supe-band`.** That switch
-drops channel 9 on duty-cycle readings, while `reticulous` uses all nine
-channels with polite spectrum access; the two would derive different
-schedules, and the run would measure the mismatch instead of the protocol.
-
-**A kind supplies what its firmware reads.** A firmware that reads other
-names for the contract's values gets them from its kind's `env`, beside the
+**A driver supplies what its firmware reads.** A firmware that reads other
+names for the contract's values gets them from its driver's `env`, beside the
 contract's own; the contract does not grow to fit one firmware.
 
-**A line is in one dialect; an intent is in every one.** A line goes only to
-stations of one kind: **Run command** and a script's `run` refuse a choice
-of stations that spans kinds unless a kind narrows it. The same text typed
+**A line is in one dialect; a verb is in every one.** A line goes only to
+stations of one base: **Run command** and a script's `run` refuse a choice
+of stations that spans bases unless `base` narrows it. The same text typed
 at another firmware means something else or nothing, and a testbed that sent
-it anyway would be reporting an answer to a question it never asked. An
-intent (`announce`, `message`, `set_role`, …) is what is meant rather than
-what is typed, so it goes to every kind and each says it in its own lines; a
-kind with no way to say it answers that it has none, for its stations alone.
+it anyway would be reporting an answer to a question it never asked. A verb
+(`lxmf.announce`, `lxmf.send`, `role`, …) is what is meant rather than what is
+typed, so it goes to every station and each driver does it its own way; a
+firmware that cannot answers that it has none, for its stations alone.
 
-**Whether a station is set up is the kind's to say, and it is sampled at the
-fork.** Each firmware leaves its own mark in `state/` on a first boot, moments
-after it starts; the answer the setup step needs is the one from before it
-ran. Get it wrong one way and setup runs on every restart, the other way
-and it never runs.
+**Whether a station is set up is the driver's to say, and it is sampled at
+the fork.** Each firmware leaves its own mark in `state/` on a first boot,
+moments after it starts; the answer the setup step needs is the one from
+before it ran. Get it wrong one way and setup runs on every restart, the
+other way and it never runs.
 
-**One conversation at a time on a station's door.** `rncfg` opens the
-station's KISS pty (KISS, "keep it simple, stupid", is the serial framing radio modems speak) per command; two at once interleave their frames and both
-read garbage, so the `sergeyculum` kind holds a lock per station around every
-invocation, the transport poll included. A `reticulous` station runs its
-framed-RPC frames one after another and answers each with the id it was sent;
-two queries in flight whose ids collided would each take the other's answer,
-so its client holds a lock per station around every frame.
+**One conversation at a time on a station's door.** A door that two callers
+can interleave on — a tool that opens a pty per command, frames whose ids
+could collide — is held by its driver with a lock per station around every
+call, its own polls included.
 
-## Framed RPC, and why the testbed does not use the TCP CLI
+## Framed RPC, and why a console and not a TCP command line
 
-A `reticulous` station is set up and asked things over framed RPC on its
-console pty, the channel flashmon uses on a board's USB console. The TCP CLI
-would work, but on a board it is closed until someone opens it, and a testbed
-that needed it open would need the firmware to behave differently here; the
-console is there from the first instant on both.
+A firmware that speaks framed RPC is asked things on its console pty, the
+channel a flasher uses on a board's USB console. A command line over TCP
+would work, but on a board it is closed until someone opens it, and a
+testbed that needed it open would need the firmware to behave differently
+here; the console is there from the first instant on both.
 
 The pty drain is a state machine rather than a search, because a read can
 end anywhere: in the middle of the magic, of a header or of a payload. Bytes
@@ -1133,15 +1178,15 @@ one key at a time rather than a subtree whose tail could be cut.
 
 **A query is retried only after a whole timeout with no answer at all**, the
 five-second bound plus margin (eight seconds), and at most twice. A slow
-command that must not run twice, such as `lxmf create`, is then never run
-again by a retry.
+command that must not run twice, such as one that makes an identity, is then
+never run again by a retry.
 
 **A driver takes T from a `command_result`, not from `clock`.** `clock`
 comes once per wall second, so at a high pace it is tens of seconds of T
 stale, and a driver that scheduled from it would send every message that
 late.
 
-**Ids are unique across kinds.** The ether keys stations by id; two processes
+**Ids are unique across firmwares.** The ether keys stations by id; two processes
 answering under one id are one station to the medium, and two sockets on one
 address. A nodeset refuses a file that repeats one, and its editor an id
 another node has.
@@ -1149,7 +1194,7 @@ another node has.
 ## The page
 
 Pinia stores hold the page's state, split as the data is: `catalog` (what
-the store holds — devices, geodata, nodesets, scripts, snapshots — and the
+the store holds — firmware, geodata, nodesets, scripts, snapshots — and the
 script runs with their output), `geodata` (which ground is on show, and for
 a pack its manifest and the sidecar's base path), `display` (how the map is
 shown, per tab), `nodes` (the Nodes tab's active layer, its selection, its
@@ -1247,47 +1292,12 @@ that span is divided by the run's pace — the pace asked for, or for `max` the
 pace the last `clock` message observed — so a ring lasts the frame's time on
 the air as the run experiences it.
 
-## What a reticulous station has instead of hardware
+## A station's console is a pty
 
-| | On a board | Here |
-|---|---|---|
-| identity | the chip's MAC | the node id, from the environment |
-| `/fixed` | a read-only image in flash | a link to the build's merged data tree |
-| `/state` | LittleFS on a partition | a directory the process `chdir()`ed into |
-| NVS (non-volatile storage) | a flash partition | a file under `/tmp`, sized from the built partition table |
-| addresses | WiFi | one loopback address per station |
-| console | a serial port | a pty, bridged to the map's terminal window, carrying framed RPC as a board's USB console does |
-| radio | an SX1262 | a model, and the ether |
-
-The pty matters: a station's stdin and stdout **are** its serial console, so
-the supervisor holds the master end and the console window is that pty over a
-websocket. Keystrokes go as binary frames and the terminal size as a JSON text
-frame, so no byte a person can type is special to the transport.
-
-## The one rule that makes interrupts real
-
-This one is the reticulous firmware's, whose driver waits on DIO1, the
-chip's interrupt line; a driver that polls the IRQ (interrupt request)
-register over the bus never meets it.
-
-The GPIO (general-purpose input/output) shim ([`hw-linux`](../hw-linux/README.md)) is a pin table, and the
-whole reason it exists is a single behaviour:
-
-> a level-triggered pin whose interrupt is enabled while its line is asserted
-> fires immediately.
-
-That is the property the LoRa driver's interrupt handling rests on — the
-trampoline disables the interrupt, the task drains whatever raised it, and
-re-enables; a line still high re-fires. Without it, a frame that completed
-behind a disabled interrupt would be a hung task here and a serviced one on
-hardware, and the testbed would be lying about the one path it most needs to
-tell the truth about.
-
-A handler runs on whichever task moved the line, which is what an interrupt
-does. The shim reads and writes its table under a critical section but calls
-the handler outside it: a handler ends in a yield, and on this port a critical
-section is a per-thread signal mask with a global nesting count, so yielding
-from inside it hands the section to the wrong thread.
+A station's stdin and stdout **are** its serial console, so the supervisor
+holds the master end and the console window is that pty over a websocket.
+Keystrokes go as binary frames and the terminal size as a JSON text frame, so
+no byte a person can type is special to the transport.
 
 ## The seam: a bus, not a chip class
 
@@ -1403,16 +1413,16 @@ ether        run {t} / rx_begin {t} / rx_end {t}      to each station due
 station      conductor moves T, runs its timers and wakes due at T, owes an idle
 ```
 
-**The station's side is `radio/src/conductor.cpp`**, in the chip library, so
-every kind has it by linking `radio/`. It keeps the last T granted, runs the
+**The station's side is `radio/src/conductor.cpp`**, in the virtual radio, so
+every firmware has it by linking the radio. It keeps the last T granted, runs the
 model's timers and the host's **wakes** when a grant reaches them, works out
 the next instant the station needs (`until`) and sends the idle. The model
 reads T; the host reads **node time**, f(T), which is where a node's own
 crystal — drift, an offset — goes. f is the identity unless the station's
 environment has `SIM_MESH_CLOCK_PROFILE`, a piecewise-linear map given as
-`T:node` pairs in microseconds, both increasing, slope 1 outside them
-([STATION.md](STATION.md#the-environment)); `nodeOf` / `conductorOf` are the
-only place it is defined. `simd --clock-ppm P` gives every station one: a
+`T:node` pairs in microseconds, both increasing, slope 1 outside them (the
+firmware contract's environment); `nodeOf` / `conductorOf` are the only place
+it is defined. `simd --clock-ppm P` gives every station one: a
 straight line from T 0 whose slope is off by a draw uniform within ±P parts
 per million, hashed from the seed and the node's name, so each station keeps
 its own time and keeps it again in a run with the same seed. A crystal is
@@ -1440,9 +1450,10 @@ its wait exactly as it ends a real one. Two rules keep it honest:
   waits on it for good.
 
 **The shim is also the station's randomness** when the environment carries
-`SIM_MESH_SEED` (a kind sets it from the ether's seed): `getentropy`,
-`getrandom` and `syscall(SYS_getrandom)` — ESP-IDF's host `esp_random` and
-mbedtls's platform entropy between them — draw from a splitmix64 counter keyed
+`SIM_MESH_SEED` (simd sets it from the ether's seed): `getentropy`,
+`getrandom` and `syscall(SYS_getrandom)` — what a firmware's random number
+generator and its crypto library's entropy come down to — draw from a
+splitmix64 counter keyed
 by the seed and `SIM_MESH_NODE_ID`. It needs no welcome, so it holds from the
 first draw. A call reserves all its words in one atomic step and takes no
 lock, so a thread switched out mid-call neither blocks another nor changes
@@ -1450,26 +1461,20 @@ its bytes. With the same seed and epoch, a station draws the same bytes in the
 same order in every run, and what is left to differ between two runs is what
 comes from outside them (below).
 
-**Idle is the station saying every thread is blocked**, and each kind has a
-way to know it:
+**Idle is the station saying every thread is blocked**, and a station has
+one of two ways to know it:
 
-- a `reticulous` station on `hw-linux`: FreeRTOS's tickless idle
-  ([`hw-linux`](../hw-linux/README.md#the-tick)), which runs only when every
-  task is blocked and knows the tick the first of them is due at. The
-  board's clock hooks ([`hw-linux`](../hw-linux/README.md#the-stations-clock))
-  are implemented by `radio/backend/esp-idf/services.cpp`: `esp_timer` counts
-  node time from the whole second of it in which the station joined, its next
-  expiry and the next tick a task waits for are wakes, so `until` is the
-  earlier of the two, and the link opens at board bring-up, since nothing in
-  the station can wait on time before the ether has said what T is. The tick
-  is not a timer: the board steps the tick count to node time every time T
-  moves (`simradio_on_advance`), before anything due at the new T runs, and
-  the port's `setitimer` is stopped. A station whose tasks sleep for a second
-  wakes the run once in that second, not a hundred times; and because every
-  station's clock is a whole number of seconds from every other's, the ticks
-  of all of them fall on the same instants of T and share their barriers.
-- a `sergeyculum` or `microreticulum` station, whose threads are plain
-  pthreads: the shim's thread census (`SIM_MESH_IDLE=threads`). A thread counts
+- a host with a scheduler of its own (FreeRTOS on ESP-IDF's Linux target)
+  says so itself, `simradio_idle()` from its idle, which runs only when every
+  task is blocked: its wakes (`simradio_wake_at`) are the tick its first task
+  is due at and its timers' next expiry, so `until` is the earliest of them.
+  Its tick is best not a timer but a count stepped to node time every time T
+  moves (`simradio_on_advance`), before anything due at the new T runs: a
+  station whose tasks sleep for a second then wakes the run once in that
+  second, not a hundred times. It opens its link before anything in it can
+  wait on time, since only the ether says what T is;
+- a station whose threads are plain pthreads: the shim's thread census
+  (`SIM_MESH_IDLE=threads`, set by its driver). A thread counts
   as blocked while it is in one of the shim's waits, an untimed
   `pthread_cond_wait`, or a read on a blocking descriptor that is not a file;
   when the last one blocks, the station is idle. A read on a regular file
@@ -1488,9 +1493,9 @@ way to know it:
 Neither can be told apart from a thread that is waiting where nothing can
 see it, so the conductor also has a **busy watchdog**: a station that has not
 said idle 20 ms of wall time after it was last told anything, or last sent
-the ether anything, says so anyway, with the `until` it has — for a
-`reticulous` station, whose `until` is the next tick while a task runs, a
-tick at a time. That is what keeps a thread spinning until T moves, or a host
+the ether anything, says so anyway, with the `until` it has — for a station
+whose `until` is the next tick while a task runs, a tick at a time. That is
+what keeps a thread spinning until T moves, or a host
 descriptor nobody is watching, from stopping T. It must not fire on honest
 work — key generation at first boot, a PBKDF2 of a community passphrase, a
 signature check under load — or T would move on while the station is still
@@ -1529,69 +1534,17 @@ a station's TCP connection to a loopback address leave from the station's own
 address (`SIM_MESH_BIND_ADDR`), so both ends of it say which station they are.
 Its reports go on the chip library's own socket to the ether, found from the
 `hello` sent on it, so each is ahead of the idle that follows it. The
-testbed's waits are on T as well: `Kind.pause`, `simd`'s `sleep`, `after`
+testbed's waits are on T as well: `Driver.pause`, `simd`'s `sleep`, `after`
 and the role poll, and a framed-RPC query's timeout. With the same seed and
 epoch, two runs of the same network put the same frames on the air at the
 same instants.
 
 What is still outside: a TCP connection from something that is not a station
 (the page's proxy to a station's web UI), a station's UDP to another, the
-files it shares with the testbed (`rncfg`'s KISS socket for a `sergeyculum`
-station), and anything a person does, which lands at whatever T the run has
+files it shares with the testbed (a pty a tool its driver runs talks on),
+and anything a person does, which lands at whatever T the run has
 reached; and a firmware that reads its console other than by `read` on
 descriptor 0 holds T a second each time it is typed at.
-
-## The rules a host-only file obeys on ESP-IDF's host target
-
-Six, for the reticulous firmware and for `radio/backend/esp-idf`, and they
-are not negotiable — each one is a way this port breaks.
-
-**No FreeRTOS task blocks in a host system call.** The port only knows a task
-is blocked when it blocked on a FreeRTOS primitive; a task sitting in `recv`
-is, to the scheduler, the running task, and it starves everything below it.
-So sockets and stdin are non-blocking, and the only waits are `select()`,
-FreeRTOS primitives and `vTaskDelay`. `select()` is hw-linux's: it blocks the
-task until a descriptor is ready, woken by a signal that lands on the running
-task's thread the way the tick does ([`hw-linux`](../hw-linux/README.md#waiting-on-a-descriptor)),
-so a quiet station's tasks sleep rather than poll. No busy-waiting.
-
-**Nothing wakes at tick rate while nothing happens.** The kernel is tickless
-([`hw-linux`](../hw-linux/README.md#the-tick)): while every task is blocked
-the tick stops, and a station costs nothing until the first of them is due.
-A task that loops on a one-tick delay or a one-tick timeout keeps the tick
-running, and in a virtual-time run wakes the whole run every 10 ms of T. A
-task waits on what it serves — its notification, `hwLinuxWait()` on its
-descriptors and its inbox — for as long as nothing comes, and a timeout is
-the time something is actually due, rounded **up** to a whole tick: rounded
-down, a deadline inside the current tick is a wait of zero, and the task
-spins until it comes — on a chip for up to a tick, and in a virtual-time run
-until the busy watchdog lets T move, 20 ms of wall each time. Where the shared source polls on a chip,
-the host's behaviour goes behind the board's weak `hwLinuxWait` or into
-`src/host/`, and the chip's path stays as it is.
-
-**The console writes with `write(2)`.** The tick signal can land inside a libc
-call that is not async-signal-safe and switch to a task that makes the same
-call. The log sink and the CLI assemble their line and put it on the
-descriptor.
-
-**Every task stack is at least 20 KB.** A task is a pthread and its stack is a
-real mapping; the port's own floor is 16 KB and a host stack frame is several
-times a Xtensa one. `spawnTask` raises anything smaller, and drops core
-affinity — there is one core, and asking for the second is an assertion
-failure.
-
-**Chip-only code leaves, host-only code arrives.** Behind
-`#if !CONFIG_IDF_TARGET_LINUX` or out of the source list; a separate file in
-`src/host/` in preference to an `#ifdef` inside a function.
-
-**The board is reached through weak symbols, never through a dependency.**
-Host-only code keeps wanting the station's identity and addresses, and those
-belong to the board straddle — which arrives with `--with` and is in nobody's
-`requires:`. A platform or feature straddle may not depend on one. So a file
-that needs `hwLinuxNodeId()`, `hwLinuxBindAddr()` or `hwLinuxEtherAddr()`
-declares it `extern "C" __attribute__((weak))` with a sane default and lets it
-resolve at executable link time. The same rule is why the chip model is
-linked by the interface that drives it rather than by the board that wires it.
 
 ## What this cannot tell you
 
@@ -1680,34 +1633,15 @@ change.
   regression checks on the ether and the loss model. Time on air is checked
   against a board, not only against the formula.
 
-**Stations and kinds**
+**Stations and firmware**
 
-- **The Python reference Reticulum as a station kind**, the oracle: under the
-  time shim with `SIM_MESH_IDLE=threads`, attached to a `reticulous` station's
-  radio through the RNode-over-TCP endpoint (`s.lora.rnode.tcp`) or through
-  `iface-tcp`. It answers what `rnsd` does when an interface stops taking
-  packets, and whether real Reticulum agrees with our neighbour and identity
-  inference.
-- **`sergeyculum` stations built with `--profile sim`** (opt-level 3), from
-  `target/sim/sim-mesh`, in `devices/local/sergeyculum_local.yaml` and the
-  README's developer loop; release is opt-level `z` with LTO (link-time
-  optimisation), several times slower at signature checks.
-- **`libudev-dev` in sim-mesh's image**: `rncfg` links `libudev` through
-  `serialport`, so Sergeyculum's Cargo workspace does not build in the image
-  without it.
-- **The mixed-kind walkthrough** in the README: announces crossing both ways,
-  a path through our transports, a two-frame split both ways, carrier sense
-  under contention, and the hidden terminal, each with its commands and what
-  `seq.py` shows.
-- **The chip model as a submodule** of `sim-mesh-radio-sys`, as an alternative
-  to `SIM_MESH_RADIO_DIR` or the workspace layout.
-- **Tests of a station's own screen**: the `lcdmirror` framebuffer tap in
-  `lcd_lvgl.cpp`'s flush callback without its WebRTC half, `tinylcd`'s 1-bit
-  buffer read directly, and LVGL's `LV_USE_TEST` for time, injected input and
-  image comparison. No panel is emulated.
-- **An `hw-qemu` board**, outside sim-mesh: a UART0 console, OpenCores Ethernet
-  for WiFi, no ADC user, no Bluetooth, to ask regularly whether the real
-  binary still boots. LittleFS does not yet format the state partition there.
+- **The `meshcore` and `meshtastic` categories**: their driver interfaces
+  beside `reticulum`'s, and a `messages` layer in the scripting library that
+  compares delivery from one node to another across the three.
+- **The mixed-firmware walkthrough** in the README: announces crossing both
+  ways, a path through another firmware's transports, a two-frame split both
+  ways, carrier sense under contention, and the hidden terminal, each with
+  its commands and what `seq.py` shows.
 
 **Running and analysing**
 
@@ -1717,11 +1651,12 @@ change.
 - **Single stations off and on** with their state kept (drawn grey), as
   `sel.stop()` and `sel.start()` in the library and on the node menu.
 - **The run analyses as tools** in `testbed/sim_mesh/reticulum/` beside
-  `delivery.py`, reading a run's logs and record: `peer left` withdrawals and
-  the routes they dropped; directory entries, full blob pools and evictions;
-  neighbour-table rows and evictions (from `table … evicted, … gone
-  silent`); paths a reloaded snapshot kept; calling-channel power and rate
-  steps per target. `callkind` classes a short HEADER_2 frame correctly.
+  `delivery.py`, reading a run's events and record: peers withdrawn and the
+  routes they dropped; directory entries, full pools and evictions;
+  neighbour-table rows and evictions; paths a reloaded snapshot kept;
+  calling-channel power and rate steps per target — each a `reticulum`
+  event a driver reports. `callkind` classes a short HEADER_2 frame
+  correctly.
 - **Traffic scripts for SUPE's departure policy**, the one pure function
   `should_channel switch(peer_state, queue_state, channel_state) -> no | now |
   wait_until(t)`, each reporting losses by cause: an interactive exchange that
@@ -1732,16 +1667,13 @@ change.
   stated timing constants: turnaround, retune gap, burst gap, guard, seed gap
   and the schedule's spacings, jitters and lifetimes. No policy is committed
   in code before these have measured it.
-- **Run options on the page**: a paced `<k>x`, a build override, and a new
-  simulation started from a snapshot.
-- **Which build a simulation runs** on its row (source and stamp), and on the
-  Firmware tab the scripts and simulations that use each build.
-- **An LR2021 model** beside the SX1262's, and a node that can be one.
-- **Meta commands carried by the firmware**: each device zip naming its own
-  implementations of a standard list of meta commands (`max_tx_pwr`,
-  `send_msg`, …), in place of the kinds' intents, so a new firmware brings
-  them with it. Until then the kinds say them, and a Meshtastic kind adds
-  its own lines.
+- **Run options on the page**: a paced `<k>x`, a firmware override, and a
+  new simulation started from a snapshot.
+- **Which firmware a simulation runs** on its row, and on the Firmware tab
+  the running simulations that use each one beside the paused runs and
+  snapshots that hold it.
+- **An LR2021 virtual radio**, `libsimradio-lr2021.so` beside the SX1262's,
+  and the ether's modulations it needs beside LoRa.
 - **Firmware changed mid-run as an experiment**: `firmware()` in `main`
   restarts the nodes it changes with their state kept; an upgrade test
   across firmwares whose stores differ needs a rule for what becomes of it.
@@ -1769,5 +1701,5 @@ change.
   median is taken per direction over time; a pair that does not hear gets a
   bound from the sensitivity, not a value; the sender's power is needed per
   frame, because SUPE varies it.
-- **x86_64 device packages** beside the aarch64 ones, from a builder of that
+- **x86_64 pre-built firmware** beside the aarch64, from a builder of that
   architecture.

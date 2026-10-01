@@ -9,21 +9,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import rpc  # noqa: E402
 import stations  # noqa: E402
+from sim_mesh.driver import Driver  # noqa: E402
 
 
-class StubKind:
-    """A kind whose binary is a shell script."""
-
-    name = "stub"
+class StubKind(Driver):
+    """A driver whose firmware is a shell script, and which hears every
+    console line."""
 
     def __init__(self, elf):
-        self.elf = elf
-
-    def env(self, station):
-        return {}
+        super().__init__({"firmware": "stub", "exec": elf, "env": {}})
+        self.heard = []
 
     def configured(self, station):
         return False
+
+    def console_line(self, station, line):
+        self.heard.append(line)
 
 
 def script(tmp_path, body):
@@ -43,9 +44,11 @@ def test_text_frames_and_the_marker_reach_their_owners_in_order(tmp_path):
     elf = script(tmp_path, "printf '%s'\nprintf '%s'\nprintf '%s'\nsleep 0.3\n" % (
         octal(lines[0] + lines[1][:9]), octal(lines[1][9:] + reply), octal(lines[2])))
 
+    driver = StubKind(elf)
+
     async def main():
         seen = []
-        station = stations.Station("alpha", 1, str(tmp_path / "alpha"), StubKind(elf),
+        station = stations.Station("alpha", 1, str(tmp_path / "alpha"), driver,
                                    "", on_output=lambda st, text: seen.append(text))
         station.watchers = 1
         station.run()
@@ -65,6 +68,8 @@ def test_text_frames_and_the_marker_reach_their_owners_in_order(tmp_path):
     assert log.endswith(b"".join(lines))
     assert rpc.MAGIC not in log
     assert b"".join(seen) == b"".join(lines)
+    # The driver hears each line whole, a reply frame taken out of it.
+    assert driver.heard == ["booting", "I [serial] framed rpc v1", "after the marker"]
 
 
 def test_no_console_bytes_cross_while_nobody_watches(tmp_path):

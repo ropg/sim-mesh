@@ -2,8 +2,8 @@
 """One firmware process, its pty, its log and its supervisor.
 
 A station is a whole firmware built for Linux and run as an ordinary process,
-keeping the station contract (STATION.md); its kind (kinds/) says which
-binary and how to talk to it. It gets:
+keeping the station contract; its firmware's driver (sim_mesh.driver) says
+how to start it and how to talk to it. It gets:
 
 - a **directory** in the run, `runs/<run>/nodes/<name>/`, its cwd, with its
   state under `state/`;
@@ -11,7 +11,7 @@ binary and how to talk to it. It gets:
   supervisor holds the master end and reads it on the pty thread (`Ptys`),
   which takes framed-RPC replies out of what the station writes (rpc.py) and
   hands them to the station's client, appends everything else to `log`, and
-  passes the same bytes to whoever is watching the console; or, for a kind
+  passes the same bytes to whoever is watching the console; or, for a firmware
   whose console need not be a terminal (`console_tty`), a pipe each way,
   read the same way, which holds none of the host's ptys;
 - a **loopback address** its id fixes in the testbed's network (`bind_addr`),
@@ -20,7 +20,7 @@ binary and how to talk to it. It gets:
   this target is a process exit.
 
 Status is what the map draws: `stopped` before anything is started and after
-it is told to stop, `starting` from the fork until its kind says it is up, `setup`
+it is told to stop, `starting` from the fork until its driver says it is up, `setup`
 while its setup lines are going in, `up` once it is answering, `restarting`
 in the gap after an unasked-for exit. Nothing here decides when `setup`
 happens — the caller does that, through `on_status`.
@@ -36,6 +36,7 @@ import sys
 import threading
 import tty
 
+import drivers as drivers_module
 import rpc as rpc_module
 
 RESTART_DELAY = 0.5         # seconds before a station that exited comes back
@@ -262,6 +263,8 @@ class Drain:
                 self.main.call_soon_threadsafe(self.rpc.on_marker)
             if self.station.watchers:
                 self.main.call_soon_threadsafe(self.station.console_out, text)
+            if self.station.hears_lines:
+                self.main.call_soon_threadsafe(self.station.console_text, text)
         for frame_id, payload in frames:
             self.main.call_soon_threadsafe(self.rpc.on_frame, frame_id, payload)
 
@@ -295,15 +298,23 @@ class Drain:
 
 
 class Station:
-    """One firmware process, its pty and its log."""
+    """One firmware process, its pty and its log; to its driver, the
+    station surface `sim_mesh.driver` names."""
 
-    def __init__(self, name, node_id, directory, kind, ether_addr,
-                 on_status=None, on_output=None, clock=None):
+    def __init__(self, name, node_id, directory, driver, ether_addr,
+                 on_status=None, on_output=None, clock=None, on_event=None):
         self.name = name
         self.node_id = node_id
         self.dir = directory
-        self.kind = kind                # a kinds.Kind: the binary and how to talk to it
+        self.driver = driver            # its firmware's driver: how to start it and talk to it
         self.ether_addr = ether_addr
+        self.on_event = on_event        # (station, event, fields): what its driver reports
+        self.board = None
+        self.line_tail = ""             # console text after the last newline
+        # Whether the driver wants every console line: only then does the pty
+        # thread hand console text to this loop when no window is open.
+        self.hears_lines = (type(driver).console_line
+                            is not drivers_module.Driver.console_line)
         # The ether, in a virtual-time run: it waits for a station it is told
         # is starting, and stops waiting for one that has gone.
         self.clock = clock
@@ -313,7 +324,7 @@ class Station:
         self.proc = None
         self.log_file = None
         self.status = STOPPED
-        self.role = None                # what it does for the mesh, as its kind last read it
+        self.role = None                # what it does for the mesh, as its driver last read it
         # Whether this station had been through a first boot when it was last
         # started. Sampled at the fork, because the station writes `state/boot`
         # moments later and the answer the setup step needs is the one from
@@ -345,14 +356,43 @@ class Station:
         return os.path.join(self.dir, "state")
 
     @property
+    def virtual(self):
+        return self.clock is not None
+
+    async def sleep(self, seconds):
+        """Wait on the run's clock: T in a virtual-time run."""
+        if self.clock is not None:
+            await self.clock.sleep(seconds)
+        else:
+            await asyncio.sleep(seconds)
+
+    def report(self, event, **fields):
+        """An event from the station's driver, for the run's record."""
+        if self.on_event is not None:
+            self.on_event(self, str(event), fields)
+
+    def console_text(self, text):
+        """Console text the pty thread read, as whole lines to the driver."""
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        lines = (self.line_tail + text).split("\n")
+        self.line_tail = lines.pop()
+        for line in lines:
+            try:
+                self.driver.console_line(self, line.rstrip("\r"))
+            except Exception as err:     # noqa: BLE001 - a firmware's callback, reported
+                log("station %s: its driver's console_line failed: %s: %s"
+                    % (self.name, type(err).__name__, err))
+
+    @property
     def configured(self):
         """True when this station has been through its first boot already.
 
-        What marks that is the kind's business — a file the firmware writes
+        What marks that is the driver's business — a file the firmware writes
         once it has run — and a directory without it is a station that has
         never been set up, which is what decides whether the setup lines go in.
         """
-        return self.kind.configured(self)
+        return self.driver.configured(self)
 
     def set_status(self, status):
         if status == self.status:
@@ -365,17 +405,18 @@ class Station:
 
     def env(self):
         env = dict(os.environ)
-        env.update(self.kind.env(self))
+        env.update(drivers_module.env(self, self.driver.firmware))
+        env.update(self.driver.env(self))
         return env
 
     def expect(self):
         """Tell the ether every process of this station's that joins the run
-        is starting (kinds.Kind.sids)."""
-        for sid in self.kind.sids(self):
+        is starting (Driver.sids)."""
+        for sid in self.driver.sids(self):
             self.clock.expect(sid)
 
     def leave(self):
-        for sid in self.kind.sids(self):
+        for sid in self.driver.sids(self):
             self.clock.leave(sid)
 
     async def start(self):
@@ -386,7 +427,7 @@ class Station:
         ptys().call(self.log_file.write, b"\n--- station %s starting ---\n"
                     % self.name.encode("utf-8"))
 
-        if getattr(self.kind, "console_tty", True):
+        if self.driver.console_tty:
             master, slave = pty.openpty()
             tty.setraw(slave)       # a serial line has no echo and no translation
             reader, child_in, child_out = master, slave, slave
@@ -401,6 +442,7 @@ class Station:
         self.outbox.clear()
         self.typed = 0
         self.syncing = False
+        self.line_tail = ""
         self.starts += 1
         self.set_status(STARTING)
         if self.clock is not None:
@@ -409,7 +451,7 @@ class Station:
             self.cpu = next_cpu()
         try:
             self.proc = await asyncio.create_subprocess_exec(
-                self.kind.elf, cwd=self.dir, env=self.env(),
+                *self.driver.argv(self), cwd=self.dir, env=self.env(),
                 stdin=child_in, stdout=child_out, stderr=child_out,
                 preexec_fn=functools.partial(os.sched_setaffinity, 0, (self.cpu,)))
         except OSError:
@@ -423,11 +465,12 @@ class Station:
         os.set_blocking(reader, False)
         marks = self.clock.console_marks(reader) if self.clock is not None else None
         self.drain = Drain(self, reader, self.rpc, asyncio.get_running_loop(), marks)
-        if self.clock is not None and self.kind.console_acted_on:
+        if self.clock is not None and self.driver.console_acted_on:
             self.clock.watch(self.node_id, self.drain.marks)
         ptys().call(self.drain.attach)
         log("station %s (%d, %s) up as pid %d on %s" % (
-            self.name, self.node_id, self.kind.name, self.proc.pid, self.addr))
+            self.name, self.node_id, self.driver.firmware.get("firmware"), self.proc.pid,
+            self.addr))
 
     def console_out(self, text):
         """Console bytes the pty thread read, for whoever has the window open."""
@@ -477,11 +520,11 @@ class Station:
             # read these bytes, and they go out once the station has the T
             # the run has, so a line typed at an instant is read at it.
             self.typed += len(data)
-            self.clock.typed(self.kind.console_sid(self), self.typed)
+            self.clock.typed(self.driver.console_sid(self), self.typed)
             if not self.syncing:
                 self.syncing = True
                 start = self.starts
-                self.clock.sync(self.kind.console_sid(self), lambda: self.synced(start))
+                self.clock.sync(self.driver.console_sid(self), lambda: self.synced(start))
             return
         self.writable()
 

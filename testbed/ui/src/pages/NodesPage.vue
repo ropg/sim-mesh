@@ -120,7 +120,7 @@
           </template>
           <template v-if="nodes.attached">
             <q-item clickable v-close-popup @click="askFactory(nodes.selection)"><q-item-section>Factory reset</q-item-section></q-item>
-            <q-item clickable v-close-popup @click="intent('announce', {}, nodes.selection.length > 1 ? 30 : 0)">
+            <q-item clickable v-close-popup @click="intent('lxmf.announce', {}, nodes.selection.length > 1 ? 30 : 0)">
               <q-item-section>Announce</q-item-section>
             </q-item>
             <q-item clickable v-close-popup @click="openCommand"><q-item-section>Run command…</q-item-section></q-item>
@@ -212,7 +212,7 @@
       </q-card>
     </q-dialog>
 
-    <!-- Run command: one line on the stations chosen, all of one kind. -->
+    <!-- Run command: one line on the stations chosen, all running one firmware base. -->
     <q-dialog v-model="commanding">
       <q-card style="min-width: 560px">
         <q-card-section class="text-subtitle2">Run command on {{ targetText }}</q-card-section>
@@ -220,7 +220,7 @@
           <div class="row q-col-gutter-sm">
             <q-select v-if="sim.kinds.length > 1" class="col-auto" style="width: 150px"
                       v-model="commandKind" :options="sim.kinds" outlined dense
-                      :disable="waiting" label="kind" />
+                      :disable="waiting" label="firmware" />
             <q-input class="col" v-model="commandLine" outlined dense autofocus
                      label="line" :disable="waiting"
                      input-style="font-family: ui-monospace, monospace"

@@ -26,7 +26,7 @@ const FILES = ['planner_wasm.js', 'planner_wasm_bg.wasm',
 
 for (const file of FILES) {
   if (!existsSync(join(source, file))) {
-    console.error(`update-planner-wasm: no ${file} in ${source} (build the planner first: sim-mesh build planner)`)
+    console.error(`update-planner-wasm: no ${file} in ${source} (build the planner first: sim does when it starts)`)
     process.exit(1)
   }
 }

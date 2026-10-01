@@ -14,7 +14,7 @@ the wall clock since the record's first line in a real one.
   every other carrier, which under SUPE's channel plan are its traffic
   channels; and by what the frame is (`by_kind`, and on the calling channel
   alone `by_kind_calling`), so the announce share can be read off. What a
-  frame is belongs to the protocol: in a run with Reticulous stations,
+  frame is belongs to the protocol: in a run with Reticulum stations,
   Reticulum packet type and context or SUPE frame type
   (`sim_mesh.reticulum.frames.kind_of`); otherwise every frame is `frame`;
 - transmit power: `power_dbm` of each frame, on the calling channel and on
