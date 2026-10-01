@@ -46,6 +46,30 @@
               : 'Run it from its top: a new simulation of its own, or on a running one' }}</q-tooltip>
           </q-btn>
         </q-toolbar>
+        <!-- What the script asks for before it runs (its script_input(…)s), chosen here. -->
+        <div v-if="!setup && scriptInputs.length" class="sp-inputs">
+          <div v-for="input in scriptInputs" :key="input.name" class="sp-input">
+            <q-toggle v-if="input.type === 'bool'" :model-value="inputValues[input.name] === 'true'"
+                      :label="input.label"
+                      @update:model-value="(v: boolean) => { inputValues[input.name] = v ? 'true' : 'false' }" />
+            <q-select v-else-if="input.type === 'run'" v-model="inputValues[input.name]"
+                      :options="runChoices" dense outlined emit-value map-options
+                      :label="input.label" class="sp-input-field" />
+            <q-select v-else-if="input.type === 'firmware'" v-model="inputValues[input.name]"
+                      :options="firmwareChoices(input.category)" dense outlined emit-value map-options
+                      :label="input.label" class="sp-input-field"
+                      :hint="input.category ? `${input.category} firmware` : undefined">
+              <template #no-option>
+                <q-item><q-item-section class="text-grey-6">
+                  No {{ input.category ?? '' }} firmware installed: add some on the Firmware tab
+                </q-item-section></q-item>
+              </template>
+            </q-select>
+            <q-input v-else v-model="inputValues[input.name]" dense outlined :label="input.label"
+                     :type="input.type === 'int' || input.type === 'float' ? 'number' : 'text'"
+                     :step="input.type === 'int' ? 1 : 'any'" class="sp-input-field" />
+          </div>
+        </div>
         <!-- The script, every file it imports (another script to edit, or the
              library's own module to read), scripts/globals.py, and the setup
              file of each nodeset it would run on. Or one nodeset's setup file alone. -->
@@ -76,22 +100,24 @@
         <p>
           A script runs from its top to its end, each call doing what it says:
           <code>from sim_mesh import *</code>, then its declarations,
-          <code>time("real")</code> (or <code>"max"</code>, or a pace such as
-          <code>10</code>), <code>firmware(which, "reticulous_dev_latest")</code> and
-          <code>on_first_boot(which, lines)</code>, then what it does:
-          <code>up(which)</code>, <code>exec(which, lines, pause=…)</code>,
-          <code>announce(which)</code>, <code>send_msg(a, b, text)</code>,
-          <code>max_tx_pwr(which)</code>, <code>wait(s)</code>,
-          <code>snapshot(name)</code>, <code>pause()</code>. <code>which</code> is
-          <code>"all"</code>, a name, a list, or <code>nodes(tag=…)</code>, combined
-          with <code>&amp; | - ~</code>.
+          <code>sim_speed("real")</code> (or <code>"max"</code>, or a pace such as
+          <code>10</code>), <code>nodes().firmware(name)</code> (an installed
+          firmware, or <code>"&lt;base&gt;_latest"</code>; most scripts ask for
+          theirs with <code>script_input("firmware", type=Firmware)</code>, chosen above
+          the script) and <code>.on_first_boot(rules)</code>, then what it does to a
+          selection, <code>nodes(tag=…)</code> or <code>node(name)</code>, combined with
+          <code>&amp; | - ~</code>: <code>.up()</code>, <code>.exec(lines)</code>,
+          <code>.radio(…)</code>, <code>.reticulum.lxmf.announce()</code>,
+          <code>.reticulum.lxmf.send(to, text)</code>, <code>.reset()</code>; and to
+          the simulation: <code>sim_wait(s)</code>, <code>sim_snapshot(name)</code>,
+          <code>sim_pause()</code>.
         </p>
         <p>
-          A script's declarations start with <code>include("scripts/startup.py")</code>,
-          which tells every node its <code>radio(…)</code> and, for a node tagged with
-          one, its <code>role(…)</code> in <code>on_first_boot</code>, then runs each
-          nodeset's own <code>nodesets/&lt;name&gt;.py</code>, then starts the radios
-          with <code>radio_up()</code>. The radio itself, the
+          A script's declarations start with <code>script_include("scripts/startup.py")</code>,
+          which tells every node its <code>Node.radio(…)</code> and, for a node tagged with
+          one, its <code>Node.reticulum.role(…)</code> in <code>.on_first_boot</code>, then
+          runs each nodeset's own <code>nodesets/&lt;name&gt;.py</code>, then starts the
+          radios with <code>Node.radio_up()</code>. The radio itself, the
           one the map draws, is in <code>scripts/globals.py</code>; a node tagged
           <code>no-radio</code> has none.
         </p>
@@ -110,9 +136,14 @@
         <q-card-section class="column q-gutter-sm">
           <q-btn-toggle v-model="runOn" dense no-caps unelevated toggle-color="primary"
                         :options="[{ label: 'a new simulation', value: 'new' },
-                                   { label: 'on a running one', value: 'running' }]" />
+                                   { label: 'on a running one', value: 'running' },
+                                   { label: 'on a paused one', value: 'paused' }]" />
           <q-select v-if="runOn === 'running'" v-model="runSim" :options="runningNames" dense outlined
                     label="simulation" />
+          <template v-else-if="runOn === 'paused'">
+            <q-select v-model="runPaused" :options="pausedNames" dense outlined label="simulation" />
+            <div class="sp-world-note">It goes on as it ended, in the script's own time (real unless its <code>time(…)</code> says otherwise), and its firmware and first-boot lines apply to it.</div>
+          </template>
           <div v-else class="sp-world">
             <div><span>geodata</span><b>{{ nodes.geodata ?? 'none: choose it on the Geodata tab' }}</b></div>
             <div><span>{{ runLayers.length > 1 ? 'nodesets, merged' : 'nodeset' }}</span>
@@ -135,10 +166,10 @@
  * as a process of the front's, and its output comes back here as it is
  * written. With `?setup=<nodeset>` the page is that nodeset's setup file
  * alone, which the Nodes tab's Edit setup opens. */
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { useQuasar } from 'quasar'
 import { useRoute, useRouter } from 'vue-router'
-import { useCatalog, type ScriptRow } from '../stores/catalog'
+import { useCatalog, type ScriptInput, type ScriptRow } from '../stores/catalog'
 import { useSim } from '../stores/sim'
 import { saveIfEditing, useNodes } from '../stores/nodes'
 import { request } from '../lib/front'
@@ -168,7 +199,7 @@ const tabs = ref<Tab[]>([])
 const tabKey = ref<string | null>(null)
 const running = ref(false)
 const starting = ref(false)
-const runOn = ref<'running' | 'new'>('new')
+const runOn = ref<'running' | 'paused' | 'new'>('new')
 const runSim = ref<string | null>(null)
 const shownRun = ref<string | null>(null)
 const outputEl = ref<HTMLPreElement>()
@@ -188,14 +219,57 @@ const runLayers = computed<string[]>(() => {
   return [...(active ? [active] : []), ...shown]
 })
 const runningNames = computed(() => sim.sims.filter(s => s.state === 'running').map(s => s.name))
-const runReady = computed(() => (runOn.value === 'running' ? !!runSim.value
-  : !!(nodes.geodata && runLayers.value.length)))
+const pausedNames = computed(() => sim.sims.filter(s => s.state === 'paused').map(s => s.name))
+const runPaused = ref<string | null>(null)
+/** The open script's inputs, and the values chosen for them, kept per script. */
+const scriptInputs = computed<ScriptInput[]>(() => info.value?.inputs ?? [])
+const chosenInputs = reactive<Record<string, Record<string, string | null>>>({})
+watch([current, scriptInputs], () => {
+  const name = current.value ?? ''
+  const mine = chosenInputs[name] ?? (chosenInputs[name] = {})
+  for (const input of scriptInputs.value) {
+    if (!(input.name in mine)) {
+      mine[input.name] = input.default != null ? String(input.default)
+        : input.type === 'bool' ? 'false' : null
+    }
+  }
+}, { immediate: true })
+
+/** The runs a run input offers: those that are not running, newest first. */
+const runChoices = computed(() => sim.sims
+  .filter(s => s.state === 'ended' || s.state === 'paused')
+  .map(s => (s.run ?? '').split('/').pop() ?? '')
+  .filter(r => r)
+  .map(r => ({ label: r, value: r })))
+const inputValues = computed<Record<string, string | null>>(() =>
+  chosenInputs[current.value ?? ''] ?? {})
+const inputsReady = computed(() => scriptInputs.value.every(i => !!inputValues.value[i.name]))
+
+/** The installed firmware a firmware input offers: the newest of each base
+ *  (`<base>_latest`) first, then every one by name; of `category` when the
+ *  input names one. */
+function firmwareChoices(category?: string) {
+  const rows = catalog.firmware.filter(f => !f.error && (!category || f.category === category))
+  const bases = [...new Set(rows.map(f => f.base))].sort()
+  return [
+    ...bases.map(b => ({ label: `${b}_latest — the newest ${b}`, value: `${b}_latest` })),
+    ...rows.map(f => ({ label: f.title ? `${f.name} — ${f.title}` : f.name, value: f.name })),
+  ]
+}
+
+const runReady = computed(() => inputsReady.value && (runOn.value === 'running' ? !!runSim.value
+  : runOn.value === 'paused' ? !!runPaused.value
+    : !!(nodes.geodata && runLayers.value.length)))
 const runOutput = computed(() => (shownRun.value ? catalog.runs[shownRun.value] ?? null : null))
 
 watch(running, (open) => {
   if (!open) return
   runSim.value = runSim.value ?? sim.selected ?? runningNames.value[0] ?? null
-  if (!runningNames.value.length) runOn.value = 'new'
+  if (!runPaused.value || !pausedNames.value.includes(runPaused.value)) {
+    runPaused.value = pausedNames.value[0] ?? null
+  }
+  if (runOn.value === 'running' && !runningNames.value.length) runOn.value = 'new'
+  if (runOn.value === 'paused' && !pausedNames.value.length) runOn.value = 'new'
 })
 watch(() => runOutput.value?.lines.length, async () => {
   await nextTick()
@@ -271,6 +345,38 @@ function openScript(name: string) {
   })
 }
 
+// `?script=<name>&geodata=<g>&nodeset=<n>…&set.<input>=<value>…`, as `sim run`
+// opens the page when a script lacks an input: the script open on its world,
+// the inputs given filled in, and Run… asked, for the rest to be chosen.
+watch(() => route.query.script, (name) => {
+  if (typeof name !== 'string' || !name) return
+  const q = { ...route.query }
+  void router.replace({ query: {} })
+  sim.show('scripts')
+  guard(() => {
+    void (async () => {
+      const layers = ([] as unknown[]).concat(q.nodeset ?? []).filter((l): l is string =>
+        typeof l === 'string' && !!l)
+      if (typeof q.geodata === 'string' && q.geodata) await nodes.chooseGeodata(q.geodata)
+      if (layers.length) {
+        const error = await nodes.activate(layers[0]!)
+        if (error) tell(error)
+        for (const layer of layers.slice(1)) {
+          if (!nodes.layers.find(l => l.name === layer)?.shown) await nodes.toggleLayer(layer)
+        }
+      }
+      const r = await request('script_open', { name })
+      if (!r.ok) { tell(r.error); return }
+      await show(name, r.script as ScriptRow, r.text as string)
+      const mine = chosenInputs[name] ?? (chosenInputs[name] = {})
+      for (const [key, value] of Object.entries(q)) {
+        if (key.startsWith('set.') && typeof value === 'string') mine[key.slice(4)] = value
+      }
+      running.value = true
+    })()
+  })
+}, { immediate: true })
+
 watch(() => route.query.setup, (name) => {
   if (typeof name !== 'string' || !name || name === setup.value) return
   sim.show('scripts')
@@ -335,9 +441,12 @@ async function run() {
     if (error) { tell(error); return }
   }
   starting.value = true
+  const inputs = { ...inputValues.value }
   const r = await request('script_run', runOn.value === 'running'
-    ? { name: current.value, sim: runSim.value }
-    : { name: current.value, geodata: nodes.geodata, nodesets: runLayers.value })
+    ? { name: current.value, sim: runSim.value, inputs }
+    : runOn.value === 'paused'
+      ? { name: current.value, resume: runPaused.value, inputs }
+      : { name: current.value, geodata: nodes.geodata, nodesets: runLayers.value, inputs })
   starting.value = false
   if (!r.ok) { tell(r.error); return }
   running.value = false
@@ -373,6 +482,11 @@ function indent(event: KeyboardEvent) {
 .sp-world span { color: #6b7280; width: 110px; flex: none; }
 .sp-world b { font-weight: 500; color: #e5e7eb; }
 .sp-world .sp-world-note { color: #6b7280; font-size: 11px; }
+.sp-inputs {
+  display: flex; flex-wrap: wrap; gap: 10px; padding: 8px 12px 10px;
+  background: #14181d; border-bottom: 1px solid #262c35; flex: none;
+}
+.sp-input-field { min-width: 380px; }
 .sp-subhead { padding-top: 12px; }
 .sp-list { width: 280px; flex: none; border-right: 1px solid #262c35; overflow-y: auto; padding: 10px 0; }
 .sp-head { display: flex; align-items: center; padding: 0 12px 4px; }

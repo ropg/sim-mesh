@@ -1,9 +1,9 @@
-"""What a frame on the air is, read the way a Reticulous station reads it.
+"""What a frame on the air is, read the way an RNode-framed Reticulum station reads it.
 
 An air frame is the RNode header byte (a sequence number and the split flag)
 and then a Reticulum packet, except for the frames the interface speaks for
 itself: SUPE's (first byte 0xC2..0xC8) and the four-byte power request. A
-Reticulum packet is the firmware's `rnsParse` layout: a flags byte, a hop
+Reticulum packet is the wire layout: a flags byte, a hop
 count, one or two addresses, a context byte, then the data. A packet too
 long for one frame goes as two, both with the split flag; which half a frame
 is follows from the order its sender sent them in (`Halves`).

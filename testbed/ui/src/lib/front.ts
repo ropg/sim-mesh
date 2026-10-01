@@ -1,6 +1,6 @@
 /* The front's own verbs, asked over the page's one socket.
  *
- * Every editor verb (device_*, geodata_*, nodeset_*, script_*, snapshot_list,
+ * Every editor verb (firmware_*, geodata_*, nodeset_*, script_*, snapshot_list,
  * losses_compute, coverage) is answered to the asking socket as
  * `{type: <verb>, ok, …}`, in the order asked, per verb; the socket store
  * hands each such answer to `answered`, which settles the oldest request for

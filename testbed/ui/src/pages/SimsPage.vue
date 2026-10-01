@@ -8,7 +8,7 @@
       <div v-if="!sim.sims.length" class="sims-none">
         No simulation runs yet. A script's Run on the Scripts tab starts one, on
         the Nodes tab's geodata and nodeset, running what the script's
-        <code>firmware()</code> says; so does <code>sim-mesh run &lt;script&gt;
+        <code>.firmware(…)</code> says; so does <code>sim run &lt;script&gt;
         --geodata &lt;g&gt; --nodeset &lt;n&gt;</code> from a shell.
       </div>
 
@@ -97,18 +97,17 @@
               <td class="sims-actions" @click.stop>
                 <q-btn v-if="s.report" flat dense no-caps size="sm" label="Report" @click="reportOf = s.run" />
                 <q-btn v-if="s.state === 'paused'" flat dense no-caps size="sm" color="primary"
-                       label="Resume" @click="sim.resumeSim(s.name)">
-                  <q-tooltip>Start it again as it ended, in a new run directory</q-tooltip>
+                       :icon="matPlayArrow" label="Resume" @click="sim.resumeSim(s.name)">
+                  <q-tooltip>Start it again as it ended, in real time, in a new run directory; a script runs on it from the Scripts tab (on a paused one)</q-tooltip>
+                </q-btn>
+                <q-btn v-if="s.state === 'running'" flat dense no-caps size="sm" color="primary"
+                       :icon="matPause" label="Pause" @click="sim.pauseSim(s.name)">
+                  <q-tooltip>Stop it with its state kept: it stays listed, to be resumed as it ended</q-tooltip>
                 </q-btn>
                 <q-btn v-if="s.state === 'running'" flat dense round size="sm" aria-label="More">
                   <span class="sims-more">⋯</span>
                   <q-menu auto-close anchor="bottom right" self="top right">
                     <q-list dense style="min-width: 210px">
-                      <q-item clickable @click="sim.pauseSim(s.name)">
-                        <q-item-section>Pause</q-item-section>
-                        <q-item-section side><span class="sims-sub">stop, keep state</span></q-item-section>
-                      </q-item>
-                      <q-separator />
                       <q-item clickable @click="to(s.name, 'reset_all')">
                         <q-item-section>Reset all</q-item-section>
                         <q-item-section side><span class="sims-sub">restart</span></q-item-section>
@@ -129,9 +128,12 @@
                        :icon="matDeleteOutline" color="grey-6" aria-label="Delete" @click="askDelete(s)">
                   <q-tooltip>Delete the run: its directory, logs, report{{ s.state === 'paused' ? ' and saved state' : '' }}</q-tooltip>
                 </q-btn>
-                <q-btn v-else flat dense no-caps size="sm" color="negative"
+                <q-btn v-if="s.state !== 'ended'" flat dense no-caps size="sm" color="negative"
+                       :icon="s.state === 'exited' ? undefined : matStop"
                        :label="s.state === 'exited' ? 'Remove' : 'Stop'"
-                       :disable="s.state === 'stopping'" @click="askStop(s.name, s.state)" />
+                       :disable="s.state === 'stopping'" @click="askStop(s.name, s.state)">
+                  <q-tooltip v-if="s.state !== 'exited'">Stop it for good: its run stays on disk, its state is not kept for resuming</q-tooltip>
+                </q-btn>
               </td>
             </tr>
             <tr v-if="s.state === 'exited' && s.tail.length" class="sims-tail-row">
@@ -189,7 +191,7 @@ import { useCatalog } from '../stores/catalog'
 import { useSocket } from '../stores/socket'
 import { clockTime, etaText, phaseText, realText, simText, speedText } from '../components/runtime'
 import ReportDialog from '../components/ReportDialog.vue'
-import { matDeleteOutline } from '@quasar/extras/material-icons'
+import { matDeleteOutline, matPause, matPlayArrow, matStop } from '@quasar/extras/material-icons'
 
 const sim = useSim()
 const catalog = useCatalog()
@@ -263,9 +265,12 @@ function askStop(simName: string, state: string) {
   if (state === 'exited') { sim.stopSim(simName); return }
   quasar.dialog({
     title: `Stop ${simName}`,
-    message: 'Its stations are flushed and stopped and its simd ends. The run '
-           + 'directory stays; nothing is saved to the nodeset or as a snapshot, and it cannot '
-           + 'be resumed (⋯ ▸ Pause keeps it resumable).',
+    message: state === 'paused'
+      ? 'The state it was paused with is deleted, so it can no longer be resumed; '
+        + 'the run directory stays, ended where it paused.'
+      : 'Its stations are flushed and stopped and its simd ends. The run '
+        + 'directory stays; nothing is saved to the nodeset or as a snapshot, and it cannot '
+        + 'be resumed (Pause keeps it resumable).',
     cancel: true,
     persistent: true,
   }).onOk(() => sim.stopSim(simName))
@@ -273,7 +278,7 @@ function askStop(simName: string, state: string) {
 </script>
 
 <style scoped>
-.sims-page { overflow-y: auto; }
+.sims-page { overflow-y: auto; height: 100%; }
 .sims-body { padding: 16px 20px 32px; max-width: 1200px; }
 .sims-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .sims-heading { font-size: 14px; font-weight: 500; color: #d1d5db; margin-bottom: 10px; }

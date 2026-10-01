@@ -64,7 +64,7 @@ def test_names_ids_and_heights_are_checked_and_nodes_declare_nothing(tmp_path):
             ("nodes:\n  a: { id: 1, lat: 0, lon: 0, height_from: guessed }\n", "height_from"),
             ("nodes:\n  a: { id: 1, lat: 0, lon: 0, role: transport }\n", "declares no role"),
             ("nodes:\n  a: { id: 1, lat: 0, lon: 0, radio: { sf: 8 } }\n", "declares no radio"),
-            ("nodes:\n  a: { id: 1, lat: 0, lon: 0, device: dev }\n", "firmware\\(\\)"),
+            ("nodes:\n  a: { id: 1, lat: 0, lon: 0, device: dev }\n", r"\.firmware\(…\)"),
             ("nodes:\n  a: { id: 1, lat: 0, lon: 0, board: { type: heltec_v4 } }\n",
              "has no board.*max_dbm"),
             ("nodes:\n  a: { id: 1, lat: 0, lon: 0, max_dbm: 30 }\n", "max_dbm is -9 to 27"),

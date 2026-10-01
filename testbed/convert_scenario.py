@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """An old scenario as main's ground, nodeset and medium.
 
-    convert_scenario.py OLD.yaml --out DIR --device KIND=DEVICE [--device ...]
+    convert_scenario.py OLD.yaml --out DIR --firmware KIND=FIRMWARE [--firmware ...]
                         [--name NAME] [--force]
 
 OLD.yaml is a `scenario.yaml` of the format before geodata and nodesets: one
@@ -11,7 +11,7 @@ never written. The conversion goes to
 
     DIR/geodata/<name>.yaml      synthetic ground: the old exponent and shadowing
     DIR/nodesets/<name>.yaml     the nodes; walls and gains as offsets; links
-    DIR/nodesets/<name>.py       the nodeset's own setup: each old kind's device
+    DIR/nodesets/<name>.py       the nodeset's own setup: each old kind's firmware
     DIR/medium.txt               the simd flags the old medium needs, one line
     DIR/conversion.txt           what went where, what did not, the distance check
 
@@ -55,11 +55,12 @@ How each part goes over, and why:
   frequency; main moves a cell to the frame's carrier by 20*log10(f/f0),
   hundredths of a dB inside a band.
 - **Kinds.** A node's old kind named its firmware, the kind's `elf`. The
-  caller maps each kind to a device (--device KIND=DEVICE), and a node of a
-  kind the mapping lacks is refused. A nodeset names no device, so each node
-  is tagged with its kind, and the nodeset's own setup says each tag's device:
-  scripts/startup.py includes it after a script's own firmware(), so its rules
-  are the last to match.
+  caller maps each kind to an installed firmware, by name or `<base>_latest`
+  (--firmware KIND=FIRMWARE), and a node of a kind the mapping lacks is
+  refused. A nodeset names no firmware, so each node is tagged with its kind,
+  and the nodeset's own setup says each tag's firmware: scripts/startup.py
+  includes it after a script's own .firmware(…), so its rules are the last to
+  match.
 - **First-boot lines**, each node's as the old testbed said them (the
   scenario's to its default kind, then the kind's, then the node's own), in
   the old kind's language: the role becomes the `transport` tag and the
@@ -68,7 +69,7 @@ How each part goes over, and why:
   are scripts/globals.py's, one radio for every node, and a difference from
   it is warned of. Every other line goes to the setup as it was, to the same
   nodes in the same order, as on_first_boot() rules in the old kind's
-  language: a kind is best mapped to a device of the kind it was.
+  language: a kind is best mapped to a firmware of the project it was.
 - **Ground.** Synthetic and flat, with the old exponent, over the square that
   holds every node. Shadowing (`shadowing_db`, `shadowing_seed`) goes to the
   geodata's keys of those names, which the shadowing layer over the loss
@@ -90,7 +91,7 @@ import yaml
 
 import antennas as antennas_module
 import boards as boards_module
-import devices as devices_module
+import firmware as firmware_module
 import geodata as geodata_module
 import nodeset as nodeset_module
 import script as script_module
@@ -176,7 +177,7 @@ def read_old(data, where):
         if odd:
             notes.append("kind %s: keys left out: %s" % (kind, ", ".join(odd)))
         if spec.get("env"):
-            notes.append("kind %s: its env (%s) belongs to the device now, and is not carried"
+            notes.append("kind %s: its env (%s) belongs to the firmware now, and is not carried"
                          % (kind, ", ".join(sorted(spec["env"]))))
     nodes = {}
     ids = {}
@@ -333,8 +334,8 @@ def rncfg_line(line):
 
 # The old kinds' types and the language their lines are in.
 DIALECTS = {"reticulous": reticulous_line, "berlinmesh": rncfg_line}
-# What each old type is in main: its device's kind.
-MAIN_KIND_OF = {"reticulous": "reticulous", "berlinmesh": "sergeyculum"}
+# What each old type is in main: its firmware's category.
+MAIN_CATEGORY_OF = {"reticulous": "reticulum", "berlinmesh": "reticulum"}
 
 
 def kind_type(old, kind):
@@ -392,25 +393,20 @@ def kind_tag(kind):
     return store.slug("kind-" + kind, "kind")
 
 
-def check_device(ref):
-    """(what a device resolves to here, or None; a warning, or None) for a
-    name main takes as a device, and ConvertError for one it does not. A
-    device not here yet is no reason to refuse: it may be built later."""
+def check_firmware(ref):
+    """(what a firmware name resolves to here, or None; a warning, or None)
+    for a name main takes as a firmware, and ConvertError for one it does
+    not. A firmware not installed here yet is no reason to refuse: it may be
+    added later."""
     ref = str(ref).strip()
-    parts = devices_module.split_name(ref)
-    looks_like_path = os.sep in ref or ref.startswith((".", "~")) or ref.endswith(".zip")
-    if not looks_like_path and parts is None:
-        raise ConvertError("device %s: a device is <project>_<catalogue>_latest, "
-                           "<project>_<catalogue>_<stamp> or a path" % ref)
-    if parts and parts[1:] == (devices_module.LOCAL, devices_module.LATEST) \
-            and "%s_%s" % parts[:2] not in devices_module.local_names():
-        return None, ("device %s is not here yet (no devices/local/%s_%s.yaml)"
-                      % ((ref,) + parts[:2]))
+    if firmware_module.latest_base(ref) is None and firmware_module.parse_name(ref) is None:
+        raise ConvertError("firmware %s: a firmware is <base>_<arch>_<version> or "
+                           "<base>_latest" % ref)
     try:
-        return devices_module.resolve(ref), None
-    except devices_module.DeviceError as err:
-        why = re.sub(r"^device %s: " % re.escape(ref), "", str(err))
-        return None, "device %s is not here yet (%s)" % (ref, why)
+        return firmware_module.resolve(ref), None
+    except firmware_module.FirmwareError as err:
+        why = re.sub(r"^firmware %s: " % re.escape(ref), "", str(err))
+        return None, "firmware %s is not here yet (%s)" % (ref, why)
 
 
 def globals_radio():
@@ -464,29 +460,31 @@ def medium_flags(physics, links, warnings):
     return flags
 
 
-def convert(data, devices, name, where="scenario"):
+def convert(data, firmwares, name, where="scenario"):
     """An old scenario's mapping as main's files, in memory: {name, geodata,
     nodeset, setup, medium, report, warnings, summary, check}, the first
-    four the files' text. `devices` maps an old kind's name to a device."""
+    four the files' text. `firmwares` maps an old kind's name to a firmware."""
     store.check_name(name, "nodeset")
     old = read_old(data, where)
     warnings = list(old["notes"])
     used = {}
     for node in old["nodes"].values():
         used[node["kind"]] = used.get(node["kind"], 0) + 1
-    missing = [kind for kind in used if kind not in devices]
+    missing = [kind for kind in used if kind not in firmwares]
     if missing:
-        raise ConvertError("%s: no device for kind %s (%s); give --device KIND=DEVICE for each"
-                           % (where, ", ".join(missing),
-                              ", ".join("%d node(s) of %s" % (used[k], k) for k in missing)))
+        raise ConvertError("%s: no firmware for kind %s (%s); give --firmware KIND=FIRMWARE "
+                           "for each" % (where, ", ".join(missing),
+                                         ", ".join("%d node(s) of %s" % (used[k], k)
+                                                   for k in missing)))
     for kind in used:
-        got, warning = check_device(devices[kind])
+        got, warning = check_firmware(firmwares[kind])
         if warning:
             warnings.append(warning)
-        want = MAIN_KIND_OF.get(kind_type(old, kind))
-        if got is not None and want and got["kind_type"] != want:
-            warnings.append("kind %s (%s) goes to %s, a %s device, not a %s one"
-                            % (kind, kind_type(old, kind), devices[kind], got["kind_type"], want))
+        want = MAIN_CATEGORY_OF.get(kind_type(old, kind))
+        if got is not None and want and got["category"] != want:
+            warnings.append("kind %s (%s) goes to %s, a %s firmware, not a %s one"
+                            % (kind, kind_type(old, kind), firmwares[kind], got["category"],
+                               want))
 
     if antennas_module.gain({"type": ANTENNA}, 0.0, 0.0) != 0.0:
         raise ConvertError("the catalogue's %s is no longer 0 dBi at the horizon, which the "
@@ -537,7 +535,7 @@ def convert(data, devices, name, where="scenario"):
             % (store.name_scalar(link["between"][0]), store.name_scalar(link["between"][1]),
                store.scalar(link["loss_db"]), store.scalar(link["note"])) for link in links)
     geodata_text = dump_ground(name, ground)
-    setup_text = setup_of(name, old, devices, used, left)
+    setup_text = setup_of(name, old, firmwares, used, left)
 
     # Read back through main's own readers, and every distance checked on
     # what they read.
@@ -557,7 +555,7 @@ def convert(data, devices, name, where="scenario"):
     gain_nodes = sum(1 for node in old["nodes"].values() if node["gain_db"])
     summary = {
         "nodes": len(records), "kinds": dict(used),
-        "devices": {kind: devices[kind] for kind in used},
+        "firmwares": {kind: firmwares[kind] for kind in used},
         "transport": roles.get(TRANSPORT, 0), "client": roles.get("client", 0),
         "role_unstated": roles.get(None, 0), "max_dbm": dict(sorted(powers.items())),
         "power_unstated": unstated, "gain_nodes": gain_nodes,
@@ -650,29 +648,30 @@ def radio_warnings(said, warnings):
                         % ", ".join(str(p) for p in values["preamble"]))
 
 
-def setup_of(name, old, devices, used, left):
-    """The nodeset's own setup: each old kind's device by its tag, then the
+def setup_of(name, old, firmwares, used, left):
+    """The nodeset's own setup: each old kind's firmware by its tag, then the
     old first-boot lines nothing else here says, to the same nodes."""
-    out = ['"""%s\'s own setup: each node on its old kind\'s device, with its old lines."""'
+    out = ['"""%s\'s own setup: each node on its old kind\'s firmware, with its old lines."""'
            % name,
            "from sim_mesh import *",
            "",
            "# Converted from an old scenario by convert_scenario.py. A script says its",
-           "# firmware() before it includes scripts/startup.py, which includes this, so",
+           "# .firmware(…) before it includes scripts/startup.py, which includes this, so",
            "# these rules are the last to match a node: a script that means another",
-           "# device says so after the include."]
+           "# firmware says so after the include."]
     for kind in old["kinds"]:
         if kind in used:
-            out.append("firmware(nodes(tag=%s), %s)" % (_quote(kind_tag(kind)),
-                                                       _quote(devices[kind])))
+            out.append("nodes(tag=%s).firmware(%s)" % (_quote(kind_tag(kind)),
+                                                      _quote(firmwares[kind])))
     if left:
         out += ["",
                 "# The old first-boot lines main does not say itself, as the old scenario",
                 "# gave them, in its kinds' own languages. startup.py says the role, the",
                 "# radio and its power first, and starts the radio after these."]
         for what, which, lines in left:
-            target = "nodes(tag=%s)" % _quote(kind_tag(which)) if what == "kind" else _quote(which)
-            out.append('on_first_boot(%s, """' % target)
+            target = "nodes(tag=%s)" % _quote(kind_tag(which)) if what == "kind" \
+                else "node(%s)" % _quote(which)
+            out.append('%s.on_first_boot("""' % target)
             out += ["    %s" % line.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
                     for line in lines]
             out.append('""")')
@@ -711,7 +710,7 @@ def report(conv, old, where):
     lines = ["The old scenario %s (%s), converted by convert_scenario.py." % (conv["name"], where),
              ""]
     lines.append("nodes      %d: %s" % (s["nodes"], ", ".join(
-        "%d %s -> %s" % (n, kind, s["devices"][kind]) for kind, n in s["kinds"].items())))
+        "%d %s -> %s" % (n, kind, s["firmwares"][kind]) for kind, n in s["kinds"].items())))
     for kind in s["kinds"]:
         spec = old["kinds"][kind]
         lines.append("           kind %s (%s) ran %s" % (kind, kind_type(old, kind),
@@ -760,7 +759,7 @@ def write(conv, out_dir, force=False):
     return list(paths)
 
 
-def convert_file(path, devices, out_dir, name=None, force=False):
+def convert_file(path, firmwares, out_dir, name=None, force=False):
     """Read an old scenario file (`-`: standard input), convert it, write it."""
     if path == "-":
         if not name:
@@ -778,19 +777,19 @@ def convert_file(path, devices, out_dir, name=None, force=False):
     except yaml.YAMLError as err:
         raise ConvertError("%s: %s" % (where, err)) from err
     name = name or re.sub(r"\.ya?ml$", "", os.path.basename(path))
-    conv = convert(data, devices, name, where)
+    conv = convert(data, firmwares, name, where)
     write(conv, out_dir, force)
     return conv
 
 
-def device_mapping(pairs):
-    """--device's KIND=DEVICE pairs as {kind: device}."""
+def firmware_mapping(pairs):
+    """--firmware's KIND=FIRMWARE pairs as {kind: firmware}."""
     out = {}
     for pair in pairs or []:
-        kind, sep, device = (part.strip() for part in pair.partition("="))
-        if not sep or not kind or not device:
-            raise ConvertError("--device is KIND=DEVICE, not %r" % pair)
-        out[kind] = device
+        kind, sep, firmware = (part.strip() for part in pair.partition("="))
+        if not sep or not kind or not firmware:
+            raise ConvertError("--firmware is KIND=FIRMWARE, not %r" % pair)
+        out[kind] = firmware
     return out
 
 
@@ -798,13 +797,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("scenario", help="the old scenario.yaml, or - for standard input")
     ap.add_argument("--out", required=True, help="where the files go")
-    ap.add_argument("--device", action="append", metavar="KIND=DEVICE",
-                    help="the device a node of this old kind runs; one per kind")
+    ap.add_argument("--firmware", action="append", metavar="KIND=FIRMWARE",
+                    help="the firmware a node of this old kind runs, by name or "
+                         "<base>_latest; one per kind")
     ap.add_argument("--name", help="the nodeset's and geodata's name (default: the file's)")
     ap.add_argument("--force", action="store_true", help="write over a conversion there")
     args = ap.parse_args(argv)
     try:
-        conv = convert_file(args.scenario, device_mapping(args.device), args.out, args.name,
+        conv = convert_file(args.scenario, firmware_mapping(args.firmware), args.out, args.name,
                             args.force)
     except (ConvertError, store.StoreError) as err:
         print("convert_scenario: %s" % err, file=sys.stderr)

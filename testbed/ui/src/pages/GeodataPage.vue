@@ -260,6 +260,9 @@ async function nameFromZip(f: File | null) {
   if (given && file.value === f) name.value = given
 }
 
+/* A click on the tab is the list, whatever was on show. */
+watch(() => sim.geodataList, () => { preview.value = null })
+
 /* Coming back to this tab puts the preview's ground back on the map, and
  * the nodeset counts are asked again. */
 watch(() => sim.view, (v) => {

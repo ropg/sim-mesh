@@ -276,10 +276,10 @@ def pairwise(tmp_path):
 
 
 # The conductors a virtual-time run can have: Ether's own, and ether_core's
-# when it is built (`sim-mesh build ether`); every virtual-time test runs on each.
+# when it is built (by `sim` when it starts); every virtual-time test runs on each.
 CORE_BUILT = os.path.exists(ether_module.CORE_PATH)
 CONDUCTORS = ["python", pytest.param("rust", marks=pytest.mark.skipif(
-    not CORE_BUILT, reason="no ether core built (sim-mesh build ether)"))]
+    not CORE_BUILT, reason="no ether core built (sim builds it when it starts)"))]
 
 
 @pytest.fixture(params=CONDUCTORS)
@@ -1987,7 +1987,7 @@ def test_a_watched_console_holds_t_only_once_it_has_printed():
     in_process(test)
 
 
-@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim-mesh build ether)")
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim builds it when it starts)")
 def test_a_burst_the_kernel_could_not_hold_is_heard_whole_by_the_core():
     """The core's reader thread takes datagrams off the socket as they come,
     whatever the loop's thread is doing: a burst far past the kernel's receive
@@ -2017,7 +2017,7 @@ def test_a_burst_the_kernel_could_not_hold_is_heard_whole_by_the_core():
     in_process(test, conductors=("rust",))
 
 
-@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim-mesh build ether)")
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim builds it when it starts)")
 def test_datagrams_that_come_while_the_core_is_handling_others_are_all_heard():
     """Datagrams keep coming from another thread while the loop handles the
     ones before them: every one is heard, none left queued with nothing to
@@ -2048,7 +2048,7 @@ def test_datagrams_that_come_while_the_core_is_handling_others_are_all_heard():
     in_process(test, conductors=("rust",))
 
 
-@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim-mesh build ether)")
+@pytest.mark.skipif(not CORE_BUILT, reason="no ether core built (sim builds it when it starts)")
 def test_the_core_counts_what_the_kernel_dropped_on_its_socket():
     """Datagrams the kernel could not hold before anyone read them are
     counted, from what it says with the next one (SO_RXQ_OVFL), and simd

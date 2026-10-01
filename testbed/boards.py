@@ -10,8 +10,9 @@ connector, and which adds 20 dB of receive gain ahead of the chip.
 
 A node's maximum power is what a station sends at: coverage and links draw
 every node at it, the startup script's radio sets it (`tx_dbm="max"`), a
-power a rule asks above it is held to it, a script's `max_tx_pwr(which)`
-sets it, and a station's first-boot lines have it as `{max_dbm}`.
+power a rule asks above it is held to it, a script's
+`.radio(tx_dbm="max")` sets it, and a station's first-boot lines have it as
+`{max_dbm}`.
 
 A station is told its board at start, `SIM_MESH_BOARD` in its environment (one
 flat JSON object: the chip, the node's maximum, and the front end's figures
@@ -119,8 +120,8 @@ def connector_dbm(board_env, chip_dbm):
 
 def chip_dbm(board_env, connector):
     """The chip power that puts `connector` dBm at the connector: the lowest
-    setting that reaches it, else the one that comes nearest (the firmware's
-    rfCalChip)."""
+    setting that reaches it, else the one that comes nearest, as a firmware
+    that converts through its front end's curve does."""
     best, best_ant = CHIP_DBM[0], connector_dbm(board_env, CHIP_DBM[0])
     for chip in range(CHIP_DBM[0], CHIP_DBM[1] + 1):
         ant = connector_dbm(board_env, chip)

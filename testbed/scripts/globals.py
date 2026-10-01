@@ -13,6 +13,6 @@ SF = 7
 BW_KHZ = 125
 CR = 5
 
-# RNode firmware's sync word, fixed in every RNode-based Reticulum firmware
-# (microReticulum among them), so a Reticulous node hears them.
+# The RNode firmware's sync word, which every RNode-based Reticulum firmware
+# has fixed, so every station hears every other.
 SYNC = 0x12

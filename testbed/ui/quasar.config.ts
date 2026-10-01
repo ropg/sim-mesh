@@ -1,7 +1,8 @@
 import { configure } from 'quasar/wrappers';
 
-// Where `quasar dev` sends /ws, /api and /planner: the front, run beside it
-// (`npm run dev` in this directory while `sim-mesh` runs).
+// `sim dev` runs `quasar dev` behind the front, which passes the page through
+// on its own port. Reached directly instead, the dev server sends /ws, /api
+// and /planner to the front here.
 const FRONT = process.env.SIM_MESH_FRONT || 'http://127.0.0.1:8800';
 
 export default configure(() => {
@@ -22,6 +23,11 @@ export default configure(() => {
         };
         if (viteConf.build) {
           viteConf.build.chunkSizeWarningLimit = Infinity;
+        }
+        // `sim dev` in a container, where edits made outside arrive as no
+        // file events: the sources are looked at instead.
+        if (process.env.CHOKIDAR_USEPOLLING) {
+          viteConf.server = { ...viteConf.server, watch: { usePolling: true, interval: 300 } };
         }
       },
     },

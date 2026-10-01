@@ -22,7 +22,7 @@ from aiohttp import web
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import coverage  # noqa: E402
-import devices  # noqa: E402
+import firmware  # noqa: E402
 import front  # noqa: E402
 import geodata  # noqa: E402
 import nodeset  # noqa: E402
@@ -42,6 +42,7 @@ class Args:
     bind = "127.0.0.1:0"
     relay_host = "127.0.0.1"
     relay_port = 0
+    page_dev = None
 
 
 def make_front():
@@ -250,10 +251,8 @@ def test_the_tables_are_computed_before_the_run_is_laid_out(tmp_path, monkeypatc
     (tmp_path / "scripts" / "four.py").write_text("from sim_mesh import *\n")
     (tmp_path / "scripts" / "globals.py").write_text("FREQ_MHZ = 869.525\nSF = 8\n"
                                                      "BW_KHZ = 125\nCR = 5\n")
-    build = tmp_path / "build.linux"
-    (build / "data_merged").mkdir(parents=True)
-    (build / "reticulous.elf").write_text("")
-    rules = [{"which": {"all": True}, "firmware": "reticulous_dev_latest"}]
+    build = "stub_x86_64_1.0.0"
+    rules = [{"which": {"all": True}, "firmware": "stub_latest"}]
 
     async def go():
         f = make_front()
@@ -267,11 +266,12 @@ def test_the_tables_are_computed_before_the_run_is_laid_out(tmp_path, monkeypatc
         assert cached or (progress[-1]["sim"] == "t"
                           and progress[-1]["done"] == progress[-1]["total"] > 0)
         spec = {"geodata": "plain-27", "nodeset": "four", "script": "four",
-                "build": str(build), "firmware_rules": rules}
+                "build": build, "firmware_rules": rules, "inputs": {"firmware": "stub_latest"}}
         run, sidecar = await f.prepare_run("t", spec)
         assert sidecar is None and run.bands() == ["868"]
         assert run.dir == str(tmp_path / "runs" / "t")
-        assert run.meta["build"] == str(build) and run.meta["builds"] == {}
+        assert run.meta["build"] == build and run.meta["builds"] == {}
+        assert run.meta["inputs"] == {"firmware": "stub_latest"}
         assert run.meta["nodeset"] == "four" and run.meta["script"] == "four"
         assert run.meta["firmware_rules"] == rules and run.meta["first_boot_rules"] == []
         assert run.script_path
@@ -339,11 +339,9 @@ def stores(tmp_path, monkeypatch):
         path = tmp_path / attr.lower()
         path.mkdir()
         monkeypatch.setattr(store, attr, str(path))
-    monkeypatch.setattr(devices, "DEVICES_DIR", str(tmp_path / "devices"))
-    monkeypatch.setattr(devices, "BUILDS_DIR", str(tmp_path / "builds"))
-    async def no_web(*args, **kwargs):
-        return []
-    monkeypatch.setattr(devices, "web_catalogues", no_web)
+    monkeypatch.setattr(firmware, "FIRMWARE_DIR", str(tmp_path / "firmware"))
+    monkeypatch.setattr(firmware, "RUNS_DIR", str(tmp_path / "runs_dir"))
+    monkeypatch.setattr(firmware, "SNAPSHOTS_DIR", str(tmp_path / "snapshots_dir"))
     monkeypatch.setattr(front, "planner_web", lambda: None)
     monkeypatch.setattr(geodata, "PLANNER_DIR", str(tmp_path / "planner"))
     monkeypatch.setattr(sources, "CACHE_DIR", str(tmp_path / "geodata_dir" / ".cache"))
@@ -397,9 +395,9 @@ def test_the_editors_list_open_and_save(stores):
         assert reply["ok"] and open(path).read().startswith("# the prose\n# kept\nnodes:\n")
         reply = await ask(ws, "nodeset_save", name="here",
                           data={"nodes": {"a": {"id": 1, "lat": 0, "lon": 0, "device": "dev"}}})
-        assert not reply["ok"] and "firmware()" in reply["error"]
+        assert not reply["ok"] and ".firmware(…)" in reply["error"]
         reply = await ask(ws, "script_new", name="drive")
-        assert reply["ok"] and 'firmware("all"' in reply["text"]
+        assert reply["ok"] and "nodes().firmware(firmware)" in reply["text"]
         assert reply["script"]["references"][0]["path"] == "sim_mesh/library.py"
         reply = await ask(ws, "module_open", path="sim_mesh/library.py")
         assert reply["ok"] and "def on_first_boot" in reply["text"]
@@ -414,8 +412,8 @@ def test_the_editors_list_open_and_save(stores):
         assert reply["ok"] and reply["geodata"]["extent_m"] == 5000
         reply = await ask(ws, "coverage", geodata="flat", nodes=[])
         assert not reply["ok"] and "synthetic" in reply["error"]
-        reply = await ask(ws, "device_list")
-        assert reply["ok"] and reply["latest"] == [] and reply["saved"] == []
+        reply = await ask(ws, "firmware_list")
+        assert reply["ok"] and reply["firmware"] == [] and reply["arch"]
         reply = await ask(ws, "antenna_list")
         kinds = {a["type"]: a for a in reply["antennas"]}
         assert kinds["yagi_directional"]["kind"] == "directional"
@@ -426,32 +424,39 @@ def test_the_editors_list_open_and_save(stores):
     running_front(check)
 
 
-def device_zip(arch):
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w") as zf:
-        zf.writestr("node.yaml", yaml.safe_dump({
-            "kind": "reticulous", "arch": arch, "stamp": "20260925035045",
-            "elf": "reticulous.elf", "virtual_hardware": "ESP32"}))
-        zf.writestr("reticulous.elf", "x")
-    return out.getvalue()
+def test_firmware_and_a_pack_are_added_over_http(stores):
+    import stub_firmware
 
-
-def test_a_device_and_a_pack_are_imported_over_http(stores):
-    arch = devices.machine_arch()
+    arch = firmware.machine_arch()
+    name = "stub-sx1262_%s_20260925035045" % arch
+    held = "stub-sx1262_%s_20260101000000" % arch
 
     async def check(f, session, base, ws):
-        async with session.post(base + "/api/devices/import", params={"name": "mine.zip"},
-                                data=device_zip(arch)) as resp:
+        data = stub_firmware.zip_bytes("stub-sx1262", "20260925035045", hardware="ESP32",
+                                       radio="sx1262")
+        async with session.post(base + "/api/firmware/add", params={"name": "mine.zip"},
+                                data=data) as resp:
             got = await resp.json()
-        assert got["ok"] and got["ref"] == "reticulous_imported_20260925035045"
-        async with session.post(base + "/api/devices/import", params={"name": "x.zip"},
-                                data=device_zip(arch)) as resp:
+        assert got["ok"] and got["name"] == name
+        async with session.post(base + "/api/firmware/add", params={"name": "x.zip"},
+                                data=data) as resp:
             got = await resp.json()
-        assert not got["ok"] and "already" in got["error"]
-        reply = await ask(ws, "device_list")
-        assert reply["saved"][0]["virtual_hardware"] == "ESP32"
-        reply = await ask(ws, "device_delete", ref="reticulous_imported_20260925035045")
-        assert reply["ok"] and (await ask(ws, "device_list"))["saved"] == []
+        assert not got["ok"] and "installed already" in got["error"]
+        stub_firmware.install(stores / "firmware", "stub-sx1262", "20260101000000")
+        paused = stores / "runs_dir" / "p"
+        (paused / "paused").mkdir(parents=True)
+        (paused / "paused" / "snapshot.yaml").write_text("{}\n")
+        (paused / "run.yaml").write_text(yaml.safe_dump({
+            "paused": {"t": 1}, "builds": {"x": {"firmware": held}}}))
+        reply = await ask(ws, "firmware_list")
+        rows = {r["name"]: r for r in reply["firmware"]}
+        assert rows[name]["hardware"] == "ESP32" and rows[name]["radio"] == "sx1262"
+        assert rows[held]["users"] == ["run p"]
+        reply = await ask(ws, "firmware_delete", names=[held])
+        assert not reply["ok"] and "held by run p" in reply["error"]
+        reply = await ask(ws, "firmware_delete", names=[name])
+        assert reply["ok"] and reply["deleted"] == [name]
+        assert [r["name"] for r in (await ask(ws, "firmware_list"))["firmware"]] == [held]
 
         pack = io.BytesIO()
         with zipfile.ZipFile(pack, "w") as zf:

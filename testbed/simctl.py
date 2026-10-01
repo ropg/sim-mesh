@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """Simulations from a shell: start, stop, list and plan them through the
-front. The `sim-mesh` launcher's `new`, `stop`, `list` and `plan` verbs.
+front. The `sim` launcher's `new`, `stop`, `pause`, `resume`, `list` and
+`plan` verbs.
 
-    sim-mesh new [NAME] (--geodata G --nodeset N | --snapshot S)
-                        [--time max|<k>x|real] [--stagger N] [--build B]
-                        [--pairwise]
-    sim-mesh stop NAME
-    sim-mesh pause NAME                    stopped, its state kept in its run
-    sim-mesh resume NAME                   a paused one, as it ended, in a new run
-    sim-mesh list [--json]
-    sim-mesh plan NAME PHASE=UNTIL ...     UNTIL in seconds of T; +N is N after now
+    sim new [NAME] (--geodata G --nodeset N | --snapshot S)
+                   [--time max|<k>x|real] [--stagger N] [--build B]
+                   [--pairwise]
+    sim stop NAME                     a paused one's state deleted, it ended
+    sim pause NAME                    stopped, its state kept in its run
+    sim resume NAME [--time T]        a paused one, as it ended, in a new run, real time
+    sim list [--json]
+    sim plan NAME PHASE=UNTIL ...     UNTIL in seconds of T; +N is N after now
 
 `new` starts the front (front.py, in the background, logging to
 runs/front.log) when nothing answers on the port, waits while the front
 computes the loss tables (progress on stderr), and prints the new
 simulation's name, control websocket, ether, network and run as JSON. A
 snapshot brings its firmware back with it; from geodata and a nodeset no node
-runs anything until a script says what (`sim-mesh run <script> --sim
-<name>`), so a simulation of those is usually a script's own, `sim-mesh run
-<script> --geodata G --nodeset N`. `--build` runs every node whose firmware
-is of that build's kind from it instead (`<project>_<catalogue>_latest`, a
-saved build, or a path such as a workspace's build.linux). `--pairwise` puts
+runs anything until a script says what (`sim run <script> --sim <name>`), so
+a simulation of those is usually a script's own, `sim run <script> --geodata
+G --nodeset N`. `--build` names an installed firmware (`<name>` or
+`<base>_latest`) that every node whose firmware has its base runs instead. `--pairwise` puts
 that simulation's ether on the pairwise rule. `--port` (default 8800) is the
 front's.
 """
@@ -136,7 +136,7 @@ def plan_text(row):
 
 
 async def main():
-    ap = argparse.ArgumentParser(prog="sim-mesh", description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(prog="sim", description=__doc__.split("\n")[0])
     port = argparse.ArgumentParser(add_help=False)
     port.add_argument("--port", type=int, default=8800, help="the front's port")
     verbs = ap.add_subparsers(dest="verb", required=True)
@@ -157,8 +157,9 @@ async def main():
     stop.add_argument("name")
     pause = verb("pause", "stop a simulation with its state kept, to be resumed")
     pause.add_argument("name")
-    resume = verb("resume", "start a paused simulation again as it ended")
+    resume = verb("resume", "start a paused simulation again as it ended, in real time")
     resume.add_argument("name")
+    resume.add_argument("--time", default="real")
     listing = verb("list", "the running simulations")
     listing.add_argument("--json", action="store_true")
     plan = verb("plan", "tell a simulation its phases")
@@ -178,7 +179,7 @@ async def main():
             print(err, file=sys.stderr)
             return 2
         except (aiohttp.ClientError, OSError):
-            print("nothing answers on port %d: `sim-mesh` or `sim-mesh new` starts the front"
+            print("nothing answers on port %d: `sim` or `sim new` starts the front"
                   % args.port, file=sys.stderr)
             return 2
         await ws.receive_json(timeout=10)       # the registry it greets with
@@ -192,7 +193,10 @@ async def main():
             answer = await reply(ws, "sim_new", progress=True)
         elif args.verb in ("stop", "pause", "resume"):
             kind = "sim_" + args.verb
-            await ws.send_str(json.dumps({"type": kind, "name": args.name}))
+            msg = {"type": kind, "name": args.name}
+            if args.verb == "resume":
+                msg["time"] = args.time
+            await ws.send_str(json.dumps(msg))
             answer = await reply(ws, kind, progress=args.verb == "resume")
         elif args.verb == "list":
             rows = (await registry(ws))["sims"]

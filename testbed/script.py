@@ -5,18 +5,20 @@
     '''What this script is for, in its first line.'''
     from sim_mesh import *
 
-    time("real")
-    firmware("all", "reticulous_dev_latest")
-    on_first_boot(nodes(tag="tcp-peer"), "tcp peer add {addr:internet}:4965")
+    firmware = script_input("firmware", type=Firmware, category="reticulum",
+                            label="Firmware for nodes not otherwise configured")
+    sim_speed("real")
+    nodes().firmware(firmware)
+    nodes(tag="tcp-peer").on_first_boot("tcp peer add {addr:internet}:4965")
 
-    up("all")
-    announce(nodes(tag="lora"), spread=300)
+    nodes().up()
+    nodes(tag="lora").reticulum.lxmf.announce(spread=300)
 
 A script says what its simulation runs and what is done to it, in order
 (sim_mesh.library is the whole of it): declarations first, then whatever it
 does, the first of which starts its simulation. It is run by the runner
 (sim_mesh.runner), a process of its own, never inside simd: what a station
-is given at its first boot travels to simd as data, `on_first_boot()`'s
+is given at its first boot travels to simd as data, `.on_first_boot()`'s
 rules, not as the script's code. A script may define `report(run_dir)`,
 which returns the run's report as Markdown once the script has run to its
 end.
@@ -25,8 +27,9 @@ A simulation started by a script keeps a copy of it in its run, and a
 snapshot keeps that copy.
 
 Listing a script reads it without running it: its docstring, whether it has
-a report, and the files it imports or includes (`references`), from its
-syntax tree, and theirs in turn.
+a report, its inputs (each `script_input(…)` at its top level, its arguments
+literals and its type one of INPUT_TYPES), and the files it imports or
+includes (`references`), from its syntax tree, and theirs in turn.
 
 Two files beside the scripts are everyone's:
 
@@ -45,14 +48,23 @@ import sys
 import store
 
 REPORT = "report"
+INPUTS = "inputs"
+INPUT_CALL = "script_input"
+INCLUDE_CALL = "script_include"
+# script_input's types as a script writes them, and as the page knows them.
+INPUT_TYPES = {"int": "int", "float": "float", "str": "str", "bool": "bool",
+               "Firmware": "firmware", "Run": "run"}
+INPUT_ARGS = ("name", "type", "label", "default", "category")
 DEFAULT_TEXT = '''"""A new script."""
 from sim_mesh import *
 
-time("real")
-firmware("all", "reticulous_dev_latest")
-include("scripts/startup.py")
+firmware = script_input("firmware", type=Firmware,
+                        label="Firmware for nodes not otherwise configured")
+sim_speed("real")
+nodes().firmware(firmware)
+script_include("scripts/startup.py")
 
-up("all")
+nodes().up()
 '''
 GLOBALS = "globals"
 # The names of globals.py read outside a script, and what each must be: the
@@ -146,6 +158,49 @@ def has_report(tree):
                for node in tree.body)
 
 
+def _input_call(node):
+    """The `script_input(…)` call a top-level statement is, or None."""
+    value = node.value if isinstance(node, (ast.Expr, ast.Assign, ast.AnnAssign)) else None
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) \
+            and value.func.id == INPUT_CALL:
+        return value
+    return None
+
+
+def declared_inputs(tree):
+    """A script's inputs, read from its top-level `script_input(…)` calls:
+    [{name, type, label, category?, default?}], in order. One whose
+    arguments are not literals, or whose type is not one of INPUT_TYPES, is
+    refused, naming its line."""
+    out = []
+    for node in tree.body:
+        call = _input_call(node)
+        if call is None:
+            continue
+        given = dict(zip(INPUT_ARGS, call.args))
+        given.update({k.arg: k.value for k in call.keywords if k.arg})
+        if "name" not in given or set(given) - set(INPUT_ARGS):
+            raise store.StoreError("line %d: script_input takes a name, and %s"
+                                   % (node.lineno, ", ".join(INPUT_ARGS[1:])))
+        kind = given.pop("type", None)
+        kind = kind.id if isinstance(kind, ast.Name) else ("str" if kind is None else None)
+        if kind not in INPUT_TYPES:
+            raise store.StoreError("line %d: script_input's type is one of %s"
+                                   % (node.lineno, ", ".join(INPUT_TYPES)))
+        try:
+            values = {k: ast.literal_eval(v) for k, v in given.items()}
+        except ValueError as err:
+            raise store.StoreError("line %d: script_input's arguments are literals"
+                                   % node.lineno) from err
+        row = {"name": str(values["name"]), "type": INPUT_TYPES[kind],
+               "label": str(values.get("label") or values["name"])}
+        for key in ("category", "default"):
+            if values.get(key) is not None:
+                row[key] = values[key]
+        out.append(row)
+    return out
+
+
 def references(tree, seen=None):
     """The files a script imports or includes that are sim-mesh's own, and
     those they import or include in turn: other scripts of the store, and
@@ -161,7 +216,7 @@ def references(tree, seen=None):
             wanted += [("%s.%s" % (node.module, a.name), module_file("%s.%s" % (node.module, a.name)))
                        for a in node.names]
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
-                and node.func.id == "include" and node.args \
+                and node.func.id == INCLUDE_CALL and node.args \
                 and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
             path = os.path.abspath(os.path.join(store.SIM_DIR, node.args[0].value))
             wanted.append((node.args[0].value, path if os.path.isfile(path) else None))
@@ -211,9 +266,10 @@ def describe(path, name=None):
         tree = parse(text, os.path.basename(path))
         doc = (ast.get_docstring(tree) or "").strip().splitlines()
         return {"name": name, "doc": doc[0] if doc else "", REPORT: has_report(tree),
-                "references": references(tree)}
+                INPUTS: declared_inputs(tree), "references": references(tree)}
     except store.StoreError as err:
-        return {"name": name, "doc": "", REPORT: False, "references": [], "error": str(err)}
+        return {"name": name, "doc": "", REPORT: False, INPUTS: [], "references": [],
+                "error": str(err)}
 
 
 def listing():
@@ -289,7 +345,9 @@ def module_of(path, name=None):
         tree = parse(handle.read(), os.path.basename(path))
     kept = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
             ast.Assign, ast.AnnAssign)
-    tree.body = [node for node in tree.body if isinstance(node, kept)]
+    # Its inputs are asked for when it runs, not when its report is written.
+    tree.body = [node for node in tree.body
+                 if isinstance(node, kept) and _input_call(node) is None]
     _, module = _module(path, name)
     exec(compile(tree, path, "exec"), module.__dict__)   # noqa: S102 - the script's own definitions
     return module

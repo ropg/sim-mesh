@@ -4,37 +4,41 @@
     nodes(tag="lora", role="transport")         both: keywords in one call are AND
     nodes(tag=("lora", "tcp-peer"))             either tag: a tuple, list or set is any of
     nodes(tag="lora") | nodes(name="internet")  OR
-    nodes(tag="lora") & nodes(kind="reticulous")  AND
+    nodes(tag="lora") & nodes(category="reticulum")  AND
     nodes(tag="lora") - nodes(role="client")    AND NOT
-    ~nodes(firmware="sergeyculum_local_latest")  NOT
+    ~nodes(base="relay-sx1262")                 NOT
     nodes(height_m=lambda h: h > 20)            a function of the value, in a driver only
     nodes()                                     every node
+    node("a20")                                 one node, by name
 
 A selection is Python's own set algebra over nodes, `&`, `|`, `-`, `^` and
 `~`, and is lazy: it is a condition, not a list, so one written at a
 script's top, before there is a simulation, picks whatever nodes it matches
-when it is used, a node placed later included. `firmware()` sends its
-condition to the simulation, so there it must be plain values (a function
-cannot travel); a driver evaluates it where it stands.
+when it is used, a node placed later included. `.firmware()` and
+`.on_first_boot()` send its condition to the simulation, so there it must
+be plain values (a function cannot travel); a script evaluates it where it
+stands. The script library's selections (sim_mesh.library) are these, with
+what can be done to their nodes.
 
 What a condition can name, each node's facts:
 
     name, id            what the nodeset calls it and its station id
     tag                 one of its tags
-    firmware            the device name its firmware was given as
-    kind                its firmware's kind (reticulous, sergeyculum)
+    firmware            the name its firmware was given as (a name or <base>_latest)
+    base                its firmware's base, the name without architecture and version
+    category            its firmware's category (reticulum, meshcore, meshtastic)
     role                the role it reports, else its role tag (transport, router, repeater)
     antenna             its antenna's type
     max_dbm             its maximum power at the antenna connector
     lat, lon, height_m  where it stands
     status              stopped, starting, setup, up, restarting
 
-`which()` takes whatever a script says for "which nodes": `"all"`, a node's
-name, a list of names, a selection, or a `sim.nodes(…)` selection.
+`which()` takes whatever stands for "which nodes": `"all"`, a node's name, a
+list of names, a selection, or a `sim.nodes(…)` selection.
 """
 
-FIELDS = ("name", "id", "tag", "firmware", "kind", "role", "antenna", "max_dbm", "lat",
-          "lon", "height_m", "status")
+FIELDS = ("name", "id", "tag", "firmware", "base", "category", "role", "antenna", "max_dbm",
+          "lat", "lon", "height_m", "status")
 ALL = "all"
 
 
@@ -44,24 +48,28 @@ class Nodes:
     def __init__(self, tree):
         self.tree = tree
 
+    # Combined, a selection keeps its class: the script library's selections
+    # carry what can be done to them.
     def __and__(self, other):
-        return Nodes({"and": [self.tree, which(other).tree]})
+        return type(self)({"and": [self.tree, which(other).tree]})
 
     def __or__(self, other):
-        return Nodes({"or": [self.tree, which(other).tree]})
+        return type(self)({"or": [self.tree, which(other).tree]})
 
     def __sub__(self, other):
-        return Nodes({"and": [self.tree, {"not": which(other).tree}]})
+        return type(self)({"and": [self.tree, {"not": which(other).tree}]})
 
     def __xor__(self, other):
-        return (self - other) | (which(other) - self)
+        return (self - other) | (type(self)(which(other).tree) - self)
 
     def __invert__(self):
-        return Nodes({"not": self.tree})
+        return type(self)({"not": self.tree})
 
     __rand__, __ror__ = __and__, __or__
 
     def __repr__(self):
+        if "names" in self.tree and len(self.tree["names"]) == 1:
+            return "node(%r)" % self.tree["names"][0]
         return "nodes(%s)" % describe(self.tree)
 
     def matches(self, facts):

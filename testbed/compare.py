@@ -25,8 +25,9 @@ destination and hop count) is Reticulum's reading of it
 
 With `--cli A.json B.json`, each run's final `rnpath` answers (a JSON object,
 station name to what it printed) are compared too: paths known by hop count.
-With `--logs`, the LXMF messages each run's senders logged as delivered
-(`sim_mesh.reticulum.delivery.log_deliveries`) are counted as well. `--until S`
+With `--logs`, the LXMF messages each run's senders' drivers reported as
+delivered (`sim_mesh.reticulum.delivery.event_deliveries`) are counted as
+well. `--until S`
 keeps the first S seconds of each run, so a record that ran on while its run
 was being stopped does not count the extra.
 """
@@ -70,6 +71,7 @@ class Run:
         self.first_path = {}                # hops -> when a path of that length first appeared
         self.end = 0.0
         self.hello_wall = None              # the run's zero, on the wall clock
+        self.hello_t = None                 # the run's zero, as T in µs
         self.year = 1970
         self.start = getattr(self, "start", None)   # the run's zero in record stamps, if given
         self.read()
@@ -129,6 +131,8 @@ class Run:
                     if self.t0 is None:
                         self.t0 = at
                         self.hello_wall = self.wall_of(stamp)
+                    if self.hello_t is None and isinstance(msg.get("t"), (int, float)):
+                        self.hello_t = msg["t"]
                     self.joined.setdefault(sid, at)
                 if kind == "welcome" and self.hello_wall is None and msg.get("epoch") \
                         and msg.get("mode") == "virtual" and self.t0 is not None:
@@ -233,15 +237,13 @@ def rx_senders(path, level_at=None):
 
 
 def log_deliveries(run_dir, run):
-    """Each sender's delivered messages, on the run's clock.
-
-    A station stamps its log from time(), which in a virtual-time run is the
-    run's epoch plus node time and in a real one the wall clock, so either
-    way the stamp less the first hello's wall-clock instant is run time.
-    """
-    if run.hello_wall is None:
+    """Each sender's delivered messages, on the run's clock: the events' T
+    less the first hello's."""
+    if run.hello_t is None:
         return {}
-    return delivery.log_deliveries(run_dir, run.hello_wall, run.year)
+    zero = run.hello_t / 1e6
+    return {name: [t - zero for t in times]
+            for name, times in delivery.event_deliveries(run_dir).items()}
 
 
 def cli_paths(path):

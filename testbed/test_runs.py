@@ -97,6 +97,17 @@ def test_a_paused_run_resumes_as_it_ended(setup):
     assert runs.paused_runs() == [] and runs.runs() == ["r1"]
 
 
+def test_a_paused_run_stopped_ends_where_it_paused(setup):
+    run = setup
+    runs.pause_run(run, "town", 5_000_000)
+    runs.stop_paused(run)
+    again = runs.open_run(run.dir)
+    assert again.paused is None and runs.paused_runs() == []
+    assert not os.path.exists(os.path.join(run.dir, runs.PAUSED))
+    assert again.meta["paused"]["t"] == 5_000_000 and again.meta["stopped"]
+    assert runs.runs() == ["r1"]
+
+
 def test_a_run_without_a_script_has_none(setup):
     gd, ns = geodata.load("flat"), nodeset.load("pair")
     run = runs.create_run(runs.run_path("bare"), gd, ns, None, "real", {})

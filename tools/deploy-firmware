@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""deploy-firmware — pre-built firmware onto sim-mesh.net.
+
+    tools/deploy-firmware ZIP…                 add or replace these zips
+    tools/deploy-firmware --delete NAME…       take these off
+    tools/deploy-firmware --dry-run ZIP…       say what it would do
+
+```
+deploy-firmware ── gh release download firmware.yaml ──► sim-mesh/sim-mesh, release `firmware`
+deploy-firmware ── gh release upload ZIP… firmware.yaml index.html ──► the release
+deploy-firmware ── repository_dispatch firmware-published ──► sim-mesh/sim-mesh.github.io
+site deploy ── the release's assets ──► sim-mesh.net/firmware/
+```
+
+The `firmware` release of sim-mesh's repository is the store: every
+pre-built zip, `firmware.yaml` (each zip's node.yaml facts, by name) and the
+`index.html` made from it, whose links carry those facts as `data-*`
+attributes so sim-mesh lists what is offered without opening a zip. The
+site's deploy copies the release under `/firmware/`, since a browser cannot
+fetch a release asset across origins.
+
+A zip is checked before it goes: its node.yaml must name it as its file is
+named, `<base>_<arch>_<version>.zip`. Run it with `gh` logged in with the
+right to upload to the release's repository. `--repo` and `--site` name
+others.
+"""
+
+import argparse
+import html
+import os
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+import yaml
+
+TAG = "firmware"
+FACTS = ("base", "arch", "version", "category", "radio", "title", "hardware")
+
+
+def gh(*args, check=True, capture=False):
+    return subprocess.run(["gh", *args], check=check, text=True,
+                          capture_output=capture)
+
+
+def facts_of(path):
+    """A zip's node.yaml facts, checked against its file name."""
+    name = os.path.basename(path)
+    with zipfile.ZipFile(path) as zf:
+        node = yaml.safe_load(zf.read("node.yaml"))
+    want = "%s_%s_%s.zip" % (node.get("base"), node.get("arch"), node.get("version"))
+    if name != want:
+        sys.exit("%s: its node.yaml names it %s" % (name, want))
+    out = {k: str(node[k]) for k in FACTS if node.get(k) not in (None, "")}
+    out["size"] = os.path.getsize(path)
+    return name[:-4], out
+
+
+def index_html(entries):
+    """The listing: one link a zip, its facts on it, newest first per base."""
+    rows = []
+    order = sorted(entries.items(), key=lambda kv: (kv[1]["base"], kv[1]["arch"], kv[0]))
+    for name, f in order:
+        attrs = "".join(' data-%s="%s"' % (k, html.escape(f[k]))
+                        for k in ("category", "radio", "title", "hardware") if f.get(k))
+        rows.append('<tr><td><a href="%s.zip"%s>%s</a></td><td>%s</td><td>%s</td>'
+                    '<td>%s</td><td>%s</td><td>%.1f MB</td></tr>'
+                    % (html.escape(name), attrs, html.escape(name),
+                       html.escape(f.get("title", "")), html.escape(f.get("category", "")),
+                       html.escape(f.get("radio", "")), html.escape(f.get("arch", "")),
+                       f.get("size", 0) / 1e6))
+    return """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pre-built firmware — sim-mesh</title>
+<style>
+body { font: 15px/1.5 Lato, system-ui, sans-serif; margin: 2em auto; max-width: 960px;
+       padding: 0 16px; color: #1f2933; background: #fff; }
+table { border-collapse: collapse; width: 100%%; }
+td, th { text-align: left; padding: 6px 10px; border-bottom: 1px solid #e4e7eb; }
+td:first-child a { font-family: ui-monospace, monospace; font-size: 13px; }
+@media (prefers-color-scheme: dark) { body { background: #111418; color: #e4e7eb; }
+  td, th { border-color: #2a2f36; } a { color: #8ab4f8; } }
+</style>
+</head>
+<body>
+<h1>Pre-built firmware</h1>
+<p>Firmware zips for <a href="../">sim-mesh</a>: add one with
+<code>sim firmware add &lt;its URL&gt;</code>, or from the Firmware tab's
+<b>Add from pre-built…</b>. What a zip is: <a href="../contract/">the firmware contract</a>.</p>
+<table>
+<thead><tr><th>Firmware</th><th>What it is</th><th>Category</th><th>Radio</th><th>Arch</th><th>Size</th></tr></thead>
+<tbody>
+%s
+</tbody>
+</table>
+</body>
+</html>
+""" % "\n".join(rows)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("zips", nargs="*")
+    ap.add_argument("--delete", nargs="+", default=[], metavar="NAME")
+    ap.add_argument("--dry-run", "-n", action="store_true")
+    ap.add_argument("--repo", default="sim-mesh/sim-mesh")
+    ap.add_argument("--site", default="sim-mesh/sim-mesh.github.io")
+    args = ap.parse_args(argv)
+    if not args.zips and not args.delete:
+        ap.error("name zips to add, or --delete names")
+
+    adding = dict(facts_of(path) for path in args.zips)
+    paths = {facts_of(path)[0]: path for path in args.zips}
+    with tempfile.TemporaryDirectory() as tmp:
+        exists = gh("release", "view", TAG, "-R", args.repo, check=False,
+                    capture=True).returncode == 0
+        entries = {}
+        if exists:
+            got = gh("release", "download", TAG, "-R", args.repo, "-p", "firmware.yaml",
+                     "-D", tmp, check=False, capture=True)
+            if got.returncode == 0:
+                with open(os.path.join(tmp, "firmware.yaml")) as f:
+                    entries = (yaml.safe_load(f) or {}).get("firmware") or {}
+        for name in args.delete:
+            if name not in entries:
+                sys.exit("%s is not on the release" % name)
+            del entries[name]
+        entries.update(adding)
+        for name in sorted(adding):
+            print("add     %s" % name)
+        for name in args.delete:
+            print("delete  %s" % name)
+        if args.dry_run:
+            return 0
+        with open(os.path.join(tmp, "firmware.yaml"), "w") as f:
+            yaml.safe_dump({"firmware": entries}, f, sort_keys=True)
+        with open(os.path.join(tmp, "index.html"), "w") as f:
+            f.write(index_html(entries))
+        if not exists:
+            gh("release", "create", TAG, "-R", args.repo, "--title", "Pre-built firmware",
+               "--notes", "The firmware zips sim-mesh.net/firmware/ offers. "
+                          "Published with tools/deploy-firmware.")
+        uploads = [paths[n] for n in sorted(adding)] + [os.path.join(tmp, "firmware.yaml"),
+                                                         os.path.join(tmp, "index.html")]
+        gh("release", "upload", TAG, "-R", args.repo, "--clobber", *uploads)
+        for name in args.delete:
+            gh("release", "delete-asset", TAG, name + ".zip", "-R", args.repo, "--yes")
+        gh("api", "repos/%s/dispatches" % args.site, "-f", "event_type=firmware-published")
+        print("published; %s redeploys" % args.site)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

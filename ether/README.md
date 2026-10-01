@@ -332,8 +332,8 @@ sends — a `state`, a `tx`, a second `hello` — means it is not idle.
 
 The conductor is the barrier above, and most of what the ether does in a
 virtual-time run: a few microseconds of work at every one of hundreds of
-thousands of instants. [`core/`](core/) does it in Rust (`sim-mesh build
-ether`, into `build/`), in the event loop's thread, on the ether's socket:
+thousands of instants. [`core/`](core/) does it in Rust (built by `sim`
+when it starts, into `build/`), in the event loop's thread, on the ether's socket:
 T, the stations' numbering and idles, the resend buffer, the barrier itself,
 and whether the stations that just ran printed anything. Everything else —
 the medium, the ether's timers, hello, the channels, the testbed's holds —

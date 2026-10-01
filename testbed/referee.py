@@ -418,8 +418,8 @@ def render(report, view, detail=False):
         name = view.names.get(sid)
         if name is None:
             return "station %s" % sid
-        kind = view.kind_type(name)
-        return "%s (%s)" % (name, kind) if kind else name
+        base = view.base(name)
+        return "%s (%s)" % (name, base) if base else name
 
     out = ["run: %.1f s of %s time, %d frames from %d stations" % (
         report["run_s"], "virtual" if report["virtual"] else "real", report["frames"],

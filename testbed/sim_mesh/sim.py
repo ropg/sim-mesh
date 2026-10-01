@@ -24,22 +24,23 @@ waiting on a call). So what a driver does about an answer, it does at the
 answer's T, and its waits (`until`, `sleep`, `all_up`, `ready`) are simd's,
 ending at an instant of the run. `sim.t` is the T of the last answer.
 
-**A selection** is some of the stations: `sim.nodes(tag=, firmware=, kind=,
-role=, names=)`, or `sim.node(name)` for one. What is done to a selection is
-done to each member that is up, spread over `spread` seconds and held back
-`after` seconds, and answers {name: reply}:
+**A selection** is some of the stations: `sim.nodes(tag=, firmware=, base=,
+category=, role=, names=)`, or `sim.node(name)` for one. What is done to a
+selection is done to each member that is up, spread over `spread` seconds and
+held back `after` seconds, and answers {name: reply}:
 
-- `run(line, kind=)`: a line in the stations' own language, macros filled in;
-  a selection of more than one kind refuses it unless `kind` narrows it;
-- the intents, which each station's kind says in its own lines:
-  `set_name()`, `set_role(role)`, `set_radio(**radio)`, `announce()`,
-  `message(to, text)`, `path(to)`, `peer_tcp(to, port)`, `address()`; a kind
-  that cannot say one answers `! …` for that station;
+- `run(line, base=)`: a line in the stations' own language, macros filled in;
+  a selection running more than one base refuses it unless `base` narrows it;
+- `verb(verb, category=None, **args)`: a driver's verb, which each station's
+  driver does its own way (`sim_mesh.driver`, `sim_mesh.reticulum.driver`);
+  with a category, only on its stations of that category. A firmware that
+  cannot do one answers `! …` for that station;
 - `reset()`, `factory_reset()`: pressed on each.
 
 `attach(name)` holds a running simulation; `start(geodata, nodesets, …)`
 asks the front for a new one, with its time and its firmware and first-boot
-rules, and holds it.
+rules, and holds it; `resume(name)` starts a paused one again and holds it.
+A script uses all of this through `sim_mesh.library`.
 """
 
 import asyncio
@@ -70,7 +71,8 @@ class Station:
         self.id = msg.get("id")
         self.tags = list(msg.get("tags") or ())
         self.firmware = msg.get("firmware")
-        self.kind = msg.get("kind")
+        self.base = msg.get("base")
+        self.category = msg.get("category")
         # What it reports, else its role tag (nodeset.tag_role).
         self.role = msg.get("role") or next(
             (t for t in self.tags if t in ("transport", "router", "repeater")), None)
@@ -83,12 +85,12 @@ class Station:
     def facts(self):
         """What a selection (sim_mesh.select) can ask of it."""
         return {"name": self.name, "id": self.id, "tags": self.tags, "firmware": self.firmware,
-                "kind": self.kind, "role": self.role, "antenna": self.antenna,
-                "max_dbm": self.max_dbm, "lat": self.lat,
+                "base": self.base, "category": self.category, "role": self.role,
+                "antenna": self.antenna, "max_dbm": self.max_dbm, "lat": self.lat,
                 "lon": self.lon, "height_m": self.height_m, "status": self.status}
 
     def __repr__(self):
-        return "<station %s #%s %s %s>" % (self.name, self.id, self.kind, self.status)
+        return "<station %s #%s %s %s>" % (self.name, self.id, self.base, self.status)
 
 
 class Selection:
@@ -107,45 +109,28 @@ class Selection:
     def __repr__(self):
         return "<selection of %d: %s>" % (len(self.names), " ".join(self.names[:8]))
 
-    async def run(self, line, spread=0.0, after=0.0, kind=None):
+    async def run(self, line, spread=0.0, after=0.0, base=None):
         return await self.sim.ask({"type": "command", "line": line}, self.names,
-                                  spread, after, kind)
+                                  spread, after, base)
 
-    async def intent(self, verb, spread=0.0, after=0.0, **args):
-        return await self.sim.ask({"type": "meta", "verb": verb, "args": args}, self.names,
-                                  spread, after)
+    async def verb(self, verb, category=None, spread=0.0, after=0.0, **args):
+        msg = {"type": "meta", "verb": verb, "args": args}
+        if category is not None:
+            msg["category"] = category
+        return await self.sim.ask(msg, self.names, spread, after)
 
-    async def set_name(self, **when):
-        return await self.intent("name", **when)
-
-    async def set_role(self, role, **when):
-        return await self.intent("role", role=role, **when)
-
-    async def set_radio(self, spread=0.0, after=0.0, **radio):
-        return await self.intent("radio", spread=spread, after=after, **radio)
-
-    async def announce(self, **when):
-        return await self.intent("announce", **when)
-
-    async def message(self, to, text, **when):
-        return await self.intent("message", to=to, text=text, **when)
-
-    async def path(self, to, **when):
-        return await self.intent("path", to=to, **when)
-
-    async def peer_tcp(self, to, port=4965, **when):
-        return await self.intent("peer_tcp", to=to, port=port, **when)
-
-    async def address(self):
-        return await self.intent("address")
-
-    async def reset(self):
+    async def reset(self, after=0.0):
         for name in self.names:
-            await self.sim.send({"type": "node_reset", "name": name})
+            await self.sim.send(_later({"type": "node_reset", "name": name}, after))
 
-    async def factory_reset(self):
+    async def factory_reset(self, after=0.0):
         for name in self.names:
-            await self.sim.send({"type": "node_factory_reset", "name": name})
+            await self.sim.send(_later({"type": "node_factory_reset", "name": name}, after))
+
+
+def _later(msg, after):
+    """`msg`, to be acted on `after` seconds of the run's clock from now."""
+    return dict(msg, after=float(after)) if after else msg
 
 
 class Sim:
@@ -175,6 +160,9 @@ class Sim:
         self.may_yield = lambda: True    # a script's runtime: its thread is waiting on a call
         self._settling = False
         self._turns = 0
+        self.gone = False                # the simulation stopped, or the socket closed
+        self.script_loglevel = "output"  # the simulation's, unless a script says its own
+        self.trace = None                # a script's log of what is sent and answered
 
     # ---- the stream ------------------------------------------------------
 
@@ -184,8 +172,18 @@ class Sim:
                 continue
             m = json.loads(msg.data)
             kind = m.get("type")
-            if kind == "snapshot":
+            if kind == "sims" and "sim" not in m:
+                # The front's registry, its own and not the simulation's: the
+                # socket to the front outlives a simulation stopped or paused
+                # under it, and this row is how the driver learns it has gone.
+                if not any(r.get("name") == self.name and r.get("state") == "running"
+                           for r in m.get("sims") or ()):
+                    break
+            elif kind == "script_loglevel":
+                self.script_loglevel = m.get("level") or self.script_loglevel
+            elif kind == "snapshot":
                 self.run = m.get("run") or {}
+                self.script_loglevel = m.get("script_loglevel") or self.script_loglevel
                 self.stations = {n["name"]: Station(n) for n in m.get("nodes") or ()}
                 if m.get("clock"):
                     self.t = m["clock"]["t"]
@@ -209,6 +207,8 @@ class Sim:
             elif kind == "node_gone":
                 self.stations.pop(m.get("name"), None)
             elif kind == "command_result":
+                if self.trace is not None and m.get("id") in self.waiting:
+                    self.trace("debug", "answered %s" % msg.data)
                 waiter = self.waiting.pop(m.get("id"), None)
                 if waiter is not None:
                     # Ours: simd gave us the floor with it, at its T.
@@ -225,12 +225,34 @@ class Sim:
             elif kind == "error":
                 self.errors.append(m.get("text"))
                 print("simd: %s" % m.get("text"), flush=True)
+        self.gone = True
         for waiter in self.waiting.values():
             if not waiter.done():
-                waiter.set_exception(SimError("simulation %s went away" % self.name))
+                waiter.set_exception(self.went_away())
+
+    def went_away(self):
+        return SimError("simulation %s went away" % self.name)
+
+    def check(self):
+        """A SimError once the simulation has gone: what every wait on it
+        asks before it waits again, so a driver never waits on a run that
+        will not move."""
+        if self.gone:
+            raise self.went_away()
+
+    def expect(self):
+        """A fresh id and the future its answer lands in."""
+        self.check()
+        ident = next(self.ids)
+        waiter = asyncio.get_running_loop().create_future()
+        self.waiting[ident] = waiter
+        return ident, waiter
 
     async def send(self, msg):
-        await self.ws.send_str(json.dumps(msg))
+        text = json.dumps(msg)
+        if self.trace is not None:
+            self.trace("debug", "sent %s" % text)
+        await self.ws.send_str(text)
 
     # ---- turns -------------------------------------------------------------
 
@@ -261,9 +283,7 @@ class Sim:
 
     async def _wait(self, msg):
         """One of simd's waits: done at the instant it ends."""
-        ident = next(self.ids)
-        waiter = asyncio.get_running_loop().create_future()
-        self.waiting[ident] = waiter
+        ident, waiter = self.expect()
         await self.send(dict(msg, id=ident))
         return await waiter
 
@@ -302,7 +322,7 @@ class Sim:
 
     # ---- choosing --------------------------------------------------------
 
-    def nodes(self, tag=None, firmware=None, kind=None, role=None, names=None):
+    def nodes(self, tag=None, firmware=None, base=None, category=None, role=None, names=None):
         """The stations with every one of these that is given, in id order."""
         chosen = []
         for s in sorted(self.stations.values(), key=lambda s: s.id or 0):
@@ -310,7 +330,9 @@ class Sim:
                 continue
             if firmware is not None and s.firmware != firmware:
                 continue
-            if kind is not None and s.kind != kind:
+            if base is not None and s.base != base:
+                continue
+            if category is not None and s.category != category:
                 continue
             if role is not None and s.role != role:
                 continue
@@ -346,26 +368,28 @@ class Sim:
         return await self._rules("first_boot", rules)
 
     async def _rules(self, verb, rules):
-        ident = next(self.ids)
-        waiter = asyncio.get_running_loop().create_future()
-        self.waiting[ident] = waiter
+        ident, waiter = self.expect()
         await self.send({"type": verb, "rules": list(rules), "id": ident})
         reply = await waiter
         if reply.get("error"):
             raise SimError(reply["error"])
         return reply.get("results") or {}
 
-    async def ready(self, selection, timeout=None):
-        """The names of a selection's stations once every one is up, after
-        any firmware said is in. A station that runs nothing is refused: it
-        needs firmware() first."""
+    async def settled(self):
+        """Once any firmware said is in."""
         if self.firmware_tasks:
             tasks, self.firmware_tasks = self.firmware_tasks, []
             await asyncio.gather(*tasks)
+
+    async def ready(self, selection, timeout=None):
+        """The names of a selection's stations once every one is up, after
+        any firmware said is in. A station that runs nothing is refused: it
+        needs firmware first."""
+        await self.settled()
         names = selection.pick(self.facts())
         bare = [n for n in names if not self.stations[n].firmware]
         if bare:
-            raise SimError("%s run%s no firmware: say firmware() for %s first"
+            raise SimError("%s run%s no firmware: say .firmware(…) for %s first"
                            % (", ".join(bare), "s" if len(bare) == 1 else "",
                               "it" if len(bare) == 1 else "them"))
         try:
@@ -388,29 +412,28 @@ class Sim:
 
     # ---- asking ----------------------------------------------------------
 
-    async def ask(self, msg, names, spread=0.0, after=0.0, kind=None):
-        """One command or intent on the named stations: {name: reply}."""
-        ident = next(self.ids)
-        waiter = asyncio.get_running_loop().create_future()
-        self.waiting[ident] = waiter
+    async def ask(self, msg, names, spread=0.0, after=0.0, base=None):
+        """One command or verb on the named stations: {name: reply}."""
+        ident, waiter = self.expect()
         msg = dict(msg, id=ident, names=list(names))
         if spread:
             msg["stagger"] = float(spread)
         if after:
             msg["after"] = float(after)
-        if kind:
-            msg["kind"] = kind
+        if base:
+            msg["base"] = base
         await self.send(msg)
-        return (await waiter)["results"]
+        reply = await waiter
+        if reply.get("error"):
+            raise SimError(reply["error"])
+        return reply["results"]
 
     async def sequence(self, steps, names, after=0.0):
         """Several commands and intents on the named stations, one after the
         other at one T inside simd: ([{name: reply}], one per step; the T in
         µs they were done at). Each step is a `command` ({type, line}) or a
         `meta` ({type, verb, args})."""
-        ident = next(self.ids)
-        waiter = asyncio.get_running_loop().create_future()
-        self.waiting[ident] = waiter
+        ident, waiter = self.expect()
         msg = {"type": "sequence", "steps": list(steps), "id": ident, "names": list(names)}
         if after:
             msg["after"] = float(after)
@@ -418,14 +441,12 @@ class Sim:
         reply = await waiter
         return reply["results"], reply.get("t")
 
-    async def command(self, line, name=None, after=0.0, stagger=0.0, kind=None):
-        """One line on one station, or on every station of `kind`: the whole
-        `command_result`, with its `t`."""
-        ident = next(self.ids)
-        waiter = asyncio.get_running_loop().create_future()
-        self.waiting[ident] = waiter
+    async def command(self, line, name=None, after=0.0, stagger=0.0, base=None):
+        """One line on one station, or on every station running `base`: the
+        whole `command_result`, with its `t`."""
+        ident, waiter = self.expect()
         msg = {"type": "command", "line": line, "id": ident}
-        for key, value in (("name", name), ("kind", kind)):
+        for key, value in (("name", name), ("base", base)):
             if value:
                 msg[key] = value
         if after > 0:
@@ -435,17 +456,17 @@ class Sim:
         await self.send(msg)
         return await waiter
 
-    async def snapshot(self, name):
+    async def snapshot(self, name, after=0.0):
         """This moment, flushed, as a snapshot."""
-        await self.send({"type": "snapshot_save_as", "name": name})
+        await self.send(_later({"type": "snapshot_save_as", "name": name}, after))
 
     save_snapshot = snapshot
 
-    async def move(self, name, lat, lon, height_m=None):
+    async def move(self, name, lat, lon, height_m=None, after=0.0):
         msg = {"type": "nodeset_move", "name": name, "lat": lat, "lon": lon, "settle": True}
         if height_m is not None:
             msg["height_m"] = height_m
-        await self.send(msg)
+        await self.send(_later(msg, after))
 
     def wait_run(self, at):
         return self.until(at)
@@ -496,20 +517,43 @@ async def attach(name=None, port=None, session=None):
     return sim
 
 
+async def resume(name, time="real", port=None, session=None):
+    """A paused simulation started again as it ended, in `time`, and held."""
+    port = port or DEFAULT_PORT
+    own = session is None
+    session = session or aiohttp.ClientSession()
+    try:
+        reply = await front_verb(session, port, {"type": "sim_resume", "name": name,
+                                                 "time": time})
+        return await attach(reply["name"], port, session)
+    except BaseException:
+        if own:
+            await session.close()
+        raise
+
+
 async def start(geodata, nodesets, script=None, time="real", name=None, build=None,
-                firmware_rules=None, first_boot_rules=None, port=None, session=None):
+                firmware_rules=None, first_boot_rules=None, port=None, session=None,
+                inputs=None):
     """A new simulation from geodata and one or more nodesets (several are
     merged), its firmware and first-boot rules given from the start, started
     by the front and held. `script` is the name of the script it keeps a
-    copy of."""
+    copy of, `inputs` the values its inputs were given, which the run keeps."""
     port = port or DEFAULT_PORT
+    own = session is None
     session = session or aiohttp.ClientSession()
     layers = [nodesets] if isinstance(nodesets, str) else list(nodesets)
     msg = {"type": "sim_new", "geodata": geodata, "nodesets": layers, "time": time,
            "firmware_rules": list(firmware_rules or []),
            "first_boot_rules": list(first_boot_rules or [])}
-    for key, value in (("script", script), ("name", name), ("build", build)):
+    for key, value in (("script", script), ("name", name), ("build", build),
+                       ("inputs", inputs)):
         if value:
             msg[key] = value
-    reply = await front_verb(session, port, msg)
-    return await attach(reply["name"], port, session)
+    try:
+        reply = await front_verb(session, port, msg)
+        return await attach(reply["name"], port, session)
+    except BaseException:
+        if own:
+            await session.close()
+        raise

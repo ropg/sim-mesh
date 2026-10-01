@@ -27,7 +27,10 @@ from sim_mesh.select import Nodes  # noqa: E402
 R = cs.EARTH_RADIUS_M
 # The latitude where a degree of longitude is half a degree of latitude.
 HALF = math.degrees(math.acos(0.5))
-DEVICES = {"reticulous": "reticulous_dev_latest", "berlinmesh": "sergeyculum_local_latest"}
+FIRMWARES = {"reticulous": "reticulous-dev-sx1262_latest",
+             "berlinmesh": "sergeyculum-sx1262_latest"}
+FIRMWARE_FLAGS = [arg for kind, firmware in FIRMWARES.items()
+                  for arg in ("--firmware", "%s=%s" % (kind, firmware))]
 
 
 def at(origin, east_m, north_m):
@@ -96,7 +99,7 @@ def test_positions_keep_every_distance_the_old_ether_had():
                 "c": {"id": 3, "pos": (0, 4000)},
                 "d": {"id": 4, "pos": (-1200, 2500), "height_m": 15}},
                origin=(HALF, 0.0))
-    conv = cs.convert(data, DEVICES, "tri")
+    conv = cs.convert(data, FIRMWARES, "tri")
     xy, written = xy_of(conv)
     # A height the file states is kept; the others stand at main's default.
     assert [written["nodes"][n]["height_m"] for n in "abcd"] == [2, 2, 2, 15]
@@ -129,7 +132,7 @@ def test_the_old_ethers_plane_is_kept_where_it_was_wrong():
     data = old({"a": {"id": 1, "pos": (0, 0)}, "b": {"id": 2, "pos": (0, 0)}})
     data["nodes"]["a"]["pos"] = [HALF, 0.0]
     data["nodes"]["b"]["pos"] = [HALF, math.degrees(1000 / R)]
-    conv = cs.convert(data, DEVICES, "wide")
+    conv = cs.convert(data, FIRMWARES, "wide")
     xy, _ = xy_of(conv)
     assert abs(dist(xy["a"], xy["b"]) - 1000) < 1e-3          # the old plane's
     true = cs.great_circle_m(data["nodes"]["a"]["pos"], data["nodes"]["b"]["pos"])
@@ -142,7 +145,7 @@ def test_a_name_yaml_would_read_as_something_else_is_carried_over_as_itself():
     # nodes, the offsets (a gain) and the links the conversion writes.
     data = old({"no": {"id": 1, "pos": (0, 0), "gain_db": 3}, "010": {"id": 2, "pos": (900, 0)}},
                links=[{"between": ["no", "010"], "loss_db": 101.5}])
-    _, written = xy_of(cs.convert(data, DEVICES, "words"))
+    _, written = xy_of(cs.convert(data, FIRMWARES, "words"))
     assert set(written["nodes"]) == {"no", "010"}
     assert written["offsets"] and all(set(o["between"]) == {"no", "010"}
                                       for o in written["offsets"])
@@ -150,8 +153,7 @@ def test_a_name_yaml_would_read_as_something_else_is_carried_over_as_itself():
 
 
 def test_links_walls_gains_kinds_and_first_boot_lines_carry_over():
-    conv = cs.convert(MIXED, {"reticulous": "reticulous_dev_latest",
-                              "berlinmesh": "sergeyculum_local_latest"}, "mixed")
+    conv = cs.convert(MIXED, FIRMWARES, "mixed")
     _, written = xy_of(conv)
     nodes = written["nodes"]
     assert {n: node["id"] for n, node in nodes.items()} == {"gw": 1, "r1": 2, "h1": 5, "h2": 7}
@@ -179,12 +181,12 @@ def test_links_walls_gains_kinds_and_first_boot_lines_carry_over():
     assert all(l["note"] == cs.LINK_NOTE for l in raw["links"])
     assert any("restate a pair" in w for w in conv["warnings"])
     assert any("name a node the file lacks" in w for w in conv["warnings"])
-    # The devices by tag, and the lines nothing else says, to the same nodes.
+    # The firmware by tag, and the lines nothing else says, to the same nodes.
     setup = conv["setup"]
-    assert 'firmware(nodes(tag="reticulous"), "reticulous_dev_latest")' in setup
-    assert 'firmware(nodes(tag="berlinmesh"), "sergeyculum_local_latest")' in setup
-    assert 'on_first_boot(nodes(tag="reticulous"), """\n    lxmf create {name}\n""")' in setup
-    assert 'on_first_boot("h2", """\n    announce interval set 900\n""")' in setup
+    assert 'nodes(tag="reticulous").firmware("reticulous-dev-sx1262_latest")' in setup
+    assert 'nodes(tag="berlinmesh").firmware("sergeyculum-sx1262_latest")' in setup
+    assert 'nodes(tag="reticulous").on_first_boot("""\n    lxmf create {name}\n""")' in setup
+    assert 'node("h2").on_first_boot("""\n    announce interval set 900\n""")' in setup
     for said in ("hostname", "lora", "name set", "transport", "set s.", "set --"):
         assert "\n    " + said not in setup
     # The ground and the medium.
@@ -198,32 +200,32 @@ def test_links_walls_gains_kinds_and_first_boot_lines_carry_over():
     assert (s["nodes"], s["links"], s["walls"], s["offsets"], s["transport"]) == (4, 2, 1, 6, 2)
 
 
-def test_the_setup_puts_each_node_on_its_kinds_device_after_a_scripts_own(runtime, monkeypatch,
-                                                                         tmp_path):
-    conv = cs.convert(MIXED, DEVICES, "mixed")
+def test_the_setup_puts_each_node_on_its_kinds_firmware_after_a_scripts_own(runtime, monkeypatch,
+                                                                           tmp_path):
+    conv = cs.convert(MIXED, FIRMWARES, "mixed")
     shutil.copytree(store.SCRIPTS_DIR, str(tmp_path / "scripts"))
     (tmp_path / "nodesets").mkdir()
     (tmp_path / "nodesets" / "mixed.py").write_text(conv["setup"])
     monkeypatch.setattr(library, "TESTBED_DIR", str(tmp_path))
     monkeypatch.syspath_prepend(store.SCRIPTS_DIR)
     runtime.configure(geodata="plain", nodesets=["mixed"])
-    # A script's declarations, as realtime.py makes them.
-    library.firmware("all", "reticulous_stable_latest")
-    library.include("scripts/startup.py")
+    # A script's declarations, as lxmf-traffic.py makes them.
+    library.nodes().firmware("reticulous-stable-sx1262_latest")
+    library.script_include("scripts/startup.py")
     _, written = xy_of(conv)
     ran = {}
     for name, node in written["nodes"].items():
         facts = {"name": name, "tags": node["tags"]}
         ran[name] = [rule["firmware"] for rule in runtime.firmware_rules
                      if Nodes(rule["which"]).matches(facts)][-1]
-    assert ran == {"gw": DEVICES["reticulous"], "r1": DEVICES["reticulous"],
-                   "h1": DEVICES["berlinmesh"], "h2": DEVICES["berlinmesh"]}
+    assert ran == {"gw": FIRMWARES["reticulous"], "r1": FIRMWARES["reticulous"],
+                   "h1": FIRMWARES["berlinmesh"], "h2": FIRMWARES["berlinmesh"]}
     # What each is told at its first boot: startup.py's role (from the tag)
     # and radio, the old lines nothing else says, then the radio started.
     told = {}
     for name, node in written["nodes"].items():
         facts = {"name": name, "tags": node["tags"]}
-        told[name] = [line["intent"] if isinstance(line, dict) else line
+        told[name] = [line["verb"] if isinstance(line, dict) else line
                       for rule in runtime.first_boot_rules if Nodes(rule["which"]).matches(facts)
                       for line in rule["lines"]]
     assert told == {"gw": ["radio", "lxmf create {name}", "radio_up"],
@@ -233,19 +235,19 @@ def test_the_setup_puts_each_node_on_its_kinds_device_after_a_scripts_own(runtim
 
 
 def test_a_kind_the_mapping_lacks_is_refused_and_so_is_a_device_that_is_no_name(tmp_path, capsys):
-    with pytest.raises(cs.ConvertError, match="no device for kind berlinmesh.*2 node"):
-        cs.convert(MIXED, {"reticulous": "reticulous_dev_latest"}, "mixed")
-    with pytest.raises(cs.ConvertError, match="a device is"):
-        cs.convert(MIXED, dict(DEVICES, berlinmesh="some build"), "mixed")
-    # A name that is a device's but no build here yet is converted, and said.
-    assert cs.check_device("nosuch_local_latest") == (
-        None, "device nosuch_local_latest is not here yet (no devices/local/nosuch_local.yaml)")
+    with pytest.raises(cs.ConvertError, match="no firmware for kind berlinmesh.*2 node"):
+        cs.convert(MIXED, {"reticulous": FIRMWARES["reticulous"]}, "mixed")
+    with pytest.raises(cs.ConvertError, match="a firmware is"):
+        cs.convert(MIXED, dict(FIRMWARES, berlinmesh="some build"), "mixed")
+    # A name that is a firmware's but not installed here yet is converted, and said.
+    got, warning = cs.check_firmware("nosuch_latest")
+    assert got is None and warning.startswith("firmware nosuch_latest is not here yet (")
     path = tmp_path / "mixed.yaml"
     # The old default kind is the first the file names: keep its order.
     path.write_text(yaml.safe_dump(MIXED, sort_keys=False))
     assert cs.main([str(path), "--out", str(tmp_path / "out"),
-                    "--device", "reticulous=reticulous_dev_latest"]) == 1
-    assert "no device for kind berlinmesh" in capsys.readouterr().err
+                    "--firmware", "reticulous=" + FIRMWARES["reticulous"]]) == 1
+    assert "no firmware for kind berlinmesh" in capsys.readouterr().err
     assert not (tmp_path / "out").exists()
 
 
@@ -254,8 +256,7 @@ def test_main_reads_what_is_written_and_prices_every_pair_as_the_old_ether(tmp_p
     # The old default kind is the first the file names: keep its order.
     path.write_text(yaml.safe_dump(MIXED, sort_keys=False))
     out = tmp_path / "out"
-    assert cs.main([str(path), "--out", str(out), "--device", "reticulous=reticulous_dev_latest",
-                    "--device", "berlinmesh=sergeyculum_local_latest"]) == 0
+    assert cs.main([str(path), "--out", str(out), *FIRMWARE_FLAGS]) == 0
     # Main's own readers take the files as they are: the links and the
     # shadowing are keys they leave to the layers that read them.
     ns = nodeset.open_path(str(out / "nodesets" / "mixed.yaml"), "mixed")
@@ -296,12 +297,9 @@ def test_main_reads_what_is_written_and_prices_every_pair_as_the_old_ether(tmp_p
             priced += 1
     assert priced == 8
     # Written once; again only with --force.
-    assert cs.main([str(path), "--out", str(out), "--device", "reticulous=reticulous_dev_latest",
-                    "--device", "berlinmesh=sergeyculum_local_latest"]) == 1
+    assert cs.main([str(path), "--out", str(out), *FIRMWARE_FLAGS]) == 1
     monkeypatch.setattr(sys, "stdin", io.StringIO(path.read_text()))
-    assert cs.main(["-", "--name", "mixed", "--force", "--out", str(out),
-                    "--device", "reticulous=reticulous_dev_latest",
-                    "--device", "berlinmesh=sergeyculum_local_latest"]) == 0
+    assert cs.main(["-", "--name", "mixed", "--force", "--out", str(out), *FIRMWARE_FLAGS]) == 0
 
 
 def test_the_medium_flags_say_what_the_old_physics_did():
@@ -321,7 +319,7 @@ def test_the_medium_flags_say_what_the_old_physics_did():
     assert [re.split(r"[ :]", w)[0] for w in warnings] == ["sf_orthogonality", "capture_model"]
     with pytest.raises(cs.ConvertError, match="capture_model"):
         cs.convert(old({"a": {"id": 1, "pos": (0, 0)}}, physics={"capture_model": "coin"}),
-                   DEVICES, "x")
+                   FIRMWARES, "x")
 
 
 def test_first_boot_lines_in_each_old_kinds_language():
@@ -337,13 +335,13 @@ def test_first_boot_lines_in_each_old_kinds_language():
         ("radio", {"sf": 9, "bw_khz": 250.0}), ("other", "set --beacon 1")]
     # Two kinds on two spreading factors: main has one radio for every node.
     data = dict(MIXED, kinds=dict(MIXED["kinds"], berlinmesh={"setup": ["set --sf 7"]}))
-    warnings = cs.convert(data, DEVICES, "x")["warnings"]
+    warnings = cs.convert(data, FIRMWARES, "x")["warnings"]
     assert any(w.startswith("the old radios differ among the nodes in sf;") for w in warnings)
     # A kind of a type the conversion has no language for keeps every line.
     data = old({"a": {"id": 1, "pos": (0, 0), "setup": ["transport on"]}},
                kinds={"other": {"type": "somefw"}})
-    conv = cs.convert(data, {"other": "reticulous_dev_latest"}, "x")
-    assert 'on_first_boot("a", """\n    transport on\n""")' in conv["setup"]
+    conv = cs.convert(data, {"other": FIRMWARES["reticulous"]}, "x")
+    assert 'node("a").on_first_boot("""\n    transport on\n""")' in conv["setup"]
     assert "transport" not in yaml.safe_load(conv["nodeset"])["nodes"]["a"]["tags"]
 
 

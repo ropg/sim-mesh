@@ -14,8 +14,8 @@ each arrow head and what the frame was on the right.
 Lifelines are named from the run's nodeset. The record is the ether's own
 account: it knows a frame's carrier, its air time and its bytes, and nothing
 about what the bytes mean. The reading on the right is the protocol's: in a
-run with Reticulous stations (or a record read on its own) it is done the way
-the firmware's receive path does it (`sim_mesh.reticulum.frames.read_frame`);
+run with Reticulum stations (or a record read on its own) it is done the way
+an RNode-framed receive path does it (`sim_mesh.reticulum.frames.read_frame`);
 in a run with none, a frame is its length and carrier.
 """
 

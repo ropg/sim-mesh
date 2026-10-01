@@ -14,8 +14,9 @@ resolved, and the loss tables the ether read.
   maximum power, unless it is tagged `no-radio`; its role is its role tag,
   a node with none a `client`. What a script set beyond them is not seen
   here.
-- **Kind.** A node's kind is its firmware's, as the run resolved it; what its
-  frames mean belongs to that kind's protocol (`sim_mesh.protocol_for`).
+- **Category.** A node's category is its firmware's, as the run resolved it;
+  what its frames mean belongs to that category's protocol
+  (`sim_mesh.protocol_for`).
 - **Levels** are the medium's own: an `Ether` holding the run's tables with
   the nodeset's links, the geodata's shadowing, the nodeset's antennas (over
   the grounds the run kept) and offsets on them (`losses.medium_tables`),
@@ -86,12 +87,20 @@ class RunView:
 
     # ---- what each node is ----------------------------------------------
 
-    def kind_type(self, name):
+    def build(self, name):
+        """What the node's firmware name resolved to (drivers.build_of), or {}."""
         ref = (self.run.meta.get("firmware") or {}).get(name)
-        return (self.builds.get(ref) or {}).get("kind_type")
+        return self.builds.get(ref) or {}
+
+    def category(self, name):
+        return self.build(name).get("category")
+
+    def base(self, name):
+        """The firmware's base: the project it is, whatever its build."""
+        return self.build(name).get("base")
 
     def protocol(self, name):
-        return sim_mesh.protocol_for(self.kind_type(name))
+        return sim_mesh.protocol_for(self.category(name))
 
     def protocols(self):
         """The protocol modules any node of the run is read by."""

@@ -1,5 +1,5 @@
-"""Scripts, and what a station is told: the listing, the library's
-declarations, selections, macros, declared settings and intents."""
+"""Scripts, and what a station is told: the listing, inputs, the library's
+declarations, selections, macros and first-boot rules."""
 
 import os
 import re
@@ -11,18 +11,12 @@ import pytest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import kinds  # noqa: E402
+import drivers  # noqa: E402
 import nodeset  # noqa: E402
 import script  # noqa: E402
 import stations  # noqa: E402
 import store  # noqa: E402
 from sim_mesh import library  # noqa: E402
-
-RETICULOUS = {"ref": "stable", "kind_type": "reticulous", "elf": "/x", "name": "Reticulous",
-              "virtual_hardware": "ESP32-S3"}
-SERGEYCULUM = {"ref": "bm", "kind_type": "sergeyculum", "elf": "/y", "tools": {"rncfg": "/r"}}
-RADIO = {"freq_mhz": 869.525, "sf": 8, "bw_khz": 125.0, "cr": 5, "tx_dbm": 14.0,
-         "sync": 0x12, "preamble": 18}
 
 
 @pytest.fixture
@@ -45,7 +39,7 @@ def test_a_script_is_described_without_being_run(scripts_dir):
         '"""Sets up, then reports.\n\nMore."""\nfrom sim_mesh import *\nfrom sim_mesh import traffic\n'
         'raise SystemExit("never run")\n'
         "def report(run_dir):\n    return '# done'\n")
-    (scripts_dir / "broken.py").write_text("firmware('all',\n")
+    (scripts_dir / "broken.py").write_text("nodes().firmware(\n")
     assert script.names() == ["broken", "told"]
     got = script.describe(script.script_path("told"), "told")
     assert got["doc"] == "Sets up, then reports." and got["report"] is True
@@ -70,7 +64,7 @@ def test_a_script_is_written_only_when_it_parses(scripts_dir):
 
 def test_a_scripts_definitions_are_read_without_running_it(scripts_dir, runtime):
     (scripts_dir / "one.py").write_text(
-        "from sim_mesh import *\nWHO = 'one'\nfirmware('all', 'x_y_latest')\nup('all')\n"
+        "from sim_mesh import *\nWHO = 'one'\nnodes().firmware('x_y_latest')\nnodes().up()\n"
         "def report(run_dir):\n    return WHO + run_dir\n")
     module = script.module_of(script.script_path("one"), "one")
     assert module.report("/r") == "one/r"
@@ -80,28 +74,29 @@ def test_a_scripts_definitions_are_read_without_running_it(scripts_dir, runtime)
 def test_declarations_are_collected_until_the_script_does_something(scripts_dir, runtime):
     (scripts_dir / "fw.py").write_text(
         "from sim_mesh import *\n"
-        "time(10)\n"
-        "firmware('all', 'reticulous_dev_latest')\n"
-        "firmware(nodes(tag='sergeyculum'), 'sergeyculum_local_latest')\n"
-        "on_first_boot(nodes(kind='reticulous'), '''\n"
+        "sim_speed(10)\n"
+        "nodes().firmware('alpha-sx1262_latest')\n"
+        "nodes(tag='beta').firmware('beta-sx1262_aarch64_1.2.0')\n"
+        "nodes(base='alpha-sx1262').on_first_boot('''\n"
         "    lora 0 txp {max_dbm}\n"
         "    # a comment\n"
         "    lxmf create {name}\n"
-        "''')\n")
+        "''', Node.reticulum.role('transport'))\n")
     script.run_file(script.script_path("fw"), "fw")
-    assert runtime.time == "10x"
+    assert runtime.speed == "10x"
     assert runtime.firmware_rules == [
-        {"which": {"all": True}, "firmware": "reticulous_dev_latest"},
-        {"which": {"where": {"tag": "sergeyculum"}}, "firmware": "sergeyculum_local_latest"}]
+        {"which": {"all": True}, "firmware": "alpha-sx1262_latest"},
+        {"which": {"where": {"tag": "beta"}}, "firmware": "beta-sx1262_aarch64_1.2.0"}]
     assert runtime.first_boot_rules == [
-        {"which": {"where": {"kind": "reticulous"}},
-         "lines": ["lora 0 txp {max_dbm}", "lxmf create {name}"]}]
+        {"which": {"where": {"base": "alpha-sx1262"}},
+         "lines": ["lora 0 txp {max_dbm}", "lxmf create {name}",
+                   {"verb": "role", "args": {"role": "transport"}, "category": "reticulum"}]}]
     # Doing something needs a simulation, which this runtime has no way to.
     with pytest.raises(library.ScriptError, match="no simulation"):
-        library.up("all")
-    assert library.time_mode("max") == "max" and library.time_mode("0.5") == "0.5x"
+        library.nodes().up()
+    assert library.speed_of("max") == "max" and library.speed_of("0.5") == "0.5x"
     with pytest.raises(library.ScriptError):
-        library.time_mode("fast")
+        library.speed_of("fast")
 
 
 def test_a_new_simulation_is_started_empty_and_given_its_rules_once_driven(runtime,
@@ -124,7 +119,8 @@ def test_a_new_simulation_is_started_empty_and_given_its_rules_once_driven(runti
             calls.append(("first_boot", rules))
 
     async def start(geodata, nodesets, script=None, time="real", name=None, build=None,
-                    firmware_rules=None, first_boot_rules=None, port=None, session=None):
+                    firmware_rules=None, first_boot_rules=None, port=None, session=None,
+                    inputs=None):
         calls.append(("start", firmware_rules, first_boot_rules))
         return Driven()
     monkeypatch.setattr(sim_module, "start", start)
@@ -140,13 +136,13 @@ def test_a_new_simulation_is_started_empty_and_given_its_rules_once_driven(runti
 def test_the_repositorys_scripts_all_parse_and_declare_what_they_run(runtime, monkeypatch,
                                                                     tmp_path):
     monkeypatch.syspath_prepend(store.SCRIPTS_DIR)
-    # include() reads under the testbed: the repository's scripts, beside a
-    # nodeset `gw` whose own setup adds a TCP peer.
+    # script_include() reads under the testbed: the repository's scripts,
+    # beside a nodeset `gw` whose own setup adds a TCP peer.
     shutil.copytree(store.SCRIPTS_DIR, str(tmp_path / "scripts"))
     (tmp_path / "nodesets").mkdir()
     (tmp_path / "nodesets" / "gw.py").write_text(
         "from sim_mesh import *\n"
-        "on_first_boot(nodes(tag=\"tcp-peer\"), \"tcp peer add {addr:internet}:4965\")\n")
+        "nodes(tag=\"tcp-peer\").on_first_boot(\"tcp peer add {addr:internet}:4965\")\n")
     monkeypatch.setattr(library, "TESTBED_DIR", str(tmp_path))
     names = script.names()
     helpers = {os.path.splitext(os.path.basename(ref["path"]))[0]
@@ -160,18 +156,20 @@ def test_the_repositorys_scripts_all_parse_and_declare_what_they_run(runtime, mo
             continue                    # included or imported by the others
         fresh = library.Runtime()
         fresh.configure(geodata="berlin-city", nodesets=["gw"])
+        # Every input a value, as the page or --set gives them.
+        fresh.given = {row["name"]: "some_latest" for row in info["inputs"]}
         library.runtime = fresh
         path = script.script_path(name)
         # Only the declarations: everything before the first thing done.
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
-        head = re.split(r"\n(?:traffic\.run|up)\(", text)[0]
+        head = re.split(r"\n(?:traffic\.run\(|nodes\(\)\.up\()", text)[0]
         exec(compile(head, path, "exec"), {"__name__": "check_" + name})   # noqa: S102
         assert fresh.firmware_rules, "%s says no firmware" % name
-        assert fresh.time in ("real", "max"), name
+        assert fresh.speed in ("real", "max"), name
         # The startup script's rules came with it, in order: roles, radios,
         # gw's own, the radios up, and the script's own after.
-        said = [line["intent"] if isinstance(line, dict) else line
+        said = [line["verb"] if isinstance(line, dict) else line
                 for rule in fresh.first_boot_rules for line in rule["lines"]]
         order = ["role", "radio", "tcp peer add {addr:internet}:4965", "radio_up"]
         assert [s for s in said if s in order] == order, name
@@ -180,17 +178,17 @@ def test_the_repositorys_scripts_all_parse_and_declare_what_they_run(runtime, mo
 def test_the_startup_script_sets_every_radio_but_the_no_radio_ones(runtime, monkeypatch):
     monkeypatch.syspath_prepend(store.SCRIPTS_DIR)
     runtime.configure(geodata="berlin-city", nodesets=["fachhochschule"])
-    library.include("scripts/startup.py")          # fachhochschule has no setup of its own
+    library.script_include("scripts/startup.py")   # fachhochschule has no setup of its own
     shared = script.shared()
     radio = [rule for rule in runtime.first_boot_rules
-             if any(isinstance(l, dict) and l["intent"] == "radio" for l in rule["lines"])]
+             if any(isinstance(l, dict) and l["verb"] == "radio" for l in rule["lines"])]
     assert radio == [{"which": {"not": {"where": {"tag": "no-radio"}}}, "lines": [
-        {"intent": "radio", "args": {"freq_mhz": shared["FREQ_MHZ"], "sf": shared["SF"],
-                                     "bw_khz": shared["BW_KHZ"], "cr": shared["CR"],
-                                     "sync": 0x12, "tx_dbm": "max"}}]}]
+        {"verb": "radio", "args": {"freq_mhz": shared["FREQ_MHZ"], "sf": shared["SF"],
+                                   "bw_khz": shared["BW_KHZ"], "cr": shared["CR"],
+                                   "sync": 0x12, "tx_dbm": "max"}}]}]
     with pytest.raises(library.ScriptError, match="no file"):
-        library.include("nodesets/nowhere.py")
-    library.include("nodesets/nowhere.py", missing_ok=True)
+        library.script_include("nodesets/nowhere.py")
+    library.script_include("nodesets/nowhere.py", missing_ok=True)
 
 
 def test_globals_shared_names_are_read_without_running_it(scripts_dir):
@@ -205,87 +203,109 @@ def test_globals_shared_names_are_read_without_running_it(scripts_dir):
 def test_macros_fill_name_id_and_addresses_and_leave_the_rest(monkeypatch):
     monkeypatch.setattr(stations, "NET", "127.16.0.0/22")
     ids = {"gw": 1, "leaf": 2}
-    assert kinds.expand("hostname {name}", "gw", 1) == "hostname gw"
-    assert kinds.expand("addr {addr} id {id} {unknown}", "gw", 1, ids) == \
+    assert drivers.expand("hostname {name}", "gw", 1) == "hostname gw"
+    assert drivers.expand("addr {addr} id {id} {unknown}", "gw", 1, ids) == \
         "addr 127.16.0.5 id 1 {unknown}"
-    assert kinds.expand("tcp peer add {addr:leaf}:4965", "gw", 1, ids) == \
+    assert drivers.expand("tcp peer add {addr:leaf}:4965", "gw", 1, ids) == \
         "tcp peer add 127.16.0.6:4965"
-    assert kinds.expand("x {addr:ghost} {name:leaf}", "gw", 1, ids) == \
+    assert drivers.expand("x {addr:ghost} {name:leaf}", "gw", 1, ids) == \
         "x {addr:ghost} {name:leaf}"
-    assert kinds.expand("lora 0 txp {max_dbm}", "gw", 1, ids, {"max_dbm": "27"}) == \
+    assert drivers.expand("lora 0 txp {max_dbm}", "gw", 1, ids, {"max_dbm": "27"}) == \
         "lora 0 txp 27"
-    assert kinds.expand_all(["a {name}", "# c", "  ", "b"], "n", 3) == ["a n", "b"]
+    assert drivers.expand_all(["a {name}", "# c", "  ", "b"], "n", 3) == ["a n", "b"]
 
 
-def test_the_name_role_and_radio_intents_in_each_kinds_own_lines():
-    ret = kinds.make_kinds({"stable": RETICULOUS})["stable"]
-    assert ret.lines("name") == ["hostname {name}"]
-    assert ret.lines("role", role="transport") == ["set s.rnsd.transport_enabled 1"]
-    assert ret.lines("radio", **RADIO) == [
-        "lora 0 freq 869.525", "lora 0 sf 8", "lora 0 bw 125", "lora 0 cr 5", "lora 0 txp 14",
-        "lora 0 sync 0x12", "lora 0 preamble 18"]
-    assert ret.lines("radio_up") == ["lora up"]
-    assert ret.label == "Reticulous (virtual ESP32-S3)"
-
-    bm = kinds.make_kinds({"bm": SERGEYCULUM})["bm"]
-    assert bm.rncfg == "/r"
-    assert bm.lines("name") == ["name set {name}"]
-    assert bm.lines("role", role="client") == ["transport off"]
-    assert bm.lines("radio", **RADIO) == [
-        "set --freq-hz 869525000 --sf 8 --bw-hz 125000 --cr 5 --txpower-dbm 14"]
-    assert bm.lines("radio_up") == []
-
-    # What a script writes for them: data simd turns into those lines.
-    assert library.lines_of([library.role("transport"), "log rnsd debug",
-                             library.radio(sf=9, tx_dbm="max")]) == [
-        {"intent": "role", "args": {"role": "transport"}}, "log rnsd debug",
-        {"intent": "radio", "args": {"sf": 9, "tx_dbm": "max"}}]
+def test_commands_said_on_node_are_data_for_the_drivers_verbs():
+    # What a script writes: data simd hands each station's driver as a verb,
+    # a category's carrying it.
+    Node = library.Node
+    assert library.lines_of([Node.reticulum.role("transport"), "log rnsd debug",
+                             [Node.radio(sf=9, tx_dbm="max"), Node.reticulum.lxmf.create()]]) == [
+        {"verb": "role", "args": {"role": "transport"}, "category": "reticulum"},
+        "log rnsd debug",
+        {"verb": "radio", "args": {"sf": 9, "tx_dbm": "max"}},
+        {"verb": "lxmf.create", "args": {}, "category": "reticulum"}]
+    assert library.lines_of([Node.reticulum.lxmf.create("carol")]) == [
+        {"verb": "lxmf.create", "args": {"name": "carol"}, "category": "reticulum"}]
+    assert repr(Node.radio(sf=9)) == "Node.radio(sf=9)"
+    with pytest.raises(library.ScriptError, match="first-boot rule is"):
+        library.lines_of([3])
+    assert set(drivers.verbs()) == {"name", "radio", "radio_up", "tx_power", "diagnostics"}
+    assert {"role", "path", "lxmf.create", "lxmf.identities", "lxmf.announce",
+            "lxmf.send"} <= set(drivers.verbs("reticulum"))
+    assert set(drivers.verbs()) <= set(drivers.verbs("reticulum"))
 
 
-def test_intents_are_said_in_each_kinds_lines_or_refused():
-    ret = kinds.make_kinds({"stable": RETICULOUS})["stable"]
-    bm = kinds.make_kinds({"bm": SERGEYCULUM})["bm"]
-    assert ret.lines("announce") == ["lora 0 a"]
-    assert bm.lines("announce") == ["announce now"]
-    assert ret.lines("message", dest="ab" * 16, text="hi there") == ["lxmf send %s hi there" % ("ab" * 16)]
-    assert bm.lines("message", dest="cd" * 16, text="hi") == ["send --no-wait %s hi" % ("cd" * 16)]
-    assert ret.lines("peer_tcp", addr="127.0.0.5", port=4965) == ["tcp peer add 127.0.0.5:4965"]
-    assert ret.lines("tx_power", dbm=10) == ["lora 0 txp 10"]
-    assert bm.lines("tx_power", dbm=10.4) == ["set --txpower-dbm 10"]
-    with pytest.raises(kinds.CommandError, match="sergeyculum station has no way to path"):
-        bm.lines("path", dest="x")
-    with pytest.raises(kinds.CommandError, match="no such intent"):
-        ret.lines("dance")
+def test_an_unknown_category_is_named():
+    with pytest.raises(drivers.CommandError, match="category 'meshcore'"):
+        drivers.load({"firmware": "mc", "category": "meshcore", "driver": "/nowhere.py"})
 
 
-def test_an_unknown_device_kind_is_named():
-    with pytest.raises(kinds.CommandError, match="kind 'meshcore'"):
-        kinds.make_kinds({"mc": {"kind_type": "meshcore"}})
+def test_inputs_are_read_without_running_and_given_when_run(scripts_dir, runtime):
+    (scripts_dir / "asks.py").write_text(
+        '"""asks"""\n'
+        "from sim_mesh import *\n"
+        "firmware = script_input('firmware', type=Firmware, category='reticulum',\n"
+        "                        label='Firmware for the rest')\n"
+        "count = script_input('count', type=int, default=3)\n"
+        "loud = script_input('loud', bool, 'Say it all', False)\n"
+        "run = script_input('run', type=Run)\n"
+        "nodes().firmware(firmware)\n"
+        "def report(run_dir):\n"
+        "    return 'r'\n")
+    row = script.describe(script.script_path("asks"), "asks")
+    assert row["inputs"] == [
+        {"name": "firmware", "type": "firmware", "label": "Firmware for the rest",
+         "category": "reticulum"},
+        {"name": "count", "type": "int", "label": "count", "default": 3},
+        {"name": "loud", "type": "bool", "label": "Say it all", "default": False},
+        {"name": "run", "type": "run", "label": "run"}]
+    # Its report is written without asking for its inputs.
+    assert script.module_of(script.script_path("asks"), "asks").report("/x") == "r"
+    with pytest.raises(library.ScriptError, match="input firmware .* has no value"):
+        script.run_file(script.script_path("asks"), "asks")
+    runtime.given.update({"firmware": "alpha-sx1262_latest", "loud": "yes", "run": "r7"})
+    script.run_file(script.script_path("asks"), "asks2")
+    assert runtime.firmware_rules[-1]["firmware"] == "alpha-sx1262_latest"
+    assert runtime.inputs == {"firmware": "alpha-sx1262_latest", "count": 3, "loud": True,
+                              "run": "r7"}
+    assert isinstance(runtime.inputs["firmware"], library.Firmware)
+    runtime.given["count"] = "many"
+    with pytest.raises(library.ScriptError, match="input count is a int"):
+        script.run_file(script.script_path("asks"), "asks3")
+    (scripts_dir / "bad.py").write_text("from sim_mesh import *\nscript_input('x', type=list)\n")
+    assert "type is one of" in script.describe(script.script_path("bad"), "bad")["error"]
+    (scripts_dir / "worse.py").write_text("from sim_mesh import *\nscript_input('x', default=X)\n")
+    assert "literals" in script.describe(script.script_path("worse"), "worse")["error"]
 
 
 # ---- selections ------------------------------------------------------------------
 
 FACTS = {
     "gw": {"id": 1, "tags": ["lora", "tcp-peer"], "role": "transport", "height_m": 30,
-           "firmware": "reticulous_dev_latest", "kind": "reticulous"},
+           "firmware": "alpha_latest", "base": "alpha", "category": "reticulum"},
     "n2": {"id": 2, "tags": ["lora"], "role": "client", "height_m": 2,
-           "firmware": "reticulous_dev_latest", "kind": "reticulous"},
-    "sg": {"id": 3, "tags": ["sergeyculum"], "role": "client", "height_m": 2,
-           "firmware": "sergeyculum_local_latest", "kind": "sergeyculum"},
+           "firmware": "alpha_latest", "base": "alpha", "category": "reticulum"},
+    "sg": {"id": 3, "tags": ["beta"], "role": "client", "height_m": 2,
+           "firmware": "beta_latest", "base": "beta", "category": "meshcore"},
 }
 
 
 def test_a_selection_is_set_algebra_over_the_nodes_facts():
-    from sim_mesh import nodes
+    from sim_mesh import node, nodes
     from sim_mesh.select import Nodes, which
 
     assert nodes().pick(FACTS) == ["gw", "n2", "sg"]
+    assert node("n2").pick(FACTS) == ["n2"] and repr(node("n2")) == "node('n2')"
+    # Combined, a script's selection keeps what can be done to it.
+    assert type(nodes(tag="lora") - node("gw")) is library.Nodes
+    assert hasattr(~nodes(), "reticulum") and hasattr(nodes() & "gw", "radio")
     assert nodes(tag="lora").pick(FACTS) == ["gw", "n2"]
     assert nodes(tag="lora", role="transport").pick(FACTS) == ["gw"]
-    assert nodes(tag=("tcp-peer", "sergeyculum")).pick(FACTS) == ["gw", "sg"]
-    assert (nodes(tag="lora") | nodes(kind="sergeyculum")).pick(FACTS) == ["gw", "n2", "sg"]
+    assert nodes(tag=("tcp-peer", "beta")).pick(FACTS) == ["gw", "sg"]
+    assert (nodes(tag="lora") | nodes(base="beta")).pick(FACTS) == ["gw", "n2", "sg"]
     assert (nodes(tag="lora") - nodes(role="client")).pick(FACTS) == ["gw"]
-    assert (~nodes(kind="reticulous")).pick(FACTS) == ["sg"]
+    assert (~nodes(category="reticulum")).pick(FACTS) == ["sg"]
     assert (nodes(tag="lora") ^ nodes(role="client")).pick(FACTS) == ["gw", "sg"]
     assert nodes(height_m=lambda h: h > 20).pick(FACTS) == ["gw"]
     assert which("all").pick(FACTS) == ["gw", "n2", "sg"]
@@ -300,3 +320,29 @@ def test_a_selection_is_set_algebra_over_the_nodes_facts():
     with pytest.raises(TypeError, match="no field"):
         nodes(colour="red")
     assert library.lines_of(["a", "b\nc"]) == ["a", "b", "c"]
+
+
+def test_sim_run_says_the_page_for_what_a_script_lacks(scripts_dir, runtime, monkeypatch,
+                                                       capsys):
+    from sim_mesh import runner
+
+    (scripts_dir / "asks.py").write_text(
+        "from sim_mesh import *\n"
+        "fw = script_input('firmware', type=Firmware)\n"
+        "n = script_input('n', type=int, default=2)\n"
+        "nodes().firmware(fw)\n")
+    monkeypatch.setenv(runner.SAY_PAGES, "1")
+    assert runner.main(["asks", "--geodata", "g", "--nodeset", "a", "--nodeset", "b"]) == 2
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "page: http://localhost:8800/?script=asks&geodata=g&nodeset=a&nodeset=b"
+    assert out[1] == "asks needs input firmware: choose it on the Scripts tab"
+    # Given its input but no simulation: the page carries what was given.
+    assert runner.main(["asks", "--set", "firmware=x_latest"]) == 2
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "page: http://localhost:8800/?script=asks&set.firmware=x_latest"
+    assert "needs a simulation" in out[1]
+    # Without `sim run`, nothing is said of pages: what it lacks is an error.
+    monkeypatch.delenv(runner.SAY_PAGES)
+    runtime.given.clear()
+    assert runner.main(["asks", "--sim", "s"]) == 2
+    assert capsys.readouterr().out == "! asks needs input firmware\n"
