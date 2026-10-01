@@ -55,6 +55,7 @@ text is shown as it is.
 
 import asyncio
 import contextlib
+import os
 
 import boards as _boards
 import rpc as _rpc
@@ -83,12 +84,14 @@ def chip_dbm(board, connector_dbm):
     return _boards.chip_dbm(board, connector_dbm)
 
 
-async def run_tool(argv, timeout):
-    """A helper program run to completion: (exit code, all it printed)."""
+async def run_tool(argv, timeout, env=None):
+    """A helper program run to completion: (exit code, all it printed).
+    `env` adds to sim-mesh's environment."""
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=dict(os.environ, **env) if env else None)
     except OSError as err:
         raise CommandError("%s: %s" % (argv[0], err)) from err
     try:
@@ -217,6 +220,32 @@ class Driver:
     async def pause(self, station, seconds):
         """Wait on the run's clock: T in a virtual-time run."""
         await station.sleep(seconds)
+
+    async def joined(self, station, timeout):
+        """True once the station has joined the ether, at the T of its hello,
+        so what the driver does next it does at that T; False when it has not
+        in `timeout` seconds. True at once in a real-time run."""
+        if station.clock is None:
+            return True
+        try:
+            await asyncio.wait_for(asyncio.shield(station.clock.joined(station.node_id)),
+                                   timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    @contextlib.contextmanager
+    def tool_turn(self, station):
+        """Around a tool run against the station's host door on the wall
+        clock: in a virtual-time run T stands while the tool has the floor and
+        runs while the station works on what it read, so each line is read and
+        answered at a T the run decides."""
+        end = station.clock.tool_session(station.node_id) if station.clock is not None else None
+        try:
+            yield
+        finally:
+            if end is not None:
+                end()
 
     async def rpc_query(self, station, line, timeout=None):
         """One framed-RPC query on the station's console: what it answered."""
