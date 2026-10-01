@@ -209,7 +209,7 @@ A real-time run:
 ```
 station → ether   hello {sid, slots}
 ether → station   welcome {t, mode: "real", rate: 1, epoch, seed}
-station → ether   state {slot, mode, freq, bw, sf, sync}          on every mode or carrier change
+station → ether   state {slot, mode, mod, freq, bw, sf, sync}     on every mode or carrier change
 station → ether   tx {slot, id, t0, t_pre, t_hdr, t_end, …, payload}
 ether → station   rx_begin {slot, id, t0, t_pre, t_hdr, t_end, level[, cad]}   each receiver it reaches
 ether → station   rx_end {slot, id, verdict, payload, rssi, snr}         at the frame's end
@@ -257,12 +257,17 @@ learns where it is.
 | Message | Says |
 |---|---|
 | `hello` | this station exists, and which radio slots it has; `"lines": 1`, it takes several messages to a datagram |
-| `state` | a slot's mode and carrier — the ether matches on these |
-| `tx` | a transmission: its carrier, its power, its three instants, and its payload |
+| `state` | a slot's mode, modulation and carrier — the ether matches on these |
+| `tx` | a transmission: its modulation, carrier and power, its three instants, and its payload |
 | `idle` | virtual time: the station has done everything the message numbered `seq` gave it to do, and next needs to run at T `until` (`null`: not on its own) |
 | `read` | virtual time: bytes it took in from outside the air — `"ch": "tty", "total": N`, its console, a running total; `"ch": "tcp/A>B", "n": N`, a TCP connection from another station |
 | `wrote` | virtual time: `"ch": "tcp/A>B", "n": N`, bytes it is about to write to another station; with `"go": k`, sent from the writing thread's own socket, which waits for the `go` |
 | `listen` | virtual time: `"at": "addr:port"`, a TCP endpoint it listens on, whose connections are its own |
+
+`mod` is the modulation a `state` or a `tx` is in, and a receiver hears only
+a frame in its own. The ether models `lora` (with `bw`, `sf`, `cr`, `sync`,
+`hdr`, `crc` and `pre`); a `state` or `tx` naming another is refused and
+logged, since nothing here knows what it would take to hear it.
 
 **Ether → station**
 

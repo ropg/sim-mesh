@@ -63,7 +63,7 @@ def expected_snr(level):
 
 def radio(mode="RX", **over):
     """The radio fields shared by a state and a transmission."""
-    fields = {"mode": mode, "ready_at": 0, "freq": FREQ, "bw": BW, "sf": SF,
+    fields = {"mode": mode, "ready_at": 0, "mod": "lora", "freq": FREQ, "bw": BW, "sf": SF,
               "cr": 5, "sync": SYNC, "hdr": "explicit", "crc": True, "pre": 8}
     fields.update(over)
     return fields
@@ -448,6 +448,19 @@ def test_wrong_sync_word_is_not_decoded(ether):
 
     sender.tx(12)
     receiver.expect_nothing()
+
+
+def test_a_modulation_the_ether_does_not_model_is_refused(ether):
+    """A frame or a state saying a modulation other than LoRa reaches nobody."""
+    ether.link(1, 2, NEAR_DB)
+    sender, receiver = ether(1), ether(2)
+    sender.hello()
+    listen(receiver)
+
+    sender.tx(13, mod="flrc")
+    receiver.expect_nothing()
+    sender.tx(14)
+    assert receiver.expect("rx_begin")
 
 
 def test_a_carrier_a_few_register_steps_off_is_the_same_carrier(ether):

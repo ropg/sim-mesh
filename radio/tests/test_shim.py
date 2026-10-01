@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from test_model import BUILD, RADIO, load_library
+from test_model import BUILD, LIBRARY, RADIO, load_library
 
 SHIM = os.path.join(BUILD, "libsimclock.so")
 STANDIN = os.path.join(BUILD, "standin")
@@ -32,11 +32,13 @@ def build_standin():
     src = os.path.join(RADIO, "tests", "standin.c")
     if (not os.path.exists(STANDIN)
             or os.path.getmtime(STANDIN) < os.path.getmtime(src)
-            or os.path.getmtime(STANDIN) < os.path.getmtime(os.path.join(BUILD, "libsimradio.a"))):
+            or os.path.getmtime(STANDIN) < os.path.getmtime(LIBRARY)):
+        # Linked as a firmware is: against the radio's shared library, which
+        # the process finds at run time.
         cc = shutil.which("gcc") or pytest.fail("no gcc to build the stand-in")
         subprocess.run([cc, "-O1", "-I", os.path.join(RADIO, "include"), src,
-                        os.path.join(BUILD, "libsimradio.a"), "-lstdc++", "-lm", "-lpthread",
-                        "-o", STANDIN], check=True)
+                        "-L", BUILD, "-lsimradio-sx1262", "-Wl,-rpath," + BUILD,
+                        "-lpthread", "-o", STANDIN], check=True)
 
 
 class Station:

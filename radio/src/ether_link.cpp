@@ -78,7 +78,7 @@ void sendIdle(uint64_t seq, int64_t until)
 void appendState(char* p, size_t cap, size_t* at, const EtherState& s)
 {
     *at += (size_t)snprintf(p + *at, cap - *at,
-        "\"slot\":%d,\"freq\":%u,\"bw\":%u,\"sf\":%d,\"cr\":%d,\"sync\":%d,"
+        "\"slot\":%d,\"mod\":\"lora\",\"freq\":%u,\"bw\":%u,\"sf\":%d,\"cr\":%d,\"sync\":%d,"
         "\"hdr\":\"%s\",\"crc\":%s,\"pre\":%d",
         s.slot, (unsigned)s.freqHz, (unsigned)s.bwHz, s.sf, s.cr, s.syncWord,
         s.hdrImplicit ? "implicit" : "explicit", s.crc ? "true" : "false", s.preamble);

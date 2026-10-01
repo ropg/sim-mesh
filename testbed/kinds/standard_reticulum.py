@@ -45,7 +45,8 @@ import stations as stations_module
 from . import HERE, CommandError, Kind
 
 COMPANION = 1_000_000       # station.py's ether id, above the node's
-SIMRADIO = os.path.normpath(os.path.join(HERE, "..", "..", "radio", "build", "libsimradio.so"))
+SIMRADIO = os.path.normpath(os.path.join(HERE, "..", "..", "radio", "build",
+                                         "libsimradio-sx1262.so"))
 DELIVERY = re.compile(r"^lxmf\.delivery\s*:\s*([0-9a-f]{32})", re.MULTILINE)
 TRANSPORT = re.compile(r"^transport:\s*(on|off)\s*$", re.MULTILINE)
 # The radio's figures as station.py's settings, and the scale from the nodeset's units.

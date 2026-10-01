@@ -525,3 +525,19 @@ extern "C" int simradio_wake_create(void (*due)(void*), void* arg) { return cond
 extern "C" void simradio_wake_at(int wake, int64_t node_us) { conductor::wakeAt(wake, node_us); }
 extern "C" void simradio_idle(void) { conductor::idle(); }
 extern "C" void simradio_on_advance(void (*moved)(void)) { conductor::onAdvance(moved); }
+extern "C" int simradio_joined(void) { return conductor::joined() ? 1 : 0; }
+extern "C" int64_t simradio_node_at_join(void) { return conductor::nodeAtJoin(); }
+
+/* The host's services, once it has handed them over; the library's own until then. */
+static std::atomic<const struct simradio_services*> s_host{nullptr};
+
+extern "C" void simradio_set_services(const struct simradio_services* services)
+{
+    s_host.store(services);
+}
+
+extern "C" const struct simradio_services* simradio_services(void)
+{
+    const struct simradio_services* host = s_host.load();
+    return host ? host : simradio_posix_services();
+}

@@ -1,6 +1,6 @@
 """The library's clock in a virtual-time run, driven by a fake conductor.
 
-Each test loads its own copy of libsimradio.so with SIM_MESH_TIME=virtual in
+Each test loads its own copy of libsimradio-sx1262.so with SIM_MESH_TIME=virtual in
 the environment (the mode, and the clock profile, are read once per copy),
 plays the ether on a UDP socket, and stands in for the host by calling
 simradio_idle itself. Nothing moves until the fake conductor says so.
