@@ -37,6 +37,10 @@
 #                                      (-f: none); a paused run's or a snapshot's is kept
 #     sim firmware prebuilt            what sim-mesh.net offers for this machine
 #     sim firmware resolve NAME        what a firmware name runs, as JSON
+#     sim install [--dry-run]          on Linux, what SIM_MESH_NATIVE=1 needs, as sim-mesh's
+#                                      image holds it: the system's packages (sudo), Node
+#                                      22 where the system's is older, and Rust; then
+#                                      the build
 #
 # The simulation verbs (new, stop, pause, resume, list, plan, run) take --port, the front's
 # (default 8800).
@@ -64,7 +68,9 @@
 #                          installed, else docker)
 #     SIM_MESH_NATIVE=1    no container: run on this machine, Linux only
 #     SIM_MESH_PYTHON      natively, the python3 to run (default: the first of
-#                          python3, /usr/bin/python3 that has aiohttp and yaml)
+#                          python3, /usr/bin/python3 that has aiohttp and yaml);
+#                          with a .venv beside this script (sim install), its
+#                          python3 is first, for sim-mesh and every station it starts
 #     SIM_MESH_FIRMWARE_INDEX
 #                          where pre-built firmware is listed
 #                          (default https://sim-mesh.net/firmware/)
@@ -72,6 +78,9 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# The environment `sim install` makes: first on the path, so the front, the
+# tools and a station that is a Python program all find what it holds.
+if [ -x "$ROOT/.venv/bin/python3" ]; then PATH="$ROOT/.venv/bin:$PATH"; fi
 PORT=8800
 URL="http://localhost:$PORT/"
 DEV_PORT=9000                       # `sim dev`: the page's development server, inside only
@@ -155,13 +164,19 @@ in_container() {
     fi
     local outer
     outer=$(cd "$ROOT/.." && pwd)
+    # A station binds its web UI's port 80 and 443 as the caller's user: the
+    # container lets any user take a port under 1024, as Docker's do by
+    # default and Podman's do not.
     local args=(run --rm --init
+                --sysctl net.ipv4.ip_unprivileged_port_start=0
                 -v "$outer:$outer" -w "$ROOT"
                 -v sim-mesh-home:/home/sim-mesh -e HOME=/home/sim-mesh
                 -e SIM_MESH_IN_CONTAINER=1)
     # What it writes in the mounted tree is the host user's: Docker runs as
-    # that uid; rootless Podman maps it so.
-    if [ "$e" = podman ]; then args+=(--userns=keep-id); else args+=(--user "$(id -u):$(id -g)"); fi
+    # that uid; rootless Podman maps it so, and root's Podman is root already.
+    if [ "$e" != podman ]; then args+=(--user "$(id -u):$(id -g)")
+    elif [ "$(id -u)" != 0 ]; then args+=(--userns=keep-id)
+    fi
     [ -z "${SIM_MESH_FIRMWARE_INDEX:-}" ] \
         || args+=(-e "SIM_MESH_FIRMWARE_INDEX=$SIM_MESH_FIRMWARE_INDEX")
     if [ "$mode" = tools ]; then
@@ -189,7 +204,7 @@ in_container() {
             open_when_up "$URL"
         fi
     fi
-    "$e" "${args[@]}" "$image" ./sim "$@"
+    "$e" "${args[@]}" "$image" "$ROOT/sim" "$@"
 }
 
 # in_front VERB…: a simulation verb inside the running front's container,
@@ -208,7 +223,9 @@ in_front() {
     [ -t 0 ] && [ -t 1 ] && args+=(-t)
     # An empty array is unbound to bash before 4.4 (a Mac's), hence the guard.
     for kv in ${EXEC_ENV[@]+"${EXEC_ENV[@]}"}; do args+=(-e "$kv"); done
-    "$e" "${args[@]}" "$FRONT_CONTAINER" ./sim "$@"
+    # This script by its own path, which the container has as well: the
+    # shell's directory need not be the one it is in.
+    "$e" "${args[@]}" "$FRONT_CONTAINER" "$ROOT/sim" "$@"
 }
 
 # ensure_front: a front answering on the port, started in the background when
@@ -490,12 +507,112 @@ run_script() {
     return "$status"
 }
 
+# ---- installing on Linux --------------------------------------------------------
+# What SIM_MESH_NATIVE=1 needs on a fresh Linux, as sim-mesh's image holds it
+# (Dockerfile): the system's packages through its package manager, with sudo;
+# where the system's Node is older than the page's Vite and Quasar take,
+# NodeSource's on Debian and Ubuntu (which ship 18) and Fedora's own later one
+# on Fedora (which defaults to 22.21); Rust through rustup, in the user's home;
+# and a Python environment beside this script, .venv, over the system's own
+# packages, where a Node the system names by its major gets its plain name.
+# Then the build. A step whose result is already there is left out, so running
+# it again costs nothing. apt (Debian, Ubuntu) and dnf (Fedora); elsewhere it
+# says what to install. The lists are the Dockerfile's (testbed/test_install.py
+# keeps them so).
+
+APT_PACKAGES=(ca-certificates curl gnupg git python3 python3-aiohttp python3-yaml
+              python3-pytest python3-venv build-essential cmake pkg-config
+              libstdc++6 procps)
+DNF_PACKAGES=(ca-certificates curl git python3 python3-aiohttp python3-pyyaml python3-pytest
+              gcc gcc-c++ make cmake pkgconf-pkg-config libstdc++ procps-ng)
+NODE_MAJOR=22                       # NodeSource's, as the image's
+NODE_FEDORA=24                      # Fedora's own, beside its default
+
+# Whether the node on the path is one the page builds with: 22.22 or later.
+# Quasar's app-vite refuses anything older when it starts
+# (lib/node-version-check.js), whatever its package.json says; Fedora 41 ships
+# 22.21.
+node_fits() {
+    command -v node >/dev/null && node -e '
+        const [a, b] = process.versions.node.split(".").map(Number);
+        process.exit((a === 22 && b >= 22) || a > 22 ? 0 : 1)' 2>/dev/null
+}
+
+cmd_install() {
+    local dry=0
+    case "${1:-}" in
+        "") ;;
+        --dry-run) dry=1 ;;
+        *) die "install: the one option is --dry-run" ;;
+    esac
+    [ "$(uname -s)" = Linux ] || die "install: Linux only; anywhere else sim-mesh runs in its image"
+    local sudo=()
+    [ "$(id -u)" = 0 ] || sudo=(sudo)
+    step() { say "$*"; [ "$dry" = 1 ] || "$@"; }
+    local manager
+    if command -v apt-get >/dev/null; then manager=apt
+    elif command -v dnf >/dev/null; then manager=dnf
+    else die "install: neither apt-get nor dnf here; install by hand what the Dockerfile holds"
+    fi
+    if [ "$manager" = apt ]; then
+        step "${sudo[@]}" apt-get update
+        step "${sudo[@]}" env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
+    else
+        step "${sudo[@]}" dnf install -y "${DNF_PACKAGES[@]}"
+    fi
+    # The environment first: it is also where a Node the system names by its
+    # major is given its plain name.
+    if [ ! -x "$ROOT/.venv/bin/python3" ]; then
+        step python3 -m venv --system-site-packages "$ROOT/.venv"
+    fi
+    PATH="$ROOT/.venv/bin:$PATH"
+    if ! node_fits; then
+        if [ "$manager" = apt ]; then
+            say "Node $NODE_MAJOR from NodeSource: the system's is older than the page takes"
+            if [ "$dry" = 0 ]; then
+                "${sudo[@]}" mkdir -p /etc/apt/keyrings
+                curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+                    | "${sudo[@]}" gpg --batch --yes --dearmor -o /etc/apt/keyrings/nodesource.gpg
+                echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" \
+                    | "${sudo[@]}" tee /etc/apt/sources.list.d/nodesource.list >/dev/null
+            fi
+            step "${sudo[@]}" apt-get update
+            step "${sudo[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+        else
+            # Fedora ships a Node newer than its default under the major's
+            # name (nodejs24: node-24, npm-24), beside the default, which
+            # stays as it is: the plain names go into the environment.
+            say "Node $NODE_FEDORA, Fedora's own: its default is older than the page takes"
+            step "${sudo[@]}" dnf install -y "nodejs$NODE_FEDORA" "nodejs$NODE_FEDORA-npm"
+            local tool
+            for tool in node npm npx; do
+                step ln -sf "/usr/bin/$tool-$NODE_FEDORA" "$ROOT/.venv/bin/$tool"
+            done
+        fi
+    fi
+    [ "$dry" = 1 ] || node_fits || die "install: node $(node --version 2>/dev/null) is still older than the page takes"
+    if ! command -v cargo >/dev/null && [ -x "$HOME/.cargo/bin/cargo" ]; then PATH="$HOME/.cargo/bin:$PATH"; fi
+    if ! command -v cargo >/dev/null; then
+        say "Rust through rustup, into $HOME/.cargo"
+        if [ "$dry" = 0 ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            PATH="$HOME/.cargo/bin:$PATH"
+        fi
+    fi
+    if command -v rustup >/dev/null; then step rustup target add wasm32-unknown-unknown; fi
+    [ "$dry" = 1 ] && return 0
+    build_stale
+    say "installed: start it with SIM_MESH_NATIVE=1 $0"
+}
+
 # ---- dispatch -------------------------------------------------------------------
 
 EXEC_ENV=()
 verb=${1:-}
 case "$verb" in
     -h|--help|help) usage; exit 0 ;;
+    install) shift; cmd_install "$@"; exit $? ;;
     ""|front|dev|-*|firmware|new|stop|pause|resume|list|plan|run) ;;
     *) die "no verb '$verb' (sim help lists them)" ;;
 esac

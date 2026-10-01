@@ -63,6 +63,15 @@ machine instead, for working on sim-mesh itself on Linux: that needs
 `python3` with `aiohttp` and `pyyaml`, `node` and `npm`, `cmake` with a C
 and C++ compiler, and `cargo` for real ground and the ether's conductor.
 
+On a fresh Debian, Ubuntu or Fedora, `sim-mesh/sim install` puts that in
+place as the image holds it: the system's packages through apt or dnf (with
+sudo); a Node the page's build takes (22.22 or later) where the system's is
+older, NodeSource's 22 on Debian and Ubuntu, which ship 18, and on Fedora,
+whose default is 22.21, its own nodejs24, given its plain names in a Python
+environment beside the clone, `sim-mesh/.venv`, which `sim` puts first on
+the path; and Rust through rustup. A step whose result is there already is
+left out; `--dry-run` says what it would do.
+
 **1. Clone it.** The directory you clone into is the one `sim` mounts
 into its image, so a firmware tree put beside sim-mesh later can build
 against its radio:

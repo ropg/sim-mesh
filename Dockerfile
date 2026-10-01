@@ -18,7 +18,9 @@
 #   - cargo via rustup, with the wasm32 target (the planner, the ether's
 #     conductor)
 #   - the station runtime the contract promises: libc, libstdc++
-FROM ubuntu:24.04
+# By its full name: podman will not guess a registry for a short one without a
+# terminal to ask on, and Docker reads it the same.
+FROM docker.io/library/ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
