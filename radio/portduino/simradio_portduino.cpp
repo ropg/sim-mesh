@@ -9,12 +9,15 @@
  *   native_radio_backend_init()   once, before its SPI.begin() and before it
  *                                 touches the radio's pins
  *   rnode_idle(max_ms)            where it has nothing to do for up to max_ms
+ *   rnode_wake()                  from any thread with work for the loop (input
+ *                                 arrived): ends the idle now, or the next one
  *
  * The init opens the station's link to the ether and chip slot 0, installs an
  * SPIChip into the global SPI that hands each transfer to the chip whole, and
  * binds the chip's pins with gpioBind: NSS (nothing to do, every transfer is
  * already one frame), RESET (its rising edge resets the chip), BUSY and DIO1
- * (the levels the chip drives). Binding a pin also turns off Portduino's
+ * (the levels the chip drives; a rise of DIO1 is never lost between two of
+ * Portduino's reads of it). Binding a pin also turns off Portduino's
  * 100 ms sleep between loop() calls, so the firmware's own idle is the only
  * wait in its loop.
  *
@@ -42,13 +45,16 @@
 #include <sys/time.h>
 #include <vector>
 
+void rnode_wake();
+
 namespace {
 
 simradio_t* s_chip;
 
 pthread_mutex_t s_mu = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  s_cv = PTHREAD_COND_INITIALIZER;   /* on the wall clock, as the shim reads it */
-bool s_rose;                    /* DIO1 has risen since the last idle returned */
+bool s_rose;                    /* DIO1 has risen, or a wake was asked, since the last idle returned */
+unsigned s_rises;               /* DIO1's rising edges, ever */
 volatile int s_dio1;
 volatile int s_busy;
 
@@ -63,6 +69,7 @@ void onPin(void*, int pin, int level)
     pthread_mutex_lock(&s_mu);
     if (level && !s_dio1) {
         s_rose = true;
+        s_rises++;
         pthread_cond_signal(&s_cv);
     }
     s_dio1 = level;
@@ -137,6 +144,41 @@ private:
     volatile int* level_;
 };
 
+/* DIO1, whose edges Portduino finds by reading the level once a loop
+ * (gpioIdle): a firmware that idles between loops can miss the line going
+ * low and high again, and its interrupt with it. A rise since the last read
+ * is reported as an edge: from a read that saw it high, the line reads low
+ * once and the idle is ended, so the next loop's read sees it rise. */
+class Dio1Pin : public GPIOPin {
+public:
+    Dio1Pin(pin_size_t n) : GPIOPin(n, "DIO1") { setSilent(); }
+
+protected:
+    PinStatus readPinHardware() override
+    {
+        pthread_mutex_lock(&s_mu);
+        unsigned rises = s_rises;
+        int level = s_dio1;
+        pthread_mutex_unlock(&s_mu);
+        if (rises != seen_) {
+            if (last_ == HIGH) {
+                last_ = LOW;
+                rnode_wake();
+                return LOW;
+            }
+            seen_ = rises;
+            last_ = HIGH;
+            return HIGH;
+        }
+        last_ = level ? HIGH : LOW;
+        return last_;
+    }
+
+private:
+    unsigned seen_ = 0;
+    PinStatus last_ = LOW;
+};
+
 }  // namespace
 
 void native_radio_backend_init()
@@ -161,7 +203,15 @@ void native_radio_backend_init()
     gpioBind(new NssPin(envInt("SIMRADIO_PIN_NSS", 1)));
     gpioBind(new ResetPin(envInt("SIMRADIO_PIN_RESET", 2)));
     gpioBind(new LevelPin(envInt("SIMRADIO_PIN_BUSY", 3), "BUSY", &s_busy));
-    gpioBind(new LevelPin(envInt("SIMRADIO_PIN_DIO1", 4), "DIO1", &s_dio1));
+    gpioBind(new Dio1Pin(envInt("SIMRADIO_PIN_DIO1", 4)));
+}
+
+void rnode_wake()
+{
+    pthread_mutex_lock(&s_mu);
+    s_rose = true;
+    pthread_cond_signal(&s_cv);
+    pthread_mutex_unlock(&s_mu);
 }
 
 void rnode_idle(uint32_t max_ms)

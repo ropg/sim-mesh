@@ -10,12 +10,12 @@ whole.
 firmware ── SPI.transfer(frame) ─────► SimChip ── simradio_transfer ──► chip model
 firmware ── digitalWrite(RESET) ─────► ResetPin: rising edge ── simradio_reset
 firmware ◄── digitalRead(BUSY/DIO1) ── LevelPin ◄── on_pin ── chip model
-firmware ── rnode_idle(max_ms) ──────► wait until max_ms or DIO1 rises (node time)
+firmware ── rnode_idle(max_ms) ──────► wait until max_ms, DIO1 rises or rnode_wake() (node time)
 ```
 
 ## What a firmware calls
 
-Two functions, each a weak function of the firmware's own whose strong
+Three functions, each a weak function of the firmware's own whose strong
 definition is here:
 
 - `void native_radio_backend_init()`, once, after the firmware knows its
@@ -28,6 +28,9 @@ definition is here:
   DIO1 rises; in a virtual-time run the time shim answers the wait in node
   time, and Portduino's next `gpioIdle()` runs the DIO1 interrupt handler.
   `max_ms == 0` returns at once.
+- `void rnode_wake()`, from any thread that has work for the firmware's loop
+  (a reader thread that took console input, say): the idle in progress
+  returns at once, or the next one does.
 
 The firmware must hand every SPI transaction to `SPI.transfer` as one frame,
 NSS low to NSS high, which is what a driver written for spidev already does.
@@ -40,6 +43,13 @@ The chip's four lines are bound at `SIMRADIO_PIN_NSS`, `SIMRADIO_PIN_RESET`,
 `SIMRADIO_PIN_BUSY` and `SIMRADIO_PIN_DIO1` (1, 2, 3 and 4 when unset), which
 must be the pins the firmware drives the chip on. NSS does nothing, since
 each frame is already one transfer.
+
+Portduino finds an interrupt's edge by reading the pin once a loop, so a
+firmware that idles between loops could miss DIO1 going low and high again
+(one reception cleared, the next arrived) and with it the interrupt. DIO1
+never loses a rise: when the line rose since Portduino's last read and that
+read saw it high, it reads low once and the idle in progress ends, so the
+next loop's read sees it rise.
 
 ## Building with it
 
