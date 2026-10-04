@@ -46,7 +46,7 @@ def standin(tmp_path, name):
 
 def launch(args, bin_dir, cwd, **env):
     environ = dict(os.environ, PATH=str(bin_dir))
-    for key in ("SIM_MESH_ENGINE", "SIM_MESH_NATIVE", "SIM_MESH_IN_CONTAINER"):
+    for key in ("SIM_MESH_ENGINE", "SIM_MESH_NATIVE", "SIM_MESH_IN_CONTAINER", "SIM_MESH_FRONT"):
         environ.pop(key, None)
     environ.update(env)
     return subprocess.run([LAUNCHER, *args], cwd=cwd, env=environ, capture_output=True,
@@ -101,3 +101,34 @@ def test_with_neither_engine_it_says_so(tmp_path):
     (bin_dir / "unused").unlink()
     done = launch(["firmware", "list"], bin_dir, tmp_path)
     assert done.returncode != 0 and "neither podman nor docker" in done.stderr
+
+
+def test_a_front_elsewhere_starts_nothing_here_and_needs_no_engine(tmp_path):
+    bin_dir, log = standin(tmp_path, "podman")
+    done = launch([], bin_dir, tmp_path, SIM_MESH_FRONT="127.0.0.1:1")
+    assert done.returncode != 0 and "start it there" in done.stderr
+    done = launch(["new", "x", "--geodata", "g", "--nodeset", "n"], bin_dir, tmp_path,
+                  SIM_MESH_FRONT="127.0.0.1:1")
+    assert done.returncode != 0 and "nothing answers at 127.0.0.1:1" in done.stderr
+    assert not log.exists()
+
+
+def test_a_front_elsewhere_is_host_and_port(tmp_path):
+    bin_dir, log = standin(tmp_path, "podman")
+    done = launch(["list"], bin_dir, tmp_path, SIM_MESH_FRONT="nowhere")
+    assert done.returncode != 0 and "host:port" in done.stderr
+    assert not log.exists()
+
+
+def test_the_library_finds_the_front_where_it_is_said_to_be():
+    from sim_mesh import sim
+    assert sim.front_address({}) == ("127.0.0.1", 8800)
+    assert sim.front_address({"SIM_MESH_PORT": "8801"}) == ("127.0.0.1", 8801)
+    assert sim.front_address({"SIM_MESH_FRONT": "host.docker.internal:8802",
+                              "SIM_MESH_PORT": "8801"}) == ("host.docker.internal", 8802)
+    try:
+        sim.front_address({"SIM_MESH_FRONT": "nowhere"})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a front without a port was taken")

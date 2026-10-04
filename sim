@@ -90,6 +90,10 @@
 #     SIM_MESH_ENGINE      podman or docker (default: podman when it is
 #                          installed, else docker)
 #     SIM_MESH_NATIVE=1    no container: run on this machine, Linux only
+#     SIM_MESH_FRONT       host:port of a front already running elsewhere (from
+#                          a container: host.docker.internal:8800): no
+#                          container either, the verbs go to that front, and
+#                          none is ever started here
 #     SIM_MESH_PYTHON      natively, the python3 to run (default: the first of
 #                          python3, /usr/bin/python3 that has aiohttp and yaml);
 #                          with a .venv beside this script (sim install), its
@@ -105,6 +109,13 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # tools and a station that is a Python program all find what it holds.
 if [ -x "$ROOT/.venv/bin/python3" ]; then PATH="$ROOT/.venv/bin:$PATH"; fi
 PORT=8800
+FRONT_HOST=127.0.0.1                # where the front answers; the page's URL stays localhost
+if [ -n "${SIM_MESH_FRONT:-}" ]; then
+    [[ $SIM_MESH_FRONT =~ ^([^:]+):([0-9]+)$ ]] \
+        || { printf 'sim: SIM_MESH_FRONT is host:port, not %s\n' "$SIM_MESH_FRONT" >&2; exit 1; }
+    FRONT_HOST=${BASH_REMATCH[1]}
+    PORT=${BASH_REMATCH[2]}
+fi
 URL="http://localhost:$PORT/"
 DEV_PORT=9000                       # `sim dev`: the page's development server, inside only
 PLANNER=$ROOT/planner
@@ -118,7 +129,7 @@ usage() { sed -n '2,/^$/{s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
 # ---- the container ------------------------------------------------------------
 
 want_container() {
-    [ -z "${SIM_MESH_IN_CONTAINER:-}" ] && [ -z "${SIM_MESH_NATIVE:-}" ]
+    [ -z "${SIM_MESH_IN_CONTAINER:-}" ] && [ -z "${SIM_MESH_NATIVE:-}" ] && [ -z "${SIM_MESH_FRONT:-}" ]
 }
 
 # The container engine, in ENGINE: SIM_MESH_ENGINE, else podman when it is
@@ -145,7 +156,7 @@ resolve_engine() {
 # front inside is still building what it serves.
 front_up() {
     (
-        exec 3<>"/dev/tcp/127.0.0.1/${1:-$PORT}" || exit 1
+        exec 3<>"/dev/tcp/$FRONT_HOST/${1:-$PORT}" || exit 1
         printf 'GET /api/sims HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3
         IFS= read -r -t 5 status <&3 || exit 1
         [[ $status == HTTP/1.?\ 200* ]]
@@ -267,6 +278,7 @@ in_front() {
 # none does, building what it needs first (natively), or in its container.
 ensure_front() {
     front_up && return 0
+    [ -z "${SIM_MESH_FRONT:-}" ] || die "nothing answers at $SIM_MESH_FRONT (SIM_MESH_FRONT): start the front there"
     if want_container; then
         say "starting the front in the background ($FRONT_CONTAINER)"
         in_container daemon front >/dev/null
@@ -671,6 +683,12 @@ case "$verb" in
     ""|front|dev|-*|firmware|index|geodata|nodeset|source|new|stop|pause|resume|list|plan|run) ;;
     *) die "no verb '$verb' (sim help lists them)" ;;
 esac
+
+if [ -n "${SIM_MESH_FRONT:-}" ]; then
+    case "$verb" in
+        ""|front|dev|-*) die "SIM_MESH_FRONT says the front runs at $SIM_MESH_FRONT: start it there, not here" ;;
+    esac
+fi
 
 if [ -z "${SIM_MESH_IN_CONTAINER:-}" ]; then
     case "$verb" in
