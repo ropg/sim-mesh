@@ -61,3 +61,13 @@ environment lists this library with a `symlink://` entry in `lib_deps`.
 case-insensitive filesystem, where its `String.h` would otherwise answer
 `#include <string.h>`. This library is linked as objects, not as an archive,
 so its strong definitions win over the firmware's weak ones.
+
+**The other architecture.** Pre-built firmware comes for aarch64 and x86_64,
+so a firmware builds both, the one that is not the machine's with that
+architecture's cross g++ (`<arch>-linux-gnu-g++`) and its libc from the
+multiarch packages. `SIM_MESH_ARCH=<arch>` in the build's environment names
+it; `cross.py`, as a `post:` extra script, swaps the cross tools into the
+program's, the sources' and every library's environment, and `link.py`
+compiles the radio with them into `radio/build.linux-<arch>/` and links that
+copy instead. Each architecture wants a build directory of its own
+(`PLATFORMIO_BUILD_DIR`).

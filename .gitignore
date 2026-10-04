@@ -11,6 +11,7 @@ testbed/ui/dist/
 testbed/ui/node_modules/
 testbed/ui/.quasar/
 radio/build/
+radio/build.linux-*/
 ether/build/
 planner/target/
 /firmware/
