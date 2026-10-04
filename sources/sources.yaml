@@ -192,3 +192,92 @@ europe:
           value: Einwohner
           crs: EPSG:3035
           cell_m: 100
+
+  NL:
+    name: Netherlands
+    sources:
+      - id: ahn-dtm
+        title: AHN DTM 0.5 m terrain
+        holds: >-
+          The Netherlands' terrain model from lidar (AHN): the bare ground's
+          height at 0.5 m, as cloud-optimised GeoTIFF sheets of 5 × 6.25 km.
+          A build reads only its rectangle, at a quarter of a cell.
+        licence: CC0 1.0
+        notice: "AHN (Actueel Hoogtebestand Nederland), Rijkswaterstaat via PDOK — CC0 1.0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 0.5
+        coverage: outline
+        find:
+          method: index
+          index: "https://service.pdok.nl/rws/ahn/atom/downloads/dtm_05m/kaartbladindex.json"
+          index_format: geojson
+          crs: EPSG:28992
+          url_property: url
+          refresh_days: 30
+        read: window
+        format: { type: geotiff, band: 1, crs: EPSG:28992 }
+
+      - id: ahn-dsm
+        title: AHN DSM 0.5 m surface
+        holds: >-
+          The Netherlands' surface model from lidar (AHN): the height of
+          whatever is on top, roofs and tree crowns, at 0.5 m, as
+          cloud-optimised GeoTIFF sheets of 5 × 6.25 km. A build reads only its
+          rectangle, at a quarter of a cell.
+        licence: CC0 1.0
+        notice: "AHN (Actueel Hoogtebestand Nederland), Rijkswaterstaat via PDOK — CC0 1.0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 0.5
+        coverage: outline
+        find:
+          method: index
+          index: "https://service.pdok.nl/rws/ahn/atom/downloads/dsm_05m/kaartbladindex.json"
+          index_format: geojson
+          crs: EPSG:28992
+          url_property: url
+          refresh_days: 30
+        read: window
+        format: { type: geotiff, band: 1, crs: EPSG:28992 }
+
+      - id: 3dbag
+        title: 3DBAG building models
+        holds: >-
+          Every building in the Netherlands in 3D (3DBAG, LoD 2.2), as CityJSON
+          tiles: each building's footprint, its ground height and its roof
+          heights, from the BAG register and AHN lidar.
+        licence: CC BY 4.0
+        notice: "3DBAG by the 3D geoinformation research group (TU Delft) and 3DGI — CC BY 4.0"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: index
+          index: "https://data.3dbag.nl/v20250903/tile_index.fgb"
+          index_format: flatgeobuf
+          crs: EPSG:28992
+          url_property: cj_download
+          sha256_property: cj_sha256
+          refresh_days: 30
+        read: whole
+        format: { type: cityjson, crs: EPSG:7415, ground: b3_h_maaiveld, roof: b3_h_dak_70p }
+
+      - id: cbs-population
+        title: CBS 100 m population grid 2023
+        holds: >-
+          The Netherlands' inhabitants per 100 m square on 1 January 2023
+          (CBS), one GeoPackage for the country; squares with fewer than five
+          inhabitants are withheld.
+        licence: CBS open data, CC BY 4.0
+        notice: "Centraal Bureau voor de Statistiek (CBS), Kaart van 100 meter bij 100 meter met statistieken 2023 — CC BY 4.0"
+        redistributable: true
+        layers: { population: 100 }
+        resolution_m: 100
+        coverage: outline
+        find:
+          method: file
+          url: "https://download.cbs.nl/vierkant/100/2026-cbs_vk100_2023_vol.zip"
+        read: whole
+        format: { type: gpkg-grid, value: aantal_inwoners, crs: EPSG:28992, cell_m: 100,
+                  members: "*.gpkg" }

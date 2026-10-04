@@ -44,8 +44,10 @@ import yaml
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import crs as crs_module  # noqa: E402
 import store  # noqa: E402
 
+KNOWN_CRS = "EPSG:4326, UTM 326zz/327zz/258zz, 3035, 28992, 7415"
 SIM_MESH_ROOT = os.path.dirname(HERE)
 SHIPPED = os.path.join(SIM_MESH_ROOT, "sources", "sources.yaml")
 OWN = os.path.join(store.SIM_DIR, "sources.yaml")
@@ -60,25 +62,34 @@ LAYERS = ("surface", "terrain", "landcover", "buildings", "population", "roads",
 CLUTTER_CLASSES = ("open", "water", "low-vegetation", "forest", "suburban", "urban",
                    "dense-urban", "industrial")
 COVERAGES = ("worldwide", "outline")
-READS = ("whole",)
+READS = ("whole", "window")
 METHODS = {
     # method: (parameters it needs, its addresses, which may each be a list of mirrors)
     "template": (("url", "tile", "crs"), ("url",)),
     "atom": (("feed", "name", "unit_m", "size_m", "crs"), ("feed",)),
+    "index": (("index", "index_format", "crs", "url_property"), ("index",)),
     "regions": (("index", "index_format", "file"), ("index",)),
     "file": (("url",), ("url",)),
 }
-INDEX_FORMATS = ("geofabrik",)
+INDEX_FORMATS = {"regions": ("geofabrik",), "index": ("geojson", "flatgeobuf")}
 CRS_RE = re.compile(r"^EPSG:(\d+)$")
 TILE_FIELD_RE = re.compile(r"\{(ns|ew|lat|lon)(?::0(\d))?\}")
 FORMATS = {
     # format: the layers it can feed
-    "geotiff": ("surface", "terrain", "landcover", "population"),
+    "geotiff": ("surface", "terrain", "landcover"),
     "xyz": ("surface", "terrain"),
     "citygml": ("buildings",),
+    "cityjson": ("buildings",),
     "osm-pbf": ("roads", "places", "buildings"),
     "csv-grid": ("population",),
+    "gpkg-grid": ("population",),
     "itu-p1812-maps": ("radio-climate",),
+}
+# A format's own parameters, each needed.
+FORMAT_NEEDS = {
+    "cityjson": ("crs", "ground", "roof"),
+    "csv-grid": ("delimiter", "x", "y", "value", "crs", "cell_m", "members"),
+    "gpkg-grid": ("value", "crs", "cell_m", "members"),
 }
 # What the compiler's readers assume, which a source's parameters must be
 # until it takes them from the source.
@@ -86,8 +97,6 @@ WORLDCOVER_CLASSES = {10: "forest", 20: "low-vegetation", 30: "low-vegetation", 
                       50: "urban", 60: "open", 70: "open", 80: "water", 90: "low-vegetation",
                       95: "low-vegetation", 100: "open"}
 COMPILER_READS = {
-    "csv-grid": {"delimiter": ";", "x": "x_mp_100m", "y": "y_mp_100m", "value": "Einwohner",
-                 "crs": "EPSG:3035", "cell_m": 100},
     "xyz": {"crs": "EPSG:25833", "spacing_m": 1},
     "citygml": {"lod": 2, "crs": "EPSG:25833"},
     "itu-p1812-maps": {"members": {"delta_n": "DN50.TXT", "n0": "N050.TXT"}},
@@ -225,9 +234,11 @@ def _check(source):
         raise _fault(path, ident, "a worldwide source stands under `global`, and only one does")
     _check_find(source)
     if e.get("read") not in READS:
-        raise _fault(path, ident, "read is %s (a window into a cloud-optimised file is to come)"
-                     % " or ".join(READS))
+        raise _fault(path, ident, "read is %s" % " or ".join(READS))
     _check_format(source)
+    if e["read"] == "window" and (e["format"]["type"] != "geotiff" or e["coverage"] == "worldwide"):
+        raise _fault(path, ident, "a window is read of a regional source's cloud-optimised "
+                                  "GeoTIFFs")
 
 
 def _check_find(source):
@@ -243,8 +254,9 @@ def _check_find(source):
         for url in source.addresses(key):
             if not re.match(r"^https?://", url):
                 raise _fault(path, ident, "find.%s is an http(s) address, not %r" % (key, url))
-    if "crs" in find and not CRS_RE.match(str(find["crs"])):
-        raise _fault(path, ident, "find.crs is EPSG:<code>")
+    if "crs" in find and not crs_module.known(find["crs"]):
+        raise _fault(path, ident, "find.crs %s is not a system sim-mesh knows (%s)"
+                     % (find["crs"], KNOWN_CRS))
     if find.get("missing", "no-data") not in ("no-data", "error"):
         raise _fault(path, ident, "find.missing is no-data (a file no host has is no data "
                                   "there) or error")
@@ -274,9 +286,15 @@ def _check_find(source):
         if not (32601 <= epsg <= 32660 or 32701 <= epsg <= 32760 or 25801 <= epsg <= 25860):
             raise _fault(path, ident, "an atom feed's tiles are in a UTM zone (326zz, 327zz, "
                                       "258zz)")
-    elif method == "regions":
-        if find["index_format"] not in INDEX_FORMATS:
-            raise _fault(path, ident, "index_format is one of %s" % ", ".join(INDEX_FORMATS))
+    elif method in ("regions", "index"):
+        if find["index_format"] not in INDEX_FORMATS[method]:
+            raise _fault(path, ident, "a %s source's index_format is one of %s"
+                         % (method, ", ".join(INDEX_FORMATS[method])))
+    if method == "index":
+        try:
+            crs_module.plane(find["crs"])
+        except store.StoreError as err:
+            raise _fault(path, ident, str(err)) from err
 
 
 def _check_format(source):
@@ -300,8 +318,28 @@ def _check_format(source):
         if {int(k): v for k, v in classes.items()} != WORLDCOVER_CLASSES:
             raise _fault(path, ident, "the compiler reads land cover as WorldCover's classes "
                                       "only, so far")
-    if kind == "geotiff" and e["find"].get("crs") not in (None, "EPSG:4326"):
-        raise _fault(path, ident, "the compiler reads GeoTIFF tiles in EPSG:4326 only, so far")
+    if kind == "geotiff":
+        heights = {"surface", "terrain"} & set(e["layers"])
+        if heights and len(e["layers"]) > 1:
+            raise _fault(path, ident, "a GeoTIFF of heights feeds surface or terrain, one of them")
+        if "landcover" in e["layers"] or e["coverage"] == "worldwide":
+            # Read through the GLO-30 and WorldCover paths: tiles in degrees.
+            if e["find"].get("crs") not in (None, "EPSG:4326"):
+                raise _fault(path, ident, "the compiler reads land cover, and a worldwide "
+                                          "surface, as GeoTIFF tiles in EPSG:4326, so far")
+            if e["coverage"] == "worldwide" and heights != {"surface"} and heights:
+                raise _fault(path, ident, "a worldwide GeoTIFF of heights is a surface, the "
+                                          "ground the compiler splits")
+    for key in FORMAT_NEEDS.get(kind, ()):
+        if fmt.get(key) in (None, ""):
+            raise _fault(path, ident, "a %s format needs %s" % (kind, key))
+    if "crs" in fmt and not crs_module.known(fmt["crs"]):
+        raise _fault(path, ident, "format.crs %s is not a system sim-mesh knows (%s)"
+                     % (fmt["crs"], KNOWN_CRS))
+    if kind == "csv-grid" and len(str(fmt["delimiter"])) != 1:
+        raise _fault(path, ident, "a csv-grid's delimiter is one character")
+    if kind in ("csv-grid", "gpkg-grid") and not (_number(fmt["cell_m"]) and fmt["cell_m"] > 0):
+        raise _fault(path, ident, "cell_m is the grid's cell, in metres")
     if kind == "osm-pbf":
         gives = fmt.get("gives")
         if not isinstance(gives, list) or set(gives) != set(e["layers"]):
@@ -310,8 +348,14 @@ def _check_format(source):
         if fmt.get(key) != want:
             raise _fault(path, ident, "the compiler reads %s with %s %s only, so far"
                          % (kind, key, json.dumps(want, ensure_ascii=False)))
-    if kind in ("xyz", "citygml", "csv-grid", "itu-p1812-maps") and not fmt.get("members"):
+    if kind in ("xyz", "citygml", "itu-p1812-maps") and not fmt.get("members"):
         raise _fault(path, ident, "format.members names what a build reads of the zip")
+
+
+def proj_of(source):
+    """The proj string a source's files are read in by the compiler: its
+    format's system, else its finding method's."""
+    return crs_module.proj(source.format.get("crs") or source.find.get("crs") or "EPSG:4326")
 
 
 def _load_outline(source):

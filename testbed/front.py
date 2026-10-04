@@ -1016,6 +1016,7 @@ class Front:
         self.run_bytes = {}                 # a run directory's real path -> its size on disk
         self.measurer = None
         self.fetching = {}                  # "index/kind/name" -> (index_progress row, task)
+        self.cancel_asked = set()           # the fetches the page's Cancel stopped
 
     @property
     def bind_port(self):
@@ -1601,6 +1602,7 @@ class Front:
             got = self.fetching.get(self.fetch_key(msg))
             if got is None:
                 raise ValueError("nothing of that is being fetched")
+            self.cancel_asked.add(self.fetch_key(msg))
             got[1].cancel()
             return {}
         if verb in ("geodata_rename", "geodata_delete"):
@@ -1883,12 +1885,16 @@ class Front:
             row["state"] = "done"
         except asyncio.CancelledError:
             row["state"] = "cancelled"
-            raise ValueError("cancelled") from None
+            raise ValueError("cancelled: %s %s from %s, by %s" % (
+                row["kind"], row["name"], row["index"],
+                "the page's Cancel" if key in self.cancel_asked
+                else "the front stopping")) from None
         except store.StoreError as err:
             row.update(state="failed", error=str(err))
             raise
         finally:
             self.fetching.pop(key, None)
+            self.cancel_asked.discard(key)
             self.broadcast({"type": "index_progress", **row})
             self.changed = True
         log("installed %s from index %s" % (", ".join(
@@ -2568,12 +2574,15 @@ class Front:
         return {"name": query.get("name"), "bbox": bbox, "res_m": float(query.get("res_m") or 30)}
 
     async def api_geodata_sources(self, request):
-        """GET `?bbox=w,s,e,n&res_m=`: what a build of that rectangle takes,
-        for the side panel: the grid, the sources chosen and what each is
-        used for, their files and what is still to fetch; or why it is
-        refused."""
+        """GET `?bbox=w,s,e,n&res_m=[&sizes=0]`: what a build of that
+        rectangle takes, for the side panel: the grid, the sources chosen and
+        what each is used for, their files and what is still to fetch; or why
+        it is refused. `sizes=0` leaves out asking the hosts how big their
+        files are, which for a city of tiles takes seconds to minutes; a
+        `to_fetch` is then null wherever something is still to fetch."""
         try:
-            got = await sources_module.plan(self.cache, self.build_spec(request.query))
+            got = await sources_module.plan(self.cache, self.build_spec(request.query),
+                                            sizes=request.query.get("sizes") != "0")
         except (store.StoreError, ValueError, TypeError) as err:
             return web.json_response({"ok": False, "error": str(err)})
         got.pop("files")

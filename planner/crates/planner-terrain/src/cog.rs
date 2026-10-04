@@ -182,6 +182,61 @@ impl CogReader<BufReader<File>> {
         }
         Ok(this)
     }
+
+    /// The image of a cloud-optimised GeoTIFF whose pixel suits `want_m`:
+    /// the coarsest of its full-resolution image and its overviews whose
+    /// pixel is no larger than `want_m`, else the full image. An overview
+    /// carries no geo tags of its own: its georeferencing is the full
+    /// image's, its pixel scaled by how much smaller it is, its outer edge
+    /// the same.
+    ///
+    /// A file fetched as a window (only the chunks a rectangle needs, the
+    /// rest a sparse hole) reads the same way: a chunk never fetched fails to
+    /// decode, and the caller takes it as no data there.
+    pub fn open_level(path: &Path, want_m: f64) -> Result<Self, TerrainError> {
+        let mut this = Self::open(path)?;
+        if this.raw_palette.is_some() {
+            return Ok(this); // palette images are read whole, at full resolution
+        }
+        let full = this.meta;
+        let mut best: Option<(usize, CogMeta)> = None;
+        let mut index = 1usize;
+        while this.decoder.seek_to_image(index).is_ok() {
+            let Ok((w, h)) = this.decoder.dimensions() else { break };
+            let (fx, fy) = (full.width as f64 / w as f64, full.height as f64 / h as f64);
+            let (dx, dy) = (full.dx * fx, full.dy * fy);
+            if dx.abs() > want_m + 1e-9 {
+                break; // overviews only get coarser from here
+            }
+            // The outer corner stays where it is; the first pixel's centre moves in.
+            let corner = Xy { x: full.origin.x - 0.5 * full.dx, y: full.origin.y - 0.5 * full.dy };
+            let (cw, ch) = this.decoder.chunk_dimensions();
+            best = Some((
+                index,
+                CogMeta {
+                    width: w,
+                    height: h,
+                    chunk_w: cw,
+                    chunk_h: ch,
+                    origin: Xy { x: corner.x + 0.5 * dx, y: corner.y + 0.5 * dy },
+                    dx,
+                    dy,
+                },
+            ));
+            index += 1;
+        }
+        let (index, meta) = best.unwrap_or((0, full));
+        this.decoder
+            .seek_to_image(index)
+            .map_err(|e| TerrainError::Cog(format!("{path:?}: image {index}: {e}")))?;
+        this.chunks_across = meta.width.div_ceil(meta.chunk_w);
+        this.meta = meta;
+        this.cache.clear();
+        if index != 0 {
+            this.raw_rows = None; // the direct row path is the full image's
+        }
+        Ok(this)
+    }
 }
 
 /// Attach direct row access, but only when it is provably equivalent.

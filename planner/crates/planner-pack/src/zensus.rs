@@ -22,11 +22,39 @@ pub fn laea_proj() -> Result<Proj, PackError> {
     .map_err(|e| PackError::Proj(format!("laea/EPSG:3035: {e}")))
 }
 
-/// Stream the CSV; for every populated 100 m cell inside the caller's region
+/// A population grid's CSV layout: its delimiter, the header names of the
+/// columns holding a cell's centre and its people, and the cell's size, in
+/// the units of the grid's system.
+#[derive(Debug, Clone)]
+pub struct GridCsv {
+    pub delimiter: char,
+    pub x: String,
+    pub y: String,
+    pub value: String,
+    pub cell_m: f64,
+}
+
+impl GridCsv {
+    /// Zensus 2022's: `GITTER_ID_100m;x_mp_100m;y_mp_100m;Einwohner`.
+    pub fn zensus() -> Self {
+        Self {
+            delimiter: ';',
+            x: "x_mp_100m".into(),
+            y: "y_mp_100m".into(),
+            value: "Einwohner".into(),
+            cell_m: 100.0,
+        }
+    }
+}
+
+/// Stream the CSV; for every populated cell inside the caller's region
 /// (decided by `target_index`), add its population share to the pack grid.
-/// `to_target` converts EPSG:3035 → the pack CRS.
+/// `to_target` converts the grid's system → the pack CRS. The columns are
+/// found by their names in the first line; a row whose value is not a
+/// positive number (a suppressed cell) is passed over.
 pub fn accumulate_population<R: Read>(
     reader: R,
+    layout: &GridCsv,
     mut to_target: impl FnMut(f64, f64) -> Result<(f64, f64), PackError>,
     mut target_index: impl FnMut(f64, f64) -> Option<usize>,
     res_m: f64,
@@ -35,21 +63,38 @@ pub fn accumulate_population<R: Read>(
     population: &mut [f32],
 ) -> Result<u64, PackError> {
     let mut total_in_region = 0u64;
-    // Sub-sample each 100 m square finely enough that every overlapped pack
-    // cell receives its share.
-    let steps = ((100.0 / res_m).ceil() as i32).max(1);
-    for line in BufReader::new(reader).lines() {
+    let cell = layout.cell_m;
+    // Sub-sample each cell finely enough that every overlapped pack cell
+    // receives its share.
+    let steps = ((cell / res_m).ceil() as i32).max(1);
+    let mut lines = BufReader::new(reader).lines();
+    let header = lines.next().transpose()?.unwrap_or_default();
+    let names: Vec<&str> = header
+        .split(layout.delimiter)
+        .map(|h| h.trim().trim_start_matches('\u{feff}'))
+        .collect();
+    let col = |want: &str| {
+        names.iter().position(|n| *n == want).ok_or_else(|| {
+            PackError::Invalid(format!(
+                "the population grid has no column {want} ({})",
+                names.join(", ")
+            ))
+        })
+    };
+    let (x_col, y_col, value_col) = (col(&layout.x)?, col(&layout.y)?, col(&layout.value)?);
+    let last = x_col.max(y_col).max(value_col);
+    for line in lines {
         let line = line?;
-        let mut it = line.split(';');
-        let (Some(_id), Some(xs), Some(ys), Some(es)) =
-            (it.next(), it.next(), it.next(), it.next())
-        else {
+        let fields: Vec<&str> = line.split(layout.delimiter).collect();
+        if fields.len() <= last {
             continue;
-        };
-        let (Ok(x), Ok(y), Ok(pop)) =
-            (xs.trim().parse::<f64>(), ys.trim().parse::<f64>(), es.trim().parse::<f64>())
-        else {
-            continue; // header and malformed rows
+        }
+        let (Ok(x), Ok(y), Ok(pop)) = (
+            fields[x_col].trim().parse::<f64>(),
+            fields[y_col].trim().parse::<f64>(),
+            fields[value_col].trim().parse::<f64>(),
+        ) else {
+            continue; // malformed rows
         };
         if pop <= 0.0 {
             continue;
@@ -65,8 +110,8 @@ pub fn accumulate_population<R: Read>(
         let mut hits: Vec<usize> = Vec::with_capacity((steps * steps) as usize);
         for iy in 0..steps {
             for ix in 0..steps {
-                let sx = x - 50.0 + (ix as f64 + 0.5) * (100.0 / steps as f64);
-                let sy = y - 50.0 + (iy as f64 + 0.5) * (100.0 / steps as f64);
+                let sx = x - cell / 2.0 + (ix as f64 + 0.5) * (cell / steps as f64);
+                let sy = y - cell / 2.0 + (iy as f64 + 0.5) * (cell / steps as f64);
                 let (px, py) = to_target(sx, sy)?;
                 if let Some(idx) = target_index(px, py) {
                     hits.push(idx);
@@ -119,6 +164,7 @@ mod tests {
         let mut pop = vec![0.0f32; 4];
         let total = accumulate_population(
             csv.as_bytes(),
+            &GridCsv::zensus(),
             |x, y| Ok((x, y)),
             |x, y| {
                 if (0.0..200.0).contains(&x) && (0.0..200.0).contains(&y) {
@@ -134,5 +180,34 @@ mod tests {
         assert_eq!(total, 40, "cell B is outside the region");
         assert!((pop[0] - 40.0).abs() < 1e-9, "{:?}", pop);
         assert_eq!(pop[1] + pop[2] + pop[3], 0.0);
+    }
+
+    #[test]
+    fn another_layout_reads_by_its_column_names() {
+        // CBS's 100 m grid as the front writes it: comma-separated, its
+        // columns in another order, a suppressed cell negative.
+        let csv = "value,y,x\n40,50,50\n-99997,150,150\n";
+        let layout = GridCsv {
+            delimiter: ',',
+            x: "x".into(),
+            y: "y".into(),
+            value: "value".into(),
+            cell_m: 100.0,
+        };
+        let mut pop = vec![0.0f32; 4];
+        let total = accumulate_population(
+            csv.as_bytes(),
+            &layout,
+            |x, y| Ok((x, y)),
+            |x, y| {
+                ((0.0..200.0).contains(&x) && (0.0..200.0).contains(&y))
+                    .then(|| ((y / 100.0) as usize).min(1) * 2 + ((x / 100.0) as usize).min(1))
+            },
+            100.0,
+            &mut pop,
+        )
+        .unwrap();
+        assert_eq!(total, 40);
+        assert!((pop[0] - 40.0).abs() < 1e-9 && pop[3] == 0.0, "{:?}", pop);
     }
 }

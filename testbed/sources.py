@@ -53,16 +53,22 @@ that a build does not need.
 
 import asyncio
 import contextlib
+import gzip
+import hashlib
 import json
 import math
 import os
 import re
 import shutil
+import struct
 import time
 import zipfile
 
 import aiohttp
 
+import cogwindow
+import crs
+import fgb
 import geodata
 import sourcefile
 import store
@@ -100,9 +106,18 @@ class File:
     where it goes in the cache, and for a zip, which of its members a build
     reads (extracted into `x/` beside it)."""
 
-    def __init__(self, source, url, name, members=None, missing="no-data"):
+    def __init__(self, source, url, name, members=None, missing="no-data", sha256=None,
+                 window=None):
         self.source, self.name, self.members, self.missing = source, name, members, missing
         self.urls = list(url) if isinstance(url, (list, tuple)) else [url]
+        self.sha256 = sha256            # what the index says the file is, checked on arrival
+        # A window of a cloud-optimised GeoTIFF: {box, want}, the box in the
+        # file's system and the pixel to read it at (cogwindow.py). `needs`
+        # is the byte ranges it takes, once `Cache.window_needs` knows them.
+        self.window = window
+        self.needs = None
+        self.length = None
+        self.head_parts = []
 
     @property
     def url(self):
@@ -268,6 +283,61 @@ def region_file(source, feature):
                 source.members(), missing=_missing(source))
 
 
+# ---- finding: an index of footprints -----------------------------------------------
+
+def read_index(source, raw):
+    """An index's features: [(properties, outer rings in its system)], from
+    GeoJSON (AHN's kaartbladindex) or FlatGeobuf (3DBAG's tile_index)."""
+    if source.find["index_format"] == "flatgeobuf":
+        try:
+            return fgb.read(raw)
+        except (fgb.FgbError, struct.error) as err:
+            raise SourceError("%s's index is not FlatGeobuf: %s" % (source.title, err)) from err
+    try:
+        doc = json.loads(raw.decode("utf-8-sig"))
+    except ValueError as err:
+        raise SourceError("%s's index is not GeoJSON: %s" % (source.title, err)) from err
+    out = []
+    for feature in doc.get("features") or ():
+        rings = [[tuple(p[:2]) for p in polygon[0]] for polygon in _rings(feature.get("geometry"))]
+        out.append((feature.get("properties") or {}, rings))
+    return out
+
+
+def _ring_box(rings):
+    xs = [x for ring in rings for x, _ in ring]
+    ys = [y for ring in rings for _, y in ring]
+    return (min(xs), min(ys), max(xs), max(ys)) if xs else None
+
+
+def window_want(source, res_m):
+    """The pixel a window reads a source at for a pack's resolution: a
+    quarter of a cell, so each cell takes a few samples a side."""
+    return float(res_m) / 4.0 if source.read == "window" else None
+
+
+def index_files(source, features, bbox, res_m=30.0):
+    """The files of an index whose footprint meets the rectangle's grid in
+    the index's system; for a source read as a window, each with the box it
+    needs of its file."""
+    box = crs.box_in(source.find["crs"], bbox, margin=4 * float(res_m))
+    want = window_want(source, res_m)
+    out = []
+    for props, rings in features:
+        b = _ring_box(rings)
+        if b is None or b[0] > box[2] or b[2] < box[0] or b[1] > box[3] or b[3] < box[1]:
+            continue
+        url = props.get(source.find["url_property"])
+        if not url:
+            continue
+        sha = props.get(source.find.get("sha256_property")) if source.find.get("sha256_property") \
+            else None
+        out.append(File(source.id, url, url.rsplit("/", 1)[-1], source.members(),
+                        missing=_missing(source), sha256=sha,
+                        window={"box": box, "want": want} if want else None))
+    return out
+
+
 def single_file(source):
     urls = source.addresses("url")
     base = urls[0].rsplit("/", 1)[-1]
@@ -409,10 +479,17 @@ class Cache:
             with open(self.sizes_path, encoding="utf-8") as handle:
                 self.sizes = json.load(handle)
         self.meta_locks = {}
+        self.features = {}              # source id -> ((index path, mtime), features)
 
     def have(self, f):
-        """True when fetched, False when its host has none, None when not yet."""
+        """True when fetched, False when its host has none, None when not yet.
+        A window is fetched when its copy holds every range it needs."""
         path = f.path(self.root)
+        if f.window is not None:
+            if f.needs is None or not os.path.isfile(path):
+                return None
+            held, _length = cogwindow.held(path)
+            return True if all(cogwindow.covers(held, s, n) for s, n in f.needs) else None
         if os.path.isfile(path):
             return True
         if os.path.isfile(path + ".absent"):
@@ -478,11 +555,19 @@ class Cache:
         return got
 
     async def sizes_of(self, files):
-        """{file: bytes still to fetch, or None when unknown} for files not here."""
+        """{file: bytes still to fetch, or None when unknown} for files not here.
+        A window's is the ranges it needs that its copy does not hold."""
         todo = [f for f in files if self.have(f) is None]
         gate = asyncio.Semaphore(HEAD_PARALLEL)
 
         async def one(f):
+            if f.window is not None:
+                try:
+                    await self.window_needs(f)
+                except SourceError:
+                    return f, None
+                held, _length = cogwindow.held(f.path(self.root))
+                return f, sum(n for s, n in f.needs if not cogwindow.covers(held, s, n))
             async with gate:
                 try:
                     whole = await self.size(f)
@@ -496,6 +581,8 @@ class Cache:
         its address or the next mirror when one fails: its path, or None
         when no host has it and its source says that is no data.
         `progress(bytes)` hears the bytes it holds as they arrive."""
+        if f.window is not None:
+            return await self.fetch_window(f, progress)
         have = self.have(f)
         path = f.path(self.root)
         if have is not None:
@@ -542,7 +629,93 @@ class Cache:
             raise SourceError("%s: %s" % (url, err or type(err).__name__)) from err
         finally:
             resp.release()
+        if f.sha256:
+            digest = hashlib.sha256()
+            with open(part, "rb") as handle:
+                for chunk in iter(lambda: handle.read(CHUNK * 16), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != f.sha256.lower():
+                os.remove(part)
+                raise SourceError("%s is not the file its index lists: its sha256 differs" % url)
         os.replace(part, path)
+        return path
+
+    # ---- windows of cloud-optimised GeoTIFFs --------------------------------
+
+    async def _range(self, url, start, length):
+        """Bytes [start, start + length) of a file, and its whole length."""
+        resp = await self.request("GET", url, {"Range": "bytes=%d-%d" % (start, start + length - 1)})
+        try:
+            if resp.status == 404:
+                raise SourceError("%s answers 404" % url)
+            if resp.status not in (200, 206):
+                raise SourceError("%s answers %d" % (url, resp.status))
+            total = None
+            m = re.match(r"bytes \d+-\d+/(\d+)", resp.headers.get("Content-Range", ""))
+            if m:
+                total = int(m.group(1))
+            if resp.status == 200:
+                raise SourceError("%s does not serve ranges, which a window needs" % url)
+            body = await resp.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise SourceError("%s: %s" % (url, err or type(err).__name__)) from err
+        finally:
+            resp.release()
+        return body, total
+
+    async def window_needs(self, f):
+        """The byte ranges a window takes (every image's directory and the
+        chunks its box meets at its level), from its copy's header when the
+        copy holds it, else fetched; and the file's length."""
+        if f.needs is not None:
+            return f.needs
+        path = f.path(self.root)
+        held, length = cogwindow.held(path)
+        local = bool(held) and os.path.isfile(path)
+        if local:
+            data = cogwindow.Bytes(cogwindow.local_reader(path))
+        else:
+            box = {"total": None}
+
+            async def remote(start, n):
+                body, total = await self._range(f.url, start, max(n, cogwindow.HEAD_BYTES))
+                box["total"] = total or box["total"]
+                return body
+            data = cogwindow.Bytes(remote)
+        try:
+            st = await cogwindow.structure(data)
+        except (cogwindow.WindowError, struct.error) as err:
+            raise SourceError("%s: %s" % (f.url, err)) from err
+        level = cogwindow.level_for(st, f.window["want"])
+        f.needs = st["used"] + cogwindow.chunks_for(st, level, f.window["box"])
+        f.length = length if local else box["total"]
+        if not local:
+            f.head_parts = list(data.parts)
+        if f.length is None:
+            raise SourceError("%s did not say its length" % f.url)
+        return f.needs
+
+    async def fetch_window(self, f, progress=None):
+        """A window's ranges into its sparse copy, those it already holds
+        left alone: its path."""
+        await self.window_needs(f)
+        path = f.path(self.root)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        held, _length = cogwindow.held(path)
+        missing = cogwindow.merge([(s, n) for s, n in f.needs
+                                   if not cogwindow.covers(held, s, n)], gap=cogwindow.MERGE_GAP)
+        parts = list(f.head_parts)
+        got = 0
+        for start, n in missing:
+            body, _total = await self._range(f.url, start, n)
+            parts.append((start, body))
+            got += len(body)
+            if progress:
+                progress(got)
+        if parts:
+            await asyncio.to_thread(cogwindow.write, path, f.length, parts,
+                                    held + [(s, len(b)) for s, b in parts])
+        f.head_parts = []
         return path
 
     def extracted(self, f):
@@ -554,6 +727,21 @@ class Cache:
         if os.path.isfile(done):
             with open(done, encoding="utf-8") as handle:
                 return [os.path.join(into, n) for n in handle.read().split("\n") if n]
+        if f.name.endswith(".gz"):
+            # One file, gzipped (3DBAG's CityJSON tiles): it, decompressed.
+            base = os.path.basename(f.name[:-3])
+            os.makedirs(into, exist_ok=True)
+            try:
+                with gzip.open(path, "rb") as src, open(os.path.join(into, base) + ".part", "wb") as dst:
+                    shutil.copyfileobj(src, dst, CHUNK)
+            except (OSError, EOFError) as err:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+                raise SourceError("%s is not gzip, and is fetched again next time: %s"
+                                  % (f.url, err)) from err
+            os.replace(os.path.join(into, base) + ".part", os.path.join(into, base))
+            store.write_text(done, base + "\n")
+            return [os.path.join(into, base)]
         names = []
         try:
             with zipfile.ZipFile(path) as zf:
@@ -573,6 +761,37 @@ class Cache:
                               % (f.url, err)) from err
         store.write_text(done, "".join(n + "\n" for n in names))
         return [os.path.join(into, n) for n in names]
+
+    def grid_csv(self, f, value):
+        """A GeoPackage grid (CBS's 100 m squares) as the CSV the compiler's
+        grid reader takes, `x,y,value`: each cell's centre, from its
+        geometry's envelope, and its `value` column, written once beside the
+        GeoPackage. Its path."""
+        gpkg = next((p for p in self.extracted(f) if p.endswith(".gpkg")), None)
+        if gpkg is None:
+            raise SourceError("%s holds no GeoPackage" % f.url)
+        out = gpkg[:-len(".gpkg")] + "." + re.sub(r"[^A-Za-z0-9_]", "_", value) + ".csv"
+        if os.path.isfile(out):
+            return out
+        import sqlite3
+        db = sqlite3.connect("file:%s?mode=ro" % gpkg, uri=True)
+        try:
+            table, column = db.execute(
+                "select table_name, column_name from gpkg_geometry_columns").fetchone()
+            rows = db.execute('select "%s", "%s" from "%s"' % (column, value, table))
+            with open(out + ".part", "w", encoding="utf-8") as handle:
+                handle.write("x,y,value\n")
+                for geom, v in rows:
+                    box = _gpkg_envelope(geom)
+                    if box is None or v is None:
+                        continue
+                    handle.write("%.3f,%.3f,%s\n" % ((box[0] + box[1]) / 2, (box[2] + box[3]) / 2, v))
+        except sqlite3.Error as err:
+            raise SourceError("%s: %s" % (gpkg, err)) from err
+        finally:
+            db.close()
+        os.replace(out + ".part", out)
+        return out
 
     @staticmethod
     def wanted(f, base):
@@ -641,6 +860,64 @@ class Cache:
         """An atom source's feed, its text."""
         return await self.meta(source.id + ".atom", source.addresses("feed"), _max_age(source))
 
+    async def index_features(self, source):
+        """An index source's features, [(properties, rings)], read again
+        only when its index is fetched again."""
+        name = "%s-%s" % (source.id, source.address("index").rsplit("/", 1)[-1])
+        path = await self.meta_file(name, source.addresses("index"), _max_age(source))
+        key = (path, os.path.getmtime(path))
+        cached = self.features.get(source.id)
+        if cached is None or cached[0] != key:
+            with open(path, "rb") as handle:
+                raw = handle.read()
+            cached = (key, await asyncio.to_thread(read_index, source, raw))
+            self.features[source.id] = cached
+        return cached[1]
+
+
+def _gpkg_envelope(blob):
+    """A GeoPackage geometry's envelope (minx, maxx, miny, maxy) from its
+    header, or from its WKB polygon's points when the header carries none."""
+    if not blob or blob[:2] != b"GP":
+        return None
+    flags = blob[3]
+    order = "<" if flags & 1 else ">"
+    kind = (flags >> 1) & 7
+    if kind:
+        return struct.unpack_from(order + "4d", blob, 8)
+    # No envelope: the WKB after the 8-byte header, a (multi)polygon's points.
+    wkb = blob[8:]
+    xs, ys = [], []
+
+    def geometry(at):
+        o = "<" if wkb[at] == 1 else ">"
+        kind = struct.unpack_from(o + "I", wkb, at + 1)[0] % 1000
+        at += 5
+        if kind == 6:                   # multipolygon: its polygons, each with its own header
+            parts = struct.unpack_from(o + "I", wkb, at)[0]
+            at += 4
+            for _ in range(parts):
+                at = geometry(at)
+            return at
+        if kind != 3:
+            raise ValueError("a grid cell is a polygon")
+        rings = struct.unpack_from(o + "I", wkb, at)[0]
+        at += 4
+        for _ in range(rings):
+            n = struct.unpack_from(o + "I", wkb, at)[0]
+            at += 4
+            for _ in range(n):
+                x, y = struct.unpack_from(o + "2d", wkb, at)
+                xs.append(x)
+                ys.append(y)
+                at += 16
+        return at
+    try:
+        geometry(0)
+    except (ValueError, struct.error):
+        return None
+    return (min(xs), max(xs), min(ys), max(ys)) if xs else None
+
 
 def _max_age(source):
     days = source.find.get("refresh_days")
@@ -654,14 +931,15 @@ def _box(lon0, lat0, lon1, lat1):
 
 
 def _cached_names(root, source):
-    """The whole files of a source in the cache: no `.part`, no `.absent`,
-    no `.x` (a zip's members extracted), not the extracted `x/`."""
+    """The files of a source in the cache, a window's copy among them: no
+    `.part`, no `.absent`, no `.x` (a zip's members extracted), no `.ranges`
+    (what a window's copy holds), not the extracted `x/`."""
     base = os.path.join(root, source)
     if not os.path.isdir(base):
         return []
     return sorted(name for name in os.listdir(base)
                   if os.path.isfile(os.path.join(base, name))
-                  and not name.endswith((".part", ".absent", ".x")))
+                  and not name.endswith((".part", ".absent", ".x", ".ranges")))
 
 
 async def source_map(cache, source_id, sources=None):
@@ -711,6 +989,23 @@ async def source_map(cache, source_id, sources=None):
             tiles = [(int(m.group("x")), int(m.group("y")))
                      for m in (pattern.search(name) for name in names) if m]
             cached = sourcefile.tile_quads(source, tiles)
+        elif method == "index":
+            # Its data is where its index has a file, as for a feed.
+            try:
+                features = await cache.index_features(source)
+            except store.StoreError as err:
+                out["error"] = "its index could not be read, so its outline is drawn: %s" % err
+            else:
+                system = source.find["crs"]
+                out["covers"] = {"type": "MultiPolygon", "coordinates": [
+                    [crs.ring_to_degrees(system, ring)] for _p, rings in features for ring in rings]}
+                out["covers_from"] = "the %d files its index lists" % len(features)
+                here = set(names)
+                prop = source.find["url_property"]
+                for props, rings in features:
+                    url = str(props.get(prop) or "")
+                    if url.rsplit("/", 1)[-1] in here:
+                        cached += [[crs.ring_to_degrees(system, ring)] for ring in rings]
         elif method == "regions":
             out["covers_from"] = "the whole world, in regions whose outlines its index gives"
             if names:
@@ -796,6 +1091,9 @@ async def plan(cache, spec, sizes=True, sources=None):
             found = template_files(source, hull)
         elif method == "atom":
             found = atom_files(source, await cache.feed(source), bbox)
+        elif method == "index":
+            found = index_files(source, await cache.index_features(source), hull,
+                                spec.get("res_m", 30))
         elif method == "regions":
             feature = smallest_extract(await cache.regions_index(source), bbox,
                                        source.find["file"])

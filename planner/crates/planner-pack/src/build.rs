@@ -1,8 +1,9 @@
 //! The pack compiler: GLO-30 surface tiles resampled onto a UTM grid and split
 //! into terrain and clutter, with whatever else the build is given merged in
-//! (buildings from LoD2 where its tiles cover the grid and from OpenStreetMap
-//! everywhere else, Berlin's 1 m lidar, WorldCover land
-//! cover, the Zensus grid, OpenStreetMap roads and places), and the manifest.
+//! (buildings from CityGML LoD2 or CityJSON where their tiles cover the grid
+//! and from OpenStreetMap everywhere else; measured terrain and surface from
+//! Berlin's 1 m XYZ or from GeoTIFFs in any projection; WorldCover land
+//! cover; a population grid; OpenStreetMap roads and places), and the manifest.
 //!
 //! Every input is a file already on disk; the compiler never reaches the
 //! network. `planner-job pack-build` is its caller.
@@ -63,6 +64,26 @@ impl Steps<'_> {
     }
 }
 
+/// A population grid: its CSV, the grid's system (a proj string), the CSV's
+/// layout, and the source's name and notice for the manifest.
+pub struct PopulationInput {
+    pub csv: PathBuf,
+    pub proj: String,
+    pub layout: crate::zensus::GridCsv,
+    pub source: String,
+    pub notice: String,
+}
+
+/// CityJSON buildings: a directory of `.json` files, their system, which
+/// attributes give ground and roof height, and the source's name and notice.
+pub struct CityJsonInput {
+    pub dir: PathBuf,
+    pub proj: String,
+    pub heights: crate::cityjson::Heights,
+    pub source: String,
+    pub notice: String,
+}
+
 pub struct BuildParams {
     /// Pre-downloaded GLO-30 tiles covering the region (EPSG:4326).
     pub dsm_tiles: Vec<PathBuf>,
@@ -99,9 +120,15 @@ pub struct BuildParams {
     /// the difference between colouring a street and colouring a 5 m cell
     /// that is part street and part Vorderhaus.
     pub lod2_geometry: bool,
-    /// Zensus 2022 100 m population CSV (extracted): Population layer for
-    /// household-weighted siting.
-    pub zensus_csv: Option<PathBuf>,
+    /// A population grid as CSV (Zensus 2022's, or CBS's as the front
+    /// writes it): Population layer for household-weighted siting.
+    pub population: Option<PopulationInput>,
+    /// Terrain and surface GeoTIFFs in their own system (AHN's DTM and DSM):
+    /// where they cover a cell, both halves measured, as Berlin's 1 m pairs.
+    pub elevation: Vec<crate::elevation::ElevationInput>,
+    /// CityJSON buildings (3DBAG's tiles): the same sidecar and clutter
+    /// merge LoD2 fills, OpenStreetMap's left out where they cover.
+    pub cityjson: Option<CityJsonInput>,
     /// ESA WorldCover tiles (EPSG:4326 COGs): ClutterClass layer for
     /// per-class calibration.
     pub worldcover_tiles: Vec<PathBuf>,
@@ -143,7 +170,9 @@ impl BuildParams {
             berlin_1m_dir: None,
             lod2_dir: None,
             lod2_geometry: false,
-            zensus_csv: None,
+            population: None,
+            elevation: Vec::new(),
+            cityjson: None,
             worldcover_tiles: Vec::new(),
             osm_pbf: None,
             osm_buildings: false,
@@ -226,7 +255,13 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         check(params.itu_maps_dir.as_ref(), "itu_maps_dir", true);
         check(params.berlin_1m_dir.as_ref(), "berlin_1m_dir", true);
         check(params.lod2_dir.as_ref(), "lod2_dir", true);
-        check(params.zensus_csv.as_ref(), "zensus_csv", false);
+        check(params.population.as_ref().map(|p| &p.csv), "population csv", false);
+        check(params.cityjson.as_ref().map(|c| &c.dir), "cityjson dir", true);
+        for e in &params.elevation {
+            for p in e.terrain.iter().chain(&e.surface) {
+                check(Some(p), "elevation tile", false);
+            }
+        }
         check(params.osm_pbf.as_ref(), "osm_pbf", false);
         for p in &params.worldcover_tiles {
             check(Some(p), "worldcover_tiles", false);
@@ -251,11 +286,12 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         names: [
             Some("terrain"),
             params.osm_pbf.as_ref().map(|_| "osm"),
-            (params.lod2_dir.is_some() || params.osm_buildings).then_some("buildings"),
-            params.berlin_1m_dir.as_ref().map(|_| "lidar"),
+            (params.lod2_dir.is_some() || params.cityjson.is_some() || params.osm_buildings)
+                .then_some("buildings"),
+            (params.berlin_1m_dir.is_some() || !params.elevation.is_empty()).then_some("lidar"),
             (!params.worldcover_tiles.is_empty()).then_some("landcover"),
             Some("clutter"),
-            params.zensus_csv.as_ref().map(|_| "population"),
+            params.population.as_ref().map(|_| "population"),
             Some("manifest"),
         ]
         .into_iter()
@@ -460,16 +496,25 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     // read as "no buildings anywhere" rather than "not measured".
     let mut built_fraction: Vec<f32> = Vec::new();
     let mut building_top: Vec<f32> = Vec::new();
-    if params.lod2_dir.is_some() || params.osm_buildings {
+    let mut n_cityjson = 0usize;
+    // Whether the sidecar was started by the measured buildings, so
+    // OpenStreetMap's lines are appended after theirs.
+    let sidecar_started = params.lod2_dir.is_some() || params.cityjson.is_some();
+    if params.lod2_dir.is_some() || params.cityjson.is_some() || params.osm_buildings {
         steps.begin("buildings");
         let mut acc = BuiltAccum::new(nx * ny);
         // The ground LoD2 covers: each tile read, by its name, or for a file
         // named otherwise the extent of its buildings.
         let mut covered: Vec<[f64; 4]> = Vec::new();
-        if let Some(dir) = &params.lod2_dir {
-            let mut sidecar = std::io::BufWriter::new(std::fs::File::create(
+        let mut sidecar = if sidecar_started {
+            Some(std::io::BufWriter::new(std::fs::File::create(
                 params.out_dir.join("buildings.jsonl"),
-            )?);
+            )?))
+        } else {
+            None
+        };
+        if let Some(dir) = &params.lod2_dir {
+            let sidecar = sidecar.as_mut().expect("started for LoD2");
             use std::io::Write as _;
             // Only the 1 km tiles meeting the grid: a district of a city-wide
             // LoD2 set reads megabytes, not the whole set.
@@ -516,8 +561,65 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 parsed_files += chunk.len() as u64;
                 steps.part("buildings", parsed_files, files.len() as u64);
             }
-            sidecar.flush()?;
             eprintln!("lod2: {} files parsed, {n_lod2} buildings", files.len());
+        }
+        if let Some(cj) = &params.cityjson {
+            use std::io::Write as _;
+            let sidecar = sidecar.as_mut().expect("started for CityJSON");
+            let src = Proj::from_proj_string(&cj.proj)
+                .map_err(|e| PackError::Proj(format!("{}: {e}", cj.proj)))?;
+            let files: Vec<PathBuf> = std::fs::read_dir(&cj.dir)
+                .map_err(|e| {
+                    PackError::Invalid(format!("CityJSON directory {}: {e}", cj.dir.display()))
+                })?
+                .flatten()
+                .map(|f| f.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+                .collect();
+            let mut skipped = 0usize;
+            let mut parsed_files = 0u64;
+            for chunk in files.chunks(n_threads.max(1)) {
+                let parsed: Result<Vec<_>, PackError> = chunk
+                    .par_iter()
+                    .map(|path| {
+                        crate::cityjson::parse_cityjson(
+                            std::io::BufReader::new(std::fs::File::open(path)?),
+                            &cj.heights,
+                            |x, y| {
+                                let mut p = (x, y, 0.0);
+                                proj4rs::transform::transform(&src, &utm, &mut p).ok()?;
+                                Some((p.0, p.1))
+                            },
+                        )
+                    })
+                    .collect();
+                for (buildings, left_out) in parsed? {
+                    skipped += left_out;
+                    // A tile's buildings are the ground it covers.
+                    let mut reach: Option<[f64; 4]> = None;
+                    for b in &buildings {
+                        let e = crate::lod2::extent(b);
+                        reach = Some(reach.map_or(e, |r| union(r, e)));
+                        if !meets(e, grid_extent) {
+                            continue;
+                        }
+                        writeln!(sidecar, "{}", b.to_json_line(params.lod2_geometry)?)?;
+                        acc.add(b, &cell_of);
+                        n_cityjson += 1;
+                    }
+                    covered.extend(reach);
+                }
+                parsed_files += chunk.len() as u64;
+                steps.part("buildings", parsed_files, files.len() as u64);
+            }
+            eprintln!(
+                "cityjson: {} files parsed, {n_cityjson} buildings, {skipped} left out (no footprint, no heights, or no taller than their ground)",
+                files.len()
+            );
+        }
+        if let Some(mut s) = sidecar {
+            use std::io::Write as _;
+            s.flush()?;
         }
         let before = osm_buildings.len();
         osm_buildings.retain(|b| !lod2_covers(&covered, b));
@@ -530,7 +632,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         for b in &osm_buildings {
             acc.add(b, &cell_of);
         }
-        if n_lod2 + osm_buildings.len() > 0 {
+        if n_lod2 + n_cityjson + osm_buildings.len() > 0 {
             let cell_area = (res * res) as f32;
             // Keep the two facts SEPARATELY as well as blended.
             //
@@ -598,13 +700,17 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         steps.end("buildings");
     }
     let used_lod2 = n_lod2 > 0;
+    let used_cityjson = n_cityjson > 0;
     let used_osm_buildings = !osm_buildings.is_empty();
 
     // Real 1 m override where Berlin DGM1+bDOM pairs cover the region
     // (EPSG:25833 ≈ 32633 within <1 m — used as-is; berlin1m.rs).
     let mut used_berlin_1m = false;
-    if let Some(dir) = &params.berlin_1m_dir {
+    let measured = params.berlin_1m_dir.is_some() || !params.elevation.is_empty();
+    if measured {
         steps.begin("lidar");
+    }
+    if let Some(dir) = &params.berlin_1m_dir {
         // Only the tiles meeting the grid. A key is the tile's south-west
         // corner in km; tiles are 1 or 2 km, so 2 km is the safe extent.
         let pairs: Vec<_> = crate::berlin1m::find_pairs(dir)?
@@ -670,6 +776,38 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 nx * ny
             );
         }
+    }
+    // Terrain and surface rasters in their own system (AHN), where they
+    // cover a cell with at least a quarter of its samples: both halves
+    // measured, as the 1 m pairs, and over any building source's clutter.
+    let mut used_elevation: Vec<&crate::elevation::ElevationInput> = Vec::new();
+    for (i, input) in params.elevation.iter().enumerate() {
+        let got = crate::elevation::sample(input, origin, res, nx, ny, &utm)?;
+        let mut overridden = 0usize;
+        for c in 0..nx * ny {
+            if got.count[c] == 0 || got.count[c] * 4 < got.per_cell {
+                continue;
+            }
+            dtm.data[c] = got.terrain[c];
+            clutter.data[c] = got.clutter[c].max(0.0);
+            measured_clutter[c] = true;
+            raise(&mut quality[c], DataQuality::LidarRaster);
+            overridden += 1;
+        }
+        eprintln!(
+            "{}: {} terrain and {} surface tile(s), {} samples a cell, {overridden}/{} pack cells measured",
+            input.source,
+            input.terrain.len(),
+            input.surface.len(),
+            got.per_cell,
+            nx * ny
+        );
+        if overridden > 0 {
+            used_elevation.push(input);
+        }
+        steps.part("lidar", i as u64 + 1, params.elevation.len() as u64);
+    }
+    if measured {
         steps.end("lidar");
     }
 
@@ -753,13 +891,12 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     // this build wrote any (the LoD2 step starts the file afresh).
     if used_osm_buildings {
         use std::io::Write as _;
-        let lod2_started = params.lod2_dir.is_some();
         let mut sidecar = std::io::BufWriter::new(
             std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
-                .append(lod2_started)
-                .truncate(!lod2_started)
+                .append(sidecar_started)
+                .truncate(!sidecar_started)
                 .open(params.out_dir.join("buildings.jsonl"))?,
         );
         for b in &mut osm_buildings {
@@ -848,18 +985,21 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     }
     steps.end("clutter");
 
-    // Zensus population layer (persons per pack cell).
-    let mut used_zensus = false;
-    if let Some(csv) = &params.zensus_csv {
+    // Population layer (persons per pack cell), from a grid in its own
+    // system: Zensus's in EPSG:3035, CBS's in RD New.
+    let mut used_population = false;
+    if let Some(input) = &params.population {
         steps.begin("population");
-        let laea = crate::zensus::laea_proj()?;
+        let grid_proj = Proj::from_proj_string(&input.proj)
+            .map_err(|e| PackError::Proj(format!("{}: {e}", input.proj)))?;
         let mut pop = vec![0f32; nx * ny];
         let total = crate::zensus::accumulate_population(
-            std::fs::File::open(csv)?,
+            std::fs::File::open(&input.csv)?,
+            &input.layout,
             |x, y| {
                 let mut pt = (x, y, 0.0);
-                proj4rs::transform::transform(&laea, &ll, &mut pt)
-                    .map_err(|e| PackError::Proj(format!("laea→ll: {e}")))?;
+                proj4rs::transform::transform(&grid_proj, &ll, &mut pt)
+                    .map_err(|e| PackError::Proj(format!("grid→ll: {e}")))?;
                 proj4rs::transform::transform(&ll, &utm, &mut pt)
                     .map_err(|e| PackError::Proj(format!("ll→utm: {e}")))?;
                 Ok((pt.0, pt.1))
@@ -871,8 +1011,8 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         let grid =
             Grid::with_axes(origin, res, -res, nx, ny, pop).map_err(PackError::Terrain)?;
         write_geotiff_f32(&params.out_dir.join("population.tif"), &grid)?;
-        used_zensus = total > 0;
-        eprintln!("zensus: {total} residents inside the region → population.tif");
+        used_population = total > 0;
+        eprintln!("{}: {total} residents inside the region → population.tif", input.source);
         steps.end("population");
     }
 
@@ -912,7 +1052,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     res_m: Some(res),
                 },
             ];
-            if used_lod2 || used_osm_buildings {
+            if used_lod2 || used_cityjson || used_osm_buildings {
                 layers.push(LayerMeta {
                     kind: LayerKind::Buildings,
                     path: "buildings.jsonl".into(),
@@ -929,7 +1069,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     res_m: Some(res),
                 });
             }
-            if used_zensus {
+            if used_population {
                 layers.push(LayerMeta {
                     kind: LayerKind::Population,
                     path: "population.tif".into(),
@@ -983,11 +1123,16 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     notice: crate::lod2::BERLIN_LOD2_NOTICE.into(),
                 });
             }
-            if used_zensus {
-                l.push(LicenseNotice {
-                    source: "Zensus 2022 100 m population grid".into(),
-                    notice: crate::zensus::ZENSUS_NOTICE.into(),
-                });
+            for e in &used_elevation {
+                l.push(LicenseNotice { source: e.source.clone(), notice: e.notice.clone() });
+            }
+            if used_cityjson {
+                let cj = params.cityjson.as_ref().expect("used");
+                l.push(LicenseNotice { source: cj.source.clone(), notice: cj.notice.clone() });
+            }
+            if used_population {
+                let p = params.population.as_ref().expect("used");
+                l.push(LicenseNotice { source: p.source.clone(), notice: p.notice.clone() });
             }
             if used_worldcover {
                 l.push(LicenseNotice {
@@ -1224,7 +1369,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut p = BuildParams::berlin_test(vec![dir.join("nope-dsm.tif")], dir.join("out"));
         p.osm_pbf = Some(dir.join("nope-berlin.osm.pbf"));
-        p.zensus_csv = Some(dir.join("nope-zensus.csv"));
+        p.population = Some(PopulationInput {
+            csv: dir.join("nope-zensus.csv"),
+            proj: "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80 +units=m +no_defs".into(),
+            layout: crate::zensus::GridCsv::zensus(),
+            source: "Zensus".into(),
+            notice: "Zensus".into(),
+        });
         p.lod2_dir = Some(dir.join("nope-lod2"));
         let err = build(&p).unwrap_err().to_string();
         assert!(err.starts_with("manifest invalid: 4 build input(s) unusable"), "{err}");

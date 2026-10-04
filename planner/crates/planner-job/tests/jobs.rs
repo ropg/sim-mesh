@@ -54,7 +54,9 @@ fn a_bad_pack_build_names_the_problem_in_one_sentence() {
         "pack-build",
         &json!({"name": "x", "out_dir": "/nonexistent/x", "bbox": [13.38, 52.51, 13.42, 52.53],
                 "res_m": 30, "utm_zone": 33, "dsm_tiles": ["/nonexistent/a.tif"],
-                "zensus_csv": "/nonexistent/z.csv"}),
+                "population": {"csv": "/nonexistent/z.csv", "proj": "+proj=longlat +datum=WGS84",
+                               "delimiter": ";", "x": "x", "y": "y", "value": "v", "cell_m": 100,
+                               "source": "z", "notice": "z"}}),
     );
     assert!(!ok);
     let e = lines.last().unwrap()["error"].as_str().unwrap();
@@ -179,7 +181,13 @@ fn small_build(buildings: &str, out: &Path) -> Option<(Vec<Value>, Value)> {
             "itu_maps_dir": c.join("itu"), "osm_pbf": inputs[3],
             "osm_buildings": buildings != "lod2",
             "lod2_dir": lod2_input(buildings, &inputs[5], out),
-            "berlin_1m_dir": null, "zensus_csv": inputs[4], "threads": 0
+            "berlin_1m_dir": null, "threads": 0,
+            "population": {
+                "csv": inputs[4],
+                "proj": "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80 +units=m +no_defs",
+                "delimiter": ";", "x": "x_mp_100m", "y": "y_mp_100m", "value": "Einwohner",
+                "cell_m": 100, "source": "Zensus 2022 100 m population grid", "notice": "Destatis"
+            }
         }),
     );
     assert!(ok, "{lines:?}");
