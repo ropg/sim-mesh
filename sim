@@ -197,12 +197,13 @@ in_container() {
     outer=$(cd "$ROOT/.." && pwd)
     # A station binds its web UI's port 80 and 443 as the caller's user: the
     # container lets any user take a port under 1024, as Docker's do by
-    # default and Podman's do not.
+    # default and Podman's do not. SIM_MESH_CALLER_DIR is where sim was run
+    # from: a relative path given to a verb is read from there.
     local args=(run --rm --init
                 --sysctl net.ipv4.ip_unprivileged_port_start=0
                 -v "$outer:$outer" -w "$ROOT"
                 -v sim-mesh-home:/home/sim-mesh -e HOME=/home/sim-mesh
-                -e SIM_MESH_IN_CONTAINER=1)
+                -e SIM_MESH_IN_CONTAINER=1 -e "SIM_MESH_CALLER_DIR=$PWD")
     # What it writes in the mounted tree is the host user's: Docker runs as
     # that uid; rootless Podman maps it so, and root's Podman is root already.
     if [ "$e" != podman ]; then args+=(--user "$(id -u):$(id -g)")
