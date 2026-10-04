@@ -26,7 +26,8 @@ modules; anything else in sim-mesh may change under it.
     exec      the executable's path
     fixed     the read-only data tree's path, or None
     env       node.yaml's `env`, `./` paths made absolute
-    name, base, arch, version, category, radio, title, hardware
+    firmware  its name, <base>_<arch>_<version>
+    base, arch, version, category, radio, title, hardware
 
 and every call names a `station`, which offers:
 

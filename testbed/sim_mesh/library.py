@@ -98,9 +98,21 @@ to be up first; a node with no firmware refuses):
 - `.reticulum.lxmf.send(to, text, sender=None)`: an LXMF message to a node or
   an LXMF identity, from the node's identity `sender` (none named: the
   first): {node: the message's id}.
+- `.meshcore.repeat(on)`: forwarding others' packets on or off.
+- `.meshcore.advert()`, `.meshcore.floodadv()`: a zero-hop or a flooded
+  advert.
+- `.meshcore.contacts()`: each node's [(name, public-key prefix, path length
+  or None for flood)].
+- `.meshcore.msg(to, text)`: a direct message to the contact `to`, a node's
+  name once it has advertised it: {node: the message's id}.
+- `.meshcore.chan(nb, text)`: a message on channel `nb`: {node: the
+  message's id}.
+- `.meshcore.path(to)`: each node's path to the contact `to`, its hops, or
+  None for flood; `.meshcore.reset_path(to)`: back to flood.
 
-A command under `.reticulum` is for a selection's Reticulum nodes and
-nothing to the others; a selection with none of them refuses it. Every
+A command under `.reticulum` or `.meshcore` is for a selection's nodes of
+that category and nothing to the others; a selection with none of them
+refuses it. Every
 command that acts takes `after=` (seconds on the run's clock before it is
 done) and `wait=False`, which returns at once with a future whose `result()`
 is the answer: how a script puts many things on the clock at once. A
@@ -628,6 +640,53 @@ class _Reticulum(_Layer):
         return _given(to=to, dest_hash=dest_hash, iface=iface)
 
 
+class _Meshcore(_Layer):
+    """MeshCore, on a selection's MeshCore nodes: `.meshcore`. Each verb is
+    meshcore-cli's command of that name."""
+
+    category = "meshcore"
+
+    @verb("repeat")
+    def repeat(self, on):
+        """Forwarding others' packets on or off."""
+        return {"on": bool(on)}
+
+    @verb("advert")
+    def advert(self):
+        """A zero-hop advert."""
+        return {}
+
+    @verb("floodadv")
+    def floodadv(self):
+        """A flooded advert."""
+        return {}
+
+    @verb("contacts")
+    def contacts(self):
+        """Each node's [(name, public-key prefix, path length or None)]."""
+        return {}
+
+    @verb("msg")
+    def msg(self, to, text):
+        """A direct message to the contact `to`: {node: the message's id}."""
+        return {"to": str(to), "text": str(text)}
+
+    @verb("chan")
+    def chan(self, nb, text):
+        """A message on channel `nb`: {node: the message's id}."""
+        return {"nb": int(nb), "text": str(text)}
+
+    @verb("path")
+    def path(self, to):
+        """Each node's path to the contact `to`: its hops, or None for flood."""
+        return {"to": str(to)}
+
+    @verb("reset_path")
+    def reset_path(self, to):
+        """Back to flood for the contact `to`."""
+        return {"to": str(to)}
+
+
 class Nodes(select_module.Nodes):
     """Some nodes (sim_mesh.select), and what can be done to them; see the
     module's docstring. On the class, `Node`, a firmware's command is a
@@ -635,6 +694,7 @@ class Nodes(select_module.Nodes):
 
     category = None
     reticulum = _Accessor(_Reticulum)
+    meshcore = _Accessor(_Meshcore)
 
     def _names(self):
         return self.pick(_sim().facts())

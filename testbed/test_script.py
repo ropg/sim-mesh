@@ -234,11 +234,24 @@ def test_commands_said_on_node_are_data_for_the_drivers_verbs():
     assert {"role", "path", "lxmf.create", "lxmf.identities", "lxmf.announce",
             "lxmf.send"} <= set(drivers.verbs("reticulum"))
     assert set(drivers.verbs()) <= set(drivers.verbs("reticulum"))
+    assert library.lines_of([Node.meshcore.repeat(True), Node.meshcore.floodadv()]) == [
+        {"verb": "repeat", "args": {"on": True}, "category": "meshcore"},
+        {"verb": "floodadv", "args": {}, "category": "meshcore"}]
+    assert set(drivers.verbs()) | {"repeat", "advert", "floodadv", "contacts", "msg", "chan",
+                                   "path", "reset_path"} == set(drivers.verbs("meshcore"))
+
+
+def test_a_meshcore_message_carries_its_id_in_its_text():
+    from sim_mesh.meshcore.driver import tagged, untagged
+    assert tagged("hello there", "alpha.1200") == "hello there #alpha.1200"
+    assert untagged("hello there #alpha.1200") == ("hello there", "alpha.1200")
+    assert untagged("hello #2 there #bravo.5.1") == ("hello #2 there", "bravo.5.1")
+    assert untagged("no id here") == ("no id here", None)
 
 
 def test_an_unknown_category_is_named():
-    with pytest.raises(drivers.CommandError, match="category 'meshcore'"):
-        drivers.load({"firmware": "mc", "category": "meshcore", "driver": "/nowhere.py"})
+    with pytest.raises(drivers.CommandError, match="category 'meshtastic'"):
+        drivers.load({"firmware": "mt", "category": "meshtastic", "driver": "/nowhere.py"})
 
 
 def test_inputs_are_read_without_running_and_given_when_run(scripts_dir, runtime):

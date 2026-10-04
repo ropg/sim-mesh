@@ -1,6 +1,6 @@
 """Stand-in firmware for the tests: a station that is a shell script, and a
-`reticulum` driver that writes down every line and verb it is given in the
-station's `lines` file."""
+`reticulum` driver (or a `meshcore` one, MESHCORE_DRIVER) that writes down
+every line and verb it is given in the station's `lines` file."""
 
 import io
 import os
@@ -72,6 +72,48 @@ class Stub(ReticulumDriver):
 
     async def current_role(self, station):
         return "client"
+
+
+DRIVER = Stub
+'''
+
+MESHCORE_DRIVER = '''
+import os
+from sim_mesh.meshcore.driver import MeshcoreDriver, tagged
+
+
+def note(station, line):
+    with open(os.path.join(station.dir, "lines"), "a") as out:
+        out.write(line + "\\n")
+    return "did %s" % line
+
+
+class Stub(MeshcoreDriver):
+    async def wait_up(self, station, timeout):
+        return True
+
+    async def run(self, station, line, timeout=None):
+        return note(station, line)
+
+    def configured(self, station):
+        return os.path.exists(os.path.join(station.dir, "lines"))
+
+    async def name(self, station, name):
+        note(station, "name %s" % name)
+
+    async def repeat(self, station, on):
+        note(station, "repeat %s" % ("on" if on else "off"))
+
+    async def msg(self, station, dest, text, mid):
+        note(station, "msg %s %s" % (dest, tagged(text, mid)))
+        self.msg_status(station, mid, "sent")
+
+    async def chan(self, station, nb, text, mid):
+        note(station, "chan %d %s" % (nb, tagged(text, mid)))
+        self.msg_status(station, mid, "sent")
+
+    async def path(self, station, dest):
+        return ["ab"] if dest == "a" else None
 
 
 DRIVER = Stub
