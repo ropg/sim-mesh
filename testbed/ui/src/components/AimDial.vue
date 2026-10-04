@@ -48,7 +48,9 @@
  * from north) and a side view for its elevation (above the horizon), each
  * with the beam's half-power width as a wedge. Dragging, scrolling or the
  * arrow keys change it; while a drag goes on the new aim is sent a few times
- * a second, so the coverage follows the needle, and once more where it ends. */
+ * a second, and once more where it ends. The needle answers at once: the
+ * coverage is redrawn behind it a slice at a time (GroundMap's paintCoverage),
+ * each new aim dropping the redraw before it, and lands when it is whole. */
 import { computed, onBeforeUnmount, ref } from 'vue'
 
 const props = defineProps<{

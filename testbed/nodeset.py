@@ -2,6 +2,7 @@
 
     testbed/nodesets/<name>.yaml
     testbed/nodesets/<name>.py        its own setup, when it has one (script.py)
+    testbed/nodesets/.origin/<name>.yaml   the index it came from, when it did (indexes.py)
 
     nodes:
       gw-alex: { id: 1, lat: 52.5219, lon: 13.4132, height_m: 38, height_from: roof,
@@ -86,10 +87,26 @@ EARTH_RADIUS_M = 6371008.8
 KEEP = object()                     # set_node: a fact not given, left as it is
 LINK_KEYS = ("between", "loss_db", "back_db", "note")
 LINK_FORM = "{ between: [a, b], loss_db, back_db?, note? }"
+ORIGINS = ".origin"                 # nodesets/.origin/<name>.yaml: the index it came from
 
 
 def nodeset_path(name):
     return os.path.join(store.NODESETS_DIR, store.check_name(name, "nodeset") + ".yaml")
+
+
+def setup_path(name):
+    """A nodeset's own setup script, which it may not have."""
+    return os.path.splitext(nodeset_path(name))[0] + ".py"
+
+
+def origin_path(name):
+    """Where an index's nodeset says where it came from (indexes.py)."""
+    return os.path.join(store.NODESETS_DIR, ORIGINS, store.check_name(name, "nodeset") + ".yaml")
+
+
+def disk_bytes(name):
+    """What a nodeset takes on disk: its file and its own setup script."""
+    return store.disk_bytes(nodeset_path(name), setup_path(name))
 
 
 def names():
@@ -619,14 +636,15 @@ def create(name):
 
 
 def delete(name):
-    """A nodeset gone, with its own setup script (`nodesets/<name>.py`)."""
+    """A nodeset gone, with its own setup script (`nodesets/<name>.py`) and
+    the note of the index it came from."""
     path = nodeset_path(name)
     if not os.path.isfile(path):
         raise store.StoreError("no nodeset called %r" % name)
     os.remove(path)
-    setup = os.path.splitext(path)[0] + ".py"
-    if os.path.isfile(setup):
-        os.remove(setup)
+    for other in (setup_path(name), origin_path(name)):
+        if os.path.isfile(other):
+            os.remove(other)
 
 
 def summary(name):
@@ -724,10 +742,14 @@ def _rows(path):
 
 
 def _number(text):
-    try:
-        return float(text) if text not in (None, "") else None
-    except ValueError:
+    """A finite number from a cell or a parsed value, else None."""
+    if text in (None, "") or isinstance(text, bool):
         return None
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _board_at(power):
@@ -831,3 +853,226 @@ def import_nodes_csv(path, height_m=15.0):
             "measured" if height is not None else "assumed",
             max_dbm=_board_at(_number(row.get("tx_power_dbm"))), tags=[kind] if kind else [])
     return data
+
+
+# ---- points from other formats ---------------------------------------------
+#
+# Each reader gives points, {label, lat, lon, height_m?, max_dbm?, tags},
+# and `from_points` makes the nodeset: a node named after its label made
+# usable and unique (else `<source>-<n>`), at the point's height above the
+# ground where the format gives one (measured) and else at `height_m`
+# (assumed), tagged with the format and the point's own tags. A height a
+# format gives above sea level (GeoJSON's third coordinate, GPX's `ele`, a
+# Meshtastic altitude) is not a height above the ground, and is passed over.
+
+POINT_FORMATS = ("csv", "geojson", "kml", "gpx", "meshtastic")
+CSV_COLUMNS = ("lat", "lon", "name", "height", "power", "tags")
+
+
+def from_points(points, source, height_m=15.0):
+    """Points as a nodeset; one off the globe is left out, and none at all
+    is refused."""
+    data = blank()
+    for point in points:
+        lat, lon = point.get("lat"), point.get("lon")
+        if lat is None or lon is None or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        node_id = len(data["nodes"]) + 1
+        name = unique_name(store.slug(point.get("label"), "%s-%d" % (source, node_id)),
+                           data["nodes"])
+        height = point.get("height_m")
+        tags = [source] + [store.slug(t, "") for t in point.get("tags") or ()]
+        data["nodes"][name] = node_record(
+            node_id, lat, lon, height if height is not None else height_m,
+            "measured" if height is not None else "assumed",
+            max_dbm=_board_at(point.get("max_dbm")),
+            tags=check_tags(t for t in tags if t))
+    if not data["nodes"]:
+        raise store.StoreError("the %s file has no point with a position" % source)
+    return data
+
+
+def _tag_list(value):
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [t for t in str(value or "").replace(";", ",").split(",") if t.strip()]
+
+
+def csv_points(text, columns):
+    """Any CSV's rows as points, its columns named by `columns`: {lat, lon,
+    name?, height?, power?, tags?}, each a header of the file. The delimiter
+    is whichever of `,`, `;` and tab the header has most of; a header written
+    as a `#` comment is a header all the same; tags are split at `,` or `;`."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise store.StoreError("the CSV is empty")
+    lines[0] = lines[0].lstrip("#").strip()
+    delimiter = max((",", ";", "\t"), key=lines[0].count)
+    reader = csv.DictReader(lines, delimiter=delimiter)
+    header = [field.strip() for field in reader.fieldnames or ()]
+    reader.fieldnames = header
+    columns = {k: v for k, v in (columns or {}).items() if k in CSV_COLUMNS and v}
+    for key in ("lat", "lon"):
+        if key not in columns:
+            raise store.StoreError("name the CSV's %s column" % ("latitude" if key == "lat"
+                                                                 else "longitude"))
+    missing = [v for v in columns.values() if v not in header]
+    if missing:
+        raise store.StoreError("the CSV has no column %s" % ", ".join(missing))
+    points = []
+    for row in reader:
+        def cell(key):
+            return (row.get(columns[key]) or "").strip() if key in columns else ""
+        points.append({"label": cell("name"), "lat": _number(cell("lat")),
+                       "lon": _number(cell("lon")), "height_m": _number(cell("height")),
+                       "max_dbm": _number(cell("power")), "tags": _tag_list(cell("tags"))})
+    return points
+
+
+def geojson_points(text):
+    """A GeoJSON FeatureCollection's, Feature's or geometry's points (Point
+    and MultiPoint). A feature's `name`, `title` or `label` is the label; its
+    `height_m` or `height_agl_m` the height; its `tags` (a list, or text split
+    at commas) and `role` are tags."""
+    try:
+        data = json.loads(text)
+    except ValueError as err:
+        raise store.StoreError("not GeoJSON: %s" % err) from err
+    features = []
+    if isinstance(data, dict) and data.get("type") == "FeatureCollection":
+        features = data.get("features") or []
+    elif isinstance(data, dict) and data.get("type") == "Feature":
+        features = [data]
+    elif isinstance(data, dict) and data.get("coordinates") is not None:
+        features = [{"geometry": data, "properties": {}}]
+    points = []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        geometry = feature.get("geometry") or {}
+        props = feature.get("properties") or {}
+        coords = geometry.get("coordinates")
+        spots = [coords] if geometry.get("type") == "Point" else \
+            coords if geometry.get("type") == "MultiPoint" else []
+        for spot in spots or ():
+            if not isinstance(spot, (list, tuple)) or len(spot) < 2:
+                continue
+            points.append({
+                "label": props.get("name") or props.get("title") or props.get("label"),
+                "lon": _number(spot[0]), "lat": _number(spot[1]),
+                "height_m": _number(props.get("height_m", props.get("height_agl_m"))),
+                "max_dbm": _number(props.get("max_dbm", props.get("tx_power_dbm"))),
+                "tags": _tag_list(props.get("tags")) + ([str(props["role"])] if props.get("role")
+                                                        else [])})
+    return points
+
+
+def _xml(text, what):
+    import xml.etree.ElementTree as ET
+    try:
+        return ET.fromstring(text.encode("utf-8"))
+    except ET.ParseError as err:
+        raise store.StoreError("not %s: %s" % (what, err)) from err
+
+
+def _local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def _child_text(element, name):
+    for child in element:
+        if _local(child.tag) == name:
+            return (child.text or "").strip()
+    return ""
+
+
+def kml_points(text):
+    """A KML file's placemarks with a point. A point whose altitudeMode is
+    relativeToGround gives its altitude as the height above the ground;
+    absolute and clamped altitudes do not."""
+    root = _xml(text, "KML")
+    points = []
+    for mark in root.iter():
+        if _local(mark.tag) != "Placemark":
+            continue
+        for point in mark.iter():
+            if _local(point.tag) != "Point":
+                continue
+            parts = _child_text(point, "coordinates").replace("\n", " ").split()
+            if not parts:
+                continue
+            values = [_number(v) for v in parts[0].split(",")]
+            if len(values) < 2:
+                continue
+            relative = _child_text(point, "altitudeMode") == "relativeToGround"
+            points.append({"label": _child_text(mark, "name"), "lon": values[0], "lat": values[1],
+                           "height_m": values[2] if relative and len(values) > 2 else None,
+                           "tags": []})
+    return points
+
+
+def gpx_points(text):
+    """A GPX file's waypoints: each `wpt` with its name, and its `type` as a
+    tag."""
+    root = _xml(text, "GPX")
+    points = []
+    for wpt in root.iter():
+        if _local(wpt.tag) != "wpt":
+            continue
+        kind = _child_text(wpt, "type")
+        points.append({"label": _child_text(wpt, "name"), "lat": _number(wpt.get("lat")),
+                       "lon": _number(wpt.get("lon")), "tags": [kind] if kind else []})
+    return points
+
+
+def meshtastic_points(text):
+    """A Meshtastic node list: `meshtastic --info`'s "Nodes in mesh:" JSON,
+    or that JSON alone, a mapping by node id or a list. A node is named after
+    its long name, else its short name or id, and tagged with its role; one
+    without a position (or at 0°, 0°, a fix never had) is left out."""
+    data = None
+    start = text.find("Nodes in mesh:")
+    try:
+        if start >= 0:
+            brace = text.index("{", start)
+            data, _ = json.JSONDecoder().raw_decode(text[brace:])
+        else:
+            data = json.loads(text)
+    except ValueError as err:
+        raise store.StoreError("not a Meshtastic node list: %s" % err) from err
+    nodes = data.values() if isinstance(data, dict) else data if isinstance(data, list) else []
+    points = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        user = node.get("user") or {}
+        pos = node.get("position") or {}
+        lat, lon = pos.get("latitude"), pos.get("longitude")
+        if lat is None and pos.get("latitudeI") is not None:
+            lat = pos["latitudeI"] * 1e-7
+        if lon is None and pos.get("longitudeI") is not None:
+            lon = pos["longitudeI"] * 1e-7
+        lat, lon = _number(lat), _number(lon)
+        if lat is None or lon is None or (lat == 0 and lon == 0):
+            continue
+        role = user.get("role")
+        points.append({"label": user.get("longName") or user.get("shortName") or user.get("id"),
+                       "lat": lat, "lon": lon, "tags": [str(role)] if role else []})
+    return points
+
+
+def import_points(fmt, text, height_m=15.0, columns=None):
+    """A file of one of POINT_FORMATS as a nodeset."""
+    if fmt == "csv":
+        points = csv_points(text, columns)
+    elif fmt == "geojson":
+        points = geojson_points(text)
+    elif fmt == "kml":
+        points = kml_points(text)
+    elif fmt == "gpx":
+        points = gpx_points(text)
+    elif fmt == "meshtastic":
+        points = meshtastic_points(text)
+    else:
+        raise store.StoreError("a file of points is one of %s" % ", ".join(POINT_FORMATS))
+    return from_points(points, fmt, height_m)

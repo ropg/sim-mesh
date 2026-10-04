@@ -1,44 +1,50 @@
-"""Where a pack's ground comes from: the public sources, what a rectangle
-needs of each, and the cache they are fetched into.
+"""Where a pack's ground comes from: what a rectangle needs of each source,
+and the cache it is fetched into. The sources themselves are data
+(sourcefile.py reads them); this module knows the methods they name.
 
 ```
-front ── GET index-v1.json ────────────► download.geofabrik.de   every extract's outline, weekly
-front ── GET <feed>/atom/0.atom ───────► gdi.berlin.de           Berlin's tiles, weekly
-front ── GET /api/v1/nodes ────────────► map.meshcore.io         its node list, weekly
-front ── HEAD <file> ──────────────────► the source's host       its size, once
-front ── GET <file>, Range: bytes=<n>- ► the source's host       into the cache, resumed
+front ── GET <regions index> ──────────► its host (Geofabrik's)    every region's outline, weekly
+front ── GET <atom feed> ──────────────► its host (Berlin's)       a source's tiles, weekly
+front ── HEAD <file> ──────────────────► the source's host         its size, once
+front ── GET <file>, Range: bytes=<n>- ► the source's host         into the cache, resumed;
+                                                                   a mirror when one fails
 ```
 
-    testbed/geodata/.cache/glo30/<tile>.tif        Copernicus GLO-30 surface model, 1° tiles
-    testbed/geodata/.cache/worldcover/<tile>.tif   ESA WorldCover 2021 land cover, 3° tiles
-    testbed/geodata/.cache/itu/DN50.TXT, N050.TXT  ITU-R P.1812-8's ΔN and N0 maps, never packed
-    testbed/geodata/.cache/geofabrik/<id>.osm.pbf  one OpenStreetMap extract
-    testbed/geodata/.cache/berlin-dgm1/<tile>.zip  Berlin's 1 m terrain, 2 km tiles; x/ extracted
-    testbed/geodata/.cache/berlin-bdom/<tile>.zip  Berlin's 1 m surface, 2 km tiles; x/ extracted
-    testbed/geodata/.cache/berlin-lod2/<tile>.zip  Berlin's LoD2 building models, 1 km tiles;
-                                                   x/ extracted
-    testbed/geodata/.cache/zensus/<zip>            Zensus 2022's population grid; x/ extracted
-    testbed/geodata/.cache/meta/                   what the sources have: Geofabrik's index,
-                                                   Berlin's feeds, the MeshCore map's node list;
-                                                   a week old at most
-    testbed/geodata/.cache/sizes.json              each file's size as its host said, by URL
+    testbed/geodata/.cache/<source id>/<file>   one source's files; a zip's members in x/
+    testbed/geodata/.cache/meta/                what sources list (a regions index as
+                                                <id>-<its name>, an atom feed as <id>.atom),
+                                                and the MeshCore map's node list; a week old
+                                                at most
+    testbed/geodata/.cache/sizes.json           each file's size as its host said, by URL
+
+**Finding a rectangle's files**, by the method a source names:
+
+- `template`: the size_deg tiles of EPSG:4326 meeting the rectangle's grid,
+  each named by its south-west corner, its address the url with {tile}.
+- `atom`: the tiles a feed lists whose square, its corner read off the file
+  name in the feed's units, meets the rectangle's grid in the feed's zone.
+- `regions`: the smallest region of the index whose outline holds the whole
+  rectangle, its `file`.
+- `file`: the one file.
+
+A file is cached under its address's own name: a template's or a feed's
+tile as its URL names it, a region's as `<region>` and the URL's suffix
+(`berlin.osm.pbf`), a single file as the URL names it when that is a plain
+file name and else as `<id>` and its suffix (`itu.zip`).
 
 Every build shares the cache, so a second region beside the first fetches
 only what is new. A file is fetched once: into `<file>.part`, resumed from
 where it stopped by a range request, and renamed into place when whole. A
 file its host does not have (GLO-30 has no tile over open sea) leaves a
-`<file>.absent` beside it and is not asked for again.
+`<file>.absent` beside it and is not asked for again, unless its source says
+a missing file is an error (`missing: error`). An address with mirrors is
+tried in order, and the next one when one fails.
 
-**OpenStreetMap is one Geofabrik extract**, the smallest whose outline holds
-the rectangle: roads, places, sites and buildings all come from it. **Berlin's
-tiles are chosen, not mirrored**: a tile's name is its south-west corner in
-kilometres of EPSG:25833 (UTM zone 33 on ETRS89), and only the tiles meeting
-the rectangle are fetched.
-
-**A build takes the best source for each part of its rectangle**, and
-offers no choice: Berlin's own data where the rectangle touches Berlin,
-GLO-30 and OpenStreetMap's buildings on the rest, the Zensus grid where it
-touches Germany (`plan` says which, and what each is used for).
+**A build takes every source whose coverage meets its rectangle**, and the
+compiler takes from each layer's sources by their priority there: Berlin's
+own data where the rectangle touches Berlin, GLO-30 and OpenStreetMap's
+buildings on the rest, the Zensus grid where it touches Germany (`plan`
+says which, and what each is used for).
 
 Every request names sim-mesh in its User-Agent, a 429 or 5xx is retried after
 the Retry-After the host gives (or a growing pause), and nothing is fetched
@@ -58,6 +64,7 @@ import zipfile
 import aiohttp
 
 import geodata
+import sourcefile
 import store
 
 CACHE_DIR = os.path.join(store.GEODATA_DIR, ".cache")
@@ -65,36 +72,23 @@ USER_AGENT = "sim-mesh (+https://github.com/sim-mesh/sim-mesh)"
 CHUNK = 1 << 16
 TRIES = 4
 BACKOFF_S = 5.0
-META_MAX_AGE_S = 7 * 86400          # the Geofabrik index and Berlin's feeds, weekly
+META_MAX_AGE_S = 7 * 86400          # a feed or an index kept this long unless the source says
 HEAD_PARALLEL = 6
 MAX_CELLS = 25_000_000              # a grid past this is refused: rasters are held whole
 RESOLUTIONS = (30.0, 10.0)
+PLAIN_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+WORLD = [-180.0, -85.0, 180.0, 85.0]
 
-GLO30_URL = "https://copernicus-dem-30m.s3.amazonaws.com/{tile}/{tile}.tif"
-WORLDCOVER_URL = ("https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/"
-                  "ESA_WorldCover_10m_2021_v200_{tile}_Map.tif")
-ITU_URL = "https://www.itu.int/dms_pubrec/itu-r/rec/p/R-REC-P.1812-8-202509-I!!ZIP-E.zip"
-ITU_MEMBERS = ("DN50.TXT", "N050.TXT")
-GEOFABRIK_INDEX = "https://download.geofabrik.de/index-v1.json"
-BERLIN_FEEDS = {"berlin-dgm1": "https://gdi.berlin.de/data/dgm1/atom/0.atom",
-                "berlin-bdom": "https://gdi.berlin.de/data/bdom/atom/0.atom",
-                "berlin-lod2": "https://gdi.berlin.de/data/a_lod2/atom/0.atom"}
-BERLIN_TILE_KM = {"berlin-dgm1": 2, "berlin-bdom": 2, "berlin-lod2": 1}
-BERLIN_ZONE = geodata.TransverseMercator(33, True, geodata.GRS80)
-ZENSUS_URL = "https://www.destatis.de/static/DE/zensus/gitterdaten/Zensus2022_Bevoelkerungszahl.zip"
-ZENSUS_MEMBER = "Zensus2022_Bevoelkerungszahl_100m-Gitter.csv"
-
-# What the side panel says of each source: what it is, and its licence.
-SOURCES = {
-    "glo30": ("Copernicus GLO-30 surface model", "Copernicus DEM licence, attribution required"),
-    "worldcover": ("ESA WorldCover 2021 land cover", "CC BY 4.0"),
-    "itu": ("ITU-R P.1812-8 ΔN and N0 maps", "ITU; kept on this machine, only two numbers enter a pack"),
-    "geofabrik": ("OpenStreetMap extract (Geofabrik)", "ODbL 1.0, © OpenStreetMap contributors"),
-    "berlin-dgm1": ("Berlin DGM1, 1 m terrain", "Datenlizenz Deutschland – Zero – 2.0"),
-    "berlin-bdom": ("Berlin bDOM, 1 m surface", "Datenlizenz Deutschland – Zero – 2.0"),
-    "berlin-lod2": ("Berlin LoD2 building models", "Datenlizenz Deutschland – Zero – 2.0"),
-    "zensus": ("Zensus 2022 100 m population grid", "Datenlizenz Deutschland – Namensnennung – 2.0"),
+# What the cache holds that is no source's, for the page's tooltip on its row.
+CACHE_HOLDS = {
+    "meta": "What the sources list, fetched at most weekly: Geofabrik's index of extracts and "
+            "their outlines, Berlin's tile feeds, the MeshCore map's node list.",
+    "osmtiles": "OpenStreetMap's rendered map tiles, for the build view's map; never part of "
+                "a pack.",
 }
+LAYER_TEXT = {"surface": "surface heights", "terrain": "terrain", "landcover": "land cover classes",
+              "buildings": "buildings", "population": "population", "roads": "roads",
+              "places": "places", "radio-climate": "the radio climate (ΔN and N0)"}
 
 
 class SourceError(store.StoreError):
@@ -102,18 +96,28 @@ class SourceError(store.StoreError):
 
 
 class File:
-    """One file of one source: where it comes from, where it goes in the
-    cache, and for a zip, which of its members a build reads (extracted into
-    `x/` beside it)."""
+    """One file of one source: where it comes from (its mirrors after it),
+    where it goes in the cache, and for a zip, which of its members a build
+    reads (extracted into `x/` beside it)."""
 
-    def __init__(self, source, url, name, members=None):
-        self.source, self.url, self.name, self.members = source, url, name, members
+    def __init__(self, source, url, name, members=None, missing="no-data"):
+        self.source, self.name, self.members, self.missing = source, name, members, missing
+        self.urls = list(url) if isinstance(url, (list, tuple)) else [url]
+
+    @property
+    def url(self):
+        return self.urls[0]
 
     def path(self, root):
         return os.path.join(root, self.source, self.name)
 
     def __repr__(self):
         return "File(%s/%s)" % (self.source, self.name)
+
+
+def registry(sources=None):
+    """The sources to plan from: those given, else every source file's."""
+    return sources if sources is not None else sourcefile.load()
 
 
 # ---- the rectangle ---------------------------------------------------------
@@ -169,43 +173,113 @@ def check(bbox, res_m):
             "size_km": [round((x1 - x0) / 1000, 2), round((y1 - y0) / 1000, 2)]}
 
 
-def hemi_lat(lat):
-    return "%s%02d" % ("N" if lat >= 0 else "S", abs(lat))
+def zone_of(crs):
+    """The transverse Mercator of a UTM `EPSG:<code>`."""
+    return geodata.TransverseMercator(*geodata.utm_zone_of(int(str(crs).split(":")[1])))
 
 
-def hemi_lon(lon):
-    return "%s%03d" % ("E" if lon >= 0 else "W", abs(lon))
+# ---- finding: template -----------------------------------------------------------
+
+def tile_name(pattern, lat, lon):
+    """A template's tile named by its south-west corner: {ns} and {ew} the
+    hemispheres, {lat} and {lon} the whole degrees without sign, `:0n`
+    padding them to n digits."""
+    def field(m):
+        what, pad = m.group(1), m.group(2)
+        if what == "ns":
+            return "N" if lat >= 0 else "S"
+        if what == "ew":
+            return "E" if lon >= 0 else "W"
+        value = abs(lat if what == "lat" else lon)
+        return "%0*d" % (int(pad), value) if pad else "%d" % value
+    return sourcefile.TILE_FIELD_RE.sub(field, pattern)
 
 
-def glo30_files(hull):
-    """The 1° tiles, named by their south-west corner."""
+def template_files(source, hull):
+    """The tiles meeting the degrees `hull` [lon0, lat0, lon1, lat1]."""
+    size = source.find["size_deg"]
     lon0, lat0, lon1, lat1 = hull
     out = []
-    for lat in range(math.floor(lat0), math.floor(lat1 - 1e-9) + 1):
-        for lon in range(math.floor(lon0), math.floor(lon1 - 1e-9) + 1):
-            tile = "Copernicus_DSM_COG_10_%s_00_%s_00_DEM" % (hemi_lat(lat), hemi_lon(lon))
-            out.append(File("glo30", GLO30_URL.format(tile=tile), tile + ".tif"))
+    for lat in range(math.floor(lat0 / size) * size, math.floor((lat1 - 1e-9) / size) * size + 1,
+                     size):
+        for lon in range(math.floor(lon0 / size) * size,
+                         math.floor((lon1 - 1e-9) / size) * size + 1, size):
+            tile = tile_name(source.find["tile"], lat, lon)
+            urls = [u.replace("{tile}", tile) for u in source.addresses("url")]
+            out.append(File(source.id, urls, urls[0].rsplit("/", 1)[-1], missing=_missing(source)))
     return out
 
 
-def worldcover_files(hull):
-    """The 3° tiles, named by their south-west corner."""
-    lon0, lat0, lon1, lat1 = hull
+def template_pattern(source):
+    """A template's cached file names as a pattern, its corner's groups ns,
+    lat, ew, lon."""
+    name = source.address("url").rsplit("/", 1)[-1].replace("{tile}", source.find["tile"])
+    out, at = "", 0
+    for m in sourcefile.TILE_FIELD_RE.finditer(name):
+        out += re.escape(name[at:m.start()])
+        what, pad = m.group(1), m.group(2)
+        out += "(?P<%s>[%s])" % (what, "NS" if what == "ns" else "EW") if what in ("ns", "ew") \
+            else "(?P<%s>\\d%s)" % (what, "{%s}" % pad if pad else "+")
+        at = m.end()
+    return re.compile("^" + out + re.escape(name[at:]) + "$")
+
+
+# ---- finding: atom -----------------------------------------------------------------
+
+HREF_RE = re.compile(r'href="([^"]+)"')
+
+
+def atom_tiles(source, feed_text):
+    """A feed's tiles: [(url, x, y)], the corner in the feed's units."""
+    name = re.compile(source.find["name"])
     out = []
-    for lat in range(math.floor(lat0 / 3) * 3, math.floor((lat1 - 1e-9) / 3) * 3 + 1, 3):
-        for lon in range(math.floor(lon0 / 3) * 3, math.floor((lon1 - 1e-9) / 3) * 3 + 1, 3):
-            tile = hemi_lat(lat) + hemi_lon(lon)
-            out.append(File("worldcover", WORLDCOVER_URL.format(tile=tile),
-                            "ESA_WorldCover_10m_2021_v200_%s_Map.tif" % tile))
+    for href in HREF_RE.findall(feed_text):
+        m = name.search(href)
+        if m:
+            out.append((href, int(m.group("x")), int(m.group("y"))))
     return out
 
 
-def itu_files():
-    return [File("itu", ITU_URL, "itu.zip", ITU_MEMBERS)]
+def atom_box(source, bbox):
+    """The rectangle's grid in a feed's zone and units."""
+    unit = float(source.find["unit_m"])
+    x0, y0, x1, y1 = utm_hull(bbox, zone_of(source.find["crs"]))
+    return x0 / unit, y0 / unit, x1 / unit, y1 / unit
 
 
-def zensus_files():
-    return [File("zensus", ZENSUS_URL, "Zensus2022_Bevoelkerungszahl.zip", (ZENSUS_MEMBER,))]
+def atom_files(source, feed_text, bbox):
+    """The tiles of a feed that meet the rectangle's grid."""
+    x0, y0, x1, y1 = atom_box(source, bbox)
+    size = float(source.find["size_m"]) / float(source.find["unit_m"])
+    return [File(source.id, url, url.rsplit("/", 1)[1], source.members(), missing=_missing(source))
+            for url, e, n in atom_tiles(source, feed_text)
+            if e < x1 and e + size > x0 and n < y1 and n + size > y0]
+
+
+# ---- finding: regions and single files -------------------------------------------
+
+def region_file(source, feature):
+    """A region's file: its `file` of the index, cached as `<region>` and the
+    URL's suffix."""
+    props = feature["properties"]
+    url = props["urls"][source.find["file"]]
+    base = url.rsplit("/", 1)[-1]
+    return File(source.id, url, props["id"] + ("." + base.split(".", 1)[1] if "." in base else ""),
+                source.members(), missing=_missing(source))
+
+
+def single_file(source):
+    urls = source.addresses("url")
+    base = urls[0].rsplit("/", 1)[-1]
+    name = base if PLAIN_NAME_RE.match(base) else \
+        source.id + ("." + base.rsplit(".", 1)[1] if "." in base else "")
+    return File(source.id, urls, name, source.members(), missing=_missing(source))
+
+
+def _missing(source):
+    """What a file no host has means: no data there (open sea for GLO-30),
+    unless the source says it is an error."""
+    return source.find.get("missing", "no-data")
 
 
 # ---- outlines --------------------------------------------------------------
@@ -283,6 +357,10 @@ def meets(geometry, bbox):
     return False
 
 
+def holds_point(geometry, lon, lat):
+    return any(_in_polygon(lon, lat, polygon) for polygon in _rings(geometry))
+
+
 def area(geometry):
     """An outline's area in square degrees, outer rings only: enough to say
     which of two outlines is the smaller."""
@@ -294,13 +372,13 @@ def area(geometry):
     return total
 
 
-def smallest_extract(index, bbox):
-    """The Geofabrik extract whose outline holds the rectangle and is the
-    smallest: its index feature, or None."""
+def smallest_extract(index, bbox, file="pbf"):
+    """The region of a Geofabrik index whose outline holds the rectangle and
+    is the smallest: its index feature, or None."""
     best = None
     for feature in index.get("features") or ():
         props = feature.get("properties") or {}
-        if not (props.get("urls") or {}).get("pbf"):
+        if not (props.get("urls") or {}).get(file):
             continue
         geometry = feature.get("geometry")
         if holds(geometry, bbox):
@@ -310,59 +388,11 @@ def smallest_extract(index, bbox):
     return best[1] if best else None
 
 
-def extract_file(feature):
-    props = feature["properties"]
-    return File("geofabrik", props["urls"]["pbf"], "%s.osm.pbf" % props["id"])
-
-
 def outline(index, extract_id):
     for feature in index.get("features") or ():
         if (feature.get("properties") or {}).get("id") == extract_id:
             return feature.get("geometry")
     return None
-
-
-# ---- Berlin ------------------------------------------------------------------
-
-TILE_RE = re.compile(r'href="([^"]+?(\d{3})_(\d{4})\.zip)"')
-
-
-def berlin_tiles(feed_text):
-    """A Berlin ATOM feed's tiles: [(url, easting km, northing km)]."""
-    return [(m.group(1), int(m.group(2)), int(m.group(3))) for m in TILE_RE.finditer(feed_text)]
-
-
-def berlin_km_box(bbox):
-    """The rectangle's extent in kilometres of EPSG:25833."""
-    x0, y0, x1, y1 = utm_hull(bbox, BERLIN_ZONE)
-    return x0 / 1000, y0 / 1000, x1 / 1000, y1 / 1000
-
-
-def berlin_files(source, feed_text, bbox):
-    """The tiles of one Berlin feed that meet the rectangle."""
-    x0, y0, x1, y1 = berlin_km_box(bbox)
-    size = BERLIN_TILE_KM[source]
-    out = []
-    for url, e, n in berlin_tiles(feed_text):
-        if e < x1 and e + size > x0 and n < y1 and n + size > y0:
-            out.append(File(source, url, url.rsplit("/", 1)[1], "*.xyz" if source != "berlin-lod2"
-                            else "*.xml"))
-    return out
-
-
-def berlin_extent(feed_text, source="berlin-lod2"):
-    """[lon0, lat0, lon1, lat1] of every tile in a feed: where Berlin's data is."""
-    tiles = berlin_tiles(feed_text)
-    if not tiles:
-        return None
-    size = BERLIN_TILE_KM[source]
-    x0 = min(t[1] for t in tiles) * 1000
-    y0 = min(t[2] for t in tiles) * 1000
-    x1 = (max(t[1] for t in tiles) + size) * 1000
-    y1 = (max(t[2] for t in tiles) + size) * 1000
-    ll = [BERLIN_ZONE.inverse(x, y) for x, y in ((x0, y0), (x0, y1), (x1, y0), (x1, y1))]
-    return [min(p[1] for p in ll), min(p[0] for p in ll),
-            max(p[1] for p in ll), max(p[0] for p in ll)]
 
 
 # ---- the cache -------------------------------------------------------------
@@ -428,11 +458,20 @@ class Cache:
         the host does not say."""
         if f.url in self.sizes:
             return self.sizes[f.url]
-        resp = await self.request("HEAD", f.url)
-        try:
-            got = None if resp.status == 404 else resp.content_length
-        finally:
-            resp.release()
+        got, error = None, None
+        for url in f.urls:
+            try:
+                resp = await self.request("HEAD", url)
+            except SourceError as err:
+                error = err
+                continue
+            try:
+                got = None if resp.status == 404 else resp.content_length
+            finally:
+                resp.release()
+            break
+        else:
+            raise error
         self.sizes[f.url] = got
         with contextlib.suppress(OSError):
             store.write_text(self.sizes_path, json.dumps(self.sizes, indent=0, sort_keys=True))
@@ -453,26 +492,44 @@ class Cache:
         return dict(await asyncio.gather(*(one(f) for f in todo)))
 
     async def fetch(self, f, progress=None):
-        """A file into the cache, resumed where a `.part` of it stopped:
-        its path, or None when its host has none. `progress(bytes)` hears
-        the bytes it holds as they arrive."""
+        """A file into the cache, resumed where a `.part` of it stopped, from
+        its address or the next mirror when one fails: its path, or None
+        when no host has it and its source says that is no data.
+        `progress(bytes)` hears the bytes it holds as they arrive."""
         have = self.have(f)
         path = f.path(self.root)
         if have is not None:
             return path if have else None
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        error, missing = None, 0
+        for url in f.urls:
+            try:
+                got = await self._fetch_from(f, url, path, progress)
+            except SourceError as err:
+                error = err
+                continue
+            if got is not None:
+                return got
+            missing += 1
+        if missing == len(f.urls):
+            if f.missing != "no-data":
+                raise SourceError("%s answers 404" % f.url)
+            store.write_text(path + ".absent", "%s\n" % f.url)
+            return None
+        raise error
+
+    async def _fetch_from(self, f, url, path, progress):
         part = path + ".part"
         start = self.fetched_bytes(f)
-        resp = await self.request("GET", f.url, {"Range": "bytes=%d-" % start} if start else None)
+        resp = await self.request("GET", url, {"Range": "bytes=%d-" % start} if start else None)
         try:
             if resp.status == 404:
-                store.write_text(path + ".absent", "%s\n" % f.url)
                 return None
             if resp.status == 416 and start:
                 os.replace(part, path)
                 return path
             if resp.status not in (200, 206):
-                raise SourceError("%s answers %d" % (f.url, resp.status))
+                raise SourceError("%s answers %d" % (url, resp.status))
             mode = "ab" if resp.status == 206 else "wb"
             got = start if resp.status == 206 else 0
             with open(part, mode) as out:
@@ -482,7 +539,7 @@ class Cache:
                     if progress:
                         progress(got)
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            raise SourceError("%s: %s" % (f.url, err or type(err).__name__)) from err
+            raise SourceError("%s: %s" % (url, err or type(err).__name__)) from err
         finally:
             resp.release()
         os.replace(part, path)
@@ -527,36 +584,42 @@ class Cache:
                 return True
         return False
 
-    async def meta(self, name, url):
-        """A file saying what a source has (the Geofabrik index, a Berlin
-        feed), fetched when missing or a week old: its text."""
-        path = await self.meta_file(name, url)
+    async def meta(self, name, url, max_age_s=META_MAX_AGE_S):
+        """A file saying what a source has (a regions index, a feed), fetched
+        when missing or older than `max_age_s`: its text."""
+        path = await self.meta_file(name, url, max_age_s)
         with open(path, encoding="utf-8-sig") as handle:
             return handle.read()
 
     async def meta_file(self, name, url, max_age_s=META_MAX_AGE_S):
         """As `meta`, the file's path: kept `max_age_s`, and the copy there
-        is served when a fetch fails."""
+        is served when a fetch fails. `url` may be a list, its mirrors."""
         path = os.path.join(self.root, "meta", name)
         lock = self.meta_locks.setdefault(name, asyncio.Lock())
         async with lock:
             fresh = os.path.isfile(path) and time.time() - os.path.getmtime(path) < max_age_s
             if not fresh:
-                try:
-                    resp = await self.request("GET", url)
+                error = None
+                for each in (url if isinstance(url, (list, tuple)) else [url]):
                     try:
-                        if resp.status != 200:
-                            raise SourceError("%s answers %d" % (url, resp.status))
-                        body = await resp.read()
-                    finally:
-                        resp.release()
+                        resp = await self.request("GET", each)
+                        try:
+                            if resp.status != 200:
+                                raise SourceError("%s answers %d" % (each, resp.status))
+                            body = await resp.read()
+                        finally:
+                            resp.release()
+                    except SourceError as err:
+                        error = err
+                        continue
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                     with open(path + ".part", "wb") as out:
                         out.write(body)
                     os.replace(path + ".part", path)
-                except SourceError:
-                    if not os.path.isfile(path):
-                        raise
+                    error = None
+                    break
+                if error is not None and not os.path.isfile(path):
+                    raise error
             return path
 
     def meta_age(self, name):
@@ -565,91 +628,197 @@ class Cache:
             return os.path.getmtime(os.path.join(self.root, "meta", name))
         return None
 
-    async def index(self):
-        text = await self.meta("geofabrik-index-v1.json", GEOFABRIK_INDEX)
+    async def regions_index(self, source):
+        """A regions source's index, parsed."""
+        name = "%s-%s" % (source.id, source.address("index").rsplit("/", 1)[-1])
+        text = await self.meta(name, source.addresses("index"), _max_age(source))
         try:
             return json.loads(text)
         except ValueError as err:
-            raise SourceError("Geofabrik's index is not JSON: %s" % err) from err
+            raise SourceError("%s's index is not JSON: %s" % (source.title, err)) from err
 
     async def feed(self, source):
-        return await self.meta(source + ".atom", BERLIN_FEEDS[source])
+        """An atom source's feed, its text."""
+        return await self.meta(source.id + ".atom", source.addresses("feed"), _max_age(source))
+
+
+def _max_age(source):
+    days = source.find.get("refresh_days")
+    return float(days) * 86400 if days else META_MAX_AGE_S
+
+
+# ---- where each source has data, and what of it is cached ------------------------
+
+def _box(lon0, lat0, lon1, lat1):
+    return [[[lon0, lat0], [lon1, lat0], [lon1, lat1], [lon0, lat1], [lon0, lat0]]]
+
+
+def _cached_names(root, source):
+    """The whole files of a source in the cache: no `.part`, no `.absent`,
+    no `.x` (a zip's members extracted), not the extracted `x/`."""
+    base = os.path.join(root, source)
+    if not os.path.isdir(base):
+        return []
+    return sorted(name for name in os.listdir(base)
+                  if os.path.isfile(os.path.join(base, name))
+                  and not name.endswith((".part", ".absent", ".x")))
+
+
+async def source_map(cache, source_id, sources=None):
+    """Where one source has data and what of it is in the cache, for the
+    page's map, as GeoJSON MultiPolygons in degrees:
+
+        {source, worldwide, covers: geometry | null, covers_from, cached:
+         geometry | null, cached_files, error}
+
+    A worldwide source's `covers` is null; an atom source's is the tiles its
+    feed lists, where its data is (its outline when the feed cannot be had);
+    any other's is its outline. What is cached is read off the file names,
+    as its method names them: a
+    template's tile its south-west corner, a feed's tile its corner in the
+    feed's units, a region's file its region, whose outline the index gives,
+    and a single file the whole coverage. A source that needs its index to
+    say this and cannot have it says so in `error`."""
+    source = registry(sources)[source_id]
+    names = _cached_names(cache.root, source_id)
+    out = {"source": source_id, "worldwide": source.worldwide,
+           "covers": None if source.worldwide else source.outline,
+           "covers_from": "the whole world" if source.worldwide else "its outline",
+           "cached": None, "cached_files": len(names), "error": None}
+    method = source.find["method"]
+    cached = []
+    try:
+        if method == "template":
+            pattern, size = template_pattern(source), source.find["size_deg"]
+            for name in names:
+                m = pattern.match(name)
+                if m:
+                    lat = int(m.group("lat")) * (-1 if m.group("ns") == "S" else 1)
+                    lon = int(m.group("lon")) * (-1 if m.group("ew") == "W" else 1)
+                    cached.append(_box(lon, lat, lon + size, lat + size))
+        elif method == "atom":
+            # Its data is where its feed has a tile: inside its outline, and
+            # no more of it than that.
+            try:
+                listed = atom_tiles(source, await cache.feed(source))
+            except store.StoreError as err:
+                out["error"] = "its feed could not be read, so its outline is drawn: %s" % err
+            else:
+                out["covers"] = {"type": "MultiPolygon", "coordinates": sourcefile.tile_quads(
+                    source, [(x, y) for _url, x, y in listed])}
+                out["covers_from"] = "the %d tiles its feed lists" % len(listed)
+            pattern = re.compile(source.find["name"])
+            tiles = [(int(m.group("x")), int(m.group("y")))
+                     for m in (pattern.search(name) for name in names) if m]
+            cached = sourcefile.tile_quads(source, tiles)
+        elif method == "regions":
+            out["covers_from"] = "the whole world, in regions whose outlines its index gives"
+            if names:
+                index = await cache.regions_index(source)
+                for name in names:
+                    cached += _rings(outline(index, name.split(".", 1)[0]))
+        elif names:
+            cached = _rings(source.outline) if source.outline else [_box(*WORLD)]
+    except store.StoreError as err:
+        out["error"] = str(err)
+    if cached:
+        out["cached"] = {"type": "MultiPolygon", "coordinates": cached}
+    return out
+
+
+async def sources_at(cache, lon, lat, sources=None):
+    """Which sources have data at a point, and whether what covers it is in
+    the cache: {source: {has, cached, error}}. A worldwide source has data
+    everywhere; any other where `source_map` says it covers."""
+    out = {}
+    reg = registry(sources)
+    for source_id, source in reg.items():
+        area_ = await source_map(cache, source_id, reg)
+        has = source.worldwide or holds_point(area_["covers"], lon, lat)
+        out[source_id] = {"has": has, "cached": has and holds_point(area_["cached"], lon, lat),
+                          "error": area_["error"]}
+    return out
+
+
+def areas(sources=None):
+    """The outlines of the sources that do not cover the world, for the
+    build view's map: [{source, title, outline}]."""
+    return [{"source": s.id, "title": s.title, "outline": s.outline}
+            for s in registry(sources).values() if not s.worldwide]
 
 
 # ---- what a build needs ------------------------------------------------------
 
-async def areas(cache):
-    """The outlines of the sources that do not cover the world, for the
-    map: {berlin: GeoJSON geometry, germany: GeoJSON geometry}."""
-    index = await cache.index()
-    return {"berlin": outline(index, "berlin"), "germany": outline(index, "germany")}
-
-
-def used_for(berlin, inside_berlin, germany, inside_germany):
-    """What each source is used for in a rectangle that touches Berlin
-    (`berlin`) or lies inside it (`inside_berlin`), and the same of Germany:
-    {source: one line}. A source with no line is not used."""
-    rest = "" if not berlin else " where Berlin has no tile" if inside_berlin else " outside Berlin"
-    out = {"glo30": "terrain and clutter" + rest,
-           "worldcover": "land cover classes",
-           "itu": "the radio climate (ΔN and N0; kept here)",
-           "geofabrik": "roads and places; buildings" + rest}
-    if berlin:
-        where = "" if inside_berlin else " inside Berlin"
-        out["berlin-dgm1"] = "terrain" + where
-        out["berlin-bdom"] = "clutter" + where
-        out["berlin-lod2"] = "buildings" + where
-    if germany:
-        out["zensus"] = "population" + ("" if inside_germany else " inside Germany")
+def used_for(chosen, whole):
+    """What each chosen source is used for: {id: one line}. `chosen` is the
+    sources the rectangle takes, `whole` which of them cover all of it. In
+    each layer a source's part is the rectangle less what sources of a
+    higher priority there cover."""
+    out = {}
+    for source in chosen:
+        parts = []
+        for layer, priority in source.layers.items():
+            over = [s for s in chosen if s.layers.get(layer, -1) > priority]
+            text = LAYER_TEXT[layer]
+            if any(whole[s.id] for s in over):
+                text += " where %s has none" % next(s.title for s in over if whole[s.id])
+            elif over:
+                text += " outside %s" % " and ".join(s.title for s in over)
+            elif not whole[source.id]:
+                text += " inside its outline"
+            parts.append(text)
+        if not source.redistributable:
+            parts[-1] += "; kept here"
+        out[source.id] = "; ".join(parts)
     return out
 
 
-async def plan(cache, spec, sizes=True):
+async def plan(cache, spec, sizes=True, sources=None):
     """What a build of `spec` ({bbox, res_m}) takes: the grid, the sources
-    chosen for the rectangle with what each is used for, and each source's
-    files with what is still to fetch.
-
-    The best source is chosen for every part of the rectangle: Berlin's 1 m
-    terrain and surface and its LoD2 buildings where the rectangle touches
-    Berlin, GLO-30 and OpenStreetMap's buildings on the rest; the Zensus
-    grid where it touches Germany, and no population elsewhere; WorldCover,
-    OpenStreetMap's roads and places, and the ITU maps everywhere.
+    whose coverage meets the rectangle with what each is used for, and each
+    one's files with what is still to fetch.
 
     {grid, extract, sources: [{source, title, licence, used_for, files,
     cached, to_fetch}], files: {source: [File]}}; to_fetch is None where a
-    host does not say a size.
+    host does not say a size. `extract` is the region a regions source took.
     """
+    reg = registry(sources)
     bbox = [float(v) for v in spec["bbox"]]
     grid = check(bbox, float(spec.get("res_m", 30)))
     tm = geodata.TransverseMercator(grid["zone"], True, geodata.WGS84)
     hull = degree_hull(bbox, tm)
-    index = await cache.index()
-    lod2_feed = await cache.feed("berlin-lod2")
-    berlin = bool(berlin_files("berlin-lod2", lod2_feed, bbox))
-    germany_outline = outline(index, "germany")
-    germany = meets(germany_outline, bbox)
-    extract = smallest_extract(index, bbox)
-    if extract is None:
-        raise store.StoreError("no Geofabrik extract holds the whole rectangle")
-    files = {"glo30": glo30_files(hull), "worldcover": worldcover_files(hull),
-             "itu": itu_files(), "geofabrik": [extract_file(extract)]}
-    if berlin:
-        files["berlin-dgm1"] = berlin_files("berlin-dgm1", await cache.feed("berlin-dgm1"), bbox)
-        files["berlin-bdom"] = berlin_files("berlin-bdom", await cache.feed("berlin-bdom"), bbox)
-        files["berlin-lod2"] = berlin_files("berlin-lod2", lod2_feed, bbox)
-    if germany:
-        files["zensus"] = zensus_files()
-    uses = used_for(berlin, berlin and holds(outline(index, "berlin"), bbox),
-                    germany, germany and holds(germany_outline, bbox))
+    files, chosen, whole, extract = {}, [], {}, None
+    for source in reg.values():
+        if not source.worldwide and not meets(source.outline, bbox):
+            continue
+        method = source.find["method"]
+        if method == "template":
+            found = template_files(source, hull)
+        elif method == "atom":
+            found = atom_files(source, await cache.feed(source), bbox)
+        elif method == "regions":
+            feature = smallest_extract(await cache.regions_index(source), bbox,
+                                       source.find["file"])
+            if feature is None:
+                raise store.StoreError("no region of %s holds the whole rectangle" % source.title)
+            found = [region_file(source, feature)]
+            extract = {"id": feature["properties"]["id"],
+                       "name": feature["properties"].get("name")}
+        else:
+            found = [single_file(source)]
+        if not found:
+            continue
+        files[source.id] = found
+        chosen.append(source)
+        whole[source.id] = source.worldwide or holds(source.outline, bbox)
+    uses = used_for(chosen, whole)
     todo = await cache.sizes_of([f for fs in files.values() for f in fs]) if sizes else {}
     rows = []
-    for source, fs in files.items():
-        title, licence = SOURCES[source]
+    for source in chosen:
+        fs = files[source.id]
         pending = [todo.get(f) for f in fs if cache.have(f) is None]
-        rows.append({"source": source, "title": title, "licence": licence,
-                     "used_for": uses[source], "files": len(fs),
+        rows.append({"source": source.id, "title": source.title, "licence": source.licence,
+                     "used_for": uses[source.id], "files": len(fs),
                      "cached": sum(1 for f in fs if cache.have(f) is not None),
                      "to_fetch": None if None in pending else sum(pending)})
-    return {"grid": grid,
-            "extract": {"id": extract["properties"]["id"], "name": extract["properties"].get("name")},
-            "sources": rows, "files": files}
+    return {"grid": grid, "extract": extract, "sources": rows, "files": files}

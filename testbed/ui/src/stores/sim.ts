@@ -117,6 +117,10 @@ export interface SimSummary {
   report?: boolean
   /** When it was paused, ISO, for a paused one. */
   paused_at?: string | null
+  /** `script` when its script paused it: the script done. */
+  paused_by?: string | null
+  /** Its run directory's size on disk, once measured. */
+  bytes?: number | null
   geodata?: string | null
   nodeset?: string | null
   script?: string | null
@@ -470,8 +474,9 @@ export const useSim = defineStore('sim', {
     /** Stopped with its state kept, to be resumed as it ended. */
     pauseSim(name: string) { useSocket().send({ type: 'sim_pause', name }) },
     resumeSim(name: string) { useSocket().send({ type: 'sim_resume', name }) },
-    /** An ended or paused run deleted, directory and all; `run` is its directory's name. */
-    deleteRun(run: string) { useSocket().send({ type: 'run_delete', run }) },
+    /** A run deleted, directory and all; `run` is its directory's name. With
+     *  `stop`, a simulation still on it is stopped first. */
+    deleteRun(run: string, stop = false) { useSocket().send({ type: 'run_delete', run, stop }) },
 
     /* ── the attached simulation's nodeset, by node name ── */
     addNode(name: string, lat: number, lon: number, fields: Record<string, unknown> = {}) {

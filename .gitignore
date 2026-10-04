@@ -6,6 +6,7 @@ testbed/snapshots/
 testbed/osmtiles/
 testbed/nodesets/
 testbed/geodata/
+testbed/indexes.yaml
 testbed/ui/dist/
 testbed/ui/node_modules/
 testbed/ui/.quasar/

@@ -22,25 +22,34 @@
 
     <div v-else class="gp-body">
       <div class="gp-head">
-        <div class="gp-heading">Geodata</div>
+        <div class="gp-heading">Installed geodata packs</div>
         <q-space />
         <q-btn flat dense no-caps label="New synthetic…" @click="creating = true" />
-        <q-btn flat dense no-caps label="Build from sources…" @click="building = true" />
+        <q-btn flat dense no-caps label="Build…" @click="building = true" />
         <q-btn unelevated dense no-caps color="primary" label="Import zip…" @click="importing = true" />
       </div>
       <div class="gp-text">
         The ground nodes stand on: a pack (terrain, clutter, buildings, roads,
-        places, with ITU-R P.1812 over the real profile), built here from public
-        sources, or synthetic ground at 0°, 0° whose degrees are metres at a nautical
-        mile to the minute. Open one to work on it: the Nodes tab shows the nodesets
-        with a node on it (counted here), and nothing before one is chosen.
+        places, with ITU-R P.1812 over the real profile), downloaded pre-built,
+        built here from public sources, or synthetic ground at 0°, 0° whose degrees
+        are metres at a nautical mile to the minute. Open one to work on it: the
+        Nodes tab shows the nodesets with a node on it (counted here), and nothing
+        before one is chosen.
       </div>
+      <SelectBar :sel="sel">
+        <template #default="{ keys }">
+          <q-btn flat dense no-caps size="sm" :icon="matDeleteOutline" label="Delete"
+                 :disable="!keys.length" @click="askDelete(keys)" />
+        </template>
+      </SelectBar>
       <table class="gp-table">
-        <thead><tr><th>Geodata</th><th>What</th><th>Extent</th><th>Nodesets</th><th></th></tr></thead>
+        <thead><tr><th class="gp-check"></th><th>Geodata</th><th>What</th><th>Extent</th><th>Nodesets</th>
+          <th class="num">Size</th><th></th></tr></thead>
         <tbody>
           <tr v-if="catalog.build" class="gp-building">
+            <td></td>
             <td><span class="gp-name">{{ catalog.build.name }}</span></td>
-            <td colspan="4">
+            <td colspan="5">
               <div class="gp-build">
                 <span v-if="catalog.build.state === 'failed'" class="gp-bad">
                   build failed: {{ catalog.build.error }}
@@ -55,27 +64,112 @@
             </td>
           </tr>
           <tr v-for="g in catalog.geodata" :key="g.name"
-              :class="{ 'gp-row': !g.error, 'gp-chosen': g.name === nodes.geodata }"
+              :class="{ 'gp-row': !g.error, 'gp-chosen': g.name === nodes.geodata, 'gp-picked': sel.has(g.name) }"
               @click="!g.error && choose(g.name)">
+            <td class="gp-check" @click.stop>
+              <q-checkbox dense size="xs" :model-value="sel.has(g.name)" @update:model-value="sel.toggle(g.name)" />
+            </td>
             <td>
               <span class="gp-name">{{ g.name }}</span>
               <span v-if="g.name === nodes.geodata" class="gp-sub">chosen</span>
+              <div v-if="g.from_index" class="gp-sub">from {{ g.from_index.index }}</div>
               <div v-if="g.error" class="gp-bad">{{ g.error }}</div>
             </td>
             <td>{{ describe(g) }}</td>
             <td class="mono">{{ extent(g) }}</td>
             <td class="mono">{{ g.error ? '' : g.nodesets ?? '…' }}</td>
+            <td class="num mono">{{ sizeText(g.bytes) }}</td>
             <td class="gp-act" @click.stop>
               <q-btn flat dense round size="sm" :icon="matEdit" @click="askRename(g.name)">
                 <q-tooltip>Rename</q-tooltip>
               </q-btn>
-              <q-btn flat dense round size="sm" :icon="matDeleteOutline" @click="askDelete(g.name)">
+              <q-btn flat dense round size="sm" :icon="matDeleteOutline" @click="askDelete([g.name])">
                 <q-tooltip>Delete, with its pack</q-tooltip>
               </q-btn>
             </td>
           </tr>
         </tbody>
       </table>
+
+      <IndexOffers kind="geodata" />
+
+      <div class="gp-head gp-section">
+        <div class="gp-heading">Geodata sources</div>
+        <q-space />
+        <q-btn flat dense no-caps size="sm" label="Refresh" @click="loadSources" />
+      </div>
+      <div class="gp-text">
+        What Build fetches its ground from, kept here so a second build beside the
+        first fetches only what is new. Emptying a source's cache costs only the
+        fetch again; it is refused while a build runs.
+      </div>
+      <div class="gp-sources">
+        <div class="gp-sources-list">
+        <div v-if="point" class="gp-at">
+          <span>
+            at {{ point.lat.toFixed(4) }}° {{ point.lat >= 0 ? 'N' : 'S' }},
+            {{ point.lon.toFixed(4) }}° {{ point.lon >= 0 ? 'E' : 'W' }}:
+            {{ shownSources.length }} source{{ shownSources.length === 1 ? '' : 's' }} with data there
+          </span>
+          <q-space />
+          <q-btn flat dense no-caps size="sm" label="All sources" @click="clearPoint" />
+        </div>
+        <table class="gp-table">
+          <thead><tr><th>Source</th><th>Licence</th><th class="num">Cached</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="s in shownSources" :key="s.source"
+                :class="{ 'gp-row': s.map, 'gp-picked': s.source === shownSource }"
+                @click="s.map && showSource(s.source)">
+              <td>
+                <span class="gp-what">{{ s.what }}</span>
+                <q-tooltip v-if="s.holds" anchor="center right" self="center left" max-width="340px"
+                           class="gp-holds">{{ s.holds }}</q-tooltip>
+                <div class="gp-sub">
+                  <span class="mono">{{ s.source }}</span><template v-if="s.where"> · {{ s.where }}</template><template
+                    v-if="s.own"> · yours</template>
+                </div>
+                <div v-if="s.layers" class="gp-sub">
+                  {{ Object.entries(s.layers).map(([l, p]) => `${l} ${p}`).join(', ') }}
+                </div>
+              </td>
+              <td class="gp-sub">{{ s.licence }}</td>
+              <td class="num mono">
+                {{ sizeText(s.bytes) }}
+                <div v-if="point" class="gp-sub">{{ point.at[s.source]?.cached ? 'this spot cached' : 'this spot not cached' }}</div>
+              </td>
+              <td class="gp-act" @click.stop>
+                <q-btn flat dense round size="sm" :icon="matDeleteOutline" :disable="!s.bytes"
+                       @click="askClear(s)">
+                  <q-tooltip>Empty this source's cache</q-tooltip>
+                </q-btn>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        </div>
+        <div class="gp-source-side">
+          <SlippyMap ref="sourceMap" class="gp-source-map" :shapes="sourceShapes"
+                     view-key="sim-mesh.sourcesmap" :pin="point ? [point.lon, point.lat] : null"
+                     @pick="pickPoint" />
+          <div class="gp-sub gp-source-note">
+            <template v-if="!shownSource">Click a source to see where it has data, and what of it is
+              cached; click the map to list only the sources with data at that spot.</template>
+            <template v-else-if="!sourceArea">asking…</template>
+            <template v-else>
+              <div class="gp-fit" title="show all of it on the map" @click="fitTo('covers')">
+                <span class="gp-key gp-key-covers" /> where it has data: {{ sourceArea.covers_from ?? 'not known here' }}
+              </div>
+              <div :class="{ 'gp-fit': sourceArea.cached }"
+                   :title="sourceArea.cached ? 'show all of it on the map' : ''"
+                   @click="sourceArea.cached && fitTo('cached')">
+                <span class="gp-key gp-key-cached" /> cached here:
+                {{ sourceArea.cached_files ? `${sourceArea.cached_files} file${sourceArea.cached_files === 1 ? '' : 's'}` : 'nothing' }}
+              </div>
+              <div v-if="sourceArea.error" class="gp-bad">{{ sourceArea.error }}</div>
+            </template>
+          </div>
+        </div>
+      </div>
     </div>
 
     <q-dialog v-model="importing">
@@ -120,18 +214,26 @@
 </template>
 
 <script setup lang="ts">
-/* The ground there is, and the three ways of getting more: New synthetic…,
- * Build from sources… (its own view, BuildView, and then a row here while it
- * builds), and Import zip…. A row opens that geodata on its own, with no
- * nodes on it, and from there Export zip takes it elsewhere. */
-import { ref, watch } from 'vue'
+/* Three sections. The ground there is, with the three ways of making or
+ * bringing more: New synthetic…, Build… (its own view, BuildView, and then a
+ * row here while it builds), and Import zip…; a row opens that geodata on its
+ * own, with no nodes on it, and from there Export zip takes it elsewhere.
+ * What the listed indexes offer pre-built (IndexOffers). And the build's
+ * sources, with what each holds in the cache. */
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useQuasar } from 'quasar'
 import { matDeleteOutline, matEdit } from '@quasar/extras/material-icons'
 import GroundMap from '../components/GroundMap.vue'
 import DisplayMenu from '../components/DisplayMenu.vue'
 import PlaceSearch from '../components/PlaceSearch.vue'
 import BuildView from '../components/BuildView.vue'
-import { useCatalog, type BuildRow, type GeodataInfo } from '../stores/catalog'
+import IndexOffers from '../components/IndexOffers.vue'
+import SlippyMap from '../components/SlippyMap.vue'
+import { boxGeometry, type Geometry, type MapShape } from '../lib/mapshape'
+import SelectBar from '../components/SelectBar.vue'
+import { useSelection } from '../lib/selection'
+import { sizeText } from '../lib/size'
+import { useCatalog, type BuildRow, type GeodataInfo, type SourceRow } from '../stores/catalog'
 import { zipGeodataName } from '../lib/zip'
 import { useGeodata } from '../stores/geodata'
 import { useDisplay } from '../stores/display'
@@ -156,6 +258,92 @@ const exponent = ref(2.7)
 const extentKm = ref(20)
 const busy = ref(false)
 const building = ref(false)
+const sel = useSelection(() => catalog.geodata.map(g => g.name))
+const sources = ref<SourceRow[]>([])
+
+onMounted(() => { void loadSources() })
+
+/* One source on the map beside the list: where it has data, tinted (the
+ * world for a worldwide one), and what of it is in the cache, filled. */
+interface SourceArea {
+  source: string; worldwide: boolean; covers: Geometry; covers_from: string | null
+  cached: Geometry; cached_files: number; error: string | null
+}
+const WORLD: [number, number, number, number] = [-180, -84, 180, 84]
+const shownSource = ref<string | null>(null)
+const sourceArea = ref<SourceArea | null>(null)
+const sourceMap = ref<InstanceType<typeof SlippyMap>>()
+const sourceShapes = computed<MapShape[]>(() => {
+  const a = sourceArea.value
+  if (!a) return []
+  return [
+    { geometry: a.worldwide ? boxGeometry(WORLD) : a.covers,
+      fill: 'rgba(59, 130, 246, 0.10)', stroke: 'rgba(59, 130, 246, 0.7)', width: 1 },
+    { geometry: a.cached, fill: 'rgba(234, 88, 12, 0.35)', stroke: 'rgba(234, 88, 12, 0.9)', width: 1 },
+  ]
+})
+
+/* A click on the map: the sources with data at that spot, and whether that
+ * part of each is cached. The list then shows those alone (the caches with
+ * no area to them, the sources' lists and the map tiles, drop out) until
+ * All sources. */
+interface PointSources { lon: number; lat: number; at: Record<string, { has: boolean; cached: boolean }> }
+const point = ref<PointSources | null>(null)
+const shownSources = computed(() => point.value
+  ? sources.value.filter(s => point.value!.at[s.source]?.has)
+  : sources.value)
+
+async function pickPoint([lon, lat]: [number, number]) {
+  const r = await request('geodata_sources_at', { lon, lat })
+  if (!r.ok) { tell(r.error); return }
+  point.value = { lon, lat, at: r.sources as PointSources['at'] }
+  if (shownSource.value && !point.value.at[shownSource.value]?.has) {
+    shownSource.value = null
+    sourceArea.value = null
+  }
+}
+
+function clearPoint() { point.value = null }
+
+async function showSource(source: string) {
+  shownSource.value = source
+  sourceArea.value = null
+  const r = await request('geodata_source_map', { source })
+  if (shownSource.value !== source) return
+  if (!r.ok) { tell(r.error); shownSource.value = null; return }
+  sourceArea.value = r as unknown as SourceArea
+  await nextTick()
+  // The cache where there is some, else where the source has data.
+  fitTo(sourceArea.value.cached ? 'cached' : 'covers')
+}
+
+/** The map on all of where the source has data (the world for a worldwide
+ *  one), or on all of what is cached. */
+function fitTo(what: 'covers' | 'cached') {
+  const a = sourceArea.value, m = sourceMap.value
+  if (!a || !m) return
+  const box = what === 'cached' ? m.extentOf([a.cached])
+    : a.worldwide ? null : m.extentOf([a.covers])
+  m.fitBox(box ?? WORLD)
+}
+
+async function loadSources() {
+  const r = await request('geodata_sources')
+  if (r.ok) sources.value = r.sources as SourceRow[]
+}
+
+function askClear(s: SourceRow) {
+  quasar.dialog({
+    title: `Empty ${s.source}`,
+    message: `${sizeText(s.bytes)} of ${s.what} goes; a build that needs it fetches it again.`,
+    ok: { label: 'Empty', color: 'negative', flat: true, noCaps: true },
+    cancel: { flat: true, noCaps: true }, persistent: true,
+  }).onOk(async () => {
+    const r = await request('geodata_source_clear', { source: s.source })
+    tell(r.ok ? null : r.error)
+    await loadSources()
+  })
+}
 
 function describe(g: GeodataInfo | null) {
   if (!g || g.error) return ''
@@ -209,21 +397,29 @@ function askRename(n: string) {
   else go()
 }
 
-function askDelete(n: string) {
+/* The geodata named deleted after one confirmation; each refusal (a run or a
+ * snapshot stands on it) is said, and the rest go. */
+function askDelete(names: string[]) {
+  const size = catalog.geodata.filter(g => names.includes(g.name)).reduce((t, g) => t + (g.bytes ?? 0), 0)
   const go = () => quasar.dialog({
-    title: `Delete ${n}`,
-    message: `Delete the geodata ${n}, its pack included? This cannot be undone. `
+    title: names.length === 1 ? `Delete ${names[0]}` : `Delete ${names.length} geodata`,
+    message: `Delete ${names.join(', ')}, packs included (${sizeText(size)})? This cannot be undone. `
       + 'Nodesets are not touched; geodata a run or a snapshot stands on is not deleted.',
     ok: { label: 'Delete', color: 'negative', flat: true, noCaps: true },
     cancel: { flat: true, noCaps: true }, persistent: true,
   }).onOk(async () => {
-    const r = await request('geodata_delete', { name: n })
-    if (!r.ok) { tell(r.error); return }
-    if (nodes.geodata === n) { await nodes.chooseGeodata(null); preview.value = null; await ground.open(null) }
+    const refused: string[] = []
+    for (const n of names) {
+      const r = await request('geodata_delete', { name: n })
+      if (!r.ok) { refused.push(r.error ?? n); continue }
+      if (nodes.geodata === n) { await nodes.chooseGeodata(null); preview.value = null; await ground.open(null) }
+    }
+    sel.none()
     await catalog.refreshGeodata()
-    tell(null, 'deleted')
+    void catalog.refreshIndexes()
+    tell(refused.length ? refused.join('; ') : null, 'deleted')
   })
-  if (nodes.geodata === n) whenSaved(quasar, go)
+  if (nodes.geodata && names.includes(nodes.geodata)) whenSaved(quasar, go)
   else go()
 }
 
@@ -268,8 +464,12 @@ watch(() => sim.geodataList, () => { preview.value = null })
 watch(() => sim.view, (v) => {
   if (v !== 'geodata') return
   void catalog.refreshGeodata()
+  void loadSources()
   if (preview.value) void ground.open(preview.value)
 })
+
+/* A build that ends has filled the cache. */
+watch(() => catalog.build, (b) => { if (!b) void loadSources() })
 
 async function doImport() {
   if (!file.value) return
@@ -300,7 +500,9 @@ async function create() {
 .gp-title { font-size: 14px; font-weight: 500; padding: 0 10px; }
 .gp-sub { font-size: 12px; font-weight: 400; color: #6b7280; padding-left: 8px; }
 .gp-map { position: relative; flex: 1 1 auto; min-height: 0; }
-.gp-body { padding: 16px 20px 32px; max-width: 1100px; overflow-y: auto; }
+/* The whole width: the paragraphs keep their own reading width, the tables
+ * and the sources' map take the rest, and the scroll bar is the window's edge. */
+.gp-body { padding: 16px 20px 32px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
 .gp-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .gp-heading { font-size: 14px; font-weight: 500; color: #d1d5db; }
 .gp-text { font-size: 12px; color: #9ca3af; line-height: 1.5; margin-bottom: 12px; max-width: 760px; }
@@ -316,6 +518,23 @@ async function create() {
 .gp-row:hover td { background: #1b2028; }
 .gp-chosen td { background: #1a2130; }
 .gp-act { white-space: nowrap; text-align: right; width: 1%; }
+.gp-table .num { text-align: right; white-space: nowrap; }
+.gp-check { width: 28px; padding-left: 2px !important; padding-right: 0 !important; }
+.gp-picked td { background: #172030; }
+.gp-section { margin-top: 28px; }
+.gp-sources { display: flex; gap: 16px; align-items: flex-start; }
+.gp-sources-list { flex: 1 1 55%; min-width: 0; }
+.gp-at { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #d1d5db;
+  background: #1a2130; border-radius: 3px; padding: 2px 4px 2px 10px; margin-bottom: 4px; }
+.gp-source-side { flex: 1 1 45%; min-width: 280px; position: sticky; top: 0; }
+.gp-source-map { height: min(60vh, 520px); border: 1px solid #262c35; border-radius: 4px; }
+.gp-source-note { margin-top: 6px; line-height: 1.7; }
+.gp-what { border-bottom: 1px dotted #4b5563; cursor: help; }
+.gp-fit { cursor: pointer; border-radius: 3px; padding: 0 4px; margin-left: -4px; width: fit-content; }
+.gp-fit:hover { background: #1b2028; color: #d1d5db; }
+.gp-key { display: inline-block; width: 12px; height: 10px; border-radius: 2px; vertical-align: -1px; }
+.gp-key-covers { background: rgba(59, 130, 246, 0.35); border: 1px solid rgba(59, 130, 246, 0.8); }
+.gp-key-cached { background: rgba(234, 88, 12, 0.5); border: 1px solid rgba(234, 88, 12, 0.9); }
 .gp-bad { font-size: 11px; color: #fca5a5; }
 .gp-building td { background: #161a20; }
 .gp-build { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #d1d5db; }

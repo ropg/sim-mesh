@@ -82,7 +82,8 @@
 
       <div class="np-left">
         <LayersPanel v-if="socket.front && !nodes.attached && nodes.geodata" @new="askNew" @import="importing = true"
-                     @save-visible="askSaveVisible" @activate="askActivate" @delete="askDelete" />
+                     @save-visible="askSaveVisible" @activate="askActivate" @delete="askDelete"
+                     @manage="managing = true" />
         <TagPanel />
         <div class="np-help">
           Click a node; Shift-click toggles it. Ctrl/Cmd-drag a rectangle to
@@ -163,17 +164,15 @@
     <WebWindow v-for="name in webs" :key="`web-${name}`" :name="name" :visible="true"
                @update:visible="v => !v && closeWeb(name)" />
 
-    <!-- A new layer from a source: the public node maps, or a planner CSV. -->
+    <NodesetsDialog v-model="managing" />
+
+    <!-- A new layer from a source: the public node maps, a planner CSV, or a file of points. -->
     <q-dialog v-model="importing">
-      <q-card style="min-width: 480px; max-width: 560px">
+      <q-card style="min-width: 520px; max-width: 600px">
         <q-card-section class="text-subtitle2">Import a new layer</q-card-section>
         <q-card-section class="column q-gutter-sm">
-          <q-option-group v-model="importSource" dense :options="[
-            { label: 'MeshCore map', value: 'meshcore' },
-            { label: 'PotatoMesh instance', value: 'potatomesh' },
-            { label: 'Planner sites (sites.csv)', value: 'sites' },
-            { label: 'Deployed-network CSV', value: 'nodes' },
-          ]" />
+          <q-select v-model="importSource" dense outlined emit-value map-options label="from"
+                    :options="IMPORT_SOURCES" />
           <template v-if="importSource === 'meshcore'">
             <q-checkbox v-model="importCompanions" dense label="companions too (repeaters and room servers always)" />
             <div class="text-caption text-grey-6">
@@ -190,9 +189,12 @@
             </div>
           </template>
           <template v-else>
-            <q-file v-model="importFile" dense outlined label="CSV file" accept=".csv,text/csv" />
-            <div class="text-caption text-grey-6">
-              A transmit power the CSV states is the node's maximum.
+            <q-file v-model="importFile" dense outlined :label="fileLabel" :accept="fileAccept"
+                    @update:model-value="readHeader" />
+            <div class="text-caption text-grey-6">{{ IMPORT_HINTS[importSource] }}</div>
+            <div v-if="importSource === 'csv' && csvHeader.length" class="np-columns">
+              <q-select v-for="c in CSV_COLUMNS" :key="c.key" v-model="csvColumns[c.key]" dense outlined
+                        :label="c.label" :options="csvHeader" clearable options-dense class="np-column" />
             </div>
           </template>
           <q-input v-model="importName" dense outlined label="layer name" />
@@ -206,7 +208,8 @@
         <q-card-actions align="right">
           <q-btn flat no-caps label="Cancel" v-close-popup />
           <q-btn flat no-caps color="primary" label="Import" :loading="busy"
-                 :disable="!importName.trim() || (csvSource && !importFile) || (importSource === 'potatomesh' && !importUrl.trim())"
+                 :disable="!importName.trim() || (fileSource && !importFile) || (importSource === 'potatomesh' && !importUrl.trim())
+                   || (importSource === 'csv' && (!csvColumns.lat || !csvColumns.lon))"
                  @click="doImport" />
         </q-card-actions>
       </q-card>
@@ -272,6 +275,7 @@ import GroundMap from '../components/GroundMap.vue'
 import NodeEditor from '../components/NodeEditor.vue'
 import TagPanel from '../components/TagPanel.vue'
 import LayersPanel from '../components/LayersPanel.vue'
+import NodesetsDialog from '../components/NodesetsDialog.vue'
 import DisplayMenu from '../components/DisplayMenu.vue'
 import PairInspector, { type PairEnd } from '../components/PairInspector.vue'
 import PlaceSearch from '../components/PlaceSearch.vue'
@@ -314,9 +318,75 @@ const importing = ref(false)
 const commanding = ref(false)
 const busy = ref(false)
 const MAX_AGE_DAYS = 365
-const importSource = ref<'meshcore' | 'potatomesh' | 'sites' | 'nodes'>('meshcore')
-const csvSource = computed(() => importSource.value === 'sites' || importSource.value === 'nodes')
+type ImportSource = 'meshcore' | 'potatomesh' | 'sites' | 'nodes' | 'csv' | 'geojson' | 'kml' | 'gpx' | 'meshtastic'
+const IMPORT_SOURCES: { label: string; value: ImportSource }[] = [
+  { label: 'MeshCore map', value: 'meshcore' },
+  { label: 'PotatoMesh instance', value: 'potatomesh' },
+  { label: 'Planner sites (sites.csv)', value: 'sites' },
+  { label: 'Deployed-network CSV', value: 'nodes' },
+  { label: 'Any CSV, its columns named here', value: 'csv' },
+  { label: 'GeoJSON points', value: 'geojson' },
+  { label: 'KML placemarks', value: 'kml' },
+  { label: 'GPX waypoints', value: 'gpx' },
+  { label: 'Meshtastic node list', value: 'meshtastic' },
+]
+const IMPORT_HINTS: Partial<Record<ImportSource, string>> = {
+  sites: 'A transmit power the CSV states is the node\'s maximum.',
+  nodes: 'A transmit power the CSV states is the node\'s maximum.',
+  csv: 'Any delimiter of comma, semicolon or tab. Name which column is which below; '
+    + 'latitude and longitude are needed, the rest is taken where named. Tags are split at commas or semicolons.',
+  geojson: 'Point and MultiPoint features. A feature\'s name, title or label names the node; its height_m '
+    + 'or height_agl_m is the height above the ground (the third coordinate is above sea level, and passed over); '
+    + 'its tags and role are tags.',
+  kml: 'Placemarks with a point, named by their name. An altitude relative to the ground is the height; '
+    + 'one above sea level is passed over.',
+  gpx: 'Waypoints, named by their name; a waypoint\'s type is a tag. Elevation is above sea level, and passed over.',
+  meshtastic: 'What meshtastic --info prints (its "Nodes in mesh:" part is read), or that JSON alone. '
+    + 'Each node with a position, named by its long name and tagged with its role.',
+}
+const CSV_COLUMNS = [
+  { key: 'lat', label: 'latitude' }, { key: 'lon', label: 'longitude' }, { key: 'name', label: 'name' },
+  { key: 'height', label: 'height above ground (m)' }, { key: 'power', label: 'max power (dBm)' },
+  { key: 'tags', label: 'tags' },
+] as const
+/** What a CSV column header suggests it holds, for the first guess. */
+const CSV_GUESS: Record<string, RegExp> = {
+  lat: /^(lat|latitude|breite|y)$/i, lon: /^(lon|lng|long|longitude|laenge|länge|x)$/i,
+  name: /^(name|label|title|id|node)$/i, height: /^(height|height_m|height_agl_m|agl|mast)$/i,
+  power: /^(power|tx_power|tx_power_dbm|dbm|max_dbm)$/i, tags: /^(tags|tag|kind|role|type)$/i,
+}
+const importSource = ref<ImportSource>('meshcore')
+const fileSource = computed(() => !['meshcore', 'potatomesh'].includes(importSource.value))
+const fileLabel = computed(() => ({
+  sites: 'CSV file', nodes: 'CSV file', csv: 'CSV file', geojson: 'GeoJSON file', kml: 'KML file',
+  gpx: 'GPX file', meshtastic: 'node list (text or JSON)',
+} as Record<string, string>)[importSource.value] ?? 'file')
+const fileAccept = computed(() => ({
+  sites: '.csv,text/csv', nodes: '.csv,text/csv', csv: '.csv,.tsv,.txt,text/csv',
+  geojson: '.geojson,.json,application/geo+json,application/json', kml: '.kml,application/vnd.google-earth.kml+xml',
+  gpx: '.gpx,application/gpx+xml', meshtastic: '.json,.txt,text/plain,application/json',
+} as Record<string, string>)[importSource.value] ?? '')
+const csvHeader = ref<string[]>([])
+const csvColumns = ref<Record<string, string | null>>({})
+const managing = ref(false)
 const importFile = ref<File | null>(null)
+
+/* A CSV's header, split as the front will split it: by whichever of comma,
+ * semicolon and tab it has most of, a leading `#` dropped; each column then
+ * guessed from its header. */
+async function readHeader(f: File | null) {
+  csvHeader.value = []
+  csvColumns.value = {}
+  if (!f || importSource.value !== 'csv') return
+  const first = (await f.slice(0, 64 * 1024).text()).split(/\r?\n/).find(l => l.trim()) ?? ''
+  const line = first.replace(/^#/, '').trim()
+  const delimiter = [',', ';', '\t'].reduce((a, b) => line.split(b).length > line.split(a).length ? b : a)
+  csvHeader.value = line.split(delimiter).map(h => h.trim()).filter(Boolean)
+  for (const c of CSV_COLUMNS) {
+    csvColumns.value[c.key] = csvHeader.value.find(h => CSV_GUESS[c.key]!.test(h)) ?? null
+  }
+}
+watch(importSource, () => { void readHeader(importFile.value) })
 const importUrl = ref('')
 const importCompanions = ref(false)
 const importName = ref('')
@@ -613,7 +683,12 @@ function doImport() {
     }
     if (importSource.value === 'meshcore') Object.assign(fields, { companions: importCompanions.value, max_age_days: MAX_AGE_DAYS })
     else if (importSource.value === 'potatomesh') fields.url = importUrl.value.trim()
-    else if (importFile.value) fields.text = await importFile.value.text()
+    else if (importFile.value) {
+      Object.assign(fields, { text: await importFile.value.text(), file: importFile.value.name })
+      if (importSource.value === 'csv') {
+        fields.columns = Object.fromEntries(Object.entries(csvColumns.value).filter(([, v]) => v))
+      }
+    }
     const error = await nodes.importNodes(fields)
     busy.value = false
     tell(error, error ? undefined : 'imported')
@@ -777,6 +852,8 @@ watch(() => sim.selected, () => {
   transition: right 0.15s ease; }
 .np-side-aside { right: 304px; }
 .np-left { position: absolute; top: 12px; left: 12px; display: flex; flex-direction: column; gap: 8px; }
+.np-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 8px; }
+.np-column { min-width: 0; }
 .np-help { width: 200px; font-size: 10px; line-height: 1.4; color: #6b7280;
   background: rgba(18, 20, 23, 0.8); padding: 4px 6px; border-radius: 3px; }
 .np-progress {

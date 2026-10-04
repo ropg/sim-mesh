@@ -477,8 +477,9 @@ class Sim:
 
     async def pause(self):
         """Stop the simulation with its state kept, through the front: it
-        stays listed as paused, to be resumed as it ended."""
-        await front_verb(self.session, self.port, {"type": "sim_pause", "name": self.name})
+        stays listed as done, the script's pause, to be resumed as it ended."""
+        await front_verb(self.session, self.port,
+                         {"type": "sim_pause", "name": self.name, "by": "script"})
 
     async def close(self):
         if self.reader is not None:

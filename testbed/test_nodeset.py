@@ -440,3 +440,68 @@ def test_an_estimate_replaces_only_an_assumed_height_and_says_what_it_rested_on(
     # each keeps its own.
     for name, source in (("n2", "assumed"), ("n3", "measured"), ("n4", "roof"), ("n5", "assumed")):
         assert (nodes[name]["height_m"], nodes[name]["height_from"]) == (15.0, source)
+
+
+def test_any_csv_imports_by_the_columns_named():
+    text = "#Label;Breite;Laenge;Mast;Leistung;Art\nTor A;52.5;13.4;12;30;router,gate\n" \
+           "kein Ort;;;;;\nTor A;52.6;13.5;;;\n"
+    data = nodeset.import_points("csv", text, 8.0, {"lat": "Breite", "lon": "Laenge",
+                                                    "name": "Label", "height": "Mast",
+                                                    "power": "Leistung", "tags": "Art"})
+    assert list(data["nodes"]) == ["tor-a", "tor-a-2"]
+    first, second = data["nodes"]["tor-a"], data["nodes"]["tor-a-2"]
+    assert (first["height_m"], first["height_from"]) == (12.0, "measured")
+    assert first["max_dbm"] == boards.FEM_MAX_DBM
+    assert first["tags"] == ["csv", "router", "gate"]
+    assert (second["height_m"], second["height_from"]) == (8.0, "assumed")
+    with pytest.raises(store.StoreError, match="longitude"):
+        nodeset.import_points("csv", text, 8.0, {"lat": "Breite"})
+    with pytest.raises(store.StoreError, match="no column"):
+        nodeset.import_points("csv", text, 8.0, {"lat": "Breite", "lon": "Lon"})
+
+
+def test_geojson_kml_and_gpx_points_import():
+    geojson = json.dumps({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "geometry": {"type": "Point", "coordinates": [13.4, 52.5, 40]},
+         "properties": {"name": "Mast 1", "height_m": 20, "tags": "hill, solar", "role": "repeater"}},
+        {"type": "Feature", "geometry": {"type": "MultiPoint",
+                                         "coordinates": [[13.41, 52.51], [13.42, 52.52]]},
+         "properties": {}},
+        {"type": "Feature", "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]}}]})
+    data = nodeset.import_points("geojson", geojson)
+    assert list(data["nodes"]) == ["mast-1", "geojson-2", "geojson-3"]
+    mast = data["nodes"]["mast-1"]
+    # The third coordinate is above sea level, not the ground: the property is the height.
+    assert (mast["height_m"], mast["height_from"]) == (20.0, "measured")
+    assert mast["tags"] == ["geojson", "hill", "solar", "repeater"]
+
+    kml = """<?xml version="1.0"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document>
+      <Placemark><name>Roof</name><Point><altitudeMode>relativeToGround</altitudeMode>
+        <coordinates>13.4,52.5,18</coordinates></Point></Placemark>
+      <Placemark><name>Hill</name><Point><coordinates>13.5,52.6,90</coordinates></Point></Placemark>
+    </Document></kml>"""
+    data = nodeset.import_points("kml", kml, 5.0)
+    assert (data["nodes"]["roof"]["height_m"], data["nodes"]["roof"]["height_from"]) == (18.0, "measured")
+    assert (data["nodes"]["hill"]["height_m"], data["nodes"]["hill"]["height_from"]) == (5.0, "assumed")
+
+    gpx = """<gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1">
+      <wpt lat="52.5" lon="13.4"><ele>60</ele><name>Base</name><type>Gateway</type></wpt></gpx>"""
+    data = nodeset.import_points("gpx", gpx, 5.0)
+    assert data["nodes"]["base"]["tags"] == ["gpx", "gateway"]
+    assert data["nodes"]["base"]["height_from"] == "assumed"
+
+
+def test_a_meshtastic_node_list_imports_from_the_info_text_or_the_json():
+    nodes = {"!a1": {"user": {"longName": "Router Hill", "role": "ROUTER"},
+                     "position": {"latitudeI": 525000000, "longitudeI": 134000000}},
+             "!b2": {"user": {"shortName": "MOB"}, "position": {"latitude": 52.51, "longitude": 13.41}},
+             "!c3": {"user": {"longName": "no fix"}, "position": {"latitudeI": 0, "longitudeI": 0}},
+             "!d4": {"user": {"longName": "silent"}}}
+    info = "Owner: me\nNodes in mesh: %s\n\nPreferences: {}\n" % json.dumps(nodes, indent=2)
+    for text in (info, json.dumps(nodes), json.dumps(list(nodes.values()))):
+        data = nodeset.import_points("meshtastic", text)
+        assert list(data["nodes"]) == ["router-hill", "mob"]
+        assert data["nodes"]["router-hill"]["lat"] == pytest.approx(52.5)
+        assert data["nodes"]["router-hill"]["tags"] == ["meshtastic", "router"]
+    with pytest.raises(store.StoreError, match="no point"):
+        nodeset.import_points("meshtastic", json.dumps({"!c3": nodes["!c3"]}))

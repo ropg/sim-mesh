@@ -22,9 +22,11 @@ A **run** is a directory, `testbed/runs/<name>/`:
                         was paused rather than stopped
 
 A **paused** run is one whose stations were stopped with their state kept:
-`run.yaml` says `paused: {simulation, t, at}`, and `paused/` holds what a
-snapshot would. Resuming it loads that into a new run directory, as a
-snapshot is loaded, and the old run's `run.yaml` says `resumed: <new run>`.
+`run.yaml` says `paused: {simulation, t, at, by?}`, and `paused/` holds what
+a snapshot would. `by: script` is a pause its script asked for, which is the
+script done; the page and `sim list` call that one **done** and any other
+paused. Resuming either loads that into a new run directory, as a snapshot
+is loaded, and the old run's `run.yaml` says `resumed: <new run>`.
 
 A **snapshot** is a directory, `testbed/snapshots/<name>/`:
 
@@ -427,12 +429,17 @@ def load_snapshot(name, directory, time_mode, snapshots_dir=None):
 
 # ---- pausing -------------------------------------------------------------
 
-def pause_run(run, simulation, t):
+def pause_run(run, simulation, t, by=None):
     """Keep a stopped run as it ended, to be resumed: its state and the rest
-    of a snapshot into `paused/`, and the pause in `run.yaml`."""
+    of a snapshot into `paused/`, and the pause in `run.yaml`. `by` is
+    `script` when its script paused it, which is the script done; a pause a
+    person asked for has none."""
     shutil.rmtree(os.path.join(run.dir, PAUSED), ignore_errors=True)
     save_snapshot(run, PAUSED, t, snapshots_dir=run.dir)
-    run.set(paused={"simulation": simulation, "t": t, "at": now_iso()})
+    paused = {"simulation": simulation, "t": t, "at": now_iso()}
+    if by:
+        paused["by"] = str(by)
+    run.set(paused=paused)
 
 
 def stop_paused(run):

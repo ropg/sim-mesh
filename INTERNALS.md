@@ -239,17 +239,24 @@ never matched to the question it answers, and whoever asked waits forever.
 So a front answer that names a simulation calls the field anything else
 (`script_run` answers `simulation`).
 
-**A run that ends pauses, it does not stop.** A simulation started for a
-script's run is the run's, and when `main` ends the network it built (its
-identities, paths, message history) is the thing worth keeping. The runner
-asks the front to pause it; the front stops the child, which flushes every
-station, and only then copies the run into its own `paused/`, as a snapshot
-would be, since state copied from a running station can be half-written.
-Resuming is a snapshot load into a new run directory, so the paused run
-and its report stay as they were written. The runner, not the front,
-pauses and then reports, so a script run from a shell ends the same way as
-one run from the page; the front pauses only what a runner that died left
-running.
+**A script that is done pauses its run, it does not stop it.** When a
+script is finished, the network it built (its identities, paths, message
+history) is the thing worth keeping, so it ends with `sim_pause()`: the
+library asks the front to pause the simulation `by: script`; the front
+stops the child, which flushes every station, and only then copies the run
+into its own `paused/`, as a snapshot would be, since state copied from a
+running station can be half-written. Resuming is a snapshot load into a new
+run directory, so the paused run and its report stay as they were written.
+The script, not the front, pauses and then reports, so a script run from a
+shell ends the same way as one run from the page. A script that says
+nothing leaves its simulation running.
+
+**Done and paused are one state with who asked.** Both are a run waiting
+in `paused/`, resumed, stopped and deleted alike; `paused.by: script` in
+`run.yaml` is the script's own pause, which the page and `sim list` call
+done, so a run the script finished is told apart from one a person stopped
+halfway. A second state would have doubled every path that resumes, stops
+or lists a pause for a difference only the page shows.
 
 **Scripts run beside the front and the simulation, never in them.** A script
 is a process of its own (`sim_mesh.runner`) that starts its simulation, or
@@ -411,6 +418,27 @@ and each is its own file so that changing one leaves the others alone:
   shadowing, or the script never recomputes it. A table finds a node by its
   name, so relabelling one does: its row and column are computed again, and
   every other pair comes from the table cached before.
+
+**Standard ground and nodesets come from an index, by their sha256.** A
+test that many people run means the same thing only on the same bytes, and
+geodata built from sources is not that: the sources change, and a build
+next month differs from this one. So a pack or a nodeset meant to be shared
+is published once, as a file, and an index lists it with its sha256; the
+installing machine checks the hash and refuses anything else, and a changed
+one is a new name, never an update, since an update would quietly change
+what every earlier result on that name meant. The front fetches, not the
+page, so `sim geodata add` and the page take one path and an index needs no
+cross-origin permission; an address may be a local path, so an index on a
+stick works offline. One file lists both kinds because whoever publishes
+ground usually publishes nodesets for it, and a nodeset entry names its
+geodata so installing it can bring that along. What was installed from where
+is a dot file beside it (`.origin.yaml`), which export, the store's
+listings and the geodata file all pass over.
+
+**Every row says what it takes on disk.** Sizes are walked on a worker
+thread: a running simulation's run directory every ten seconds, any other
+once and again when it changes state, so the registry sent every second
+reads a number and never walks a tree.
 
 **A script names no firmware of its own.** Which firmware is the experiment,
 so a system script asks for it as an input (`script_input("firmware", type=Firmware)`)
@@ -695,11 +723,29 @@ to just the tiles this rectangle needs, since the cache holds every tile any
 build fetched.
 
 **The front chooses the sources; the compiler takes what it is given.**
-`sources.plan` picks the best source for each part of the rectangle (Berlin's
-1 m pairs and LoD2 where it touches Berlin, the Zensus grid where it touches
-Germany, GLO-30 and OpenStreetMap everywhere) and says what each is used
-for, so the page offers no choice and the dialog after **Build** reads the
-same list. Given both `lod2_dir` and `osm_buildings`, the compiler takes
+`sources.plan` takes every source of the source files whose coverage meets
+the rectangle (with the shipped ones: Berlin's 1 m pairs and LoD2 where it
+touches Berlin, the Zensus grid where it touches Germany, GLO-30 and
+OpenStreetMap everywhere) and says what each is used for, so the page offers
+no choice and the dialog after **Build** reads the same list. `packbuild`
+hands each chosen source's files to the compiler input its format and layer
+go to (`packbuild.INPUTS`), never by the source's name, and refuses two
+sources for an input that takes one.
+
+**Sources are data, and the compiler's readers are fixed for now.** The
+compiler reads a format one way (a census grid as Zensus lays it out, XYZ
+and CityGML as Berlin's, land cover as WorldCover's classes), so
+`sourcefile.py` refuses a source whose format parameters ask for anything
+else, when the file is read: an entry the compiler would misread fails in
+`sim source check` and in the tests, not halfway through a build. When the
+compiler takes its readers' parameters from the source, that check goes.
+
+**An outline is a source's own.** A regional source ships its coverage as a
+GeoJSON file beside the source file, so no source's coverage depends on
+another source's index being fetched; Berlin's and Germany's are Geofabrik's
+outlines of them, made once with `sim source outline … --geofabrik`.
+
+Given both `lod2_dir` and `osm_buildings`, the compiler takes
 LoD2's buildings on the 1 km tiles in that directory that meet the grid and
 OpenStreetMap's everywhere else: an OpenStreetMap building whose centroid
 lies on one of those tiles is left out, so no building is counted twice.
@@ -714,8 +760,8 @@ else OSM default.
 region serves roads, places, peaks and masts, and buildings alike, and
 Geofabrik's index gives every extract's outline, so the smallest one holding
 the rectangle is chosen. Overpass would be four queries per region, is
-rate-limited, and times out on a city's buildings. The selection is at the
-top of `planner-pack/src/osm.rs`.
+rate-limited, and times out on a city's buildings. The selection is
+`sources.smallest_extract`, the `regions` method's.
 
 **Nodes are never ground.** A planner pack could carry a `Nodes` layer, the
 deployed network baked in at build time. sim-mesh's compiler never writes one,
@@ -1674,8 +1720,9 @@ change.
   snapshots that hold it.
 - **An LR2021 virtual radio**, `libsimradio-lr2021.so` beside the SX1262's,
   and the ether's modulations it needs beside LoRa.
-- **Firmware changed mid-run as an experiment**: `firmware()` in `main`
-  restarts the nodes it changes with their state kept; an upgrade test
+- **Firmware changed mid-run as an experiment**: `.firmware()` after a
+  script's simulation has started restarts the nodes it changes with their
+  state kept; an upgrade test
   across firmwares whose stores differ needs a rule for what becomes of it.
 - **An editable node id** in the editor, refusing one another node has and
   saying that the station restarts.
@@ -1692,6 +1739,10 @@ change.
   pack gives all three bands.
 - **A batched pair request** in `planner-web`, parallel over pairs, instead
   of one request per cell.
+- **sim-mesh-examples' packs**: a few small real regions built once and
+  published as release assets, each in the index with its sha256 and a
+  nodeset made for it (a dense flat city, a mountain valley, a coast,
+  hilly farmland), as the standard ground tests are run on.
 - **A geodata editor** on the Geodata tab's map, and synthetic terrains other
   than `flat`.
 - **Losses from a running network**: measured cells (the table's flag bit 4

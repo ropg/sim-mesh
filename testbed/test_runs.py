@@ -91,8 +91,11 @@ def test_a_paused_run_resumes_as_it_ended(setup):
     assert run.meta["resumed"] == "r1-2" and runs.paused_runs() == []
     assert runs.open_run(run.dir).paused is None
 
-    runs.pause_run(back, "town", 1)
+    runs.pause_run(back, "town", 1, by="script")
     assert [r.name for r in runs.paused_runs()] == ["r1-2"]
+    # Its script paused it: the script is done, and a pause a person asks
+    # for says nobody.
+    assert back.paused["by"] == "script" and "by" not in run.meta["paused"]
     runs.delete_run(back)
     assert runs.paused_runs() == [] and runs.runs() == ["r1"]
 

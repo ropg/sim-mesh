@@ -40,11 +40,24 @@ import store
 PROGRESS_HZ = 4.0
 TAIL_LINES = 20
 FETCH_PARALLEL = 4
+# Which compiler input a source's files go to, by its format and a layer it
+# feeds: the compiler's readers as they are (sourcefile.COMPILER_READS).
+INPUTS = {
+    ("geotiff", "surface"): "dsm_tiles",
+    ("geotiff", "landcover"): "worldcover_tiles",
+    ("itu-p1812-maps", "radio-climate"): "itu_maps_dir",
+    ("osm-pbf", "roads"): "osm_pbf",
+    ("citygml", "buildings"): "lod2_dir",
+    ("xyz", "terrain"): "berlin_1m_dir",
+    ("xyz", "surface"): "berlin_1m_dir",
+    ("csv-grid", "population"): "zensus_csv",
+}
 
 
 class Build:
-    def __init__(self, cache, spec, binary, say, preexec_fn=None):
+    def __init__(self, cache, spec, binary, say, preexec_fn=None, sources_=None):
         self.cache = cache
+        self.sources = sources_             # the sources to plan from; None: the source files'
         self.binary = binary
         self.say = say
         self.preexec_fn = preexec_fn
@@ -84,10 +97,10 @@ class Build:
 
     async def run(self):
         try:
-            planned = self.planned = await sources.plan(self.cache, self.spec)
+            planned = self.planned = await sources.plan(self.cache, self.spec, sources=self.sources)
             await self.fetch_all(planned)
             self.tell(True, state="compiling", step="unpacking", done=0, total=0)
-            params = await asyncio.to_thread(self.params, planned)
+            params = await asyncio.to_thread(self.params, planned, self.sources)
             await self.compile(params)
             self.finish()
             self.tell(True, state="done", step=None)
@@ -105,6 +118,7 @@ class Build:
         """Every file the build needs into the cache, a few at a time."""
         todo = [f for fs in planned["files"].values() for f in fs if self.cache.have(f) is None]
         known = [r["to_fetch"] for r in planned["sources"]]
+        titles = {r["source"]: r["title"] for r in planned["sources"]}
         of = None if None in known else sum(known)
         progress = {}
         self.tell(True, step="downloading", done=0, total=len(todo), fetched=0, of=of)
@@ -114,7 +128,7 @@ class Build:
         async def one(f):
             async with gate:
                 start = self.cache.fetched_bytes(f)
-                title = sources.SOURCES[f.source][0]
+                title = titles.get(f.source, f.source)
 
                 def heard(got):
                     progress[f.name] = got - start
@@ -132,37 +146,60 @@ class Build:
             os.symlink(path, os.path.join(into, os.path.basename(path)))
         return into
 
-    def params(self, planned):
+    def params(self, planned, sources_=None):
         """The compiler's input, from the files now in the cache, the zips
         among them extracted: on a worker thread, as a city's tiles are
-        gigabytes."""
+        gigabytes.
+
+        Each chosen source goes to the compiler input its format and layer
+        are read through (INPUTS): a surface GeoTIFF is the DSM tiles, a
+        land cover one WorldCover's, XYZ terrain and surface the 1 m pairs,
+        and so on. An input that takes one source is refused two."""
         files = planned["files"]
+        reg = sources.registry(sources_)
         have = lambda source: [f.path(self.cache.root) for f in files.get(source, ())  # noqa: E731
                                if self.cache.have(f)]
         extracted = lambda source: [p for f in files.get(source, ())  # noqa: E731
                                     if self.cache.have(f) for p in self.cache.extracted(f)]
-        dsm = have("glo30")
+        given = {}
+        for source_id in files:
+            source = reg[source_id]
+            for layer in source.layers:
+                into = INPUTS.get((source.format_type, layer))
+                if into is not None and source_id not in given.setdefault(into, []):
+                    given[into].append(source_id)
+        for into, ids in given.items():
+            if len(ids) > 1 and into not in ("berlin_1m_dir",):
+                raise store.StoreError("the compiler takes one source for %s, and the rectangle "
+                                       "has %s" % (into, ", ".join(ids)))
+        one = lambda into: given.get(into, [None])[0]  # noqa: E731
+        dsm = have(one("dsm_tiles")) if one("dsm_tiles") else []
         if not dsm:
-            raise store.StoreError("GLO-30 has no tile under this rectangle (open sea?)")
-        itu = extracted("itu")
-        pbf = have("geofabrik")
+            raise store.StoreError("no surface tile lies under this rectangle (open sea?)")
+        itu = extracted(one("itu_maps_dir")) if one("itu_maps_dir") else []
+        pbf_source = one("osm_pbf")
+        pbf = have(pbf_source) if pbf_source else []
         params = {
             "name": self.name, "out_dir": self.part,
             "bbox": [float(v) for v in self.spec["bbox"]], "res_m": float(self.spec["res_m"]),
             "utm_zone": planned["grid"]["zone"],
-            "dsm_tiles": dsm, "worldcover_tiles": have("worldcover"),
+            "dsm_tiles": dsm,
+            "worldcover_tiles": have(one("worldcover_tiles")) if one("worldcover_tiles") else [],
             "itu_maps_dir": os.path.dirname(itu[0]) if itu else None,
-            "osm_pbf": pbf[0] if pbf else None, "osm_buildings": bool(pbf),
+            "osm_pbf": pbf[0] if pbf else None,
+            "osm_buildings": bool(pbf) and "buildings" in reg[pbf_source].layers,
             "lod2_dir": None, "berlin_1m_dir": None, "zensus_csv": None, "threads": 0,
         }
         shutil.rmtree(self.inputs, ignore_errors=True)
-        if "berlin-lod2" in files:
-            params["lod2_dir"] = self.link_dir("lod2", extracted("berlin-lod2"))
-        if "berlin-dgm1" in files:
+        if one("lod2_dir"):
+            params["lod2_dir"] = self.link_dir("lod2", extracted(one("lod2_dir")))
+        if given.get("berlin_1m_dir"):
+            # Terrain first, as the pairs have always been laid out.
+            ids = sorted(given["berlin_1m_dir"], key=lambda s: "terrain" not in reg[s].layers)
             params["berlin_1m_dir"] = self.link_dir(
-                "berlin-1m", extracted("berlin-dgm1") + extracted("berlin-bdom"))
-        if "zensus" in files:
-            csv = extracted("zensus")
+                "berlin-1m", [p for s in ids for p in extracted(s)])
+        if one("zensus_csv"):
+            csv = extracted(one("zensus_csv"))
             params["zensus_csv"] = csv[0] if csv else None
         return params
 

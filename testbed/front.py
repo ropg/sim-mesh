@@ -18,6 +18,8 @@ browser ── GET  localhost:8800/osm/<z>/<x>/<y>.png ► front ── (cache m
 browser ── GET  localhost:8800/api/nominatim?q= ───► front ─────────────────► nominatim.openstreetmap.org
 front ── GET /api/v1/nodes (weekly) ───────────────► map.meshcore.io  for nodeset_import
 front ── planner-job nodes-import, JSON on stdin ──► planner-job      the nodes inside the geodata
+front ── GET <index address> ───────────────────────► its host       index_list (indexes.py)
+front ── GET <entry url> ───────────────────────────► its host       index_install, checked by sha256
 browser ── GET  localhost:8800/api/geodata/sources ► front          what a rectangle's build takes
 browser ── POST localhost:8800/api/geodata/build ──► front          a build started (DELETE cancels)
 front ── fetch into geodata/.cache/<source>/ ──────► source hosts     (sources.py)
@@ -39,8 +41,8 @@ front ── script_run {run, simulation: <sim>} ──► page          which g
 runner: the script from its top; sim_speed(), .firmware(), .on_first_boot() collected
 runner ── sim_new {name: <sim>, …, time, firmware_rules, first_boot_rules} ──► front
 runner ── ws localhost:8800/ws?sim=<sim> ─► front ─► child     what the script does
-runner ── sim_pause {name} ─► front                            when the script says pause()
-front: stop the child, runs.pause_run → runs/<sim>/paused/    the registry keeps it, paused
+runner ── sim_pause {name, by: script} ─► front               when the script says sim_pause()
+front: stop the child, runs.pause_run → runs/<sim>/paused/    the registry keeps it, done
 runner: report(run_dir) → runs/<sim>/report.md                when the script has a report
 front ── script_output {run, line} … script_exit {run, code} ─► every page
 page ── sim_resume {name} ──► front: runs.resume_run → runs/<sim>-N/, a child on it
@@ -94,30 +96,69 @@ sim_new {name?, geodata, nodeset | nodesets, script?, time?, stagger?, build?, p
 sim_new {name?, snapshot, time?, stagger?, build?, pairwise?}
       → {ok, name, control, ether, net, run, time, geodata, nodeset, script, snapshot}
 sim_stop {name}                   for good; a paused one's state deleted, ended → {ok, name}
-sim_pause {name}                  stopped, its state kept in its run  → {ok, name}
-sim_resume {name, time?}          a paused one, from that state, real time unless `time` → as sim_new
-run_delete {run}                  an ended or paused run's directory, gone  → {ok, run}
+sim_pause {name, by?}             stopped, its state kept in its run; `by: script` is its
+                                  script's pause, which lists it as done  → {ok, name}
+sim_resume {name, time?}          a paused or done one, from that state, real time unless
+                                  `time` → as sim_new
+run_delete {run, stop?}           a run's directory, gone; with `stop`, a simulation still on it
+                                  is stopped first, else that is refused  → {ok, run}
 select {sim}                                              which simulation the socket is on
 
 firmware_list                     → {firmware: [row…], arch}      firmware.listing, each row with
-                                    the paused runs and snapshots that hold it (`users`)
+                                    the paused runs and snapshots that hold it (`users`) and
+                                    its size on disk (`bytes`)
 firmware_prebuilt                 → {firmware: [row…], index}     what sim-mesh.net offers this
                                     machine, each row saying whether it is installed
 firmware_add {url}                → {firmware: row}               a pre-built zip, installed
 firmware_delete {names}           → {deleted}                     refused for any one held
 antenna_list                      → {antennas: [antenna…]}       antennas.catalogue
-geodata_list                      → {geodata: [{name, kind, bbox, licences, …} | {name, error}],
-                                     build: the running or failed build's row, or null}
+geodata_list                      → {geodata: [{name, kind, bbox, licences, bytes, from_index, …}
+                                     | {name, error, bytes}], build: the running or failed
+                                     build's row, or null}   from_index: the index it came
+                                     from (indexes.geodata_origin), or null
+geodata_sources                   → {sources: [{source, what, licence, holds, layers, where,
+                                     worldwide, own, map, bytes}],
+                                     building}   the build's cache, one row per source, and the
+                                    map's tiles, the sources as the source files say them
+                                    (sourcefile.py); `holds` what its files hold, `layers`
+                                    {layer: priority}, `where` global or continent › country,
+                                    `own` from testbed/sources.yaml, `map` whether it has an
+                                    area to draw
+geodata_source_map {source}       → {source, worldwide, covers, covers_from, cached,
+                                     cached_files, error}   where it has data and what of it
+                                    is cached, GeoJSON in degrees (sources.source_map)
+geodata_sources_at {lon, lat}     → {lon, lat, sources: {source: {has, cached, error}}}
+                                    which sources have data at a point, and whether that
+                                    part is cached (sources.sources_at)
+geodata_source_clear {source}     → {source}   that source's cache emptied; refused while a
+                                    build runs
+index_list                        → {indexes: [{name, address, own, title, description,
+                                     error?, geodata, nodesets}], fetching: [row…]}
+                                     every listed index, its description its text about
+                                     the collection, each
+                                     entry with `installed`, `taken`, and for a nodeset `changed`
+index_new {address}               → {index}    another index listed (indexes.add_index)
+index_delete {name}               → {names}    an added index forgotten
+index_install {index, kind, name} → {kind, name, installed: [{kind, name}…]}   when it is
+                                    in; its progress goes to every page as index_progress
+index_cancel {index, kind, name}  → {}         a fetch under way stopped
 geodata_open {name}               → {geodata, planner}   holds the sidecar for this socket
 geodata_close                                            lets it go
 geodata_new {name, pack | synthetic: {terrain, exponent, extent_m}}   → {geodata}
 geodata_save {name, data} · geodata_save_as {name, data}              → {geodata}
-nodeset_list {geodata?}           → {nodesets: [{name, nodes, bbox, tags, inside?} | {name, error}]}
-                                    inside: whether a node stands in that geodata's extent
+nodeset_list {geodata?}           → {nodesets: [{name, nodes, bbox, tags, bytes, from_index,
+                                     inside?} | {name, error, bytes}]}
+                                    inside: whether a node stands in that geodata's extent;
+                                    from_index: the index it came from, `changed` when edited
+                                    since
 nodeset_open {name}               → {nodeset}
 nodeset_new {name}                → {nodeset}
 nodeset_save {name, data} · nodeset_save_as {name, data}              → {nodeset}
 nodeset_import {name, source: sites|nodes, text | path, height_m?}  → {nodeset}
+nodeset_import {name, source: csv|geojson|kml|gpx|meshtastic, text, columns?, geodata?,
+                height_m?}   → {nodeset}   a file of points (nodeset.import_points); a CSV's
+                                    `columns` name which of its columns is lat, lon, name,
+                                    height, power and tags
 nodeset_import {name, source: meshcore|potatomesh, geodata, url?, companions?, max_age_days?,
                 height_m?}   → {nodeset, report}   a public node map inside the
                                     geodata's extent, through planner-job nodes-import
@@ -147,7 +188,8 @@ script_run {name, sim | resume | geodata, nodeset | nodesets, build?, inputs?}  
                                   script's inputs
 script_stop {run}                 → {}
 script_log {run}                  → {run, lines}
-snapshot_list                     → {snapshots: [{name, t, run, geodata, nodeset, script, …}]}
+snapshot_list                     → {snapshots: [{name, t, run, geodata, nodeset, script, bytes,
+                                     …}]}
 losses_compute {geodata, nodeset, bands?}  → {tables: {band: {path, cached}}}
 links {geodata, node, nodes: {name: record}, band?}  → {node, band, f0_hz, cells: {other:
                                     {to, from, flags}}}   one node's row and column from the
@@ -166,6 +208,9 @@ front → all sockets   sims {port, sims: [...], script_runs: [...], geodata_nam
                       null with `globals_error` saying why when it cannot be read
                       a sim's state: starting, running, stopping, exited, paused, or
                       ended (a run on disk that is neither; named by its run directory);
+                      a paused one's `paused_by` is `script` when its script paused it
+                      (done); `bytes`: its run directory's size, measured on a worker
+                      thread, a running one's every SIZE_EVERY_S;
                       `report` on a sim or a script run: its run has a report.md;
                       `started`, `ended`: wall seconds (`ended` null while it runs),
                       `t`: its T now, or where it stopped, in microseconds
@@ -174,6 +219,12 @@ front → all sockets   geodata_progress {build: {name, state, step, done, total
                                                 error, spec} | null}
 front → all sockets   script_output {run, line} · script_exit {run, code}
 front → all sockets   firmware_changed {}                          firmware added or deleted
+front → all sockets   index_progress {index, kind, name, state, now, fetched, of, error}
+                                                                   an entry being installed: state
+                                                                   fetching, done, failed or
+                                                                   cancelled; `now` the kind and
+                                                                   name being fetched (a
+                                                                   nodeset's geodata first)
 front → asker         coverage_tile {geodata, node, key} · coverage_error {geodata, node, error}
 anything else         → the child named by `sim`, or the selected one
 child → socket        the child's own message, with `sim` added
@@ -215,6 +266,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import socket
 import sys
@@ -233,6 +285,7 @@ import coverage as coverage_module  # noqa: E402
 import drivers as drivers_module    # noqa: E402
 import firmware as firmware_module  # noqa: E402
 import geodata as geodata_module    # noqa: E402
+import indexes as indexes_module    # noqa: E402
 import losses as losses_module      # noqa: E402
 import nodeset as nodeset_module    # noqa: E402
 import packbuild as packbuild_module   # noqa: E402
@@ -260,6 +313,9 @@ MESHCORE_NODES = "https://map.meshcore.io/api/v1/nodes"
 MESHCORE_META = "meshcore-nodes.json"
 MESHCORE_MAX_AGE_DAYS = 365         # an advert older than this is a clock never set, or a node gone
 POTATOMESH_NODES = "/api/nodes?limit=1000"
+# The imports that are a file the page hands over: the planner's CSVs, and
+# files of points (nodeset.import_points).
+FILE_IMPORTS = ("sites", "nodes") + nodeset_module.POINT_FORMATS
 
 CONTROL_PORTS = range(9100, 9200)   # a child's page, proxy and relay (TCP and UDP)
 ETHER_PORTS = range(7100, 7200)     # a child's ether
@@ -275,6 +331,8 @@ TAIL_LINES = 40                     # a child's last lines, kept for the page
 LINK_CELLS_KEPT = 200_000           # pairs the links verb keeps, oldest dropped first
 SCRIPT_LINES = 2000                 # a script run's last lines, kept for the page
 ERRORS_KEPT = 5
+SIZE_EVERY_S = 10.0                 # how often a running simulation's run directory is measured
+PROGRESS_EVERY_S = 0.25             # how often an index download's progress is told
 MAX_UPLOAD = 4 << 30                # a pack zip is hundreds of megabytes
 EXPORT_CHUNK = 1 << 20              # an export's zip goes out a megabyte at a time,
 EXPORT_QUEUE = 8                    # at most this many ahead of the reader
@@ -291,7 +349,9 @@ EDITOR_VERBS = (
     "firmware_list", "firmware_prebuilt", "firmware_add", "firmware_delete", "antenna_list",
     "module_open",
     "geodata_list", "geodata_open", "geodata_close", "geodata_new", "geodata_save",
-    "geodata_save_as", "geodata_rename", "geodata_delete",
+    "geodata_save_as", "geodata_rename", "geodata_delete", "geodata_sources",
+    "geodata_source_clear", "geodata_source_map", "geodata_sources_at",
+    "index_list", "index_new", "index_delete", "index_install", "index_cancel",
     "nodeset_list", "nodeset_open", "nodeset_new", "nodeset_save", "nodeset_save_as",
     "nodeset_delete",
     "nodeset_import", "nodeset_merge", "nodeset_setup_open", "nodeset_setup_save",
@@ -300,7 +360,8 @@ EDITOR_VERBS = (
     "script_run", "script_stop", "script_log",
     "snapshot_list", "losses_compute", "links", "coverage")
 QUIET_VERBS = ("firmware_list", "firmware_prebuilt", "antenna_list", "module_open",
-               "geodata_list",
+               "geodata_list", "geodata_sources", "geodata_source_map", "geodata_sources_at",
+               "index_list",
                "nodeset_list", "script_list", "snapshot_list", "geodata_open", "nodeset_open",
                "nodeset_setup_open", "script_open", "geodata_close", "script_log", "links", "coverage")
 
@@ -952,6 +1013,9 @@ class Front:
         self.tiles = {}                     # OSM tile path -> the fetch of it under way
         self.nominatim_lock = asyncio.Lock()
         self.nominatim_at = 0.0
+        self.run_bytes = {}                 # a run directory's real path -> its size on disk
+        self.measurer = None
+        self.fetching = {}                  # "index/kind/name" -> (index_progress row, task)
 
     @property
     def bind_port(self):
@@ -1210,6 +1274,9 @@ class Front:
         """Stop a simulation with its state kept in its run, to be resumed as
         it ended; it stays in the registry as paused."""
         name = msg.get("name")
+        by = msg.get("by") or None
+        if by not in (None, "script"):
+            raise ValueError("a pause is by its script, or by nobody named: not %s" % by)
         child = self.children.get(name)
         if child is None or child.state != "running":
             raise ValueError("no running simulation named %s" % name)
@@ -1217,10 +1284,12 @@ class Front:
         run_dir = child.run_dir
         await self.sim_stop({"name": name})
         run = runs_module.open_run(run_dir)
-        await asyncio.to_thread(runs_module.pause_run, run, name, t)
+        await asyncio.to_thread(runs_module.pause_run, run, name, t, by)
         self.paused[name] = run
+        self.forget_size(run_dir)
         self.changed = True
-        log("%s: paused at T %.0f s, in %s" % (name, t / 1e6, os.path.relpath(run_dir)))
+        log("%s: %s at T %.0f s, in %s" % (name, "done" if by == "script" else "paused",
+                                           t / 1e6, os.path.relpath(run_dir)))
         return {"type": "sim_pause", "ok": True, "name": name}
 
     async def sim_resume(self, msg):
@@ -1243,21 +1312,26 @@ class Front:
         return dict(reply, type="sim_resume")
 
     async def run_delete(self, msg):
-        """A run that is not running deleted, directory and all: an ended one,
-        or a paused one, which can then no longer be resumed."""
+        """A run deleted, directory and all: an ended one, or a paused one,
+        which can then no longer be resumed. One a simulation is still on,
+        running or exited, is refused, unless `stop` asks for that to be
+        stopped first."""
         name = msg.get("run")
         path = runs_module.run_path(name)
         if not os.path.isfile(os.path.join(path, runs_module.RUN_FILE)):
             raise ValueError("no run called %s" % name)
         real = os.path.realpath(path)
-        if any(os.path.realpath(c.run_dir) == real and c.state != "exited"
-               for c in self.children.values()):
+        on = [c for c in self.children.values() if os.path.realpath(c.run_dir) == real]
+        if any(c.state != "exited" for c in on) and not msg.get("stop"):
             raise ValueError("run %s is running: stop it first" % name)
+        for child in on:
+            await self.sim_stop({"name": child.name})
         for sim, run in list(self.paused.items()):
             if os.path.realpath(run.dir) == real:
                 del self.paused[sim]
         await asyncio.to_thread(runs_module.delete_run, runs_module.open_run(path))
         self.ended_cache.pop(name, None)
+        self.forget_size(path)
         self.changed = True
         log("run %s deleted" % name)
         return {"type": "run_delete", "ok": True, "run": name}
@@ -1312,6 +1386,7 @@ class Front:
         return {"name": name, "state": "paused", "code": None, "run": os.path.relpath(run.dir, SIM_DIR),
                 "time": run.meta.get("time"), "started": run.started_at(),
                 "ended": run.ended_at(), "paused_at": paused.get("at"),
+                "paused_by": paused.get("by"),
                 "geodata": run.meta.get("geodata"), "nodeset": run.meta.get("nodeset"),
                 "script": run.meta.get("script"), "snapshot": run.meta.get("snapshot"),
                 "dirty": False, "stations": stations, "counts": {}, "errors": [], "tail": [],
@@ -1326,6 +1401,7 @@ class Front:
             run = self.paused.pop(name)
             await asyncio.to_thread(runs_module.stop_paused, run)
             self.ended_cache.pop(run.name, None)
+            self.forget_size(run.dir)
             self.changed = True
             log("%s: stopped, its pause's state deleted" % name)
             return {"type": "sim_stop", "ok": True, "name": name}
@@ -1336,6 +1412,7 @@ class Front:
         for conn in list(self.conns):
             conn.close_upstream(name)
         self.sidecars.release(child.holder)
+        self.forget_size(child.run_dir)
         self.changed = True
         log("%s: stopped" % name)
         return {"type": "sim_stop", "ok": True, "name": name}
@@ -1450,7 +1527,11 @@ class Front:
         """One editor verb, answered to the asking socket."""
         name = msg.get("name")
         if verb == "firmware_list":
-            rows = await asyncio.to_thread(firmware_module.listing)
+            def listing():
+                dirs = firmware_module.installed()
+                return [dict(r, bytes=store.disk_bytes(dirs[r["name"]]) if r["name"] in dirs else None)
+                        for r in firmware_module.listing()]
+            rows = await asyncio.to_thread(listing)
             return {"firmware": rows, "arch": firmware_module.machine_arch()}
         if verb == "firmware_prebuilt":
             rows = await firmware_module.prebuilt()
@@ -1469,20 +1550,59 @@ class Front:
         if verb == "antenna_list":
             return {"antennas": await asyncio.to_thread(antennas_module.listing)}
         if verb == "geodata_list":
-            # Each geodata with how many nodesets have a node on it.
-            sets = []
-            for each in nodeset_module.names():
-                with contextlib.suppress(store.StoreError):
-                    sets.append(nodeset_module.load(each))
-            rows = []
-            for each in geodata_module.names():
-                try:
-                    gd = load_geodata(each)
-                    rows.append({**gd.as_dict(),
-                                 "nodesets": sum(1 for ns in sets if ns.inside(gd.bbox))})
-                except store.StoreError as err:
-                    rows.append({"name": each, "error": str(err)})
-            return {"geodata": rows, "build": self.build.row if self.build else None}
+            # Each geodata with how many nodesets have a node on it, its
+            # size and the index it came from.
+            def listing():
+                sets = []
+                for each in nodeset_module.names():
+                    with contextlib.suppress(store.StoreError):
+                        sets.append(nodeset_module.load(each))
+                rows = []
+                for each in geodata_module.names():
+                    extra = {"bytes": store.disk_bytes(geodata_module.geodata_dir(each)),
+                             "from_index": indexes_module.geodata_origin(each)}
+                    try:
+                        gd = load_geodata(each)
+                        rows.append({**gd.as_dict(), **extra,
+                                     "nodesets": sum(1 for ns in sets if ns.inside(gd.bbox))})
+                    except store.StoreError as err:
+                        rows.append({"name": each, "error": str(err), **extra})
+                return rows
+            return {"geodata": await asyncio.to_thread(listing),
+                    "build": self.build.row if self.build else None}
+        if verb == "geodata_sources":
+            return {"sources": await asyncio.to_thread(self.source_rows),
+                    "building": self.build is not None and self.build.running}
+        if verb == "geodata_source_clear":
+            return await self.clear_source(str(msg.get("source") or ""))
+        if verb == "geodata_source_map":
+            source = str(msg.get("source") or "")
+            if source not in sources_module.registry():
+                raise ValueError("no source called %s with an area" % source)
+            return await sources_module.source_map(self.cache, source)
+        if verb == "geodata_sources_at":
+            lon, lat = float(msg["lon"]), float(msg["lat"])
+            return {"lon": lon, "lat": lat,
+                    "sources": await sources_module.sources_at(self.cache, lon, lat)}
+        if verb == "index_list":
+            return {"indexes": await indexes_module.listing(self.session),
+                    "fetching": [row for row, _task in self.fetching.values()]}
+        if verb == "index_new":
+            row = await indexes_module.add_index(str(msg.get("address") or ""), self.session)
+            log("listed index %s at %s" % (row["name"], row["address"]))
+            return {"index": row}
+        if verb == "index_delete":
+            names = indexes_module.remove_index(str(msg.get("name") or ""))
+            log("forgot index %s" % ", ".join(names))
+            return {"names": names}
+        if verb == "index_install":
+            return await self.index_install(msg)
+        if verb == "index_cancel":
+            got = self.fetching.get(self.fetch_key(msg))
+            if got is None:
+                raise ValueError("nothing of that is being fetched")
+            got[1].cancel()
+            return {}
         if verb in ("geodata_rename", "geodata_delete"):
             live = [c.name for c in self.children.values()
                     if c.state != "exited" and c.loaded.get("geodata") == name]
@@ -1514,16 +1634,21 @@ class Front:
         if verb == "nodeset_list":
             # The extent is the manifest's: listing needs no planner.
             bbox = geodata_module.load(msg["geodata"]).bbox if msg.get("geodata") else None
-            rows = []
-            for each in nodeset_module.names():
-                try:
-                    row = nodeset_module.summary(each)
-                    if bbox is not None:
-                        row["inside"] = nodeset_module.load(each).inside(bbox)
-                    rows.append(row)
-                except store.StoreError as err:
-                    rows.append({"name": each, "error": str(err)})
-            return {"nodesets": rows}
+
+            def listing():
+                rows = []
+                for each in nodeset_module.names():
+                    extra = {"bytes": nodeset_module.disk_bytes(each),
+                             "from_index": indexes_module.nodeset_origin(each)}
+                    try:
+                        row = {**nodeset_module.summary(each), **extra}
+                        if bbox is not None:
+                            row["inside"] = nodeset_module.load(each).inside(bbox)
+                        rows.append(row)
+                    except store.StoreError as err:
+                        rows.append({"name": each, "error": str(err), **extra})
+                return rows
+            return {"nodesets": await asyncio.to_thread(listing)}
         if verb == "nodeset_open":
             return {"nodeset": nodeset_module.load(name).as_dict()}
         if verb == "nodeset_delete":
@@ -1535,8 +1660,8 @@ class Front:
             return self.write_nodeset(store.check_name(name, "nodeset"), msg["data"],
                                       new=verb == "nodeset_save_as")
         if verb == "nodeset_import":
-            if (msg.get("source") or msg.get("format") or "sites") in ("sites", "nodes"):
-                return self.import_nodeset(msg)
+            if (msg.get("source") or msg.get("format") or "sites") in FILE_IMPORTS:
+                return await asyncio.to_thread(self.import_nodeset, msg)
             return await self.import_node_map(msg)
         if verb == "nodeset_heights":
             return await self.estimate_heights(conn, store.check_name(name, "nodeset"), msg)
@@ -1585,13 +1710,16 @@ class Front:
                 raise ValueError("no script run %s" % msg.get("run"))
             return {"run": run.id, "lines": list(run.lines)}
         if verb == "snapshot_list":
-            rows = []
-            for each in runs_module.snapshots():
-                with contextlib.suppress(store.StoreError):
-                    info = runs_module.snapshot_info(each)
-                    rows.append({"name": each, **{k: v for k, v in info.items()
-                                                  if k != "builds"}})
-            return {"snapshots": rows}
+            def listing():
+                rows = []
+                for each in runs_module.snapshots():
+                    with contextlib.suppress(store.StoreError):
+                        info = runs_module.snapshot_info(each)
+                        rows.append({"name": each, **{k: v for k, v in info.items()
+                                                      if k != "builds"},
+                                     "bytes": store.disk_bytes(runs_module.snapshot_path(each))})
+                return rows
+            return {"snapshots": await asyncio.to_thread(listing)}
         if verb == "losses_compute":
             gd = load_geodata(msg["geodata"])
             ns = nodeset_module.load(msg["nodeset"])
@@ -1671,15 +1799,24 @@ class Front:
         return web.json_response({"meshcore": {"fetched": self.cache.meta_age(MESHCORE_META)}})
 
     def import_nodeset(self, msg):
-        """A planner CSV as a new nodeset, its transmit powers in the nodes'
-        radios; with `geodata`, only its nodes inside that geodata's extent."""
+        """A file as a new nodeset: a planner CSV, its transmit powers in the
+        nodes' radios, or a file of points (any CSV, GeoJSON, KML, GPX, a
+        Meshtastic node list); with `geodata`, only its nodes inside that
+        geodata's extent."""
         name = store.check_name(msg["name"], "nodeset")
         path = nodeset_module.nodeset_path(name)
         self.new_path(path, "nodeset", name)
         fmt = msg.get("source") or msg.get("format") or "sites"
-        if fmt not in ("sites", "nodes"):
-            raise ValueError("an import is format sites (planner optimize) or nodes "
-                             "(planner nodes import)")
+        if fmt not in FILE_IMPORTS:
+            raise ValueError("a file's import is one of %s" % ", ".join(FILE_IMPORTS))
+        if fmt in nodeset_module.POINT_FORMATS:
+            text = msg.get("text")
+            if text is None:
+                with open(msg["path"], encoding="utf-8", errors="replace") as handle:
+                    text = handle.read()
+            data = nodeset_module.import_points(fmt, text, float(msg.get("height_m") or 15.0),
+                                                msg.get("columns"))
+            return self.write_imported(name, path, data, msg, fmt)
         source, tmp = msg.get("path"), None
         if not source:
             fd, tmp = tempfile.mkstemp(suffix=".csv")
@@ -1697,16 +1834,97 @@ class Front:
         finally:
             if tmp:
                 os.unlink(tmp)
+        return self.write_imported(name, path, data, msg, fmt)
+
+    @staticmethod
+    def write_imported(name, path, data, msg, fmt):
+        """An imported nodeset written, with `geodata` only its nodes inside
+        that geodata's extent."""
         if msg.get("geodata"):
             gd = geodata_module.load(msg["geodata"])
             data["nodes"] = {n: node for n, node in data["nodes"].items()
                              if gd.holds(node["lat"], node["lon"])}
             if not data["nodes"]:
-                raise store.StoreError("the CSV has no node inside %s's extent" % gd.name)
+                raise store.StoreError("the file has no node inside %s's extent" % gd.name)
         nodeset_module.write(path, data, "imported from %s (%s)" % (
-            os.path.basename(msg.get("path") or "an upload"), fmt))
+            os.path.basename(msg.get("file") or msg.get("path") or "an upload"), fmt))
         log("imported %d nodes into nodeset %s" % (len(data["nodes"]), name))
         return {"nodeset": nodeset_module.load(name).as_dict()}
+
+    # ---- indexes, and the build's cache ----------------------------------
+
+    @staticmethod
+    def fetch_key(msg):
+        return "%s/%s/%s" % (msg.get("index"), msg.get("kind"), msg.get("name"))
+
+    async def index_install(self, msg):
+        """One entry of a listed index installed, answered when it is in.
+        Its progress goes to every page as `index_progress`, at most every
+        PROGRESS_EVERY_S; `index_cancel` stops it."""
+        key = self.fetch_key(msg)
+        if key in self.fetching:
+            raise ValueError("%s %s is being fetched already" % (msg.get("kind"), msg.get("name")))
+        row = {"index": str(msg.get("index")), "kind": str(msg.get("kind")),
+               "name": str(msg.get("name")), "state": "fetching", "now": None,
+               "fetched": 0, "of": None, "error": None}
+        told = [0.0]
+
+        def progress(kind, name, fetched, of):
+            row.update(now={"kind": kind, "name": name}, fetched=fetched, of=of)
+            if time.monotonic() - told[0] >= PROGRESS_EVERY_S:
+                told[0] = time.monotonic()
+                self.broadcast({"type": "index_progress", **row})
+
+        self.fetching[key] = (row, asyncio.current_task())
+        self.broadcast({"type": "index_progress", **row})
+        try:
+            got = await indexes_module.install(row["index"], row["kind"], row["name"],
+                                               self.session, progress)
+            row["state"] = "done"
+        except asyncio.CancelledError:
+            row["state"] = "cancelled"
+            raise ValueError("cancelled") from None
+        except store.StoreError as err:
+            row.update(state="failed", error=str(err))
+            raise
+        finally:
+            self.fetching.pop(key, None)
+            self.broadcast({"type": "index_progress", **row})
+            self.changed = True
+        log("installed %s from index %s" % (", ".join(
+            "%s %s" % ("geodata" if each["kind"] == "geodata" else "nodeset", each["name"])
+            for each in got["installed"]), row["index"]))
+        return got
+
+    def source_rows(self):
+        """The build's cache, one row per source, and the map's tiles: what
+        each is, its licence, and what it holds here."""
+        rows = [dict(source.as_dict(), map=True, bytes=store.disk_bytes(
+                    os.path.join(sources_module.CACHE_DIR, source.id)))
+                for source in sources_module.registry().values()]
+        rows.append({"source": "meta", "what": "the sources' own lists: Geofabrik's index, "
+                     "Berlin's feeds, the MeshCore map's node list", "licence": "", "map": False,
+                     "holds": sources_module.CACHE_HOLDS["meta"], "where": "",
+                     "bytes": store.disk_bytes(os.path.join(sources_module.CACHE_DIR, "meta"))})
+        rows.append({"source": "osmtiles", "what": "OpenStreetMap map tiles, for the build's map",
+                     "licence": "ODbL 1.0, © OpenStreetMap contributors", "map": False,
+                     "holds": sources_module.CACHE_HOLDS["osmtiles"], "where": "",
+                     "bytes": store.disk_bytes(OSM_TILES_DIR)})
+        return rows
+
+    async def clear_source(self, source):
+        """One source's cache emptied, refused while a build runs: it would
+        be reading it."""
+        if source not in sources_module.registry() and source not in ("meta", "osmtiles"):
+            raise ValueError("no source called %s" % source)
+        if source != "osmtiles" and self.build is not None and self.build.running:
+            raise store.StoreError("%s is being built from the cache: cancel it first"
+                                   % self.build.name)
+        path = OSM_TILES_DIR if source == "osmtiles" else os.path.join(sources_module.CACHE_DIR,
+                                                                        source)
+        await asyncio.to_thread(shutil.rmtree, path, True)
+        log("emptied the cache of %s" % source)
+        return {"source": source}
 
     async def script_run(self, msg):
         """A script, run: on a new simulation of its own from geodata and
@@ -1830,11 +2048,35 @@ class Front:
         rows = ([c.summary() for c in self.children.values()]
                 + [self.paused_summary(n, r) for n, r in self.paused.items()]
                 + self.ended_rows())
+        rows = [dict(r, bytes=self.run_bytes.get(os.path.realpath(os.path.join(SIM_DIR, r["run"]))))
+                for r in rows]
         rows.sort(key=lambda r: r.get("started") or 0, reverse=True)
         return {"type": "sims", "port": self.args.public_port,
                 "sims": rows,
                 "script_runs": [r.summary() for r in self.script_runs.values()],
                 **simd_module.store_lists()}
+
+    def forget_size(self, run_dir):
+        """A run directory measured again at the next pass: it changed."""
+        self.run_bytes.pop(os.path.realpath(run_dir), None)
+
+    async def measure(self):
+        """Every run directory's size, on a worker thread: a running
+        simulation's every SIZE_EVERY_S, any other once, and again after it
+        changes (forget_size)."""
+        while True:
+            live = [c.run_dir for c in self.children.values()]
+            known = set(self.run_bytes)
+
+            def walk():
+                todo = list(live) + [p for p in (runs_module.run_path(n) for n in runs_module.runs())
+                                     if os.path.realpath(p) not in known]
+                return {os.path.realpath(p): store.disk_bytes(p) for p in todo}
+            got = await asyncio.to_thread(walk)
+            if any(self.run_bytes.get(p) != b for p, b in got.items()):
+                self.run_bytes.update(got)
+                self.changed = True
+            await asyncio.sleep(SIZE_EVERY_S)
 
     async def report(self):
         """The registry to every socket once a wall second, and on a change
@@ -2338,9 +2580,10 @@ class Front:
         return web.json_response({"ok": True, **got})
 
     async def api_geodata_areas(self, request):
-        """GET: the outlines of the sources that do not cover the world."""
+        """GET: the outlines of the sources that do not cover the world,
+        {areas: [{source, title, outline}]}."""
         try:
-            return web.json_response({"ok": True, **await sources_module.areas(self.cache)})
+            return web.json_response({"ok": True, "areas": sources_module.areas()})
         except store.StoreError as err:
             return web.json_response({"ok": False, "error": str(err)})
 
@@ -2522,6 +2765,7 @@ class Front:
         await self.open_sessions()
         await self.start_http()
         self.reporter = asyncio.ensure_future(self.report())
+        self.measurer = asyncio.ensure_future(self.measure())
         try:
             await done
         finally:
@@ -2529,8 +2773,11 @@ class Front:
 
     async def shutdown(self):
         log("stopping")
-        if self.reporter is not None:
-            self.reporter.cancel()
+        for task in (self.reporter, self.measurer):
+            if task is not None:
+                task.cancel()
+        for _row, task in list(self.fetching.values()):
+            task.cancel()
         if self.build is not None and self.build.running:
             self.build.cancel()
             with contextlib.suppress(asyncio.CancelledError):

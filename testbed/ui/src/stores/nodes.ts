@@ -102,7 +102,11 @@ export type SelectMode = 'replace' | 'add' | 'toggle' | 'remove'
 
 /** One row of the Layers panel: a nodeset with a node on the geodata, how
  *  many it has and how many of them stand on it. */
-export interface LayerRow { name: string; nodes: number; inside: number; shown: boolean }
+export interface LayerRow {
+  name: string; nodes: number; inside: number; shown: boolean
+  /** The nodeset's size on disk, with its own setup script. */
+  bytes: number | null
+}
 
 type Bbox = [number, number, number, number]
 
@@ -439,13 +443,13 @@ export const useNodes = defineStore('nodes', {
       const r = await request('nodeset_list', { geodata: this.geodata })
       if (!r.ok) return
       const rows = (r.nodesets as (NodesetRow & { inside?: number })[]).filter(n => !n.error)
-      const count = new Map(rows.map(n => [n.name, [n.nodes ?? 0, n.inside ?? 0] as const]))
+      const count = new Map(rows.map(n => [n.name, [n.nodes ?? 0, n.inside ?? 0, n.bytes ?? null] as const]))
       const on = new Set(rows.filter(n => n.inside).map(n => n.name))
       const active = this.active
       if (active) on.add(active)
       const row = (name: string, shown: boolean): LayerRow => {
-        const [nodes, inside] = count.get(name) ?? [0, 0]
-        return { name, nodes, inside, shown }
+        const [nodes, inside, bytes] = count.get(name) ?? [0, 0, null]
+        return { name, nodes, inside, shown, bytes }
       }
       const kept = this.layers.filter(l => on.has(l.name)).map(l => row(l.name, l.shown))
       const known = new Set(kept.map(l => l.name))
@@ -504,7 +508,7 @@ export const useNodes = defineStore('nodes', {
       const r = await request('nodeset_new', { name })
       if (!r.ok) return r.error ?? 'could not make it'
       await this.activateData(r.nodeset as NodesetData)
-      if (!this.layers.some(l => l.name === name)) this.layers.unshift({ name, nodes: 0, inside: 0, shown: true })
+      if (!this.layers.some(l => l.name === name)) this.layers.unshift({ name, nodes: 0, inside: 0, shown: true, bytes: null })
       return null
     },
 
@@ -512,7 +516,7 @@ export const useNodes = defineStore('nodes', {
      *  nodeset, which becomes the active layer; the layers it came from are hidden. */
     async saveVisibleAs(name: string): Promise<string | null> {
       const shown = this.layers.filter(l => l.shown)
-      if (this.nodeset && !this.nodeset.name) shown.unshift({ name: 'unnamed', nodes: 0, inside: 0, shown: true })
+      if (this.nodeset && !this.nodeset.name) shown.unshift({ name: 'unnamed', nodes: 0, inside: 0, shown: true, bytes: null })
       // What is visible: each layer's nodes on the geodata.
       const layers = shown.map(l => {
         const own = l.name === this.active || (l.name === 'unnamed' && this.active === '')
@@ -535,7 +539,7 @@ export const useNodes = defineStore('nodes', {
       const row = this.layers.find(l => l.name === name)
       if (row) this.layers.splice(this.layers.indexOf(row), 1)
       const count = Object.keys((r.nodeset as NodesetData).nodes).length
-      this.layers.unshift({ name, nodes: count, inside: count, shown: true })
+      this.layers.unshift({ name, nodes: count, inside: count, shown: true, bytes: null })
       return null
     },
 

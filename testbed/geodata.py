@@ -2,6 +2,7 @@
 
     testbed/geodata/<name>/geodata.yaml
     testbed/geodata/<name>/manifest.json, …     a pack's own files, beside it
+    testbed/geodata/<name>/.origin.yaml         the index it came from, when it did (indexes.py)
 
 One directory per geodata, holding everything it is: deleting or renaming
 the directory is deleting or renaming the geodata. One of two kinds:
