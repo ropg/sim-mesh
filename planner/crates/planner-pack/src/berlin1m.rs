@@ -5,7 +5,8 @@
 //!
 //! Real clutter = bDOM − DGM1 (clamped ≥ 0). EPSG:25833 (ETRS89/UTM33) vs
 //! the pack's EPSG:32633 (WGS84/UTM33) differ by well under a meter — the
-//! coordinates are used as-is, documented here.
+//! coordinates are used as-is, documented here. A pack in another zone
+//! projects them into its own (`build.rs`).
 //!
 //! Verified 2026-08-31 against tile 392_5820: points at half-meter centers,
 //! 1 m spacing, south-to-north scan order.

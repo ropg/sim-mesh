@@ -41,7 +41,8 @@ pub struct Lod2Building {
     /// multipolygon relation.
     pub id: String,
     /// Area-weighted footprint centroid in the pack CRS (LoD2's EPSG:25833
-    /// is taken as UTM 33 within a metre).
+    /// is taken as UTM 33 within a metre, and projected into a pack in any
+    /// other zone).
     pub e: f64,
     pub n: f64,
     /// Mean ground elevation (m amsl) of the footprint rings; for an
