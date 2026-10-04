@@ -372,6 +372,29 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         }
     };
     let project = |lat: f64, lon: f64| to_utm(&utm, &ll, lon, lat).unwrap_or((f64::NAN, f64::NAN));
+    // The 1 m pairs and the LoD2 tiles are EPSG:25833, ETRS89 / UTM 33. In a
+    // zone-33 pack that IS the grid (within a metre; berlin1m.rs) and they are
+    // used as they are. A pack west of 12° E is in zone 32 (Schwerin, Wismar,
+    // the Prignitz), and there the same coordinates land ~400 km east of where
+    // they belong, so they are projected into the pack's zone point by point.
+    let utm33 = if params.utm_zone == 33 { None } else { Some(utm_proj(33)?) };
+    let from_33 = |x: f64, y: f64| -> Option<(f64, f64)> {
+        let Some(src) = &utm33 else { return Some((x, y)) };
+        let mut pt = (x, y, 0.0);
+        proj4rs::transform::transform(src, &utm, &mut pt).ok()?;
+        Some((pt.0, pt.1))
+    };
+    // The grid in zone 33, for choosing those tiles by the corner in their
+    // names.
+    let grid_extent_33 = match &utm33 {
+        None => grid_extent,
+        Some(dst) => reproject_extent(grid_extent, |x, y| {
+            let mut pt = (x, y, 0.0);
+            proj4rs::transform::transform(&utm, dst, &mut pt).ok()?;
+            Some((pt.0, pt.1))
+        })
+        .ok_or_else(|| PackError::Proj("grid → utm33".into()))?,
+    };
 
     // Parallel resample: one row per task, per-worker tile readers.
     use rayon::prelude::*;
@@ -525,7 +548,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 .filter(|p| {
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     (name.ends_with(".xml") || name.ends_with(".gml"))
-                        && crate::lod2::tile_extent(name).map_or(true, |t| meets(t, grid_extent))
+                        && crate::lod2::tile_extent(name).map_or(true, |t| meets(t, grid_extent_33))
                 })
                 .collect();
             // Parse in parallel, chunked to bound in-flight memory; scatter
@@ -540,9 +563,13 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                         ))
                     })
                     .collect();
-                for (path, buildings) in chunk.iter().zip(parsed?) {
+                for (path, mut buildings) in chunk.iter().zip(parsed?) {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    let tile = crate::lod2::tile_extent(name);
+                    let mut tile = crate::lod2::tile_extent(name);
+                    if utm33.is_some() {
+                        buildings.retain_mut(|b| reproject_building(b, from_33));
+                        tile = tile.and_then(|t| reproject_extent(t, from_33));
+                    }
                     let mut reach = tile;
                     for b in &buildings {
                         let e = crate::lod2::extent(b);
@@ -704,7 +731,8 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     let used_osm_buildings = !osm_buildings.is_empty();
 
     // Real 1 m override where Berlin DGM1+bDOM pairs cover the region
-    // (EPSG:25833 ≈ 32633 within <1 m — used as-is; berlin1m.rs).
+    // (EPSG:25833 ≈ 32633 within <1 m — used as-is in zone 33, projected in
+    // any other; berlin1m.rs).
     let mut used_berlin_1m = false;
     let measured = params.berlin_1m_dir.is_some() || !params.elevation.is_empty();
     if measured {
@@ -719,7 +747,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 let mut it = key.split('_').map(|v| v.parse::<f64>().ok());
                 match (it.next().flatten(), it.next().flatten()) {
                     (Some(e), Some(n)) => {
-                        meets([e * 1000.0, n * 1000.0, (e + 2.0) * 1000.0, (n + 2.0) * 1000.0], grid_extent)
+                        meets([e * 1000.0, n * 1000.0, (e + 2.0) * 1000.0, (n + 2.0) * 1000.0], grid_extent_33)
                     }
                     _ => true,
                 }
@@ -743,7 +771,8 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     .collect();
                 for (key, dgm, dom) in parsed? {
                     eprintln!("berlin-1m: ingesting tile {key}");
-                    crate::berlin1m::accumulate_grids(&dgm, &dom, cell_of, &mut dtm_acc, &mut clut_acc);
+                    let target = |x: f64, y: f64| from_33(x, y).and_then(|(x, y)| cell_of(x, y));
+                    crate::berlin1m::accumulate_grids(&dgm, &dom, target, &mut dtm_acc, &mut clut_acc);
                 }
                 pairs_done += chunk.len() as u64;
                 steps.part("lidar", pairs_done, pairs.len() as u64);
@@ -1178,6 +1207,47 @@ fn union(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
     [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
 }
 
+/// An extent through a projection: the extent of its corners and edge
+/// midpoints, the midpoints for the slight bow a straight edge of one UTM
+/// zone takes in the next. `None` if any point fails.
+fn reproject_extent(e: [f64; 4], f: impl Fn(f64, f64) -> Option<(f64, f64)>) -> Option<[f64; 4]> {
+    let (mx, my) = ((e[0] + e[2]) / 2.0, (e[1] + e[3]) / 2.0);
+    let mut out = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+    for (x, y) in [
+        (e[0], e[1]),
+        (mx, e[1]),
+        (e[2], e[1]),
+        (e[2], my),
+        (e[2], e[3]),
+        (mx, e[3]),
+        (e[0], e[3]),
+        (e[0], my),
+    ] {
+        let (px, py) = f(x, y)?;
+        out = union(out, [px, py, px, py]);
+    }
+    Some(out)
+}
+
+/// A building through a projection: its centroid and every ring. False if
+/// any point fails, and the building is dropped.
+fn reproject_building(
+    b: &mut crate::lod2::Lod2Building,
+    f: impl Fn(f64, f64) -> Option<(f64, f64)>,
+) -> bool {
+    let Some((e, n)) = f(b.e, b.n) else { return false };
+    (b.e, b.n) = (e, n);
+    for p in &mut b.rings {
+        for ring in std::iter::once(&mut p.exterior).chain(p.interiors.iter_mut()) {
+            for pt in ring.iter_mut() {
+                let Some(q) = f(pt.0, pt.1) else { return false };
+                *pt = q;
+            }
+        }
+    }
+    true
+}
+
 /// Whether a building stands on ground LoD2 covers: its centroid inside one
 /// of the covered extents (half-open, so a centroid on a shared tile edge
 /// belongs to one tile).
@@ -1418,6 +1488,50 @@ mod tests {
         assert!(!lod2_covers(&covered, &at(390_500.0, 5_821_000.0)));
         assert!(!lod2_covers(&[], &at(390_500.0, 5_820_500.0)));
         assert_eq!(union([0.0, 1.0, 2.0, 3.0], [-1.0, 2.0, 1.0, 5.0]), [-1.0, 1.0, 2.0, 5.0]);
+    }
+
+    /// A zone-33 tile in a zone-32 pack (Schwerin, 11.41° E): the building
+    /// lands where its longitude and latitude put it in zone 32, not ~400 km
+    /// east of it, and a tile's extent follows.
+    #[test]
+    fn a_zone_33_building_is_projected_into_a_zone_32_pack() {
+        let ll = longlat_proj().unwrap();
+        let (u33, u32_) = (utm_proj(33).unwrap(), utm_proj(32).unwrap());
+        let (e33, n33) = to_utm(&u33, &ll, 11.41, 53.63).unwrap();
+        let (e32, n32) = to_utm(&u32_, &ll, 11.41, 53.63).unwrap();
+        let from_33 = |x: f64, y: f64| {
+            let mut pt = (x, y, 0.0);
+            proj4rs::transform::transform(&u33, &u32_, &mut pt).ok()?;
+            Some((pt.0, pt.1))
+        };
+        let mut b = crate::lod2::Lod2Building {
+            id: "b".into(),
+            e: e33,
+            n: n33,
+            ground_z: 0.0,
+            area_m2: 100.0,
+            height_m: 9.0,
+            source: planner_buildings::HeightSource::Lod2,
+            rings: vec![crate::lod2::Polygon {
+                exterior: vec![
+                    (e33 - 5.0, n33 - 5.0),
+                    (e33 + 5.0, n33 - 5.0),
+                    (e33 + 5.0, n33 + 5.0),
+                ],
+                interiors: Vec::new(),
+            }],
+        };
+        assert!((e33 - e32).abs() > 300_000.0, "{e33} {e32}");
+        assert!(reproject_building(&mut b, from_33));
+        assert!((b.e - e32).abs() < 0.01 && (b.n - n32).abs() < 0.01, "{} {}", b.e, b.n);
+        // The two grids are turned ~3° to each other here: a corner keeps its
+        // distance from the centroid, not its offsets.
+        let (x, y) = b.rings[0].exterior[1];
+        let d = ((x - e32).powi(2) + (y - n32).powi(2)).sqrt();
+        assert!((d - 50f64.sqrt()).abs() < 0.01, "{x} {y}");
+        let t = reproject_extent([e33 - 1000.0, n33 - 1000.0, e33 + 1000.0, n33 + 1000.0], from_33)
+            .unwrap();
+        assert!(t[0] < e32 && e32 < t[2] && t[1] < n32 && n32 < t[3], "{t:?}");
     }
 
     #[test]
