@@ -137,13 +137,16 @@ carrying `tag`, or all of them. A line is in one firmware's language, so
 the chosen stations must all run one base, or `base` must narrow them to
 one; a verb goes to every station, each through its own driver. `meta`'s
 verbs are every firmware's (`sim_mesh.driver`) and a category's
-(`sim_mesh.reticulum.driver`); with `category`, a meta is only for the
-chosen stations of that category, and one that leaves none of them is an
-error. `lxmf.send` takes `to`, a node or an LXMF identity, whose address is
-asked of its station first, and `path` may (or `dest_hash` and `iface`,
-or nothing for the whole table); `lxmf.send` may take `from`, its sender
-the same way, in place of a choice of stations, and is answered with each
-message's id, which simd gives it; `peer_tcp` takes `to` and `port`.
+(`sim_mesh.reticulum.driver`, `sim_mesh.meshcore.driver`); with `category`,
+a meta is only for the chosen stations of that category, and one that leaves
+none of them is an error. `lxmf.send` takes `to`, a node or an LXMF
+identity, whose address is asked of its station first, and `path` may (or
+`dest_hash` and `iface`, or nothing for the whole table); `lxmf.send` may
+take `from`, its sender the same way, in place of a choice of stations, and
+is answered with each message's id, which simd gives it; `peer_tcp` takes
+`to` and `port`. With `category: meshcore`, `msg`, `path` and `reset_path`
+take `to`, a contact's name (a node's own, once it has advertised it),
+passed as it is, and `msg` and `chan` are answered with each message's id.
 
 `role` is what the station's driver reads from it (`current_role`), polled;
 None when it cannot say. `?quiet=1` on the websocket leaves out tx, rx, radio and levels,
@@ -202,6 +205,8 @@ NODE_FIELDS = ("id", "lat", "lon", "height_m", "height_from", "max_dbm", "antenn
 CLEARABLE_FIELDS = ("max_dbm",)
 EVENTS_FILE = "events.jsonl"  # what drivers report, a JSON object a line
 NAMED_VERBS = ("name", "lxmf.create")  # verbs whose `name` is the node's own unless given
+MESHCORE_TO_VERBS = ("msg", "path", "reset_path")   # `to`, a contact's name, is their `dest`
+MESHCORE_MID_VERBS = ("msg", "chan")                # answered with the message's id
 SCRIPT_LOGLEVELS = ("output", "commands", "debug")  # what a script's scripts.log holds
 
 log = stations_module.log
@@ -1689,9 +1694,15 @@ class Simd:
         sender = args.pop("from", None)
         if "dest_hash" in args:
             args["dest"] = args.pop("dest_hash")
+        category = msg.get("category")
+        meshcore = category == "meshcore"
         if verb == "lxmf.send" and not to:
             raise drivers_module.CommandError("lxmf.send needs `to`, a node or an LXMF identity")
-        if verb in ("lxmf.send", "path") and to:
+        if meshcore and verb in MESHCORE_TO_VERBS:
+            if not to:
+                raise drivers_module.CommandError("%s needs `to`, a contact's name" % verb)
+            args["dest"] = str(to)
+        elif verb in ("lxmf.send", "path") and to:
             args["dest"] = await self.address_of(to)
         elif verb == "peer_tcp":
             args["addr"] = stations_module.bind_addr(self.nodeset.node(to)["id"])
@@ -1702,7 +1713,6 @@ class Simd:
                 raise drivers_module.CommandError("%s is not up" % node)
         else:
             targets = self.chosen(msg)
-        category = msg.get("category")
         if category is not None:
             # A category's verb is nothing to a station of another; one that
             # leaves none of those chosen is a mistake, said.
@@ -1719,7 +1729,7 @@ class Simd:
                     mine[key] = self.max_dbm(name)
             if verb in NAMED_VERBS and "name" not in mine:
                 mine["name"] = name
-            if verb == "lxmf.send":
+            if verb == "lxmf.send" or (meshcore and verb in MESHCORE_MID_VERBS):
                 mine["mid"] = self.new_mid(name)
                 await self.do_verb(station, verb, mine)
                 return mine["mid"]

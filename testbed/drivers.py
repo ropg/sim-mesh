@@ -31,13 +31,14 @@ import sys
 import firmware as firmware_module
 import stations as stations_module
 from sim_mesh.driver import CommandError, Driver
+from sim_mesh.meshcore.driver import MeshcoreDriver
 from sim_mesh.reticulum.driver import ReticulumDriver
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RADIO_BUILD = os.path.normpath(os.path.join(HERE, "..", "radio", "build"))
 # The time shim every station of a virtual-time run is started with.
 SHIM = os.path.join(RADIO_BUILD, "libsimclock.so")
-CATEGORY_CLASSES = {"reticulum": ReticulumDriver}
+CATEGORY_CLASSES = {"reticulum": ReticulumDriver, "meshcore": MeshcoreDriver}
 MACRO_RE = re.compile(r"\{([a-z_]+)(?::([A-Za-z0-9_.-]+))?\}")
 BUILD_KEYS = ("firmware", "base", "category", "radio", "title", "hardware", "version", "arch",
               "dir", "exec", "driver", "fixed", "env", "asked")

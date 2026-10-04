@@ -432,6 +432,9 @@ def test_commands_and_verbs_go_to_the_stations_chosen(stores):
                 {"verb": "lxmf.send", "args": {}}]})
         with pytest.raises(ValueError, match="no firmware category"):
             daemon.check_first_boot({"which": {"all": True}, "lines": [
+                {"verb": "role", "args": {}, "category": "meshtastic"}]})
+        with pytest.raises(ValueError, match="no such verb 'role' for meshcore firmware"):
+            daemon.check_first_boot({"which": {"all": True}, "lines": [
                 {"verb": "role", "args": {}, "category": "meshcore"}]})
 
         # The scripts' log level: kept in the run, in the snapshot, said to all.
@@ -452,6 +455,45 @@ def test_commands_and_verbs_go_to_the_stations_chosen(stores):
         got = [m for m in daemon.said if m["type"] == "command_result"][-1]
         assert got["results"] == {"d": "did only"}
         assert daemon.run.meta["builds"]["other_latest"]["base"] == "other"
+        await daemon.stop_all(flush=False)
+        daemon.ether.close()
+    asyncio.run(go())
+
+
+def test_meshcore_verbs_name_a_contact_and_mint_a_message_id(stores):
+    """`msg` and `chan` of the meshcore category are answered with
+    sim-mesh's id, which the driver puts in the text; `to` is the contact's
+    name, passed as it is; a reticulum station is no target of them."""
+    stub_firmware.install(stores / "firmware", "mc", "20260101000000",
+                          driver=stub_firmware.MESHCORE_DRIVER, category="meshcore")
+
+    async def go():
+        daemon = make_simd(stores)
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three", "firmware_rules": [
+            ALL_STUB, {"which": {"names": ["a", "c"]}, "firmware": "mc_latest"}]})
+        assert await until(lambda: len(daemon.stations) == 3 and all(
+            s.status == "up" for s in daemon.stations.values()))
+
+        async def meta(verb, **msg):
+            await daemon.do_meta(dict(msg, verb=verb, category="meshcore", id=verb))
+            return [m for m in daemon.said if m["type"] == "command_result"][-1]
+
+        got = await meta("msg", name="a", args={"to": "c", "text": "yo"})
+        mid = got["results"]["a"]
+        assert mid.startswith("a.")
+        assert lines_of(daemon.run, "a")[-1] == "msg c yo #%s" % mid
+        got = await meta("chan", name="c", args={"nb": 0, "text": "all"})
+        assert lines_of(daemon.run, "c")[-1] == "chan 0 all #%s" % got["results"]["c"]
+        assert (await meta("path", name="c", args={"to": "a"}))["results"] == {"c": ["ab"]}
+        got = await meta("msg", name="a", args={"text": "nobody"})
+        assert "msg needs `to`" in got["error"]
+        got = await meta("repeat", args={"on": True})
+        assert sorted(got["results"]) == ["a", "c"]           # b runs reticulum firmware
+        with open(os.path.join(daemon.run.dir, "events.jsonl")) as handle:
+            events = [json.loads(line) for line in handle]
+        assert [(e["event"], e["mid"], e["status"]) for e in events if e["node"] == "a"] == [
+            ("msg.status", mid, "sent")]
         await daemon.stop_all(flush=False)
         daemon.ether.close()
     asyncio.run(go())

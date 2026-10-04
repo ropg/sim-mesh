@@ -169,10 +169,10 @@ names the newest installed firmware of exactly that base for this machine,
 newest by stamp or by semantic version; a base keeps to one of the two.
 
 **A category** says what kind of mesh a firmware's stations make, and which
-driver interface its driver implements: `reticulum` (the one there is),
-`meshcore` and `meshtastic` to come. A script's verbs are its category's
-(below), and the traffic and delivery analyses are the `reticulum`
-category's own.
+driver interface its driver implements: `reticulum`, `meshcore`
+([§7a](#7a-the-meshcore-category)), and `meshtastic` to come. A script's
+verbs are its category's (below), and the traffic and delivery analyses are
+the `reticulum` category's own.
 
 **Adding** one: **Add from zip…** or **Add from pre-built…** on the Firmware
 tab, or
@@ -1009,7 +1009,12 @@ to be up first (a node with no firmware refuses), and answering
   `.reticulum.lxmf.create(name=None)`, `.identities()` each node's
   `[(name, address)]`, `.announce(name=None)`, and `.send(to, text,
   sender=None)`, a message to a node or an LXMF identity by name, answering
-  its id. These take `spread=`, the nodes spread over that many seconds.
+  its id; and under `.meshcore`, for a selection's MeshCore nodes, the
+  `meshcore` verbs ([§7a](#7a-the-meshcore-category)): `.meshcore.repeat(on)`,
+  `.advert()`, `.floodadv()`, `.contacts()`, `.msg(to, text)` and
+  `.chan(nb, text)` answering each message's id, `.path(to)` and
+  `.reset_path(to)`, `to` a contact's name. These take `spread=`, the nodes
+  spread over that many seconds.
 
 **The simulation**: `sim_wait(seconds)`, `sim_until(seconds)`, `sim_now()`,
 the run's clock in seconds since the script's simulation began;
@@ -2082,7 +2087,7 @@ A YAML mapping at the archive's root.
 | `base` | yes | as in the name |
 | `arch` | yes | as in the name |
 | `version` | yes | as in the name, a string |
-| `category` | yes | the driver interface its driver implements, and so the verbs it answers: `reticulum` (§7); `meshcore`, `meshtastic` to come |
+| `category` | yes | the driver interface its driver implements, and so the verbs it answers: `reticulum` (§7), `meshcore` (§7a); `meshtastic` to come |
 | `exec` | yes | the executable's path in the archive |
 | `driver` | yes | the driver's path in the archive, a Python file (§6) |
 | `radio` | no | the virtual radio it is linked with, by the library's name: `sx1262` is `libsimradio-sx1262.so` (§9). Absent: sim-mesh provides none, and the station speaks the ether's protocol itself (§8) or has no radio |
@@ -2201,7 +2206,7 @@ change under it. sim-mesh makes one `DRIVER(firmware)` per installed
 firmware a run uses, shared by its stations.
 
 **What a driver is given.** `self.firmware`: `dir`, `exec`, `fixed`, `env`
-(paths made absolute), `driver`, `name`/`firmware`, `base`, `arch`,
+(paths made absolute), `driver`, `firmware` (its name), `base`, `arch`,
 `version`, `category`, `radio`, `title`, `hardware`. Every call names a
 `station`, which offers:
 
@@ -2317,6 +2322,56 @@ the station says under its own id is given to
 firmware has an id is reported under `mid` directly. sim-mesh writes each
 event as a line of the run's `events.jsonl`:
 `{"t": <T in µs>, "node": …, "event": …, …fields}`.
+
+### 7a. The `meshcore` category
+
+```
+script ── node(n).meshcore.msg(to, text) ──► simd: mid ──► msg(dest, text, mid) ──► station
+sender ── sent, acknowledged ──► its driver ──► msg.status {mid, status}
+receiver ── the message, mid in its text ──► its driver ──► msg.received {mid, text, sender | chan}
+```
+
+A firmware of category `meshcore` is a MeshCore node: a companion, which a
+person drives through meshcore-cli, a repeater or a room server. Its
+`DRIVER` subclasses `sim_mesh.meshcore.driver.MeshcoreDriver` and implements
+every firmware's verbs and the category's, each taking the station first; a
+verb it cannot do raises `CommandError` (`self.cannot(verb)`), which the
+default does. A script reaches them as `<selection>.meshcore.<verb>`. They
+carry meshcore-cli's command names and mean what those commands mean; they
+are not shaped like the `reticulum` verbs, and a comparison across
+protocols is a layer above both.
+
+| Verb | Means | Returns |
+|---|---|---|
+| `repeat(on)` | forwarding others' packets on or off | |
+| `advert()` | a zero-hop advert | |
+| `floodadv()` | a flooded advert | |
+| `contacts()` | | `[(name, public-key prefix, path length or None)]`, None for a contact reached by flood |
+| `msg(dest, text, mid)` | a direct message to the contact `dest`, by its name; `mid` is sim-mesh's id | |
+| `chan(nb, text, mid)` | a message on channel `nb` | |
+| `path(dest)` | | the contact's path, its hops' hash prefixes (`[]` for a neighbour), or None for flood |
+| `reset_path(dest)` | back to flood for that contact | |
+
+A script names the other end of `msg`, `path` and `reset_path` with `to`, a
+contact's name, which is a node's own once it has advertised it; simd passes
+it as it is. `msg` and `chan` are answered with the message's id.
+
+**Events.** The sender's driver reports what became of every message under
+its `mid`, as the event `msg.status`: `sent`, then for `msg` `delivered`
+(its acknowledgement came back) or `failed` (with `why`); a channel message
+has no acknowledgement and ends at `sent`.
+
+```
+self.msg_status(station, mid, "delivered")
+self.msg_received(station, mid, text, sender=<public-key prefix>)   # or chan=<nb>
+```
+
+The receiving station's driver reports every message the station received
+as the event `msg.received`, with `mid`, the text, and the sender's
+public-key prefix or the channel. `mid` travels in the message's text,
+put there with `sim_mesh.meshcore.driver.tagged(text, mid)` (`<text>
+#<mid>`) and read back with `untagged`, so a receiver knows it with nothing
+of the sender's.
 
 ### 8. The ether's protocol
 
@@ -2676,7 +2731,7 @@ tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 | `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, links, edits, the geometry hash, the merge of shown layers, the imports (the planner's CSVs, any CSV, GeoJSON, KML, GPX, a Meshtastic node list) |
 | `planner/` | the Rust workspace: `planner-web` (the sidecar), `planner-job` (a pack's build, a node map's import), `planner-pack` (the compiler, OpenStreetMap from a PBF extract), `planner-buildings`, `planner-import`, and the ground, propagation and coverage crates |
 | `testbed/script.py` | scripts: listing, checking, loading, a script's inputs read without running it |
-| `testbed/sim_mesh/library.py`, `testbed/sim_mesh/select.py` | the script library: `script_…`, `sim_…`, and `nodes()`/`node()` selections with what is done to them (`.firmware`, `.on_first_boot`, `.exec`, `.radio`, `.reticulum…`), `Node` for first-boot rules, and `scripts.log` |
+| `testbed/sim_mesh/library.py`, `testbed/sim_mesh/select.py` | the script library: `script_…`, `sim_…`, and `nodes()`/`node()` selections with what is done to them (`.firmware`, `.on_first_boot`, `.exec`, `.radio`, `.reticulum…`, `.meshcore…`), `Node` for first-boot rules, and `scripts.log` |
 | `testbed/losses.py` | a loss table, on synthetic ground or through the sidecar; the cache; links, shadowing, antennas and offsets as layers, the ground under each node; one node's row |
 | `testbed/coverage.py` | a node's coverage raster on a pack, through the sidecar, cached |
 | `testbed/runs.py` | a run directory, and snapshots taken from and loaded into one |
@@ -2686,7 +2741,7 @@ tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 | `testbed/webrtc.py` | the WebRTC relay: the signalling rewritten, and one UDP port in front of every station's DataChannel |
 | `testbed/ui/` | the page (Quasar 2 on Vue 3; Pinia stores `catalog`, `geodata`, `nodes`, `sim`, `coverage`, `display`, `socket`); `vendor/planner-wasm` is the planner's built planner-wasm, copied in by `vendor/update-planner-wasm.mjs` so the page builds with no planner beside it |
 | `testbed/seq.py`, `compare.py`, `airtime.py`, `links.py`, `delivery.py`, `compliance.py`, `referee.py` | the analysis tools ([Reading a run](#reading-a-run)) |
-| `testbed/sim_mesh/` | the library: `library` (what a script says, synchronously), `select` (`nodes()`), `driver` (what a firmware's driver is, and what sim-mesh hands it), `traffic` (the LXMF traffic driver), `sim` (the async hold on a simulation the library runs on), `runner` (a script run, its simulation started, its report), `view` (a run opened for analysis), `record`; `sim_mesh/reticulum/` holds Reticulum's parts: the category's driver interface, frame reading (Reticulum packets, SUPE), delivery analysis |
+| `testbed/sim_mesh/` | the library: `library` (what a script says, synchronously), `select` (`nodes()`), `driver` (what a firmware's driver is, and what sim-mesh hands it), `traffic` (the LXMF traffic driver), `sim` (the async hold on a simulation the library runs on), `runner` (a script run, its simulation started, its report), `view` (a run opened for analysis), `record`; `sim_mesh/reticulum/` holds Reticulum's parts: the category's driver interface, frame reading (Reticulum packets, SUPE), delivery analysis; `sim_mesh/meshcore/` the `meshcore` category's driver interface |
 | `testbed/boards.py` | the one board, an SX1262 with a GC1109 front end above 22 dBm; a node's maximum power; what a station is told of it |
 | `testbed/scripts/` | the scripts: `realtime.py`, `lxmf-traffic.py`; `startup.py`, which every script includes; `globals.py`, the settings they share and the page reads |
 | `testbed/geodata/`, `testbed/nodesets/` | your geodata and nodesets (not committed) |
