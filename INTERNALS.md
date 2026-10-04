@@ -52,8 +52,8 @@ virtual time.
 
 ## Its own launcher, and its own container
 
-sim-mesh simulates whatever firmware brings a driver, Reticulum firmwares
-today and Meshtastic or MeshCore nodes as much its business tomorrow. So it
+sim-mesh simulates whatever firmware brings a driver, Reticulum and MeshCore
+firmware today and Meshtastic nodes as much its business tomorrow. So it
 is no verb of the tool that builds any one of them: it has its own launcher
 (`sim`), its own image and its own site of pre-built firmware, and a
 clone runs with no firmware tree beside it.
@@ -1791,8 +1791,8 @@ change.
   firmware and rules only), so a simulation loaded from one logs at the
   default level.
 
-- **The `meshcore` and `meshtastic` categories**: their driver interfaces
-  beside `reticulum`'s, and a `messages` layer in the scripting library that
+- **The `meshtastic` category**: its driver interface beside `reticulum`'s
+  and `meshcore`'s, and a `messages` layer in the scripting library that
   compares delivery from one node to another across the three.
 - **The mixed-firmware walkthrough** in the README: announces crossing both
   ways, a path through another firmware's transports, a two-frame split both
