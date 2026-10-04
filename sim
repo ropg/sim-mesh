@@ -37,6 +37,10 @@
 #                                      (-f: none); a paused run's or a snapshot's is kept
 #     sim firmware prebuilt            what sim-mesh.net offers for this machine
 #     sim firmware resolve NAME        what a firmware name runs, as JSON
+#     sim firmware publish [--dry-run] ZIP… | --delete NAME…
+#                                      put zips on sim-mesh.net's pre-built list, or
+#                                      take them off (a token from gh logged in here,
+#                                      or GH_TOKEN)
 #     sim index list                   the indexes geodata and nodesets come from, and
 #                                      what each offers
 #     sim index add ADDRESS            list another index (a URL, or a path)
@@ -716,7 +720,7 @@ if want_container; then
 fi
 
 case "$verb" in
-    firmware) shift; [ $# -gt 0 ] || die "firmware: add, list, delete, prebuilt or resolve"; cmd_firmware "$@" ;;
+    firmware) shift; [ $# -gt 0 ] || die "firmware: add, list, delete, prebuilt, resolve or publish"; cmd_firmware "$@" ;;
     index|geodata|nodeset)
         [ $# -gt 1 ] || die "$verb: $([ "$verb" = index ] && echo "list, add or delete" \
                                      || echo "list, offered, add, delete or publish")"
