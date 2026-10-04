@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/random.h>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -99,6 +100,7 @@ enum {
     REG_IQ_CONFIG       = 0x0736,
     REG_SYNC_WORD_MSB   = 0x0740,
     REG_SYNC_WORD_LSB   = 0x0741,
+    REG_RANDOM_NUMBER   = 0x0819,   /* four bytes, RandomNumberGen[0..3] */
     REG_SENSITIVITY     = 0x0889,
     REG_RX_GAIN         = 0x08AC,
     REG_TX_CLAMP        = 0x08D8,
@@ -263,6 +265,17 @@ static int connectorDbm(int chipDbm)
  * well short of the byte's +31.75 dB anyway: it saturates a little above 10 dB
  * however strong the link (an LR2021 on a desk read 14 dB at -16 dBm). So a
  * link reads no more than +12 dB, and no less than the byte's -32 dB. */
+/* RandomNumberGen while the chip receives: the chip samples its receiver's
+ * noise, which differs from chip to chip. Here it is the C library's
+ * getrandom, which the time shim keys by the run's seed and the station in a
+ * virtual-time run, so each station draws its own and a run repeats. */
+static uint8_t randomByte()
+{
+    uint8_t b = 0;
+    while (getrandom(&b, 1, 0) != 1) { }
+    return b;
+}
+
 static const int kSnrCeilingDb = 12;
 
 static uint8_t snrRegister(int db)
@@ -780,8 +793,14 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
     case CMD_READ_REGISTER:
         if (len >= 4) {
             uint16_t addr = ((uint16_t)out[1] << 8) | out[2];
+            bool rx = strcmp(d.mode, "RX") == 0;
             for (size_t i = 4; i < len; i++) {
-                auto it = d.regs.find((uint16_t)(addr + (i - 4)));
+                uint16_t reg = (uint16_t)(addr + (i - 4));
+                if (rx && reg >= REG_RANDOM_NUMBER && reg < REG_RANDOM_NUMBER + 4) {
+                    in[i] = randomByte();
+                    continue;
+                }
+                auto it = d.regs.find(reg);
                 in[i] = it == d.regs.end() ? 0x00 : it->second;
             }
         }
