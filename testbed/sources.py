@@ -40,11 +40,12 @@ file its host does not have (GLO-30 has no tile over open sea) leaves a
 a missing file is an error (`missing: error`). An address with mirrors is
 tried in order, and the next one when one fails.
 
-**A build takes every source whose coverage meets its rectangle**, and the
-compiler takes from each layer's sources by their priority there: Berlin's
+**A build takes every source whose coverage meets its rectangle**: Berlin's
 own data where the rectangle touches Berlin, GLO-30 and OpenStreetMap's
-buildings on the rest, the Zensus grid where it touches Germany (`plan`
-says which, and what each is used for).
+buildings on the rest, the Zensus grid where it touches Germany. `plan` says
+which, and what each is used for by its priority in each layer; the compiler
+is never given a priority, and measured data overwrites the worldwide data
+on the cells it covers (INTERNALS, "Priority is the plan's").
 
 Every request names sim-mesh in its User-Agent, a 429 or 5xx is retried after
 the Retry-After the host gives (or a growing pause), and nothing is fetched

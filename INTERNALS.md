@@ -433,7 +433,10 @@ stick works offline. One file lists both kinds because whoever publishes
 ground usually publishes nodesets for it, and a nodeset entry names its
 geodata so installing it can bring that along. What was installed from where
 is a dot file beside it (`.origin.yaml`), which export, the store's
-listings and the geodata file all pass over.
+listings and the geodata file all pass over. An entry counts as installed
+when the origin beside it names the entry's sha256; a geodata or nodeset of
+that name with no origin, or another one, is taken, and installing over it
+is refused rather than compared byte for byte.
 
 **Every row says what it takes on disk.** Sizes are walked on a worker
 thread: a running simulation's run directory every ten seconds, any other
@@ -723,6 +726,15 @@ tiles and lidar pairs that meet its grid, and the front hands it a directory of 
 to just the tiles this rectangle needs, since the cache holds every tile any
 build fetched.
 
+**A source is parameters, never code.** What a pack is built from changes far
+more often than how a kind of data is read: a new region's lidar comes in a
+feed standard, a tile scheme and a file format sim-mesh reads already. So an
+entry picks one finding method, one way of reading and one format, and fills
+in their parameters; the methods and the readers are sim-mesh's. A source
+file can come from anyone, and an entry that could carry code would make
+taking one running a stranger's code. A dataset no method fits is a new
+method or reader in sim-mesh, which every source can then use.
+
 **The front chooses the sources; the compiler takes what it is given.**
 `sources.plan` takes every source of the source files whose coverage meets
 the rectangle (with the shipped ones: the state surveys' terrain, surface
@@ -764,6 +776,24 @@ open, the last one used tried first: a source of 1 km tiles is a hundred
 of them under a 10 km pack, past the 256 open files macOS allows a
 process if every worker opened all.
 
+**Measured terrain and surface come as a pair.** A regional terrain source
+is used only with a surface source in the same projection and with the same
+no-data value, and the build refuses a rectangle where one has no partner
+("… has no surface to pair with in its system"). A cell is measured only
+when both halves are: the terrain and the clutter above it come from the
+same survey, and a 1 m terrain is never set under GLO-30's 30 m surface.
+
+**Priority is the plan's; the compiler's order is the cell's.** A source's
+priority in a layer decides what `sources.plan` says it is used for
+("buildings outside Berlin LoD2 building models"), and nothing else: the
+compiler is never given it. In the compiler, measured pairs overwrite
+GLO-30's split on every cell they cover enough, the 1 m XYZ pairs first and
+then the GeoTIFF pairs in the order given, so where two measured sources
+cover one cell the later stands. LoD2 and CityJSON buildings displace
+OpenStreetMap's on their tiles. An input that takes one source (population,
+the surface tiles, land cover, the PBF) refuses a rectangle that two
+sources meet.
+
 **A window is a sparse copy of the whole file.** `read: window` fetches a
 cloud-optimised GeoTIFF's first 256 KB, walks its directories (TIFF and
 BigTIFF, tiled only), and fetches the chunks of one level that the
@@ -777,6 +807,13 @@ reads zeros where it holds nothing.
 GeoJSON file beside the source file, so no source's coverage depends on
 another source's index being fetched; Berlin's and Germany's are Geofabrik's
 outlines of them, made once with `sim source outline … --geofabrik`.
+
+**A pack carries only what may be passed on.** `redistributable: true` is a
+claim about the licence, and an entry that makes it gives the `notice` a
+pack carries; `sourcefile` refuses one without. A source that is not
+redistributable (the ITU maps) stays in the cache, and only values taken
+from it enter a pack. A pull request that adds a source is reviewed for its
+licence before anything else.
 
 Given both `lod2_dir` and `osm_buildings`, the compiler takes
 LoD2's buildings on the 1 km tiles in that directory that meet the grid and
@@ -796,7 +833,16 @@ region serves roads, places, peaks and masts, and buildings alike, and
 Geofabrik's index gives every extract's outline, so the smallest one holding
 the rectangle is chosen. Overpass would be four queries per region, is
 rate-limited, and times out on a city's buildings. The selection is
-`sources.smallest_extract`, the `regions` method's.
+`sources.smallest_extract`, the `regions` method's. The same holds for every
+source: a source is files, fetched whole or by range into the cache, never a
+query service (OGC API, WCS, Overpass), whose limits and timeouts make a
+city's build unreliable.
+
+**The build's map tiles come through the front.** The page asks
+`/osm/<z>/<x>/<y>.png` and the front serves it from `testbed/osmtiles/`,
+asking tile.openstreetmap.org only on a miss. One origin keeps one cache, as
+the tile usage policy asks, whatever browsers have the page open. Place
+search goes the same way (`/api/nominatim`), one request per search.
 
 **Nodes are never ground.** A planner pack could carry a `Nodes` layer, the
 deployed network baked in at build time. sim-mesh's compiler never writes one,
@@ -808,8 +854,9 @@ bucket (kept, or dropped and why).
 
 **The DataQuality layer's codes are wire values; `rank()` orders them.**
 0 GLO-30 synthesized, 1 LoD2, 2 lidar 1 m, 3 OSM default heights, 4 OSM
-tagged heights. A cell takes the best-ranked evidence it has: GLO-30 < OSM
-default < OSM tagged < LoD2 < lidar.
+tagged heights, 5 lidar raster (a measured GeoTIFF pair). A cell takes the
+best-ranked evidence it has: GLO-30 < OSM default < OSM tagged < LoD2 <
+lidar, the two lidar codes ranking alike.
 
 ## A table of every pair
 
@@ -1231,6 +1278,18 @@ can interleave on — a tool that opens a pty per command, frames whose ids
 could collide — is held by its driver with a lock per station around every
 call, its own polls included.
 
+**A category's rule is inert elsewhere; a category's command that reaches no
+node of it is refused.** A rule and a verb carry their category (`{verb,
+args, category}`), and simd hands them only to stations of that category. A
+rule is a standing condition over a network that may be mixed:
+`Node.reticulum.role("transport")` on a selection that also holds another
+firmware's nodes means its Reticulum nodes, and is nothing to the rest, now
+or when a node is placed later. A command is given once, now:
+`<selection>.reticulum.…` on a selection with no Reticulum node would do
+nothing anywhere and answer as if it had, which is a script naming the
+wrong nodes, so the library refuses it before it is sent, and simd refuses a
+meta that leaves no station of its category.
+
 ## Framed RPC, and why a console and not a TCP command line
 
 A firmware that speaks framed RPC is asked things on its console pty, the
@@ -1289,7 +1348,11 @@ simd restartable under a page that is open. The active layer is the one
 exception, deliberately: it is the page's own until it is saved. That is
 also why Save visible as sends the layers as they stand to the front to be
 merged there (`nodeset.merge`), rather than naming files: the active one's
-unsaved edits are part of what is saved.
+unsaved edits are part of what is saved. Save visible as is the only way to
+save a nodeset under a new name and the only way to merge: one layer shown
+is that layer's Save as, several are the merge. A merged node keeps its tags
+and gains its layer's name as a tag, so a script can still tell the layers
+apart after the merge.
 
 **A reply the sidecar cut short is never drawn as if it were whole.** The
 sidecar caps a footprint reply's vertices and fills it in the pack's order,
@@ -1715,6 +1778,11 @@ change.
   against a board, not only against the formula.
 
 **Stations and firmware**
+
+- **A snapshot keeps the scripts' log level.** `script_loglevel` is kept in
+  `run.yaml` but not in a snapshot (`runs.take_snapshot` writes the builds,
+  firmware and rules only), so a simulation loaded from one logs at the
+  default level.
 
 - **The `meshcore` and `meshtastic` categories**: their driver interfaces
   beside `reticulum`'s, and a `messages` layer in the scripting library that

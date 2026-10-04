@@ -195,7 +195,8 @@ run or snapshot goes first. On the Firmware tab each row says its size on
 disk and has a checkbox; **Delete** above the list deletes the chosen ones
 nothing holds, after one confirmation naming those it keeps.
 
-**Pre-built firmware** is listed on [sim-mesh.net/firmware](https://sim-mesh.net/firmware/),
+**Pre-built firmware** is listed on [sim-mesh.net/firmware](https://sim-mesh.net/firmware/)
+(`SIM_MESH_FIRMWARE_INDEX` names another list),
 whose `index.html` carries each zip's facts, so the page can say what each
 is without fetching it. Projects put theirs there with `tools/deploy-firmware`
 ([Publishing firmware](#publishing-firmware)).
@@ -531,8 +532,10 @@ rectangle's centre; a rectangle wider than its zone, or a grid of more than
 25 million cells, is refused with the sentence saying why.
 
 The sources are not a choice: the build takes every source whose coverage
-meets the rectangle ([Sources](#sources)), and in each layer the one of the
-highest priority there for each part of it. With the sources sim-mesh ships:
+meets the rectangle ([Sources](#sources)), and measured data takes the
+place of the worldwide data wherever it covers; a source's priority says
+which one the build is said to use where several meet. With the sources
+sim-mesh ships:
 
 - **terrain and clutter**: the state surveys' 1 m terrain and their surface
   models where the rectangle touches Berlin, Brandenburg or
@@ -579,7 +582,8 @@ is fetched once, resumed where it stopped, and one its host does not have
 | CBS 2023 100 m grid | the Netherlands | `download.cbs.nl` |
 
 Geofabrik's index, Berlin's feeds and the MeshCore node list are kept in
-`testbed/geodata/.cache/meta/` and asked again when a week old. A Berlin tile's name
+`testbed/geodata/.cache/meta/` and asked again when a week old, or after the
+`refresh_days` a source's `find` gives. A Berlin tile's name
 is its south-west corner in kilometres of EPSG:25833, so a district costs
 megabytes rather than the city's gigabytes. OpenStreetMap is read from one
 protocol buffer file (PBF) extract, not from Overpass: one file serves roads,

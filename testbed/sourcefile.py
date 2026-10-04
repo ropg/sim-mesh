@@ -3,7 +3,7 @@
     sim-mesh/sources/sources.yaml             what sim-mesh ships, grouped
     sim-mesh/sources/outlines/<id>.geojson    a regional source's coverage
     testbed/sources.yaml                      a person's own, the same shape
-    testbed/sources/outlines/<id>.geojson
+    testbed/outlines/<id>.geojson             its outlines, beside it
 
 ```yaml
 global:                             # sources with data everywhere
@@ -23,8 +23,8 @@ sources.py plans and fetches from what it reads.
 
 **The compiler reads what it reads.** Until it takes its readers' parameters
 from a source, a format's parameters must be the ones its reader assumes:
-a `csv-grid` is Zensus's layout, an `xyz` or `citygml` Berlin's, a
-landcover `geotiff` WorldCover's classes. A source that asks for anything
+an `xyz` or `citygml` the German state surveys' layout in EPSG:25833, a
+landcover `geotiff` WorldCover's classes, a worldwide surface EPSG:4326. A source that asks for anything
 else is refused here, rather than read wrongly in a build.
 
 Run as a script it is `sim source`: `check` reads every file and says what
