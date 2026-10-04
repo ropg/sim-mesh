@@ -53,7 +53,27 @@ import time
 
 import aiohttp
 
-DEFAULT_PORT = int(os.environ.get("SIM_MESH_PORT") or 8800)
+
+def front_address(environ=os.environ):
+    """The front's host and port: `SIM_MESH_FRONT`'s `host:port`, a front
+    running elsewhere (from a container, `host.docker.internal:8800`), else
+    this machine's on `SIM_MESH_PORT` (which the front gives the scripts it
+    runs) or 8800."""
+    given = environ.get("SIM_MESH_FRONT")
+    if given:
+        host, _, port = given.rpartition(":")
+        if not host or not port.isdigit():
+            raise ValueError("SIM_MESH_FRONT is host:port, not %r" % given)
+        return host, int(port)
+    return "127.0.0.1", int(environ.get("SIM_MESH_PORT") or 8800)
+
+
+FRONT_HOST, DEFAULT_PORT = front_address()
+
+
+def front_ws(port, query=""):
+    """The front's control websocket at `port`."""
+    return "http://%s:%d/ws%s" % (FRONT_HOST, port, query)
 
 
 class SimError(Exception):
@@ -489,7 +509,7 @@ class Sim:
 
 async def front_verb(session, port, msg, timeout=None):
     """One of the front's own verbs on a socket of its own: its answer."""
-    async with session.ws_connect("http://127.0.0.1:%d/ws" % port, max_msg_size=0) as ws:
+    async with session.ws_connect(front_ws(port), max_msg_size=0) as ws:
         await ws.send_str(json.dumps(msg))
         async for raw in ws:
             if raw.type != aiohttp.WSMsgType.TEXT:
@@ -509,7 +529,7 @@ async def attach(name=None, port=None, session=None):
         raise SimError("attach to which simulation? name one, or run under the front")
     port = port or DEFAULT_PORT
     session = session or aiohttp.ClientSession()
-    ws = await session.ws_connect("http://127.0.0.1:%d/ws?quiet=1&sim=%s" % (port, name),
+    ws = await session.ws_connect(front_ws(port, "?quiet=1&sim=%s" % name),
                                   max_msg_size=0)
     sim = Sim(ws, session, name, port)
     sim.reader = asyncio.ensure_future(sim.read())

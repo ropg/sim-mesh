@@ -24,7 +24,8 @@ a simulation of those is usually a script's own, `sim run <script> --geodata
 G --nodeset N`. `--build` names an installed firmware (`<name>` or
 `<base>_latest`) that every node whose firmware has its base runs instead. `--pairwise` puts
 that simulation's ether on the pairwise rule. `--port` (default 8800) is the
-front's.
+front's. With `SIM_MESH_FRONT=host:port` the front is one already running
+there, and none is started here.
 """
 import argparse
 import asyncio
@@ -40,6 +41,7 @@ SIM_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SIM_DIR)
 
 import store                        # noqa: E402 - the path is set just above
+from sim_mesh import sim as sim_module  # noqa: E402
 FRONT_START_S = 15.0
 
 
@@ -49,7 +51,7 @@ class NotFront(Exception):
 
 async def connect(session, port):
     """A websocket to the front, and its greeting; NotFront if something else answers."""
-    ws = await session.ws_connect("http://127.0.0.1:%d/ws?quiet=1" % port, max_msg_size=0)
+    ws = await session.ws_connect(sim_module.front_ws(port, "?quiet=1"), max_msg_size=0)
     first = await ws.receive_json(timeout=10)
     if first.get("type") != "hello" or not first.get("front"):
         await ws.close()
@@ -59,11 +61,12 @@ async def connect(session, port):
 
 
 async def front(session, port, start):
-    """The front's websocket, starting front.py first when nothing answers and `start`."""
+    """The front's websocket, starting front.py first when nothing answers and
+    `start`, unless the front is elsewhere (`SIM_MESH_FRONT`)."""
     try:
         return await connect(session, port)
     except (aiohttp.ClientError, OSError):
-        if not start:
+        if not start or os.environ.get("SIM_MESH_FRONT"):
             raise
     os.makedirs(os.path.join(SIM_DIR, "runs"), exist_ok=True)
     out = open(os.path.join(SIM_DIR, "runs", "front.log"), "a")
@@ -153,7 +156,7 @@ def plan_text(row):
 async def main():
     ap = argparse.ArgumentParser(prog="sim", description=__doc__.split("\n")[0])
     port = argparse.ArgumentParser(add_help=False)
-    port.add_argument("--port", type=int, default=8800, help="the front's port")
+    port.add_argument("--port", type=int, default=sim_module.DEFAULT_PORT, help="the front's port")
     verbs = ap.add_subparsers(dest="verb", required=True)
 
     def verb(name, text):
@@ -194,8 +197,12 @@ async def main():
             print(err, file=sys.stderr)
             return 2
         except (aiohttp.ClientError, OSError):
-            print("nothing answers on port %d: `sim` or `sim new` starts the front"
-                  % args.port, file=sys.stderr)
+            if os.environ.get("SIM_MESH_FRONT"):
+                print("nothing answers at %s:%d (SIM_MESH_FRONT): start the front there"
+                      % (sim_module.FRONT_HOST, args.port), file=sys.stderr)
+            else:
+                print("nothing answers on port %d: `sim` or `sim new` starts the front"
+                      % args.port, file=sys.stderr)
             return 2
         await ws.receive_json(timeout=10)       # the registry it greets with
 

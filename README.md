@@ -1525,6 +1525,21 @@ the lock of, so two fronts on one host never share one) and run directory
 after `--` go to every simd as they stand: `sim -- --pairwise --stagger
 30`.
 
+**A front elsewhere.** With `SIM_MESH_FRONT=host:port`, `sim` uses a front
+that is already running at that address. The usual case is a build container
+on the same machine, where it is `host.docker.internal:8800`. In that mode:
+- the simulation verbs (`new`, `stop`, `pause`, `resume`, `list`, `plan`,
+  `run`) talk to it;
+- no container is started, and no front is ever started here (`sim` and `sim
+  dev` refuse);
+- the file verbs (`firmware`, `geodata`, …) work on the tree here, which is
+  the front's own when the workspace is shared;
+- a page URL the runner prints still says `localhost`, for the browser beside
+  the front.
+
+Unset, nothing changes: the variable is not passed into sim-mesh's image, and
+inside it the front is always its own `127.0.0.1`.
+
 **Simulations** lists each one: its nodeset, geodata and script, its pace
 and T, the phase its driver says it is in with a bar of the plan, when it
 should be done, and how many of its stations are up; a simulation that exited
