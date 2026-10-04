@@ -124,7 +124,7 @@ function progressText(f: Fetching) {
 
 async function install(index: string, e: IndexEntry) {
   const r = await request('index_install', { index, kind: props.kind, name: e.name })
-  if (!r.ok && r.error !== 'cancelled') tell(r.error)
+  if (!r.ok && !String(r.error).startsWith('cancelled')) tell(r.error)
   else if (r.ok) {
     const all = (r.installed as { kind: string; name: string }[]).map(i => i.name).join(' and ')
     tell(null, `added ${all}`)

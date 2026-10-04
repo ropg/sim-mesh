@@ -133,7 +133,11 @@ def flow(value):
 def disk_bytes(*paths):
     """What files and directories take on disk together, in bytes: every
     file's size, symbolic links not followed, a path that is not there 0.
-    What the page and the CLI say a row occupies."""
+    A sparse file (a window of a large one, cogwindow.py) counts what it
+    holds, not its length. What the page and the CLI say a row occupies."""
+    def size(st):
+        held = getattr(st, "st_blocks", None)
+        return st.st_size if held is None else min(st.st_size, held * 512)
     total = 0
     for path in paths:
         try:
@@ -141,12 +145,12 @@ def disk_bytes(*paths):
         except OSError:
             continue
         if not os.path.isdir(path) or os.path.islink(path):
-            total += st.st_size
+            total += size(st)
             continue
         for top, _dirs, files in os.walk(path):
             for each in files:
                 try:
-                    total += os.lstat(os.path.join(top, each)).st_size
+                    total += size(os.lstat(os.path.join(top, each)))
                 except OSError:
                     pass
     return total

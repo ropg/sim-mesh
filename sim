@@ -373,6 +373,14 @@ build_radio() {
     touch "$ROOT/radio/build/libsimclock.so" "$ROOT/radio/build/libsimradio-sx1262.so"
 }
 
+# cargo build with the crates already on this machine, and only when one is
+# missing with the network: a start without the network builds whenever
+# Cargo.lock's crates have been fetched once. The offline attempt is quiet;
+# a real compile error shows in the second.
+cargo_build() {
+    cargo build --offline "$@" 2>/dev/null || cargo build "$@"
+}
+
 # The ether's conductor in Rust (ether/core), a Python extension module the
 # ether loads from ether/build/; without it the ether's own conductor, in
 # Python, runs a virtual-time run, and gives the same run.
@@ -380,7 +388,7 @@ build_ether() {
     command -v cargo >/dev/null || die "the ether's conductor needs cargo"
     say "the ether's conductor: ether_core (cargo build --release)"
     (cd "$ROOT/ether/core" && PYO3_PYTHON="$(pick_python)" \
-        cargo build --release --target-dir "$ROOT/ether/build/target")
+        cargo_build --release --target-dir "$ROOT/ether/build/target")
     cp "$ROOT/ether/build/target/release/libether_core.so" "$ROOT/ether/build/ether_core.abi3.so"
 }
 
@@ -410,7 +418,7 @@ build_planner() {
         say "the planner: no wasm-pack, so planner-web embeds the planner-wasm output already in $static"
     fi
     say "the planner: planner-web and planner-job (cargo build --release)"
-    (cd "$PLANNER" && cargo build --release -p planner-web -p planner-job)
+    (cd "$PLANNER" && cargo_build --release -p planner-web -p planner-job)
     touch "$PLANNER/target/release/planner-web" "$PLANNER/target/release/planner-job"
 }
 

@@ -9,6 +9,8 @@
 
 pub mod berlin1m;
 pub mod build;
+pub mod cityjson;
+pub mod elevation;
 pub mod itu_maps;
 pub mod lod2;
 pub mod nodes;
@@ -188,6 +190,9 @@ pub enum DataQuality {
     /// Clutter heights merged from OpenStreetMap footprints, most of the
     /// cell's built area carrying a tagged `height` or `building:levels`.
     OsmTaggedHeights = 4,
+    /// Lidar-derived terrain AND surface from a raster source (e.g. AHN's
+    /// DTM and DSM), sampled into pack cells at the overview the build reads.
+    LidarRaster = 5,
 }
 
 impl DataQuality {
@@ -198,6 +203,7 @@ impl DataQuality {
             2 => DataQuality::Lidar1m,
             3 => DataQuality::OsmDefaultHeights,
             4 => DataQuality::OsmTaggedHeights,
+            5 => DataQuality::LidarRaster,
             _ => return None,
         })
     }
@@ -208,17 +214,18 @@ impl DataQuality {
             DataQuality::Lidar1m => "lidar 1 m",
             DataQuality::OsmDefaultHeights => "OSM buildings, default heights",
             DataQuality::OsmTaggedHeights => "OSM buildings, tagged heights",
+            DataQuality::LidarRaster => "lidar raster",
         }
     }
     /// Worst to best: GLO-30 < OSM default heights < OSM tagged heights <
-    /// LoD2 < lidar.
+    /// LoD2 < lidar (1 m points or a raster of them, alike).
     pub fn rank(self) -> u8 {
         match self {
             DataQuality::Glo30Pseudo => 0,
             DataQuality::OsmDefaultHeights => 1,
             DataQuality::OsmTaggedHeights => 2,
             DataQuality::Lod2Buildings => 3,
-            DataQuality::Lidar1m => 4,
+            DataQuality::Lidar1m | DataQuality::LidarRaster => 4,
         }
     }
     pub const ALL: &'static [DataQuality] = &[
@@ -227,6 +234,7 @@ impl DataQuality {
         DataQuality::OsmTaggedHeights,
         DataQuality::Lod2Buildings,
         DataQuality::Lidar1m,
+        DataQuality::LidarRaster,
     ];
 }
 

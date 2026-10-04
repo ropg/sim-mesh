@@ -535,18 +535,22 @@ meets the rectangle ([Sources](#sources)), and in each layer the one of the
 highest priority there for each part of it. With the sources sim-mesh ships:
 
 - **terrain and clutter**: Berlin's DGM1 and bDOM (1 m terrain and surface)
-  where the rectangle touches Berlin, Copernicus GLO-30 everywhere else;
+  where the rectangle touches Berlin, AHN's (0.5 m) where it touches the
+  Netherlands, Copernicus GLO-30 everywhere else;
 - **buildings**: Berlin's LoD2 models where the rectangle touches Berlin,
-  OpenStreetMap's everywhere else (an OpenStreetMap building on a LoD2
-  tile is left out);
+  3DBAG's where it touches the Netherlands, OpenStreetMap's everywhere else
+  (an OpenStreetMap building on a LoD2 or 3DBAG tile is left out);
 - **population**: the Zensus 2022 grid where the rectangle touches Germany,
-  none elsewhere;
+  CBS's 2023 grid where it touches the Netherlands, none elsewhere;
 
 and always ESA WorldCover land cover, OpenStreetMap roads and places, and
 the ITU maps. The panel lists the sources chosen, each with what it is used
 for ("buildings inside its outline", "buildings outside Berlin LoD2 building
 models"), what is still to fetch (what is in the cache costs nothing) and
-its licence. **Build**
+its licence. Build is ready as soon as the sources and their files are
+known; the download sizes come after, since they mean asking every file's
+host (Amsterdam's 167 3DBAG tiles and 24 AHN sheets take seconds to
+minutes). **Build**
 says the same in a dialog, which sources go into the pack and for which
 part, and goes back to the list, where the build's row shows its step and
 progress and has **Cancel**; when it ends the row is geodata like any
@@ -567,6 +571,9 @@ is fetched once, resumed where it stopped, and one its host does not have
 | P.1812-8 ΔN and N0 maps | the world | `itu.int`, kept here, never packed |
 | DGM1, bDOM, LoD2 | Berlin | `gdi.berlin.de`'s ATOM feeds: only the tiles meeting the rectangle |
 | Zensus 2022 100 m grid | Germany | `destatis.de` |
+| AHN DTM and DSM, 0.5 m | the Netherlands | PDOK's sheet index (`service.pdok.nl`): only the windows of the sheets meeting the rectangle |
+| 3DBAG buildings | the Netherlands | `data.3dbag.nl`'s tile index: only the tiles meeting the rectangle |
+| CBS 2023 100 m grid | the Netherlands | `download.cbs.nl` |
 
 Geofabrik's index, Berlin's feeds and the MeshCore node list are kept in
 `testbed/geodata/.cache/meta/` and asked again when a week old. A Berlin tile's name
@@ -635,20 +642,43 @@ europe:                             # a continent
 - **Finding**: `template` (tiles of whole degrees named by their south-west
   corner: `{ns}`, `{lat}`, `{ew}`, `{lon}`, `:0n` padding), `atom` (an
   INSPIRE download feed, each tile's corner read off its file name),
+  `index` (a file of footprints, GeoJSON or FlatGeobuf, in the `crs` it
+  names: each footprint meeting the rectangle is a file, its address the
+  `url_property`, its checksum the `sha256_property` when it has one),
   `regions` (Geofabrik's index, the smallest region holding the rectangle)
   or `file`. Any address may be a list: mirrors, tried in order. A file no
   host has is no data there (`missing: error` makes it a failed build).
-- **Reading** is `whole`: the file, resumed when a fetch breaks off.
-- **Formats** are `geotiff`, `xyz`, `citygml`, `osm-pbf`, `csv-grid` and
-  `itu-p1812-maps`. The compiler reads each as it always has, so a source's
-  parameters must be those its reader assumes: a `csv-grid` is Zensus's
-  layout, an `xyz` or a `citygml` Berlin's, a land cover `geotiff`
-  WorldCover's classes. Anything else is refused when the file is read,
-  with the sentence saying which.
+- **Reading** is `whole`, the file, resumed when a fetch breaks off, or
+  `window`, for a regional cloud-optimised GeoTIFF: its directories and only
+  the chunks the rectangle meets, at the coarsest level whose pixel is no
+  larger than a quarter of the pack's cell, fetched by HTTP range into a
+  sparse copy of the file (its `.ranges` beside it says what it holds). A
+  Delft-sized pack takes about 10 MB of an AHN sheet's 330 MB.
+- **Formats**, with their parameters:
+  - `geotiff` (`band`; `crs` when it is not EPSG:4326; `classes` for land
+    cover, which must be WorldCover's). A worldwide one is a surface in
+    EPSG:4326; a regional one is a terrain or a surface in any projection
+    sim-mesh knows.
+  - `xyz` and `citygml`, Berlin's layouts.
+  - `cityjson` (`crs`, and the attributes that hold the `ground` and `roof`
+    heights): each Building's LoD0 footprint, as tall as roof less ground.
+  - `csv-grid` (`delimiter`, the `x`, `y` and `value` columns, `crs`,
+    `cell_m`) and `gpkg-grid` (a GeoPackage of square cells: `value`, `crs`,
+    `cell_m`; a negative value is withheld).
+  - `osm-pbf` and `itu-p1812-maps`.
+
+  A file that does not fit its format is refused when it is read, with the
+  sentence saying which.
+- **Projections** a source may name are EPSG:4326, EPSG:3035, UTM (WGS 84
+  and ETRS89 zones) and RD New (EPSG:28992, and EPSG:7415 for its heights).
 - **Layers** are `surface`, `terrain`, `landcover`, `buildings`,
   `population`, `roads`, `places` and `radio-climate`, each source with its
-  priority in each. Berlin's terrain, surface and buildings are 100 to
-  GLO-30's and OpenStreetMap's 10.
+  priority in each. Berlin's and the Netherlands' terrain, surface and
+  buildings are 100 to GLO-30's and OpenStreetMap's 10.
+
+Shipped beyond the worldwide set: Germany (Berlin's DGM1, bDOM and LoD2,
+and the Zensus 2022 grid) and the Netherlands (AHN's 0.5 m terrain and
+surface, the 3DBAG buildings and CBS's 100 m population grid).
 
 An id is one source: a person's file may not take one sim-mesh ships (a
 second address for the same data is a mirror, in the shipped entry). Every
@@ -2603,6 +2633,9 @@ tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 | `sources/sources.yaml`, `sources/outlines/` | the sources sim-mesh builds packs from, as data, and their outlines |
 | `testbed/sourcefile.py` | the source files read and checked; `sim source` |
 | `testbed/sources.py` | a build's sources: the finding methods, what a rectangle needs of each, the download cache and its fetches (mirrors included), each source's area and cache for the map |
+| `testbed/crs.py` | the projections a source may name: their proj strings for the compiler, and RD New both ways for planning |
+| `testbed/fgb.py` | a FlatGeobuf file's features: properties and polygon rings |
+| `testbed/cogwindow.py` | a window of a cloud-optimised GeoTIFF: its directories, the level and chunks a rectangle needs, the sparse copy and its `.ranges` |
 | `testbed/packbuild.py` | one pack built from its sources: fetch, each source's files to the compiler input its format and layer go to, `planner-job pack-build`, the pack into place |
 | `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, links, edits, the geometry hash, the merge of shown layers, the imports (the planner's CSVs, any CSV, GeoJSON, KML, GPX, a Meshtastic node list) |
 | `planner/` | the Rust workspace: `planner-web` (the sidecar), `planner-job` (a pack's build, a node map's import), `planner-pack` (the compiler, OpenStreetMap from a PBF extract), `planner-buildings`, `planner-import`, and the ground, propagation and coverage crates |

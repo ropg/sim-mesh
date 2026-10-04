@@ -717,28 +717,52 @@ pack-build's steps, each only when it applies: `terrain`, `osm`,
 `buildings`, `lidar`, `landcover`, `clutter`, `population`, `manifest`. Its
 input names every file (the GLO-30 tiles, the WorldCover tiles, the ITU
 maps' directory, the PBF extract, a directory of LoD2 CityGML, one of
-Berlin's 1 m XYZ pairs, the Zensus CSV); it reads only the LoD2 tiles and
-lidar pairs that meet its grid, and the front hands it a directory of links
+CityJSON, one of Berlin's 1 m XYZ pairs, terrain and surface GeoTIFFs with
+their projection, a population CSV with its layout); it reads only the LoD2
+tiles and lidar pairs that meet its grid, and the front hands it a directory of links
 to just the tiles this rectangle needs, since the cache holds every tile any
 build fetched.
 
 **The front chooses the sources; the compiler takes what it is given.**
 `sources.plan` takes every source of the source files whose coverage meets
 the rectangle (with the shipped ones: Berlin's 1 m pairs and LoD2 where it
-touches Berlin, the Zensus grid where it touches Germany, GLO-30 and
-OpenStreetMap everywhere) and says what each is used for, so the page offers
+touches Berlin, the Zensus grid where it touches Germany, AHN, 3DBAG and
+CBS where it touches the Netherlands, GLO-30 and OpenStreetMap everywhere)
+and says what each is used for, so the page offers
 no choice and the dialog after **Build** reads the same list. `packbuild`
 hands each chosen source's files to the compiler input its format and layer
 go to (`packbuild.INPUTS`), never by the source's name, and refuses two
 sources for an input that takes one.
 
-**Sources are data, and the compiler's readers are fixed for now.** The
-compiler reads a format one way (a census grid as Zensus lays it out, XYZ
-and CityGML as Berlin's, land cover as WorldCover's classes), so
-`sourcefile.py` refuses a source whose format parameters ask for anything
-else, when the file is read: an entry the compiler would misread fails in
-`sim source check` and in the tests, not halfway through a build. When the
-compiler takes its readers' parameters from the source, that check goes.
+**Sources are data; some of the compiler's readers are still fixed.** A
+GeoTIFF terrain or surface comes with its proj string, a population grid
+with its delimiter, columns, projection and cell, CityJSON with its
+projection and height attributes, so those are any source's. XYZ and
+CityGML are read as Berlin's, land cover as WorldCover's classes, a
+worldwide surface as EPSG:4326 (`sourcefile.COMPILER_READS` and the
+GeoTIFF rules), and `sourcefile.py` refuses a source that asks otherwise
+when the file is read: an entry the compiler would misread fails in
+`sim source check` and in the tests, not halfway through a build. A
+GeoPackage grid reaches the compiler as the CSV the front writes from it
+beside the download (x, y of each cell's centre, value).
+
+**Measured ground from GeoTIFF is sampled, not resampled.** Each cell takes
+up to 8 × 8 samples, about a pixel apart, each transformed from the pack's
+UTM to the source's projection and read nearest-pixel: terrain is their
+mean, clutter the representative height of the surface above it. A cell
+whose samples are three quarters missing keeps GLO-30's. The reader opens
+the coarsest level whose pixel is no larger than a quarter of the cell, the
+level a window fetched (below), so a sparse copy is only ever read where it
+holds data.
+
+**A window is a sparse copy of the whole file.** `read: window` fetches a
+cloud-optimised GeoTIFF's first 256 KB, walks its directories (TIFF and
+BigTIFF, tiled only), and fetches the chunks of one level that the
+rectangle meets, ranges closer than 16 KB merged, written at their own
+offsets into a file of the remote's length. `<file>.ranges` lists what the
+copy holds; a later rectangle fetches only what it lacks, and the copy
+counts on disk as the blocks it holds. Any GeoTIFF reader opens it, and
+reads zeros where it holds nothing.
 
 **An outline is a source's own.** A regional source ships its coverage as a
 GeoJSON file beside the source file, so no source's coverage depends on
@@ -751,7 +775,9 @@ OpenStreetMap's everywhere else: an OpenStreetMap building whose centroid
 lies on one of those tiles is left out, so no building is counted twice.
 The tile is the unit of LoD2's coverage, not the city boundary, so on a
 tile that Berlin's border crosses the part outside Berlin has no buildings.
-Both write to one `buildings.jsonl`, LoD2's lines first, each line's
+CityJSON's coverage is each file's extent, an OpenStreetMap building on it
+left out the same way. All write to one `buildings.jsonl`, LoD2's and
+CityJSON's lines first, each line's
 `source` saying which, and the manifest carries both notices. A cell's
 DataQuality code follows most of its built area: LoD2, else OSM tagged,
 else OSM default.

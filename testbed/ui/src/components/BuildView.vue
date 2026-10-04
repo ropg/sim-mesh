@@ -49,7 +49,10 @@
               </tr>
             </tbody>
           </table>
-          <div v-else-if="asking" class="bv-dim">asking what it takes…</div>
+          <div v-else-if="asking" class="bv-dim">Finding which sources cover this rectangle and which of their files it needs…</div>
+          <div v-if="sizing" class="bv-dim">
+            You can build now. The download sizes take a while: each file's host is asked how big it is.
+          </div>
 
           <q-btn unelevated no-caps color="primary" label="Build" :loading="starting"
                  :disable="!plan || !!refused || !name.trim() || !!catalog.build && catalog.build.state !== 'failed'"
@@ -75,7 +78,10 @@
  * The side panel asks the front's /api/geodata/sources what the rectangle
  * takes at its resolution, whenever either changes: the grid, the sources
  * the front chose for it and what each is used for, and each source's
- * download still to fetch (what is in the cache costs nothing). Build starts
+ * download still to fetch (what is in the cache costs nothing). It asks
+ * first without the sizes, which takes a moment and is all Build needs, then
+ * with them, which asks every file's host and for a city of tiles takes
+ * seconds to minutes; Build does not wait for that. Build starts
  * it on the front, a dialog says which sources go into the pack and for
  * what, and the view goes back to the list, where the build's row shows how
  * it goes. */
@@ -110,6 +116,8 @@ const res = ref(30)
 const plan = ref<Plan | null>(null)
 const refused = ref<string | null>(null)
 const asking = ref(false)
+const sizing = ref(false)
+const sizesFailed = ref(false)
 const starting = ref(false)
 let askTimer: ReturnType<typeof setTimeout> | null = null
 let askCtrl: AbortController | null = null
@@ -120,7 +128,8 @@ function mb(bytes: number) {
 
 function fetchText(s: SourceRow) {
   if (s.cached === s.files) return 'in the cache'
-  if (s.to_fetch === null) return 'size unknown'
+  if (s.to_fetch === null && sizing.value) return 'asking the host for the size…'
+  if (s.to_fetch === null) return sizesFailed.value ? 'size unknown: the host did not answer' : 'size unknown'
   return `${mb(s.to_fetch)}${s.cached ? ` (${s.cached} cached)` : ''}`
 }
 
@@ -136,22 +145,34 @@ function askSoon() {
   askTimer = setTimeout(() => { void ask() }, ASK_AFTER_MS)
 }
 
+/* Twice: first without the download sizes, which is quick and all Build
+ * needs, then with them, which means asking every file's host. */
 async function ask() {
   askCtrl?.abort()
   const ctrl = new AbortController()
   askCtrl = ctrl
   asking.value = true
+  sizesFailed.value = false
   try {
-    const r = await fetch(`/api/geodata/sources?${query().toString()}`, { signal: ctrl.signal })
-    const body = await r.json() as Plan & { ok: boolean; error?: string }
-    if (ctrl.signal.aborted) return
-    if (!body.ok) { plan.value = null; refused.value = body.error ?? 'refused'; return }
-    refused.value = null
-    plan.value = body
+    for (const sizes of [false, true]) {
+      const q = query()
+      if (!sizes) q.set('sizes', '0')
+      const r = await fetch(`/api/geodata/sources?${q.toString()}`, { signal: ctrl.signal })
+      const body = await r.json() as Plan & { ok: boolean; error?: string }
+      if (ctrl.signal.aborted) return
+      if (!body.ok && sizes) { sizesFailed.value = true; return }
+      if (!body.ok) { plan.value = null; refused.value = body.error ?? 'refused'; return }
+      refused.value = null
+      plan.value = body
+      if (!sizes) { asking.value = false; sizing.value = true }
+    }
   } catch (e) {
-    if (!ctrl.signal.aborted) { plan.value = null; refused.value = (e as Error).message }
+    if (!ctrl.signal.aborted) {
+      if (sizing.value) sizesFailed.value = true       // the plan stands; only the sizes are missing
+      else { plan.value = null; refused.value = (e as Error).message }
+    }
   } finally {
-    if (askCtrl === ctrl) asking.value = false
+    if (askCtrl === ctrl) { asking.value = false; sizing.value = false }
   }
 }
 

@@ -34,6 +34,7 @@ import signal
 import time
 
 import geodata
+import sourcefile
 import sources
 import store
 
@@ -41,17 +42,24 @@ PROGRESS_HZ = 4.0
 TAIL_LINES = 20
 FETCH_PARALLEL = 4
 # Which compiler input a source's files go to, by its format and a layer it
-# feeds: the compiler's readers as they are (sourcefile.COMPILER_READS).
+# feeds (and for a surface GeoTIFF, whether it is the worldwide one the
+# compiler splits, or a regional one paired with a terrain).
 INPUTS = {
-    ("geotiff", "surface"): "dsm_tiles",
-    ("geotiff", "landcover"): "worldcover_tiles",
-    ("itu-p1812-maps", "radio-climate"): "itu_maps_dir",
-    ("osm-pbf", "roads"): "osm_pbf",
-    ("citygml", "buildings"): "lod2_dir",
-    ("xyz", "terrain"): "berlin_1m_dir",
-    ("xyz", "surface"): "berlin_1m_dir",
-    ("csv-grid", "population"): "zensus_csv",
+    ("geotiff", "surface", True): "dsm_tiles",
+    ("geotiff", "surface", False): "elevation_surface",
+    ("geotiff", "terrain", False): "elevation_terrain",
+    ("geotiff", "landcover", True): "worldcover_tiles",
+    ("itu-p1812-maps", "radio-climate", True): "itu_maps_dir",
+    ("osm-pbf", "roads", True): "osm_pbf",
+    ("citygml", "buildings", False): "lod2_dir",
+    ("cityjson", "buildings", False): "cityjson",
+    ("xyz", "terrain", False): "berlin_1m_dir",
+    ("xyz", "surface", False): "berlin_1m_dir",
+    ("csv-grid", "population", False): "population",
+    ("gpkg-grid", "population", False): "population",
 }
+# The inputs that take several sources; every other takes one.
+MANY = ("berlin_1m_dir", "elevation_terrain", "elevation_surface")
 
 
 class Build:
@@ -165,11 +173,11 @@ class Build:
         for source_id in files:
             source = reg[source_id]
             for layer in source.layers:
-                into = INPUTS.get((source.format_type, layer))
+                into = INPUTS.get((source.format_type, layer, source.worldwide))
                 if into is not None and source_id not in given.setdefault(into, []):
                     given[into].append(source_id)
         for into, ids in given.items():
-            if len(ids) > 1 and into not in ("berlin_1m_dir",):
+            if len(ids) > 1 and into not in MANY:
                 raise store.StoreError("the compiler takes one source for %s, and the rectangle "
                                        "has %s" % (into, ", ".join(ids)))
         one = lambda into: given.get(into, [None])[0]  # noqa: E731
@@ -188,7 +196,8 @@ class Build:
             "itu_maps_dir": os.path.dirname(itu[0]) if itu else None,
             "osm_pbf": pbf[0] if pbf else None,
             "osm_buildings": bool(pbf) and "buildings" in reg[pbf_source].layers,
-            "lod2_dir": None, "berlin_1m_dir": None, "zensus_csv": None, "threads": 0,
+            "lod2_dir": None, "berlin_1m_dir": None, "population": None, "elevation": [],
+            "cityjson": None, "threads": 0,
         }
         shutil.rmtree(self.inputs, ignore_errors=True)
         if one("lod2_dir"):
@@ -198,10 +207,53 @@ class Build:
             ids = sorted(given["berlin_1m_dir"], key=lambda s: "terrain" not in reg[s].layers)
             params["berlin_1m_dir"] = self.link_dir(
                 "berlin-1m", [p for s in ids for p in extracted(s)])
-        if one("zensus_csv"):
-            csv = extracted(one("zensus_csv"))
-            params["zensus_csv"] = csv[0] if csv else None
+        params["elevation"] = self.elevation(given, reg, have)
+        if one("cityjson"):
+            s = reg[one("cityjson")]
+            params["cityjson"] = {
+                "dir": self.link_dir("cityjson", extracted(s.id)),
+                "proj": sourcefile.proj_of(s), "ground": s.format["ground"],
+                "roof": s.format["roof"], "source": s.title, "notice": s.notice or ""}
+        if one("population"):
+            s = reg[one("population")]
+            fmt = s.format
+            if fmt["type"] == "gpkg-grid":
+                csv = [self.cache.grid_csv(f, fmt["value"]) for f in files[s.id] if self.cache.have(f)]
+                layout = {"delimiter": ",", "x": "x", "y": "y", "value": "value"}
+            else:
+                csv = extracted(s.id)
+                layout = {k: str(fmt[k]) for k in ("delimiter", "x", "y", "value")}
+            if csv:
+                params["population"] = dict(layout, csv=csv[0], proj=sourcefile.proj_of(s),
+                                            cell_m=float(fmt["cell_m"]), source=s.title,
+                                            notice=s.notice or "")
         return params
+
+    def elevation(self, given, reg, have):
+        """Regional terrain and surface GeoTIFFs as the compiler's pairs: the
+        terrain and the surface sources in one system together, read at a
+        quarter of a cell. A system with only one of the two is no pair, and
+        said so."""
+        by_proj = {}
+        for role in ("terrain", "surface"):
+            for source_id in given.get("elevation_" + role, ()):
+                s = reg[source_id]
+                pair = by_proj.setdefault(sourcefile.proj_of(s), {"terrain": [], "surface": []})
+                pair[role].append(s)
+        out = []
+        for proj, pair in by_proj.items():
+            if not pair["terrain"] or not pair["surface"]:
+                lone = (pair["terrain"] or pair["surface"])[0]
+                raise store.StoreError("%s has no %s to pair with in its system" % (
+                    lone.title, "surface" if pair["terrain"] else "terrain"))
+            both = pair["terrain"] + pair["surface"]
+            out.append({
+                "terrain": [p for s in pair["terrain"] for p in have(s.id)],
+                "surface": [p for s in pair["surface"] for p in have(s.id)],
+                "proj": proj, "pixel_m": float(self.spec["res_m"]) / 4.0,
+                "source": " and ".join(s.title for s in both),
+                "notice": " / ".join(dict.fromkeys(s.notice or "" for s in both))})
+        return out
 
     async def compile(self, params):
         shutil.rmtree(self.part, ignore_errors=True)

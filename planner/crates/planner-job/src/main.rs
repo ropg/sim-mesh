@@ -14,7 +14,10 @@
 use planner_import::meshcore_map::{self, MapBbox, MapFilter, MeshCoreKind};
 use planner_import::potatomesh::{self, NodeFilter};
 use planner_import::PositionQuality;
-use planner_pack::build::{build, BuildParams, Progress};
+use planner_pack::build::{build, BuildParams, CityJsonInput, PopulationInput, Progress};
+use planner_pack::cityjson::Heights;
+use planner_pack::elevation::ElevationInput;
+use planner_pack::zensus::GridCsv;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -95,10 +98,53 @@ struct PackBuild {
     osm_buildings: bool,
     #[serde(default)]
     berlin_1m_dir: Option<PathBuf>,
+    /// A population grid as CSV, in its own system.
     #[serde(default)]
-    zensus_csv: Option<PathBuf>,
+    population: Option<PopulationJob>,
+    /// Terrain and surface GeoTIFF pairs, each in its own system.
+    #[serde(default)]
+    elevation: Vec<ElevationJob>,
+    /// CityJSON buildings.
+    #[serde(default)]
+    cityjson: Option<CityJsonJob>,
     #[serde(default)]
     threads: usize,
+}
+
+/// {csv, proj, delimiter, x, y, value, cell_m, source, notice}
+#[derive(Debug, Deserialize)]
+struct PopulationJob {
+    csv: PathBuf,
+    proj: String,
+    delimiter: String,
+    x: String,
+    y: String,
+    value: String,
+    cell_m: f64,
+    source: String,
+    notice: String,
+}
+
+/// {terrain: [path], surface: [path], proj, pixel_m, source, notice}
+#[derive(Debug, Deserialize)]
+struct ElevationJob {
+    terrain: Vec<PathBuf>,
+    surface: Vec<PathBuf>,
+    proj: String,
+    pixel_m: f64,
+    source: String,
+    notice: String,
+}
+
+/// {dir, proj, ground, roof, source, notice}
+#[derive(Debug, Deserialize)]
+struct CityJsonJob {
+    dir: PathBuf,
+    proj: String,
+    ground: String,
+    roof: String,
+    source: String,
+    notice: String,
 }
 
 fn pack_build(input: &str) -> Result<Value, String> {
@@ -134,7 +180,50 @@ fn pack_build(input: &str) -> Result<Value, String> {
         berlin_1m_dir: job.berlin_1m_dir,
         lod2_dir: job.lod2_dir,
         lod2_geometry: true,
-        zensus_csv: job.zensus_csv,
+        population: match job.population {
+            Some(p) => {
+                let mut chars = p.delimiter.chars();
+                let (Some(delimiter), None) = (chars.next(), chars.next()) else {
+                    return Err(format!(
+                        "the population grid's delimiter {:?} is not one character",
+                        p.delimiter
+                    ));
+                };
+                Some(PopulationInput {
+                    csv: p.csv,
+                    proj: p.proj,
+                    layout: GridCsv {
+                        delimiter,
+                        x: p.x,
+                        y: p.y,
+                        value: p.value,
+                        cell_m: p.cell_m,
+                    },
+                    source: p.source,
+                    notice: p.notice,
+                })
+            }
+            None => None,
+        },
+        elevation: job
+            .elevation
+            .into_iter()
+            .map(|e| ElevationInput {
+                terrain: e.terrain,
+                surface: e.surface,
+                proj: e.proj,
+                pixel_m: e.pixel_m,
+                source: e.source,
+                notice: e.notice,
+            })
+            .collect(),
+        cityjson: job.cityjson.map(|c| CityJsonInput {
+            dir: c.dir,
+            proj: c.proj,
+            heights: Heights { ground: c.ground, roof: c.roof },
+            source: c.source,
+            notice: c.notice,
+        }),
         worldcover_tiles: job.worldcover_tiles,
         osm_pbf: job.osm_pbf,
         osm_buildings: job.osm_buildings,

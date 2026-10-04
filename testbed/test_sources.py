@@ -265,12 +265,15 @@ def test_each_source_says_what_it_is_used_for():
 
 def test_the_shipped_sources_hold_together():
     assert list(SHIPPED) == ["glo30", "worldcover", "itu", "geofabrik", "berlin-dgm1",
-                             "berlin-bdom", "berlin-lod2", "zensus"]
+                             "berlin-bdom", "berlin-lod2", "zensus", "ahn-dtm", "ahn-dsm",
+                             "3dbag", "cbs-population"]
     for source in SHIPPED.values():
         assert source.worldwide == (source.continent == sourcefile.GLOBAL)
         assert source.worldwide or source.outline["type"] in ("Polygon", "MultiPolygon")
         assert source.redistributable == (source.id != "itu")
     assert SHIPPED["zensus"].where == "Europe › Germany"
+    assert SHIPPED["3dbag"].where == "Europe › Netherlands"
+    assert sourcefile.proj_of(SHIPPED["ahn-dtm"]).startswith("+proj=sterea")
 
 
 @pytest.mark.parametrize("change, why", [
@@ -280,7 +283,8 @@ def test_the_shipped_sources_hold_together():
     (lambda e: e["find"].update(method="ftp"), "find.method"),
     (lambda e: e["find"].pop("feed"), "needs feed"),
     (lambda e: e["find"].update(name="(\\d+)"), "(?P<x>"),
-    (lambda e: e.update(read="window"), "read is whole"),
+    (lambda e: e.update(read="stream"), "read is whole or window"),
+    (lambda e: e.update(read="window"), "a window is read of a regional source's cloud-optimised"),
     (lambda e: e["format"].update(crs="EPSG:4326"), "the compiler reads xyz"),
     (lambda e: e.update(notice=None), "gives the notice"),
 ])
@@ -368,7 +372,13 @@ def test_a_build_fetches_what_it_needs_and_hands_the_compiler_its_inputs(tmp_pat
         params = json.loads(saw.read_text())
         assert params["osm_buildings"] and params["utm_zone"] == 33
         assert os.path.basename(params["lod2_dir"]) == "lod2"
-        assert params["berlin_1m_dir"] and "zensus_csv" in params
+        assert params["berlin_1m_dir"] and params["elevation"] == [] and params["cityjson"] is None
+        # Zensus's grid as a population input, its layout and system from its source.
+        population = params["population"]
+        assert population["csv"].endswith("Zensus2022_Bevoelkerungszahl_100m-Gitter.csv")
+        assert (population["delimiter"], population["x"], population["value"], population["cell_m"]) \
+            == (";", "x_mp_100m", "Einwohner", 100.0)
+        assert population["proj"].startswith("+proj=laea +lat_0=52 +lon_0=10")
         assert params["osm_pbf"].endswith("geofabrik/berlin.osm.pbf")
         assert os.path.basename(params["itu_maps_dir"]) == "x"
         assert [os.path.basename(p) for p in params["dsm_tiles"]] == [
@@ -419,6 +429,9 @@ class StandInCache:
     async def feed(self, source):
         return ('<a href="https://gdi.berlin.de/x/DGM1_390_5818.zip"/>'
                 '<a href="https://gdi.berlin.de/x/DGM1_392_5818.zip"/>')
+
+    async def index_features(self, source):
+        raise store.StoreError("no index in this test")
 
 
 def test_a_sources_area_and_its_cache_come_from_names_feeds_and_outlines(tmp_path):
