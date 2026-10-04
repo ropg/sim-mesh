@@ -1603,7 +1603,14 @@ first draw. A call reserves all its words in one atomic step and takes no
 lock, so a thread switched out mid-call neither blocks another nor changes
 its bytes. With the same seed and epoch, a station draws the same bytes in the
 same order in every run, and what is left to differ between two runs is what
-comes from outside them (below).
+comes from outside them (below). The chip model's random-number register
+(`RandomNumberGen`, 0x0819 to 0x081C) answers from the same `getrandom` while
+the chip receives, as the chip samples its own receiver's noise, and holds
+still outside receive: a firmware that seeds its generator from the radio
+(RadioLib's `random()`, which MeshCore seeds its retransmit jitter with) gets
+a seed of its own on every station. A register that never moved gave every
+station one seed, and repeaters hearing one flood retransmitted it at the
+same instant.
 
 **Idle is the station saying every thread is blocked**, and a station has
 one of two ways to know it:

@@ -575,6 +575,22 @@ def test_the_sync_word_register_publishes_the_word_it_encodes(chip):
     assert state["sync"] == 0x42
 
 
+def test_the_random_number_register_draws_while_receiving_and_reads_still_outside(chip):
+    """RadioLib seeds a firmware's generator from 0x0819 read in RX, its low
+    bit each time: a chip whose register never changed gives every station
+    the same seed."""
+    chip.configure()
+    chip.write(SET_STANDBY, 0x00)
+    assert chip.read_register(0x0819, 4) == b"\x00\x00\x00\x00"
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+    reads = [chip.read_register(0x0819, 1)[0] for _ in range(64)]
+    assert len(set(reads)) > 8
+    assert len({r & 1 for r in reads}) == 2
+    chip.write(SET_STANDBY, 0x00)
+    assert chip.read_register(0x0819, 1) == b"\x00"
+
+
 # ---------------------------------------------------------------------------
 # 10. Channel activity detection
 # ---------------------------------------------------------------------------
