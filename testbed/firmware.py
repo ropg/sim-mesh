@@ -537,6 +537,208 @@ async def prebuilt(index_url=None, firmware_dir=None, arch=None):
 
 # ---- the CLI -----------------------------------------------------------------
 
+# ---- publishing --------------------------------------------------------------
+
+PUBLISH_REPO = "sim-mesh/sim-mesh"
+PUBLISH_SITE = "sim-mesh/sim-mesh.github.io"
+PUBLISH_TAG = "firmware"
+PUBLISHED_FACTS = ("base", "arch", "version", "category", "radio", "title", "hardware")
+GITHUB_API = os.environ.get("SIM_MESH_GITHUB_API", "https://api.github.com")
+UPLOAD_TIMEOUT_S = 3600
+
+
+def zip_facts(path):
+    """(name, facts) of a firmware zip about to be published: its node.yaml's
+    facts and its size, the zip's file name checked against them."""
+    name = os.path.basename(path)
+    try:
+        with zipfile.ZipFile(path) as zf:
+            node = yaml.safe_load(zf.read(NODE_YAML))
+    except (OSError, KeyError, zipfile.BadZipFile, yaml.YAMLError) as err:
+        raise FirmwareError("%s: %s" % (path, err)) from err
+    if not isinstance(node, dict):
+        raise FirmwareError("%s: its node.yaml is no mapping" % name)
+    want = "%s.zip" % make_name(str(node.get("base")), str(node.get("arch")),
+                                str(node.get("version")))
+    if name != want:
+        raise FirmwareError("%s: its node.yaml names it %s" % (name, want))
+    facts = {k: str(node[k]) for k in PUBLISHED_FACTS if node.get(k) not in (None, "")}
+    facts["size"] = os.path.getsize(path)
+    return name[:-4], facts
+
+
+def index_html(entries):
+    """The pre-built listing: one link a zip, its facts on it as data-*
+    attributes (what parse_index reads), by base, then arch, then name."""
+    rows = []
+    order = sorted(entries.items(), key=lambda kv: (kv[1]["base"], kv[1]["arch"], kv[0]))
+    for name, f in order:
+        attrs = "".join(' data-%s="%s"' % (k, html.escape(f[k]))
+                        for k in ("category", "radio", "title", "hardware") if f.get(k))
+        rows.append('<tr><td><a href="%s.zip"%s>%s</a></td><td>%s</td><td>%s</td>'
+                    '<td>%s</td><td>%s</td><td>%.1f MB</td></tr>'
+                    % (html.escape(name), attrs, html.escape(name),
+                       html.escape(f.get("title", "")), html.escape(f.get("category", "")),
+                       html.escape(f.get("radio", "")), html.escape(f.get("arch", "")),
+                       f.get("size", 0) / 1e6))
+    return """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pre-built firmware — sim-mesh</title>
+<style>
+body { font: 15px/1.5 Lato, system-ui, sans-serif; margin: 2em auto; max-width: 960px;
+       padding: 0 16px; color: #1f2933; background: #fff; }
+table { border-collapse: collapse; width: 100%%; }
+td, th { text-align: left; padding: 6px 10px; border-bottom: 1px solid #e4e7eb; }
+td:first-child a { font-family: ui-monospace, monospace; font-size: 13px; }
+@media (prefers-color-scheme: dark) { body { background: #111418; color: #e4e7eb; }
+  td, th { border-color: #2a2f36; } a { color: #8ab4f8; } }
+</style>
+</head>
+<body>
+<h1>Pre-built firmware</h1>
+<p>Firmware zips for <a href="../">sim-mesh</a>: add one with
+<code>sim firmware add &lt;its URL&gt;</code>, or from the Firmware tab's
+<b>Add from pre-built…</b>. What a zip is: <a href="../contract/">the firmware contract</a>.</p>
+<table>
+<thead><tr><th>Firmware</th><th>What it is</th><th>Category</th><th>Radio</th><th>Arch</th><th>Size</th></tr></thead>
+<tbody>
+%s
+</tbody>
+</table>
+</body>
+</html>
+""" % "\n".join(rows)
+
+
+class _GitHub:
+    """The few calls of GitHub's REST API publishing makes, with the token
+    from GH_TOKEN (or GITHUB_TOKEN), which `sim` takes from the gh logged in
+    where it runs."""
+
+    def __init__(self, session, need_token=True):
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if not token and need_token:
+            raise FirmwareError("publishing needs a GitHub token: log in with gh where sim "
+                                "runs, or set GH_TOKEN")
+        self.session = session
+        self.api = GITHUB_API.rstrip("/")
+        self.headers = {"Accept": "application/vnd.github+json",
+                        "User-Agent": "sim-mesh (+https://github.com/sim-mesh/sim-mesh)"}
+        if token:
+            self.headers["Authorization"] = "Bearer " + token
+
+    async def _call(self, method, url, ok, what, **kwargs):
+        headers = dict(self.headers, **kwargs.pop("headers", {}))
+        async with self.session.request(method, url, headers=headers, **kwargs) as resp:
+            if resp.status not in ok:
+                raise FirmwareError("%s: HTTP %d %s" % (what, resp.status,
+                                                        (await resp.text())[:200]))
+            if resp.status == 404:
+                return None
+            if "json" in (resp.headers.get("Content-Type") or ""):
+                return await resp.json()
+            return await resp.read()
+
+    async def release(self, repo, tag):
+        return await self._call("GET", "%s/repos/%s/releases/tags/%s" % (self.api, repo, tag),
+                                (200, 404), "%s: release %s" % (repo, tag))
+
+    async def make_release(self, repo, tag):
+        return await self._call("POST", "%s/repos/%s/releases" % (self.api, repo), (201,),
+                                "%s: making release %s" % (repo, tag), json={
+                                    "tag_name": tag, "name": "Pre-built firmware",
+                                    "body": "The firmware zips sim-mesh.net/firmware/ offers. "
+                                            "Published with `sim firmware publish`."})
+
+    async def asset(self, repo, asset):
+        return await self._call("GET", "%s/repos/%s/releases/assets/%d" % (
+            self.api, repo, asset["id"]), (200,), "%s: %s" % (repo, asset["name"]),
+            headers={"Accept": "application/octet-stream"})
+
+    async def delete_asset(self, repo, asset):
+        await self._call("DELETE", "%s/repos/%s/releases/assets/%d" % (
+            self.api, repo, asset["id"]), (204,), "%s: deleting %s" % (repo, asset["name"]))
+
+    async def upload(self, rel, path, name):
+        import aiohttp
+
+        with open(path, "rb") as body:
+            await self._call(
+                "POST", rel["upload_url"].split("{", 1)[0], (201,), "uploading %s" % name,
+                params={"name": name}, data=body,
+                headers={"Content-Type": "application/octet-stream",
+                         "Content-Length": str(os.path.getsize(path))},
+                timeout=aiohttp.ClientTimeout(total=UPLOAD_TIMEOUT_S))
+
+    async def dispatch(self, repo, event):
+        await self._call("POST", "%s/repos/%s/dispatches" % (self.api, repo), (204,),
+                         "%s: %s" % (repo, event), json={"event_type": event})
+
+
+async def publish(zips, delete=(), dry_run=False, repo=PUBLISH_REPO, site=PUBLISH_SITE,
+                  say=print):
+    """Firmware zips put on the pre-built list, and named ones taken off it.
+
+    The list is the `firmware` release of `repo`: every zip, `firmware.yaml`
+    (each zip's node.yaml facts, by name) and the `index.html` made from it.
+    A zip of a name already there is replaced. The zips go up first and the
+    listing last, so the listing never names a zip that is not there; then
+    `site` is told to redeploy (`firmware-published`), since a browser cannot
+    fetch a release's assets across origins and the site serves a copy."""
+    import aiohttp
+
+    adding = {}
+    paths = {}
+    for path in zips:
+        name, facts = zip_facts(path)
+        adding[name] = facts
+        paths[name] = path
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT_S)) \
+            as session:
+        hub = _GitHub(session, need_token=not dry_run)
+        rel = await hub.release(repo, PUBLISH_TAG)
+        assets = {a["name"]: a for a in (rel or {}).get("assets") or ()}
+        entries = {}
+        if "firmware.yaml" in assets:
+            listed = yaml.safe_load(await hub.asset(repo, assets["firmware.yaml"])) or {}
+            entries = listed.get("firmware") or {}
+        for name in delete:
+            if name not in entries:
+                raise FirmwareError("%s is not on the list" % name)
+            del entries[name]
+        entries.update(adding)
+        for name in sorted(adding):
+            say("add     %s" % name)
+        for name in delete:
+            say("delete  %s" % name)
+        if dry_run:
+            return entries
+        if rel is None:
+            rel = await hub.make_release(repo, PUBLISH_TAG)
+        with tempfile.TemporaryDirectory() as tmp:
+            listing_files = []
+            for name, text in (("firmware.yaml", yaml.safe_dump({"firmware": entries},
+                                                                  sort_keys=True)),
+                               ("index.html", index_html(entries))):
+                listing_files.append((name, os.path.join(tmp, name)))
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+            for name, path in [(n + ".zip", paths[n]) for n in sorted(adding)] + listing_files:
+                if name in assets:
+                    await hub.delete_asset(repo, assets[name])
+                say("uploading %s" % name)
+                await hub.upload(rel, path, name)
+        for name in delete:
+            if name + ".zip" in assets:
+                await hub.delete_asset(repo, assets[name + ".zip"])
+        await hub.dispatch(site, "firmware-published")
+        say("published; %s redeploys" % site)
+    return entries
+
+
 def _print_rows(rows):
     for r in rows:
         held = "   held by %s" % ", ".join(r["users"]) if r.get("users") else ""
@@ -561,18 +763,35 @@ def main(argv=None):
     p.add_argument("--index", default=None)
     p = sub.add_parser("resolve", help="what a firmware name runs, as JSON")
     p.add_argument("firmware")
+    p = sub.add_parser("publish", help="put firmware zips on the pre-built list "
+                                       "(sim-mesh.net/firmware/), or take them off")
+    p.add_argument("zip", nargs="*")
+    p.add_argument("--delete", nargs="+", default=[], metavar="NAME",
+                   help="take these off the list")
+    p.add_argument("-n", "--dry-run", action="store_true", help="say what it would do")
+    p.add_argument("--repo", default=PUBLISH_REPO, help="whose `firmware` release is the list")
+    p.add_argument("--site", default=PUBLISH_SITE, help="the site told to redeploy")
     args = ap.parse_args(argv)
+
+    # A relative path is read from where `sim` was run, which it passes into
+    # its container.
+    base = os.environ.get("SIM_MESH_CALLER_DIR")
+
+    def caller(path):
+        return os.path.join(base, path) if base and not os.path.isabs(path) else path
 
     try:
         if args.verb == "add":
-            # A relative path is read from where `sim` was run, which it
-            # passes into its container.
-            base = os.environ.get("SIM_MESH_CALLER_DIR")
             for source in args.zip:
-                if "://" not in source and base and not os.path.isabs(source):
-                    source = os.path.join(base, source)
+                if "://" not in source:
+                    source = caller(source)
                 got = asyncio.run(add(source))
                 print("added %s" % got["name"])
+        elif args.verb == "publish":
+            if not args.zip and not args.delete:
+                ap.error("publish: name zips to add, or --delete names")
+            asyncio.run(publish([caller(z) for z in args.zip], args.delete, args.dry_run,
+                                args.repo, args.site))
         elif args.verb == "list":
             _print_rows(listing(args.substring))
         elif args.verb == "prebuilt":

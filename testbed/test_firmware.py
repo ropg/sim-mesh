@@ -157,6 +157,100 @@ def test_the_prebuilt_index_lists_this_machines_zips_with_their_facts():
     assert "category" not in rows[0]
 
 
+def test_publishing_replaces_a_zip_lists_it_last_and_the_listing_reads_back(tmp_path,
+                                                                           monkeypatch):
+    """`sim firmware publish` against a GitHub of the test's own: the zips go
+    up before the listing, a zip of a name already there is replaced, a
+    deleted one comes off, the site is told, and the index.html it writes is
+    what the pre-built list reads."""
+    import asyncio
+
+    from aiohttp import web
+
+    calls, assets, ids = [], {}, [0]
+    listed = {"firmware": {"old-sx1262_%s_20250101000000" % ARCH: {
+        "base": "old-sx1262", "arch": ARCH, "version": "20250101000000", "size": 1}}}
+
+    def asset(name, data):
+        ids[0] += 1
+        assets[name] = {"id": ids[0], "name": name, "data": data}
+
+    asset("firmware.yaml", yaml.safe_dump(listed).encode())
+    asset("old-sx1262_%s_20250101000000.zip" % ARCH, b"old")
+    asset("relay-sx1262_%s_20260101000000.zip" % ARCH, b"stale")
+
+    def release_json():
+        return {"id": 1, "upload_url": "%s/upload/1{?name,label}" % base[0],
+                "assets": [{"id": a["id"], "name": n} for n, a in assets.items()]}
+
+    async def tag(request):
+        assert request.headers["Authorization"] == "Bearer secret"
+        return web.json_response(release_json())
+
+    async def get_asset(request):
+        found = [a for a in assets.values() if a["id"] == int(request.match_info["id"])]
+        return web.Response(body=found[0]["data"], content_type="application/octet-stream")
+
+    async def delete_asset(request):
+        name = [n for n, a in assets.items() if a["id"] == int(request.match_info["id"])][0]
+        calls.append(("delete", name))
+        del assets[name]
+        return web.Response(status=204)
+
+    async def upload(request):
+        name = request.query["name"]
+        calls.append(("upload", name))
+        asset(name, await request.read())
+        return web.json_response({}, status=201)
+
+    async def dispatch(request):
+        calls.append(("dispatch", (await request.json())["event_type"]))
+        return web.Response(status=204)
+
+    base = [None]
+    relay = zip_file(tmp_path, "relay-sx1262", "20260101000000", title="Relay")
+    monkeypatch.setenv("GH_TOKEN", "secret")
+
+    async def go():
+        app = web.Application()
+        app.router.add_get("/repos/o/r/releases/tags/firmware", tag)
+        app.router.add_get("/repos/o/r/releases/assets/{id}", get_asset)
+        app.router.add_delete("/repos/o/r/releases/assets/{id}", delete_asset)
+        app.router.add_post("/upload/1", upload)
+        app.router.add_post("/repos/o/site/dispatches", dispatch)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        base[0] = "http://127.0.0.1:%d" % runner.addresses[0][1]
+        monkeypatch.setattr(firmware, "GITHUB_API", base[0])
+        try:
+            said = []
+            got = await firmware.publish([relay], ["old-sx1262_%s_20250101000000" % ARCH],
+                                         True, "o/r", "o/site", said.append)
+            assert calls == [] and said[0].startswith("add     relay-sx1262")
+            await firmware.publish([relay], ["old-sx1262_%s_20250101000000" % ARCH],
+                                   False, "o/r", "o/site", said.append)
+            return got
+        finally:
+            await runner.cleanup()
+
+    got = asyncio.run(go())
+    relay_zip = "relay-sx1262_%s_20260101000000.zip" % ARCH
+    assert list(got) == ["relay-sx1262_%s_20260101000000" % ARCH]
+    assert calls == [("delete", relay_zip), ("upload", relay_zip),
+                     ("delete", "firmware.yaml"), ("upload", "firmware.yaml"),
+                     ("upload", "index.html"),
+                     ("delete", "old-sx1262_%s_20250101000000.zip" % ARCH),
+                     ("dispatch", "firmware-published")]
+    assert assets[relay_zip]["data"] == open(relay, "rb").read()
+    rows = firmware.parse_index(assets["index.html"]["data"].decode(), "https://x/firmware/")
+    assert [(r["name"], r["title"]) for r in rows] == [(relay_zip[:-4], "Relay")]
+    with pytest.raises(firmware.FirmwareError, match="names it"):
+        firmware.zip_facts(zip_file(tmp_path, "relay-sx1262", "20260101000000",
+                                    filename="renamed.zip"))
+
+
 def test_a_zip_can_be_made_in_memory_for_the_page():
     data = stub_firmware.zip_bytes("relay", "1.0.0")
     with zipfile.ZipFile(io.BytesIO(data)) as zf:

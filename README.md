@@ -198,7 +198,7 @@ nothing holds, after one confirmation naming those it keeps.
 **Pre-built firmware** is listed on [sim-mesh.net/firmware](https://sim-mesh.net/firmware/)
 (`SIM_MESH_FIRMWARE_INDEX` names another list),
 whose `index.html` carries each zip's facts, so the page can say what each
-is without fetching it. Projects put theirs there with `tools/deploy-firmware`
+is without fetching it. Projects put theirs there with `sim firmware publish`
 ([Publishing firmware](#publishing-firmware)).
 
 ### Drivers and the `reticulum` verbs
@@ -2019,12 +2019,23 @@ which sim-mesh.net's site serves under `/firmware/` with an `index.html` that
 lists every zip with its `node.yaml`'s facts:
 
 ```sh
-tools/deploy-firmware ZIP…                  # add or replace these, then redeploy the site
-tools/deploy-firmware --delete NAME…        # take these off it
-tools/deploy-firmware --dry-run ZIP…        # say what it would do
+sim firmware publish ZIP…                   # add or replace these, then redeploy the site
+sim firmware publish --delete NAME…         # take these off it
+sim firmware publish --dry-run ZIP…         # say what it would do
 ```
 
-It needs `gh`, logged in with the right to upload to sim-mesh/sim-mesh.
+```
+sim ── GitHub's REST API, the token of the gh logged in here ──► sim-mesh/sim-mesh, release `firmware`
+        the zips, then firmware.yaml and index.html               (each zip's node.yaml facts)
+sim ── repository_dispatch firmware-published ──► sim-mesh/sim-mesh.github.io, which redeploys
+```
+
+It runs where every `sim` verb does, in sim-mesh's image, so it needs
+nothing installed beside `sim`; the token is the one of the `gh` logged in
+where `sim` runs (or `GH_TOKEN`), with the right to upload to
+sim-mesh/sim-mesh and to dispatch to the site's repository. A zip is checked
+before it goes: its node.yaml must name it as its file is named. A zip of a
+name already listed is replaced. `--repo` and `--site` name others.
 
 ## The firmware contract
 
@@ -2519,7 +2530,7 @@ shared libraries beyond the C library and C++ runtime under `lib/`, and
 `libc`, `libm`, `libstdc++`, `libgcc_s`, the loader and `libsimradio-*`
 belongs in `lib/`. Then `sim firmware add` it, and run a script with it. A
 firmware that publishes its zips puts them on the pre-built list with
-`tools/deploy-firmware` ([Publishing firmware](#publishing-firmware)).
+`sim firmware publish` ([Publishing firmware](#publishing-firmware)).
 
 ### 11. A whole example
 
@@ -2706,7 +2717,6 @@ tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 |---|---|
 | `sim` | the one command: the front natively or in sim-mesh's image (building what is stale first), `new`, `stop`, `pause`, `resume`, `list`, `plan`, `run`, `firmware` |
 | `Dockerfile` | sim-mesh's image, which everything runs in: the system a firmware may count on |
-| `tools/deploy-firmware` | pre-built firmware onto the `firmware` release, and the site redeployed |
 | `radio/` | the virtual SX1262 and the station's UDP link to the ether, as a shared library |
 | `radio/src/conductor.cpp` | the station's side of virtual time: T, node time, wakes, the idle |
 | `radio/shim/simclock.c` | `libsimclock.so`, the C library's time in node time (its sleeps, descriptor waits, condition and semaphore waits), the seeded randomness, the console and TCP counts, the listening sockets and the watchdog's hold; `radio/include/simclock.h` is what it is handed |
@@ -2717,7 +2727,7 @@ tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 | `testbed/simctl.py` | behind `sim new`, `stop`, `pause`, `resume`, `list` and `plan`: the front from a shell; starts the front when none answers; done for a script's pause |
 | `testbed/store.py` | where geodata, nodesets, scripts, tables, coverage, runs and snapshots live, what a name may be, and what a row takes on disk |
 | `testbed/indexes.py` | indexes: reading one, the listed ones, installing an entry by its sha256 and remembering where it came from; `sim index`, `sim geodata`, `sim nodeset` |
-| `testbed/firmware.py` | installed firmware: names and `_latest`, adding a zip, what holds one, deleting, the pre-built index; `sim firmware` |
+| `testbed/firmware.py` | installed firmware: names and `_latest`, adding a zip, what holds one, deleting, the pre-built index, publishing onto it (the `firmware` release, and the site redeployed); `sim firmware` |
 | `testbed/drivers.py` | a run's firmware resolved, each one's driver imported from its own directory, and the contract's environment |
 | `testbed/antennas.py`, `testbed/antennas/` | the antenna catalogue and pictures, a pattern's gain by direction, a pair's gain in three dimensions |
 | `testbed/geodata.py` | geodata: packs and synthetic ground, the projections, the extent, a sim-mesh geodata pack's export and import |
