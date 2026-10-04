@@ -90,8 +90,8 @@ sim-mesh/sim
 
 It builds whichever of the page, the virtual radios, the ether's conductor
 and the planner (sim-mesh's own, in `planner/`; without cargo the last two
-are left out, sim says so, synthetic ground works and the ether's Python
-conductor runs virtual time) is not
+are left out, sim says so, synthetic ground works, and a virtual-time run is
+refused until the conductor is built; real time needs none) is not
 built yet or is older than a file of its sources (hidden directories and
 `__pycache__` aside), so a fresh clone or a pull needs nothing more, then
 starts the front and opens
@@ -2596,7 +2596,7 @@ None needs firmware, a planner or a network:
 
 ```sh
 cd sim-mesh/testbed && python3 -m pytest -q      # the stores, firmware, the front, simd, the drivers, the library, the tools
-cd sim-mesh/ether   && python3 -m pytest -q      # the medium and both conductors, over real UDP and in-process
+cd sim-mesh/ether   && python3 -m pytest -q      # the medium and the conductor (built first), over real UDP and in-process
 cd sim-mesh/radio   && python3 -m pytest -q tests  # the chip model, the conductor, the time shim
 cd sim-mesh/testbed/ui && npx vue-tsc --noEmit && npx quasar build
 ```
