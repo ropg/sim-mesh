@@ -37,6 +37,29 @@
 #                                      (-f: none); a paused run's or a snapshot's is kept
 #     sim firmware prebuilt            what sim-mesh.net offers for this machine
 #     sim firmware resolve NAME        what a firmware name runs, as JSON
+#     sim index list                   the indexes geodata and nodesets come from, and
+#                                      what each offers
+#     sim index add ADDRESS            list another index (a URL, or a path)
+#     sim index delete NAME            forget an added index; what came from it stays
+#     sim geodata list                 the installed geodata, with sizes and origins
+#     sim geodata offered [SUBSTRING]  what the listed indexes offer
+#     sim geodata add NAME|ZIP…        install from a listed index by name, or a pack zip
+#     sim geodata delete [-f] NAME…    delete, after listing it for confirmation
+#     sim geodata publish NAME --index PATH [--as ENTRY] [--title T] [--description D]
+#                      [--tags A,B]   add it to a local index: its zip beside the
+#                                      index, or uploaded to the GitHub release the
+#                                      index's `release:` names (a token from gh
+#                                      logged in here, or GH_TOKEN)
+#     sim nodeset list | offered [SUBSTRING] | add NAME… | delete [-f] NAME…
+#     sim nodeset publish NAME --index PATH [--as ENTRY] [--geodata ENTRY] …
+#                                      the same for nodesets; a nodeset's geodata
+#                                      comes with it from its index when not here
+#     sim source check                 read every source file (sources/sources.yaml and
+#                                      testbed/sources.yaml) and say what is wrong
+#     sim source list                  every source, where it stands, what it feeds
+#     sim source outline ID [--geofabrik REGION]
+#                                      write a source's outline: its feed's tiles, or a
+#                                      Geofabrik region's outline
 #     sim install [--dry-run]          on Linux, what SIM_MESH_NATIVE=1 needs, as sim-mesh's
 #                                      image holds it: the system's packages (sudo), Node
 #                                      22 where the system's is older, and Rust; then
@@ -187,6 +210,9 @@ in_container() {
     fi
     [ -z "${SIM_MESH_FIRMWARE_INDEX:-}" ] \
         || args+=(-e "SIM_MESH_FIRMWARE_INDEX=$SIM_MESH_FIRMWARE_INDEX")
+    [ -z "${SIM_MESH_INDEX:-}" ] || args+=(-e "SIM_MESH_INDEX=$SIM_MESH_INDEX")
+    # publish's upload to a GitHub release; the value stays out of the command line.
+    [ -z "${GH_TOKEN:-}" ] || args+=(-e GH_TOKEN)
     if [ "$mode" = tools ]; then
         args+=(-i)
         [ -t 0 ] && [ -t 1 ] && args+=(-t)
@@ -471,6 +497,18 @@ cmd_firmware() {
     exec "$py" "$ROOT/testbed/firmware.py" "$@"
 }
 
+cmd_source() {
+    local py
+    py=$(pick_python)
+    exec "$py" "$ROOT/testbed/sourcefile.py" "$@"
+}
+
+cmd_indexes() {
+    local py
+    py=$(pick_python)
+    exec "$py" "$ROOT/testbed/indexes.py" "$@"
+}
+
 cmd_sims() {
     local py
     py=$(pick_python)
@@ -621,7 +659,7 @@ verb=${1:-}
 case "$verb" in
     -h|--help|help) usage; exit 0 ;;
     install) shift; cmd_install "$@"; exit $? ;;
-    ""|front|dev|-*|firmware|new|stop|pause|resume|list|plan|run) ;;
+    ""|front|dev|-*|firmware|index|geodata|nodeset|source|new|stop|pause|resume|list|plan|run) ;;
     *) die "no verb '$verb' (sim help lists them)" ;;
 esac
 
@@ -630,11 +668,18 @@ if [ -z "${SIM_MESH_IN_CONTAINER:-}" ]; then
         run) run_script "$@"; exit $? ;;
         new) ensure_front ;;
     esac
+    # Publishing uploads with the GitHub token of the gh logged in here,
+    # unless one is set already.
+    if [ "${2:-}" = publish ] && [ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] && command -v gh >/dev/null; then
+        GH_TOKEN=$(gh auth token 2>/dev/null) || GH_TOKEN=
+        export GH_TOKEN
+    fi
+    [ -z "${GITHUB_TOKEN:-}" ] || [ -n "${GH_TOKEN:-}" ] || export GH_TOKEN=$GITHUB_TOKEN
 fi
 
 if want_container; then
     case "$verb" in
-        firmware) in_container tools "$@" ;;
+        firmware|index|geodata|nodeset|source) in_container tools "$@" ;;
         new|stop|pause|resume|list|plan) in_front "$@" ;;
         front) shift; in_container front "$@" ;;
         dev) in_container dev "$@" ;;
@@ -645,6 +690,11 @@ fi
 
 case "$verb" in
     firmware) shift; [ $# -gt 0 ] || die "firmware: add, list, delete, prebuilt or resolve"; cmd_firmware "$@" ;;
+    index|geodata|nodeset)
+        [ $# -gt 1 ] || die "$verb: $([ "$verb" = index ] && echo "list, add or delete" \
+                                     || echo "list, offered, add, delete or publish")"
+        cmd_indexes "$@" ;;
+    source) shift; [ $# -gt 0 ] || die "source: check, list or outline"; cmd_source "$@" ;;
     new|stop|pause|resume|list|plan) cmd_sims "$@" ;;
     run) shift; cmd_run "$@" ;;
     front) shift; cmd_front "$@" ;;

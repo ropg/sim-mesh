@@ -8,8 +8,10 @@ front. The `sim` launcher's `new`, `stop`, `pause`, `resume`, `list` and
                    [--pairwise]
     sim stop NAME                     a paused one's state deleted, it ended
     sim pause NAME                    stopped, its state kept in its run
-    sim resume NAME [--time T]        a paused one, as it ended, in a new run, real time
-    sim list [--json]
+    sim resume NAME [--time T]        a paused or done one, as it ended, in a new run,
+                                      real time
+    sim list [--json]                 each with its state (done: its script paused it)
+                                      and its run directory's size
     sim plan NAME PHASE=UNTIL ...     UNTIL in seconds of T; +N is N after now
 
 `new` starts the front (front.py, in the background, logging to
@@ -35,6 +37,9 @@ import time
 import aiohttp
 
 SIM_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SIM_DIR)
+
+import store                        # noqa: E402 - the path is set just above
 FRONT_START_S = 15.0
 
 
@@ -106,6 +111,16 @@ def t_text(us):
     return "%dd + %02d:%02d" % (d, h, m) if d else "%02d:%02d:%02d" % (h, m, s)
 
 
+def state_text(row):
+    """A row's state as `sim list` says it: a pause its script asked for is
+    the script done; an exited one says its code."""
+    if row["state"] == "paused" and row.get("paused_by") == "script":
+        return "done"
+    if row["state"] == "exited":
+        return "exited %s" % row.get("code")
+    return row["state"]
+
+
 def clock_text(row):
     """Simulated T, real time elapsed, and how fast T runs."""
     if row.get("t") is None:
@@ -117,7 +132,7 @@ def clock_text(row):
         if end:
             t += " / %s real" % t_text((end - row["started"]) * 1e6)
     if row.get("state") in ("paused", "ended"):
-        return "%s %s" % (t, row["state"])
+        return "%s %s" % (t, state_text(row))
     if row.get("mode") == "virtual":
         pace = row.get("rate") or row.get("pace")
         return "%s at %s" % (t, "%.1fx" % pace if pace else "max")
@@ -205,13 +220,12 @@ async def main():
                 return 0
             for row in rows:
                 counts = row.get("counts") or {}
-                state = row["state"] if row["state"] != "exited" \
-                    else "exited %s" % row.get("code")
                 what = ("snapshot %s" % row["snapshot"]) if row.get("snapshot") else \
                     "/".join(row.get(k) or "—" for k in ("geodata", "nodeset", "script"))
-                print("%-16s %-12s %-30s %3d/%-3d up  %-40s %s" % (
-                    row["name"], state, what,
-                    counts.get("up", 0), row.get("stations", 0),
+                size = store.human_bytes(row["bytes"]) if row.get("bytes") is not None else "—"
+                print("%-16s %-12s %-30s %3d/%-3d up  %8s  %-40s %s" % (
+                    row["name"], state_text(row), what,
+                    counts.get("up", 0), row.get("stations", 0), size,
                     clock_text(row), plan_text(row)))
             if not rows:
                 print("no simulations")

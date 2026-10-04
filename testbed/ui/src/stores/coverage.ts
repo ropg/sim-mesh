@@ -30,8 +30,25 @@ import { NO_RADIO, type NodeView } from './nodes'
 
 export interface Raster { w: number; h: number; ox: number; oy: number; rx: number; ry: number; loss: Uint16Array }
 
-/** What the map asks at each point: the best margin in dB over the nodes, or null. */
-export interface CoverageSource { version: string; marginAt(x: number, y: number): number | null }
+/** What the map asks at each point: the best margin in dB over the nodes, or
+ *  null. `prepare` makes it ready a slice at a time, yielding to the page
+ *  between slices; it resolves false when `stale` says the work is no longer
+ *  wanted (a newer aim, a moved view), and marginAt is asked only after it
+ *  resolved true. */
+export interface CoverageSource {
+  version: string
+  prepare(stale: () => boolean): Promise<boolean>
+  marginAt(x: number, y: number): number | null
+}
+
+/** How long one slice of coverage work may hold the page before it yields,
+ *  so a dial being dragged, a map being panned, stay live. */
+export const SLICE_MS = 12
+
+/** The page's turn: a frame drawn and input handled before the next slice. */
+export function yieldToPage(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0))
+}
 
 const NEVER = 65535
 const RX_GAIN_DBI = 0
@@ -76,7 +93,9 @@ function beamGain(b: Beam, x: number, y: number, rxGround: number): number {
  * the rasters' own cell size, over the union of their extents. Each node's
  * raster is merged in once, when it and its terrain are there: a set whose
  * rasters land one by one grows, it is not rebuilt. The last COMPOSITES_KEPT
- * sets are kept. */
+ * sets are kept. A merge goes a row at a time, yielding every SLICE_MS; one
+ * given up halfway is merged again whole next time, which leaves the grid as
+ * one merge would, since a cell keeps the best margin. */
 const COMPOSITES_KEPT = 6
 
 interface Each { key: string; budget: number; raster: Raster | null; terrain: Grid | null; beam: Beam }
@@ -90,10 +109,11 @@ class Composite {
   best: Float32Array = new Float32Array(0)
   merged = new Set<string>()
 
-  /** Merge the rasters not yet in, growing the grid to hold them. */
-  add(each: Each[]) {
+  /** Merge the rasters not yet in, growing the grid to hold them; false
+   *  when given up because `stale` said so. */
+  async add(each: Each[], stale: () => boolean): Promise<boolean> {
     const fresh = each.filter(e => e.raster && e.terrain && !this.merged.has(e.key))
-    if (!fresh.length) return
+    if (!fresh.length) return true
     const all = [...fresh.map(e => e.raster!)]
     const res = this.res || all[0]!.rx
     let minx = this.w ? this.ox : Infinity, maxy = this.h ? this.oy : -Infinity
@@ -112,10 +132,16 @@ class Composite {
       }
       Object.assign(this, { res, ox: minx, oy: maxy, w, h, best: grown })
     }
+    let since = performance.now()
     for (const e of fresh) {
       const r = e.raster!, t = e.terrain!
       const dc = Math.round((r.ox - this.ox) / res), dr = Math.round((this.oy - r.oy) / res)
       for (let row = 0; row < r.h; row++) {
+        if (performance.now() - since > SLICE_MS) {
+          await yieldToPage()
+          if (stale()) return false
+          since = performance.now()
+        }
         const to = (row + dr) * this.w + dc
         const y = r.oy - row * r.ry
         for (let col = 0; col < r.w; col++) {
@@ -128,6 +154,7 @@ class Composite {
       }
       this.merged.add(e.key)
     }
+    return true
   }
 
   at(x: number, y: number): number | null {
@@ -142,13 +169,12 @@ class Composite {
 
 const composites = new Map<string, Composite>()
 
-function compositeFor(key: string, each: Each[]): Composite {
+function compositeFor(key: string): Composite {
   let c = composites.get(key)
   if (c) composites.delete(key)       // to the back: the most recently used
   else c = new Composite()
   composites.set(key, c)
   while (composites.size > COMPOSITES_KEPT) composites.delete(composites.keys().next().value!)
-  c.add(each)
   return c
 }
 
@@ -275,12 +301,12 @@ export const useCoverage = defineStore('coverage', {
         // nodes: a repaint is a lookup a cell, whatever the count, and
         // coming back to a set (the whole network after one node) is free.
         const grid = compositeFor(`${gd.name}|${radioKey}|${noiseFigureDb}|${Object.keys(antennas).length}|${nodes.map((n, i) =>
-          `${n.name}:${each[i]!.key}:${antennaKey(n)}`).join(';')}`,
-        each)
-        return { version, marginAt: (x, y) => grid.at(x, y) }
+          `${n.name}:${each[i]!.key}:${antennaKey(n)}`).join(';')}`)
+        return { version, prepare: stale => grid.add(each, stale), marginAt: (x, y) => grid.at(x, y) }
       }
       return {
         version,
+        prepare: () => Promise.resolve(true),
         marginAt(x: number, y: number): number | null {
           let best: number | null = null
           for (const e of each) {

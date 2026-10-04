@@ -6,6 +6,9 @@
       <q-btn flat dense no-caps size="sm" label="New" @click="emit('new')" />
       <q-btn flat dense no-caps size="sm" label="Import…" @click="emit('import')" />
       <q-btn flat dense no-caps size="sm" label="Save visible as…" :disable="!anyShown" @click="emit('saveVisible')" />
+      <q-btn flat dense no-caps size="sm" label="Nodesets…" @click="emit('manage')">
+        <q-tooltip>Every nodeset, with its size, and what the indexes offer</q-tooltip>
+      </q-btn>
     </div>
     <div v-if="nodes.active === ''" class="lp-row lp-active">
       <span class="lp-dot">●</span><span class="lp-eye">👁</span>
@@ -29,6 +32,7 @@
             :title="l.inside < l.nodes ? `${l.nodes - l.inside} of ${l.nodes} nodes are outside the geodata and will not be loaded` : ''">
         {{ l.name === nodes.active ? nodes.names.length : l.inside }}<template v-if="l.inside < l.nodes">/{{ l.nodes }}</template>
       </span>
+      <span class="lp-size">{{ l.bytes === null ? '' : sizeText(l.bytes) }}</span>
       <span class="lp-dirty">{{ l.name === nodes.active && nodes.dirty ? '•' : '' }}</span>
       <span class="lp-up lp-click" :style="{ visibility: i ? 'visible' : 'hidden' }"
             title="up: earlier in Save visible as" @click="nodes.raiseLayer(l.name)">▲</span>
@@ -46,18 +50,22 @@
  * in; the name makes it the active one, whose nodes are edited (the page
  * asks first about unsaved edits); the count is its nodes on the geodata,
  * of how many when some are off it; ▲ moves it up, which is earlier in Save
- * visible as, where the earlier layer's node wins; the bin deletes it. */
+ * visible as, where the earlier layer's node wins; the bin deletes it.
+ * Nodesets… is every nodeset, on this geodata or not, and the indexes'. */
 import { computed } from 'vue'
 import { useNodes } from '../stores/nodes'
+import { sizeText } from '../lib/size'
 
-const emit = defineEmits<{ new: []; import: []; saveVisible: []; activate: [name: string]; delete: [name: string] }>()
+const emit = defineEmits<{
+  new: []; import: []; saveVisible: []; manage: []; activate: [name: string]; delete: [name: string]
+}>()
 const nodes = useNodes()
 const anyShown = computed(() => nodes.active === '' || nodes.layers.some(l => l.shown))
 </script>
 
 <style scoped>
 .lp {
-  width: 280px; background: rgba(27, 31, 38, 0.92); border: 1px solid #2b313b; border-radius: 4px;
+  width: 340px; background: rgba(27, 31, 38, 0.92); border: 1px solid #2b313b; border-radius: 4px;
   padding: 4px 6px 6px; font-size: 12px; color: #d1d5db; max-height: 40vh; overflow-y: auto;
 }
 .lp-head { display: flex; align-items: center; gap: 2px; margin-bottom: 2px; }
@@ -71,6 +79,7 @@ const anyShown = computed(() => nodes.active === '' || nodes.layers.some(l => l.
 .lp-active .lp-name { font-weight: 500; color: #f3f4f6; }
 .lp-count { font: 11px ui-monospace, monospace; color: #6b7280; }
 .lp-dirty { width: 8px; color: #f59e0b; }
+.lp-size { font: 10px ui-monospace, monospace; color: #4b5563; width: 44px; text-align: right; }
 .lp-up { font-size: 9px; color: #6b7280; }
 .lp-swatch { width: 9px; height: 9px; border-radius: 50%; border: 2px solid transparent; flex: none; }
 .lp-active .lp-swatch { background: #e5e7eb; }

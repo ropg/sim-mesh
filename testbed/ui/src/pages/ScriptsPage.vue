@@ -137,7 +137,7 @@
           <q-btn-toggle v-model="runOn" dense no-caps unelevated toggle-color="primary"
                         :options="[{ label: 'a new simulation', value: 'new' },
                                    { label: 'on a running one', value: 'running' },
-                                   { label: 'on a paused one', value: 'paused' }]" />
+                                   { label: 'on a paused or done one', value: 'paused' }]" />
           <q-select v-if="runOn === 'running'" v-model="runSim" :options="runningNames" dense outlined
                     label="simulation" />
           <template v-else-if="runOn === 'paused'">

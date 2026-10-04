@@ -13,7 +13,7 @@ browser ── localhost:8800 ──► front.py ─┬─► simd (lora) ─┬
                                         │                ├─ stations     (firmware processes, one pty each)
                                         │                └─ proxy        <station>.lora.sim.localhost ─► the station's :80
                                         ├─► simd (supe)  …
-                                        ├─► sim_mesh.runner  a script's main, driving one simulation
+                                        ├─► sim_mesh.runner  a script, top to end, driving one simulation
                                         ├─► planner-web  one per ground-data pack in use
                                         └─► planner-job  a pack built from its sources, a node map imported
 ```
@@ -28,7 +28,8 @@ sim-mesh keeps, each on its own because each changes on its own:
 |---|---|---|
 | a **firmware** | one station build, installed from its zip: the executable, whatever it needs beside it, and its driver | `firmware/<base>_<arch>_<version>/` |
 | an **antenna** | a kind of antenna and its radiation pattern | `testbed/antennas/` |
-| **geodata** | the ground: a pack built from public sources, or synthetic ground at 0°, 0° | `testbed/geodata/<name>/`: `geodata.yaml`, and the pack's files beside it |
+| **geodata** | the ground: a pack fetched pre-built from an index or built from public sources, or synthetic ground at 0°, 0° | `testbed/geodata/<name>/`: `geodata.yaml`, and the pack's files beside it |
+| an **index** | a YAML file listing geodata packs and nodesets to fetch, each by its sha256, so standard ground is the same bytes everywhere | at its own address; the ones added here in `testbed/indexes.yaml` |
 | a **nodeset** | which nodes stand where with what maximum power and antenna, their tags, the offsets and any stated links; its own setup script beside it | `testbed/nodesets/<name>.yaml`, `<name>.py` |
 | a **loss table** | every ordered pair's path loss, derived from geodata and a nodeset | `testbed/losses/…`, a cache |
 | a **script** | plain Python against the sim-mesh library, top to end: the time, what each node runs and is given at first boot, and what is done | `testbed/scripts/<name>.py` |
@@ -103,14 +104,17 @@ machine's architecture (`aarch64` or `x86_64`) and installs one with a
 click; **Add from zip…** installs a zip of your own. From a shell,
 `sim firmware add <zip or URL>` does the same.
 
-**4. A first simulation.** No geodata and no nodesets come with sim-mesh:
-both are your own, kept in `testbed/geodata/` and `testbed/nodesets/` and
-never committed. Make ground on the **Geodata** tab, **Build from
-sources…** over a rectangle of the map or **New synthetic…**, and click
-it to choose it. On the **Nodes** tab place nodes on it, or **Import…**
-them in the Layers panel from a public node map, and **Save nodes as
-nodeset…**; a nodeset is offered on any geodata that holds one of its
-nodes, and is chosen in the Layers panel. On the **Scripts** tab open
+**4. A first simulation.** Geodata and nodesets are kept in
+`testbed/geodata/` and `testbed/nodesets/` and never committed: they are
+fetched from an index, or made here. On the **Geodata** tab, **Download
+pre-built geodata packs** lists what sim-mesh's own index, `sim-mesh-examples`, and
+any index you add offer, and **Add** installs one; or make ground,
+**Build…** over a rectangle of the map or **New synthetic…**. Click it to
+choose it. On the **Nodes** tab place nodes on it, **Import…** them in the
+Layers panel from a public node map or a file, or fetch a nodeset from an
+index under **Nodesets…**, and **Save nodes as nodeset…**; a nodeset is
+offered on any geodata that holds one of its nodes, and is chosen in the
+Layers panel. On the **Scripts** tab open
 `lxmf-traffic`, choose the firmware its nodes run in **Firmware for nodes
 not otherwise configured** above the script, and **Run…** it: a new
 simulation of that nodeset on that ground. The page goes over to the
@@ -187,7 +191,9 @@ already holds firmware versioned the other way, when a firmware of its name
 is installed already, and when its `node.yaml` or anything it names is
 missing. **Deleting** is refused for a firmware a paused run or a snapshot
 holds: their state can only be resumed on the firmware that wrote it, so the
-run or snapshot goes first.
+run or snapshot goes first. On the Firmware tab each row says its size on
+disk and has a checkbox; **Delete** above the list deletes the chosen ones
+nothing holds, after one confirmation naming those it keeps.
 
 **Pre-built firmware** is listed on [sim-mesh.net/firmware](https://sim-mesh.net/firmware/),
 whose `index.html` carries each zip's facts, so the page can say what each
@@ -353,9 +359,30 @@ it is sent with every request and kept in the table's header, and a table
 at one percentage is cached apart from, and never used for, another. The
 coverage rasters stay the planner's own sweep at 90 %.
 
-There are three ways of getting ground, one button each on the Geodata tab:
-**New synthetic…**, **Build from sources…** and **Import zip…**. Nothing else
-makes or moves geodata.
+There are four ways of getting ground, each on the Geodata tab: **Add** on
+an entry under **Download pre-built geodata packs** ([Indexes](#indexes)), **New
+synthetic…**, **Build…** ([Build from sources](#build-from-sources)) and
+**Import zip…**. Nothing else makes or moves geodata.
+
+The tab has three sections. **Installed geodata packs** is every geodata here,
+each row with its kind, extent, the nodesets standing on it, its size on
+disk, the index it came from when it did, rename and a trash can; a
+checkbox begins each row, and **All**, **None**, **Invert** and **Delete**
+above the list act on the chosen ones. **Download pre-built geodata packs** is
+what the listed indexes offer. **Geodata sources** is the build's cache, one
+row per source with its licence and what it holds here, and a trash can
+that empties it (refused while a build runs; the cost is fetching it again).
+Hovering a source's name says what kind of data its files hold; under it,
+where it stands in the source files and the layers it feeds with its
+priority in each. Beside the list is a map: clicking a source shows where
+it has data, tinted (the world for a worldwide source; for a source with a
+feed, the tiles its feed lists, inside its outline; for any other its
+outline), and what of it is in the cache, filled (read off the cached files'
+names as its method names them: a template's tile its south-west corner, a
+feed's tile its corner, a region's file its region). Clicking either line of
+the key under the map fits the map to all of that area. Clicking
+the map pins a point and lists only the sources with data there, each
+saying whether that spot is cached; **All sources** lists them all again.
 
 ### A sim-mesh geodata pack
 
@@ -377,7 +404,107 @@ A pack holds only data that may be passed on. The ITU-R P.1812 maps stay in
 the cache: the manifest carries the two numbers taken from them (ΔN and N0),
 and each source's notice.
 
-### Build from sources…
+### Indexes
+
+```
+page ── index_list ────────────────────────────► front ── GET <address> ───► the index's host
+page ── index_install {index, kind, name} ─────► front ── GET <entry url> ──► the file's host
+front ── index_progress {index, kind, name, fetched, of, …} ─► every page
+front: size and sha256 checked; a pack expanded as Import zip expands one, a nodeset written
+```
+
+An **index** is one YAML file listing geodata packs and nodesets that can be
+fetched. It is how standard ground and standard nodesets reach every
+machine as the same bytes, so a test on them means the same thing on each:
+
+```yaml
+index: sim-mesh-examples              # a usable name
+title: sim-mesh examples
+description: |                        # what the collection is, printed as it stands
+  These examples will soon include some varied geographies and nodesets.
+  …
+geodata:
+  - name: berlin-mitte                # the name it is installed under
+    title: Berlin Mitte, dense flat city
+    url: berlin-mitte.zip             # a sim-mesh geodata pack, relative to the index
+    sha256: 3f1c…                     # 64 hex digits: what the file is
+    bytes: 9400000                    # its size, which the page shows before fetching
+    bbox: [13.36, 52.50, 13.44, 52.54]
+    licences: ODbL 1.0; dl-de/zero-2.0; CC BY 4.0; Copernicus
+    tags: [standard, urban, flat]
+    description: …
+nodesets:
+  - name: mitte-40
+    title: 40 rooftop nodes in Mitte
+    url: mitte-40.yaml                # a nodeset file
+    sha256: 9ab0…
+    bytes: 5210
+    geodata: berlin-mitte             # the ground it is made for
+    nodes: 40
+```
+
+`name`, `url` and `sha256` are an entry's own; the rest is what the page
+shows. The index's own `description` is text about the whole collection,
+shown under its name on the page and printed by `sim index list`, its line
+breaks kept. **An entry is immutable**: its sha256 is what it is, and a pack or
+nodeset that changes is published under a new name. **An address** is an
+http(s) URL, a `file://` URL or a path on this machine; one ending in `/`
+means the `index.yaml` in it, and every entry's `url` is relative to it, so
+anyone can publish a directory holding an index and its files: a web site,
+a release, a USB stick.
+
+sim-mesh's own index, `sim-mesh-examples`, is always listed, from
+`https://sim-mesh.net/examples/index.yaml` (`SIM_MESH_INDEX` names another):
+varied geographies and nodesets that show sim-mesh and serve as reference
+environments for comparing mesh protocols and firmware versions. **Add
+index…** lists another by its address, under the name it gives; its trash
+can forgets it again, and what came from it stays installed. The list is
+kept in `testbed/indexes.yaml`, one list for geodata and nodesets alike.
+
+**Installed, an entry remembers where it came from**, in
+`geodata/<name>/.origin.yaml` or `nodesets/.origin/<name>.yaml`, so its row
+says the index and the page can say it is installed. A name taken here by
+other ground or another nodeset is refused, and nothing is replaced: rename
+or delete what is there first. A nodeset edited since it came says so. A
+nodeset whose geodata the same index offers, and which is not here, brings
+that geodata with it. From a shell:
+
+```sh
+sim index list                         # every listed index and what it offers
+sim index add https://example.org/mesh/index.yaml
+sim index delete someone-elses
+sim geodata offered [SUBSTRING]        # what the indexes offer, and what is here
+sim geodata add berlin-mitte           # by name from a listed index, or a pack zip
+sim geodata list                       # installed, with sizes and origins
+sim geodata delete [-f] NAME…
+sim nodeset offered | add NAME… | list | delete [-f] NAME…
+```
+
+**Publishing** puts something installed here into an index you have
+checked out, its entry written for you:
+
+```
+sim geodata publish berlin --as berlin-centre --index ../sim-mesh.github.io/examples
+  ─► the pack exported as a zip ─► its sha256, size, extent and licences
+  ─► uploaded to the GitHub release the index names (`release: owner/repo:tag`),
+     made when the repository has none by that tag
+  ─► the entry appended to index.yaml, which you commit and push
+```
+
+```sh
+sim geodata publish NAME --index PATH [--as ENTRY] [--title T] [--description D] [--tags A,B]
+sim nodeset publish NAME --index PATH [--as ENTRY] [--geodata ENTRY] [--title T] …
+```
+
+An index without `release:` gets the file beside it, its `url` relative,
+for one served as a directory or carried on a stick. An entry the index has
+already, or a file of that name in the release, is refused: an entry never
+changes. The upload's token is `GH_TOKEN` or `GITHUB_TOKEN`; with neither
+set, `sim` takes it from `gh` where it runs. sim-mesh-examples names
+`sim-mesh/sim-mesh:examples`, so publishing to it takes the right to upload
+there.
+
+### Build from sources
 
 ```
 page ── GET /osm/<z>/<x>/<y>.png ─────────────────► front ── (cache miss) ──► tile.openstreetmap.org
@@ -389,11 +516,11 @@ planner-job ── one JSON line per step ────────────�
 planner-job ── geodata/.part-<name>/ ──────────────► front: geodata/<name>/, with its geodata.yaml
 ```
 
-A view of its own, with **‹ Back**. The map is OpenStreetMap's standard
+**Build…** on the Geodata tab opens a view of its own, with **‹ Back**. The map is OpenStreetMap's standard
 tiles, fetched through the front and kept under `testbed/osmtiles/` a week
 at least, as the tile usage policy asks; the packs there are outlined
-with their names, and the areas of the sources that do not cover the world
-(Berlin's own data, Germany's census grid) are tinted. A drag pans, the
+with their names, and the outlines of the sources that do not cover the
+world (Berlin's own data, Germany's census grid) are tinted. A drag pans, the
 wheel zooms, Ctrl or Cmd and a drag draws the rectangle, and the place
 search asks Nominatim, OpenStreetMap's geocoder, once per search (on Enter),
 as its policy allows.
@@ -403,8 +530,9 @@ The side panel under the rectangle has its name and resolution (30 m or
 rectangle's centre; a rectangle wider than its zone, or a grid of more than
 25 million cells, is refused with the sentence saying why.
 
-The sources are not a choice: the build takes the best one for each part of
-the rectangle, and the lesser one for the rest.
+The sources are not a choice: the build takes every source whose coverage
+meets the rectangle ([Sources](#sources)), and in each layer the one of the
+highest priority there for each part of it. With the sources sim-mesh ships:
 
 - **terrain and clutter**: Berlin's DGM1 and bDOM (1 m terrain and surface)
   where the rectangle touches Berlin, Copernicus GLO-30 everywhere else;
@@ -416,8 +544,9 @@ the rectangle, and the lesser one for the rest.
 
 and always ESA WorldCover land cover, OpenStreetMap roads and places, and
 the ITU maps. The panel lists the sources chosen, each with what it is used
-for ("buildings inside Berlin", "buildings outside Berlin"), what is still
-to fetch (what is in the cache costs nothing) and its licence. **Build**
+for ("buildings inside its outline", "buildings outside Berlin LoD2 building
+models"), what is still to fetch (what is in the cache costs nothing) and
+its licence. **Build**
 says the same in a dialog, which sources go into the pack and for which
 part, and goes back to the list, where the build's row shows its step and
 progress and has **Cancel**; when it ends the row is geodata like any
@@ -428,7 +557,7 @@ compiler's diagnostics go to `testbed/geodata/.cache/logs/<name>.log`.
 **The sources** are fetched into `testbed/geodata/.cache/<source>/`, shared by every
 build, so a second region beside the first fetches only what is new; a file
 is fetched once, resumed where it stopped, and one its host does not have
-(GLO-30 over open sea) is not asked for again:
+(GLO-30 over open sea) is not asked for again. Those sim-mesh ships:
 
 | Source | Covers | From |
 |---|---|---|
@@ -445,6 +574,92 @@ is its south-west corner in kilometres of EPSG:25833, so a district costs
 megabytes rather than the city's gigabytes. OpenStreetMap is read from one
 protocol buffer file (PBF) extract, not from Overpass: one file serves roads,
 places, peaks and masts and buildings alike.
+
+### Sources
+
+```
+sim-mesh/sources/sources.yaml ─┐   global, then continent ▸ country ▸ sources
+testbed/sources.yaml ──────────┴─► every source here, by id (sourcefile.py)
+page ── GET /api/geodata/sources?bbox=&res_m= ─► front: for each source whose coverage
+      meets the rectangle, its `find` method: the files the rectangle needs
+front ── GET <file>, the next mirror when one fails ─► into geodata/.cache/<id>/
+front ── planner-job pack-build: each source's files as the compiler input its
+      format and layer go to ─► the pack
+```
+
+Where a pack's ground comes from is data: `sources/sources.yaml` in
+sim-mesh's repository, which grows by issues and pull requests, and a
+person's own beside it in `testbed/sources.yaml`, the same shape. A source
+picks one of sim-mesh's methods and fills in their parameters, and never
+carries code:
+
+```yaml
+global:                             # sources with data everywhere
+  - id: glo30
+    title: Copernicus GLO-30 surface model
+    holds: Surface heights at 30 m …    # the page's tooltip
+    licence: Copernicus DEM licence, attribution required
+    notice: "© DLR e.V. …"              # what a pack carries
+    redistributable: true               # false: only values from it enter a pack
+    layers: { surface: 10 }             # each layer it feeds, with its priority there
+    resolution_m: 30
+    coverage: worldwide
+    find:
+      method: template
+      url: "https://copernicus-dem-30m.s3.amazonaws.com/{tile}/{tile}.tif"
+      tile: "Copernicus_DSM_COG_10_{ns}{lat:02}_00_{ew}{lon:03}_00_DEM"
+      size_deg: 1
+      crs: EPSG:4326
+    read: whole
+    format: { type: geotiff, band: 1 }
+europe:                             # a continent
+  DE:                               # a country, by ISO 3166-1 alpha-2
+    name: Germany
+    sources:
+      - id: berlin-lod2
+        coverage: outline           # sources/outlines/berlin-lod2.geojson
+        find:
+          method: atom
+          feed: "https://gdi.berlin.de/data/a_lod2/atom/0.atom"
+          name: "(?P<x>\\d{3})_(?P<y>\\d{4})\\.zip$"   # the tile's corner in its name
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25833
+        …
+```
+
+- **Coverage** is `worldwide`, only under `global`, or `outline`, a GeoJSON
+  polygon in `outlines/<id>.geojson` beside the file. `sim source outline ID`
+  writes one from the source's own feed, or `--geofabrik REGION` from a
+  Geofabrik region's.
+- **Finding**: `template` (tiles of whole degrees named by their south-west
+  corner: `{ns}`, `{lat}`, `{ew}`, `{lon}`, `:0n` padding), `atom` (an
+  INSPIRE download feed, each tile's corner read off its file name),
+  `regions` (Geofabrik's index, the smallest region holding the rectangle)
+  or `file`. Any address may be a list: mirrors, tried in order. A file no
+  host has is no data there (`missing: error` makes it a failed build).
+- **Reading** is `whole`: the file, resumed when a fetch breaks off.
+- **Formats** are `geotiff`, `xyz`, `citygml`, `osm-pbf`, `csv-grid` and
+  `itu-p1812-maps`. The compiler reads each as it always has, so a source's
+  parameters must be those its reader assumes: a `csv-grid` is Zensus's
+  layout, an `xyz` or a `citygml` Berlin's, a land cover `geotiff`
+  WorldCover's classes. Anything else is refused when the file is read,
+  with the sentence saying which.
+- **Layers** are `surface`, `terrain`, `landcover`, `buildings`,
+  `population`, `roads`, `places` and `radio-climate`, each source with its
+  priority in each. Berlin's terrain, surface and buildings are 100 to
+  GLO-30's and OpenStreetMap's 10.
+
+An id is one source: a person's file may not take one sim-mesh ships (a
+second address for the same data is a mirror, in the shipped entry). Every
+file is read whole and checked, and the tests read sim-mesh's own the same
+way, so a pull request that breaks it fails.
+
+```sh
+sim source check                     # read every source file, say what is wrong
+sim source list                      # every source, where it stands, what it feeds
+sim source outline zensus --geofabrik germany
+```
 
 **Buildings from OpenStreetMap** are closed `building` ways and building
 multipolygons, courtyards kept as holes, written to the pack's
@@ -569,7 +784,7 @@ A nodeset is offered on every geodata whose extent holds one of its nodes,
 as a layer of the Nodes tab ([The Nodes tab](#the-nodes-tab)).
 
 **Importing** makes a new nodeset of the nodes inside the geodata's extent,
-from one of four sources:
+from one of these sources:
 
 - **the MeshCore map**, the node list at `map.meshcore.io/api/v1/nodes`,
   fetched by the front at most once a week into the cache under a user agent
@@ -578,14 +793,34 @@ from one of four sources:
   both are clocks never set;
 - **a PotatoMesh instance**'s `/api/nodes`, by its address: Meshtastic and
   MeshCore nodes both, a position whose precision was cut on purpose left out;
-- **planner sites** (`sites.csv`) and **a deployed-network CSV**.
+- **planner sites** (`sites.csv`) and **a deployed-network CSV**;
+- **any CSV**: the dialog reads its header and asks which column is the
+  latitude, the longitude, the name, the height above the ground, the
+  maximum power and the tags (latitude and longitude needed, each guessed
+  from its header to start); comma, semicolon or tab, whichever the header
+  has most of; tags split at commas or semicolons;
+- **GeoJSON** Point and MultiPoint features: `name`, `title` or `label`
+  names a node, `height_m` or `height_agl_m` is its height, `tags` and
+  `role` are tags;
+- **KML** placemarks with a point, and **GPX** waypoints (a waypoint's
+  `type` is a tag);
+- **a Meshtastic node list**, what `meshtastic --info` prints (its "Nodes in
+  mesh:" part is read) or that JSON alone: each node with a position, named
+  by its long name and tagged with its role.
+
+A height a file gives above sea level — GeoJSON's third coordinate, a KML
+altitude not relative to the ground, GPX's `ele`, a Meshtastic altitude — is
+not a height above the ground, and is passed over; only a KML altitude
+relative to the ground is taken. A nodeset can also be fetched from an
+index ([Indexes](#indexes)).
 
 The public Meshtastic maps are not a source: their positions are truncated on
 purpose, and PotatoMesh carries the Meshtastic nodes there are. The two node
 maps are read by `planner-job nodes-import`, `planner-import`'s parsers. Every
 imported node stands at the height the dialog asks
 (marked assumed) where the source gives none, has the default antenna and the default radio (at a
-CSV's transmit power where it states one), and is tagged with its source, its
+CSV's transmit power where it states one), and is tagged with its source (the
+format, for a file), its
 kind (`repeater`, `room-server`, `companion`, `router`, `client`, …) and how
 good its position is (`position-gps`, `position-fixed`, `position-truncated`,
 `position-unknown`). Measurements (range tests, neighbour reports) are not
@@ -780,7 +1015,7 @@ sim run lxmf-traffic --resume mitte7 --set firmware=relay-sx1262_latest
 A simulation keeps a copy of a script of `scripts/` (a file from elsewhere
 only drives it), and a snapshot keeps that copy. The simulation runs on when
 the script ends; one the script paused (`sim_pause()`) stays on the Simulations
-tab to be resumed ([Pausing](#pausing-and-resuming)). The other way round,
+tab as done, to be resumed ([Pausing](#pausing-and-resuming)). The other way round,
 a script whose simulation is stopped or paused under it, or ends on its
 own, stops with "simulation … went away" the next time it waits on it or
 asks it anything, and exits 1. A script that stops or pauses its simulation
@@ -898,19 +1133,27 @@ and a page that finds the front serving another build of it (the front's
 
 **Firmware** lists the installed firmware ([Firmware](#firmware)), each by
 its name with its title, its category, the hardware and radio it plays and
-its version, the paused runs and snapshots that hold it, and a trash can
-(off for one that is held). **Add from zip…** uploads a zip; **Add from
-pre-built…** lists what sim-mesh.net offers this machine, each installed
-with one click.
+its version, the paused runs and snapshots that hold it, its size on disk,
+and a trash can (off for one that is held); a checkbox begins each row, and
+**Delete** above the list deletes the chosen ones nothing holds. **Add from
+zip…** uploads a zip; **Add from pre-built…** lists what sim-mesh.net
+offers this machine, each installed with one click.
+
+**Every list of things on disk works alike**: each row says how much it
+takes, a checkbox begins it, and **All**, **None** and **Invert** above the
+list choose rows for the list's own actions there, each taking only the
+chosen rows it applies to after one confirmation that says what happens.
 
 **Antennas** lists the antenna catalogue, each with its picture and what it
 is; clicking one shows its figures and its radiation pattern in the
 horizontal plane (azimuth, at the horizon) and in the vertical plane
 (elevation) ([Antennas](#antennas)).
 
-**Geodata** lists the geodata with its kind, its extent and how many
-nodesets have a node inside it, and a pack being built with its step, its
-progress and **Cancel** (or why it failed). Nothing is chosen when the page
+**Geodata** lists the geodata with its kind, its extent, how many nodesets
+have a node inside it, its size and the index it came from, and a pack
+being built with its step, its progress and **Cancel** (or why it failed);
+below it, what the indexes offer and the build's sources ([Geodata](#geodata)).
+Nothing is chosen when the page
 starts, and the world is empty. Clicking a row **chooses** that geodata:
 it is shown on its own, with no nodes, scrollable and zoomable, with
 **Export zip** on its toolbar, and it is the ground the Nodes tab works on,
@@ -920,30 +1163,46 @@ edited has unsaved changes: save them, discard them, or stay. Each row
 renames its geodata or deletes it, its pack included; neither is allowed
 while a run or a snapshot stands on its pack, whose copy of the geodata
 names the pack's directory, and the page says which. **New synthetic…**
-makes flat synthetic ground at an exponent and an extent, **Build from
-sources…** opens the build view, and **Import zip…** takes a sim-mesh geodata
-pack or a bare planner pack ([Geodata](#geodata)).
+makes flat synthetic ground at an exponent and an extent, **Build…** opens
+the build view, and **Import zip…** takes a sim-mesh geodata pack or a bare
+planner pack ([Geodata](#geodata)).
 
 **Scripts** lists the scripts with their first docstring line, edits one
 (saved through the front, which checks it parses), and **Run…** starts a
 new simulation of its own on the Nodes tab's geodata and shown nodesets
 (which the dialog shows, not changes) and goes over to its live map, framed
-on its nodes; a script with a `main` can drive a running simulation
-instead. Its output is beside the editor as it comes, with **Stop** while
-it runs. A new one is paused when `main` ends.
+on its nodes, or runs on a running simulation, or on a paused or done one,
+which it resumes. Its output is beside the editor as it comes, with
+**Stop** while it runs.
 
 **Simulations** is the registry of **simulation runs** ([Running
-simulations](#running-simulations)): every simulation, running, paused, or ended
-(every run directory under `testbed/runs/` that is neither, by its name).
+simulations](#running-simulations)): every simulation, running, paused, done
+or ended (every run directory under `testbed/runs/` that is none of those,
+by its name). **Done** is a simulation its script paused (`sim_pause()`,
+which a script says when it is finished), drawn in its own colour with a
+tick; **paused** is one a person paused. Both are kept to be resumed.
 Clicking a running simulation's row opens it: its live map, in place of the
 list, with **‹ Simulations** (or the tab itself) back to the list; it stays
-open while other tabs are on show, and going to the Nodes tab closes it. Its **⋯** menu
-pauses it, resets or factory-resets all its stations, saves a snapshot of
-it, or loads one into it; **Stop** ends it. A paused one has **Resume**, and
-**Stop**, which deletes the state it was paused with and leaves it an ended
-run, ended where it paused; a paused or ended one has a trash can, which
-deletes its run directory. A row
-whose run has a report, as its script's `report` wrote it, has **Report**.
+open while other tabs are on show, and going to the Nodes tab closes it.
+
+```
+[All] [None] [Invert]  2 chosen   [■ Stop] [❚❚ Pause] [🗑 Delete]
+☐ lora     running  …  12/12   48 MB      ❚❚  ■  ⋯     🗑
+☑ town     done     …  40      1.2 GB  ▶      ■     📄 🗑
+☑ old-3    ended    …  40      880 MB                📄 🗑
+```
+
+Each row's actions are icons, each in a narrow column of its own so they
+line up, the trash can last: **▶** resumes a paused or done one, in real
+time, in a new run directory; **❚❚** pauses a running one; **■** stops one
+for good (a paused or done one's kept state goes, and it is an ended run,
+ended where it paused); **⋯**, on a running one, resets or factory-resets
+all its stations, saves a snapshot of it, or loads one into it; the report
+icon opens its report, as its script's `report` wrote it; the trash can
+deletes its run directory, and a running one's warning says it is stopped
+first. **Stop**, **Pause** and **Delete** above the list do the same to the
+chosen rows. Each row says its run directory's size, measured every ten
+seconds while it runs.
 Each row shows its simulated time T and the real time it has been running
 (for a stopped one, from its start to its end; T from its pause, or from the
 last line of its record), and how fast T runs; a real-time run's T is its
@@ -959,14 +1218,15 @@ a row of the Layers panel on the left, above the tags; a nodeset with none
 there is not listed:
 
 ```
-Layers                               [New] [Import…] [Save visible as…]
- ● 👁 ● town-core          42      •  ▲ 🗑   active: edited, selected, saved
- ○ 👁 ◯ meshcore-2026-09   318/402    ▲ 🗑   shown, drawn hollow in its colour
- ○ ·  ◯ potatomesh         77         ▲ 🗑   hidden
+Layers                  [New] [Import…] [Save visible as…] [Nodesets…]
+ ● 👁 ● town-core          42        6 kB •  ▲ 🗑   active: edited, selected, saved
+ ○ 👁 ◯ meshcore-2026-09   318/402  88 kB    ▲ 🗑   shown, drawn hollow in its colour
+ ○ ·  ◯ potatomesh         77       21 kB    ▲ 🗑   hidden
 ```
 
 The eye shows or hides a layer; the ring beside it is the colour its nodes
-are drawn in. The count is its nodes inside the geodata, and where some are
+are drawn in. The size is the nodeset's file and its own setup script on
+disk. The count is its nodes inside the geodata, and where some are
 outside, of how many (amber): those are not loaded, nor drawn, and a Save
 writes them back as they were. **One layer is active**: clicking a node,
 the selection, the tags, the editor, the coverage and **Save** are the
@@ -982,6 +1242,11 @@ changes: save them (a new one is asked a name), discard them, or stay.
 
 - **New** asks a name and adds an empty layer, active.
 - **Import…** makes a new layer from a source ([Nodesets](#nodesets)), active.
+- **Nodesets…** lists every nodeset, on this geodata or not, with its node
+  count, its size and the index it came from (and whether it was changed
+  here since), checkboxes and **Delete** for several at once; below, what
+  the indexes offer ([Indexes](#indexes)), each nodeset with the geodata it
+  is made for, which **Add** brings along when it is not here.
 - **Save visible as…** asks a name and writes one new nodeset from every
   shown layer as it stands, unsaved edits included, top of the panel first.
   With one layer shown it is that layer's Save as; with several it is the
@@ -1115,8 +1380,13 @@ ground it is the log-distance formula, worked out on the page. On a pack each
 node's raster is the planner's point-to-area sweep to a receiver 2 m above
 the ground within 10 km, which the front has the sidecar compute one node at a
 time and caches by the node's position and height (`testbed/coverage/`), so
-changing power, radio or antenna redraws at once and moving a node sweeps
+changing power, radio or antenna redraws without asking the planner and moving a node sweeps
 only that one; rasters in the cache draw at once and the rest as they land.
+A redraw is worked out a slice at a time between the page's other work, so
+the aim dial, the map and the editor answer while it goes on: the coverage
+drawn last stays on show with **redrawing coverage…** in the map's corner,
+and the new one replaces it when it is whole. Each new aim, power or view
+drops the redraw before it, so turning the dial redraws once, where it stops.
 Either way the antenna's gain is taken toward each point from its tip to a
 receiver 2 m over the ground there, the pack's terrain under each cell
 fetched with its raster, so a high collinear's narrow beam passes over the
@@ -1211,15 +1481,16 @@ after `--` go to every simd as they stand: `sim -- --pairwise --stagger
 **Simulations** lists each one: its nodeset, geodata and script, its pace
 and T, the phase its driver says it is in with a bar of the plan, when it
 should be done, and how many of its stations are up; a simulation that exited
-says so with its last lines, and a paused one where T stood when it paused.
-Clicking a running one's row opens its live map.
+says so with its last lines, and a paused or done one where T stood when it
+stopped. Clicking a running one's row opens its live map.
 
 ### Pausing and resuming
 
 ```
-runner ── sim_pause {name} ──► front     main ended, on a simulation started for it
+runner ── sim_pause {name, by: script} ──► front     the script says sim_pause(): it is done
+page   ── sim_pause {name} ──────────────► front     a person pauses it (the page, sim pause)
 front: stop its simd (stations flushed), runs/<run>/paused/ ← the run as a snapshot
-front ── sims {…, {name, state: paused, t}} ──► every page
+front ── sims {…, {name, state: paused, paused_by, t}} ──► every page
 page ── sim_resume {name} ──► front: runs/<run>/paused/ → runs/<name>-N/, a simd on it
 ```
 
@@ -1237,9 +1508,13 @@ otherwise, and its firmware and first-boot lines apply to it as to a running
 one.
 **Stop** (or `sim stop <name>`) deletes `paused/` and lists the run as
 ended where it paused, so it no longer holds its firmware; its trash can
-deletes the run directory, and with it the pause. A script's run pauses the simulation it started when
-`main` ends; **⋯ ▸ Pause**, `sim pause`, and `sim.pause()` pause any running
-one.
+deletes the run directory, and with it the pause.
+
+**Done** is the same pause, asked for by the simulation's script: a script
+says `sim_pause()` when it is finished (`lxmf-traffic` does, at its end),
+and the run's `run.yaml` records `paused: {…, by: script}`. The page draws
+a done one apart from one a person paused (❚❚ on its row, `sim pause`) and
+`sim list` says `done`; it resumes, stops and deletes as a paused one does.
 
 From a shell, `sim`'s simulation verbs do the same (`sim help` lists
 every verb); they run inside the front's container, `sim-mesh-front`.
@@ -1259,7 +1534,8 @@ sim new pw --geodata berlin-city --nodeset mitte7 --time max --pairwise
                                                # prints its control address, ether, network and run as JSON
 sim new --snapshot mitte7-warm --time 2x --build relay-sx1262_latest
                                                # named after what it loads: mitte7-warm
-sim list
+sim list                                       # each with its state (done: its script
+                                               # paused it) and its run directory's size
 sim plan lora warm-up=+600 traffic=+4200       # T each phase ends at; +N is N s from now
 sim pause lora                                 # stopped, its state kept; listed as paused
 sim resume lora                                # started again as it ended, in a new run, real time
@@ -1267,7 +1543,8 @@ sim resume lora --time max                     # or as fast as it goes
 sim run my-study --resume lora                 # or a script on it, in the script's time
 sim stop lora                                  # a paused one: its state deleted, it ended
 sim run lxmf-traffic --sim lora --set firmware=relay-sx1262_latest
-                                               # a script's main: one of scripts/ by name, or a path
+                                               # a script, one of scripts/ by name or a path,
+                                               # on a running simulation
 ```
 
 A driver never picks a port or a network for a simulation: it asks the front
@@ -1473,26 +1750,35 @@ simulation's `state` (`starting`, `running`, `stopping`, `exited` with its
 `snapshot` it loaded, `time`, `mode`, `rate`, `t`, `pace` (T per wall second
 over the last two minutes), station `counts` by status, its `plan`, the
 current `phase` `{name, from, until, eta}` and `eta`, the wall time the last
-phase should end, and where it is: `port`, `ether`, `net`, `run`. `GET
-/api/sims` is the same as JSON.
+phase should end, and where it is: `port`, `ether`, `net`, `run`; a paused
+one's `paused_by` (`script`: done); and `bytes`, its run directory's size.
+`GET /api/sims` is the same as JSON.
+
+The simulation verbs: `sim_new`, `sim_stop {name}`, `sim_pause {name, by?}`
+(`by: script` is its script's pause, done), `sim_resume {name, time?}`, and
+`run_delete {run, stop?}`, a run's directory gone, refused while a
+simulation is on it unless `stop` asks for that to be stopped first.
 
 The front's editor verbs are answered to the asking socket as `{type, ok,
 …}`, and need no simulation running:
 
 | Verbs | |
 |---|---|
-| `firmware_list` | the installed firmware, each with what holds it |
+| `firmware_list` | the installed firmware, each with what holds it and its size |
 | `firmware_prebuilt`, `firmware_add {url}` | what sim-mesh.net offers this machine, and one of those installed |
 | `firmware_delete {names}` | firmware removed, refused for any a paused run or a snapshot holds |
 | `antenna_list` | the antenna catalogue, each with its picture |
-| `geodata_list`, `geodata_open`, `geodata_close`, `geodata_new`, `geodata_save`, `geodata_save_as` | geodata, each listed with how many nodesets have a node on it; opening a pack holds its sidecar for the socket |
+| `geodata_list`, `geodata_open`, `geodata_close`, `geodata_new`, `geodata_save`, `geodata_save_as` | geodata, each listed with how many nodesets have a node on it, its size (`bytes`) and the index it came from (`from_index`); opening a pack holds its sidecar for the socket |
 | `geodata_rename {name, to}`, `geodata_delete {name}` | another name, or gone, with its own pack; refused while a running simulation stands on it; a delete says what keeps the pack (`kept_by`) |
-| `nodeset_list {geodata?}`, `nodeset_open`, `nodeset_new`, `nodeset_save`, `nodeset_save_as`, `nodeset_delete` | nodesets; with `geodata`, each row says how many of its nodes stand on it (`inside`); a delete takes the nodeset's own setup script too |
-| `nodeset_import {name, source, …}` | a new nodeset from the MeshCore map, a PotatoMesh instance, `sites.csv` or a deployed-network CSV |
+| `geodata_sources`, `geodata_source_clear {source}` | the build's cache, one row per source with its licence and size, and one source's emptied (refused while a build runs) |
+| `index_list`, `index_new {address}`, `index_delete {name}` | the listed indexes, each entry saying whether it is here; another listed; an added one forgotten |
+| `index_install {index, kind, name}`, `index_cancel {index, kind, name}` | an entry installed, answered when it is in, its progress to every page as `index_progress`; a fetch stopped |
+| `nodeset_list {geodata?}`, `nodeset_open`, `nodeset_new`, `nodeset_save`, `nodeset_save_as`, `nodeset_delete` | nodesets, each with its size and the index it came from; with `geodata`, each row says how many of its nodes stand on it (`inside`); a delete takes the nodeset's own setup script too |
+| `nodeset_import {name, source, …}` | a new nodeset from the MeshCore map, a PotatoMesh instance, `sites.csv`, a deployed-network CSV, or a file of points (`csv` with its `columns`, `geojson`, `kml`, `gpx`, `meshtastic`) |
 | `nodeset_merge {name, layers}` | Save visible as: the shown layers, top first, as they stand, as one new nodeset |
 | `script_list`, `script_open`, `script_new`, `script_save`, `script_save_as` | scripts, checked to parse, each with its inputs |
-| `script_run {name, sim \| geodata, nodeset, inputs?}`, `script_stop {run}`, `script_log {run}` | a script's `main` as a process, its inputs given, and its output |
-| `snapshot_list`, `losses_compute` | the snapshots, and a nodeset's tables |
+| `script_run {name, sim \| resume \| geodata, nodeset, inputs?}`, `script_stop {run}`, `script_log {run}` | a script as a process, its inputs given, and its output |
+| `snapshot_list`, `losses_compute` | the snapshots, each with its size, and a nodeset's tables |
 | `coverage {geodata, nodes}` | each node's pack raster: cached ones at once, the rest as `coverage_tile` messages as they land |
 
 and its HTTP side: `POST /api/firmware/add?name=<zip name>` and `POST
@@ -2307,15 +2593,18 @@ tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 | [`ether/`](ether/README.md) | the medium: the loss tables, who hears a frame and how it comes out; `slt.py` reads and writes a table |
 | `testbed/front.py` | several simulations behind one port: the registry, the editors' verbs, the imports, the planner sidecars, the loss tables before a start, one simd per simulation, script runs, coverage, station hostnames by simulation, the WebRTC relay one level up, the finish estimate |
 | `testbed/simd.py` | one simulation: the ether, the stations and their setup, the proxy, the control server, commands and verbs on chosen stations, a moved node's row |
-| `testbed/simctl.py` | behind `sim new`, `stop`, `pause`, `resume`, `list` and `plan`: the front from a shell; starts the front when none answers |
-| `testbed/store.py` | where geodata, nodesets, scripts, tables, coverage, runs and snapshots live, and what a name may be |
+| `testbed/simctl.py` | behind `sim new`, `stop`, `pause`, `resume`, `list` and `plan`: the front from a shell; starts the front when none answers; done for a script's pause |
+| `testbed/store.py` | where geodata, nodesets, scripts, tables, coverage, runs and snapshots live, what a name may be, and what a row takes on disk |
+| `testbed/indexes.py` | indexes: reading one, the listed ones, installing an entry by its sha256 and remembering where it came from; `sim index`, `sim geodata`, `sim nodeset` |
 | `testbed/firmware.py` | installed firmware: names and `_latest`, adding a zip, what holds one, deleting, the pre-built index; `sim firmware` |
 | `testbed/drivers.py` | a run's firmware resolved, each one's driver imported from its own directory, and the contract's environment |
 | `testbed/antennas.py`, `testbed/antennas/` | the antenna catalogue and pictures, a pattern's gain by direction, a pair's gain in three dimensions |
 | `testbed/geodata.py` | geodata: packs and synthetic ground, the projections, the extent, a sim-mesh geodata pack's export and import |
-| `testbed/sources.py` | a build's sources: what a rectangle needs of each, the download cache and its fetches |
-| `testbed/packbuild.py` | one pack built from its sources: fetch, `planner-job pack-build`, the pack into place |
-| `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, links, edits, the geometry hash, the merge of shown layers, the imports |
+| `sources/sources.yaml`, `sources/outlines/` | the sources sim-mesh builds packs from, as data, and their outlines |
+| `testbed/sourcefile.py` | the source files read and checked; `sim source` |
+| `testbed/sources.py` | a build's sources: the finding methods, what a rectangle needs of each, the download cache and its fetches (mirrors included), each source's area and cache for the map |
+| `testbed/packbuild.py` | one pack built from its sources: fetch, each source's files to the compiler input its format and layer go to, `planner-job pack-build`, the pack into place |
+| `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, links, edits, the geometry hash, the merge of shown layers, the imports (the planner's CSVs, any CSV, GeoJSON, KML, GPX, a Meshtastic node list) |
 | `planner/` | the Rust workspace: `planner-web` (the sidecar), `planner-job` (a pack's build, a node map's import), `planner-pack` (the compiler, OpenStreetMap from a PBF extract), `planner-buildings`, `planner-import`, and the ground, propagation and coverage crates |
 | `testbed/script.py` | scripts: listing, checking, loading, a script's inputs read without running it |
 | `testbed/sim_mesh/library.py`, `testbed/sim_mesh/select.py` | the script library: `script_…`, `sim_…`, and `nodes()`/`node()` selections with what is done to them (`.firmware`, `.on_first_boot`, `.exec`, `.radio`, `.reticulum…`), `Node` for first-boot rules, and `scripts.log` |

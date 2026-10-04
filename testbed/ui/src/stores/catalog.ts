@@ -22,6 +22,8 @@ export interface FirmwareRow {
   title?: string
   hardware?: string | null
   users?: string[]
+  /** Its directory's size on disk. */
+  bytes?: number | null
   error?: string
 }
 
@@ -45,7 +47,18 @@ export interface GeodataInfo {
   loc_pct?: number
   /** How many nodesets have a node inside its bbox. */
   nodesets?: number
+  /** Its directory's size on disk. */
+  bytes?: number
+  /** The index it came from, when it did. */
+  from_index?: Origin | null
   error?: string
+}
+
+/** Where something installed from an index came from. */
+export interface Origin {
+  index: string; address: string; url: string; sha256: string; added: string
+  /** A nodeset edited since it came. */
+  changed?: boolean
 }
 
 export interface NodesetRow {
@@ -53,7 +66,62 @@ export interface NodesetRow {
   nodes?: number
   bbox?: [number, number, number, number] | null
   tags?: Record<string, number>
+  /** Its file's size on disk, with its own setup script. */
+  bytes?: number
+  from_index?: Origin | null
   error?: string
+}
+
+export type IndexKind = 'geodata' | 'nodesets'
+
+/** One thing an index offers, and whether it is here. */
+export interface IndexEntry {
+  name: string; url: string; sha256: string; bytes?: number
+  title?: string; description?: string; licences?: string; tags?: string[]
+  bbox?: [number, number, number, number]
+  /** A nodeset's: the geodata it is made for, and how many nodes it has. */
+  geodata?: string; nodes?: number
+  installed: boolean
+  /** The name is something else's here. */
+  taken: boolean
+  /** A nodeset installed from it and edited since. */
+  changed?: boolean
+}
+
+export interface IndexRow {
+  name: string; address: string
+  /** sim-mesh's own, always listed. */
+  own: boolean
+  title: string
+  /** The index's text about its collection, line breaks its own. */
+  description: string
+  error?: string
+  geodata: IndexEntry[]
+  nodesets: IndexEntry[]
+}
+
+/** An entry being installed, as the front tells it. */
+export interface Fetching {
+  index: string; kind: IndexKind; name: string
+  state: 'fetching' | 'done' | 'failed' | 'cancelled'
+  /** What is being fetched now: a nodeset's geodata comes first. */
+  now: { kind: IndexKind; name: string } | null
+  fetched: number; of: number | null; error: string | null
+}
+
+/** One source of the build's cache. */
+export interface SourceRow {
+  source: string; what: string; licence: string; bytes: number
+  /** What its files hold, for the row's tooltip. */
+  holds: string
+  /** Whether it has an area to draw on the map. */
+  map: boolean
+  /** A source's layers and its priority in each, where it stands in the
+   *  source files (`global`, or continent › country), and whether it is
+   *  this machine's own (testbed/sources.yaml). */
+  layers?: Record<string, number>
+  where?: string
+  own?: boolean
 }
 
 /** A file a script imports that is sim-mesh's own: the library's (read-only
@@ -126,6 +194,11 @@ export const useCatalog = defineStore('catalog', {
      *  with `globalsError` when the file does not give it. */
     globals: null as Globals | null,
     globalsError: null as string | null,
+    /** The listed indexes, as last fetched; null before they are asked for. */
+    indexes: null as IndexRow[] | null,
+    indexesLoading: false,
+    /** Entries being installed, by `index/kind/name`. */
+    fetching: {} as Record<string, Fetching>,
   }),
 
   getters: {
@@ -143,6 +216,19 @@ export const useCatalog = defineStore('catalog', {
       }
       if (msg.type === 'firmware_changed') {
         void this.refreshFirmware()
+      } else if (msg.type === 'index_progress') {
+        const row = msg as unknown as Fetching
+        const key = fetchKey(row.index, row.kind, row.name)
+        if (row.state === 'fetching') {
+          this.fetching[key] = row
+        } else {
+          delete this.fetching[key]
+          if (row.state === 'done') {
+            void this.refreshIndexes()
+            void this.refreshGeodata()
+            void this.refreshNodesets()
+          }
+        }
       } else if (msg.type === 'geodata_progress') {
         const row = msg.build as BuildRow | null
         this.build = row && row.state !== 'done' && row.state !== 'cancelled' ? row : null
@@ -222,6 +308,23 @@ export const useCatalog = defineStore('catalog', {
       if (f.ok) this.takeFirmware(f)
     },
 
+    async refreshNodesets() {
+      const n = await request('nodeset_list')
+      if (n.ok) this.nodesets = n.nodesets as NodesetRow[]
+    },
+
+    /** Every listed index, fetched again by the front, and what is being
+     *  installed from them. */
+    async refreshIndexes() {
+      this.indexesLoading = true
+      const r = await request('index_list')
+      this.indexesLoading = false
+      if (!r.ok) return
+      this.indexes = r.indexes as IndexRow[]
+      this.fetching = Object.fromEntries((r.fetching as Fetching[])
+        .map(f => [fetchKey(f.index, f.kind, f.name), f]))
+    },
+
     /** A script run's output so far, for a page opened after it began. */
     async loadRun(run: string) {
       const r = await request('script_log', { run })
@@ -230,6 +333,8 @@ export const useCatalog = defineStore('catalog', {
     },
   },
 })
+
+export function fetchKey(index: string, kind: string, name: string) { return `${index}/${kind}/${name}` }
 
 /** Whether [lon0, lat0, lon1, lat1] boxes overlap. */
 export function overlaps(a: number[] | null | undefined, b: number[] | null | undefined): boolean {

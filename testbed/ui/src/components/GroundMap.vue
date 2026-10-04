@@ -34,6 +34,7 @@
       <template v-else>{{ credits.join(' · ') }} ⓘ</template>
     </div>
     <div v-if="busy" class="wmap-busy">loading ground…</div>
+    <div v-else-if="coverageBusy && display.coverage" class="wmap-busy">redrawing coverage…</div>
   </div>
 </template>
 
@@ -84,7 +85,7 @@ import { computed, onMounted, onUnmounted, ref, watch, nextTick } from 'vue'
 import { useGeodata } from '../stores/geodata'
 import { useSim } from '../stores/sim'
 import type { Display } from '../stores/display'
-import { COVERAGE_BANDS, type CoverageSource } from '../stores/coverage'
+import { COVERAGE_BANDS, SLICE_MS, yieldToPage, type CoverageSource } from '../stores/coverage'
 import type { Offset } from '../stores/nodes'
 import { M_PER_DEGREE } from '../lib/proj'
 import { forwardingRole, type GroundPoint, type LinkMark, type MapNode, type OtherNode, type Pick } from '../lib/marks'
@@ -374,7 +375,7 @@ function settled() {
   if (settleTimer) clearTimeout(settleTimer)
   settleTimer = setTimeout(() => {
     settleTimer = null
-    fetchGround(); fetchFootprints(); fetchRoads(); paintOverlay(); paintCoverage()
+    fetchGround(); fetchFootprints(); fetchRoads(); paintOverlay(); void paintCoverage()
     void fetchPopulation()
   }, SETTLE_MS)
 }
@@ -713,31 +714,56 @@ function marginColour(m: number): readonly number[] {
   return COVERAGE_BANDS[COVERAGE_BANDS.length - 1]!.rgba
 }
 
-function paintCoverage() {
-  coverageSurface.on = false
-  redrawWanted = true
+/* A paint is a job: the source made ready and the image painted a slice at
+ * a time (SLICE_MS), yielding to the page between slices, into a canvas of
+ * its own that replaces the one on show only when it is whole. A newer
+ * paint (an aim, a move of the view) makes the older one stale, and it
+ * stops at its next slice; meanwhile the last coverage stays drawn and
+ * `coverageBusy` puts up "redrawing coverage". */
+let coverageJob = 0
+const coverageBusy = ref(false)
+
+async function paintCoverage() {
+  const job = ++coverageJob
+  const stale = () => job !== coverageJob
   const src = props.coverage
   coverageVersion = src?.version ?? ''
-  if (!src || !props.display.coverage || !size.w) return
-  const cols = Math.ceil(size.w / COVERAGE_PX), rows = Math.ceil(size.h / COVERAGE_PX)
-  coverageSurface.canvas.width = cols
-  coverageSurface.canvas.height = rows
-  coverageSurface.w = size.w
-  coverageSurface.h = size.h
-  coverageSurface.view = { ...view.value }
-  const c = coverageSurface.canvas.getContext('2d')!
+  if (!src || !props.display.coverage || !size.w) {
+    coverageSurface.on = false
+    coverageBusy.value = false
+    redrawWanted = true
+    return
+  }
+  coverageBusy.value = true
+  if (!await src.prepare(stale)) return
+  // The view as it is now: the image is of it, wherever the view goes meanwhile.
+  const at = { ...view.value }, w = size.w, h = size.h
+  const cols = Math.ceil(w / COVERAGE_PX), rows = Math.ceil(h / COVERAGE_PX)
+  const canvas = document.createElement('canvas')
+  canvas.width = cols
+  canvas.height = rows
+  const c = canvas.getContext('2d')!
   const img = c.createImageData(cols, rows)
+  let since = performance.now()
   for (let row = 0; row < rows; row++) {
+    if (performance.now() - since > SLICE_MS) {
+      await yieldToPage()
+      if (stale()) return
+      since = performance.now()
+    }
+    const y = at.cy - ((row + 0.5) * COVERAGE_PX - h / 2) * at.mpp
     for (let col = 0; col < cols; col++) {
-      const [x, y] = fromScreen((col + 0.5) * COVERAGE_PX, (row + 0.5) * COVERAGE_PX)
+      const x = at.cx + ((col + 0.5) * COVERAGE_PX - w / 2) * at.mpp
       const m = src.marginAt(x, y)
       if (m === null || m < 0) continue
-      const k = (row * cols + col) * 4
-      img.data.set(marginColour(m), k)
+      img.data.set(marginColour(m), (row * cols + col) * 4)
     }
   }
+  if (stale()) return
   c.putImageData(img, 0, 0)
-  coverageSurface.on = true
+  Object.assign(coverageSurface, { canvas, w, h, view: at, on: true, grey: null })
+  coverageBusy.value = false
+  redrawWanted = true
 }
 
 /* ── drawing ── */
@@ -1360,6 +1386,7 @@ onUnmounted(() => {
   groundReq?.abort(); overviewReq?.abort(); wayReq?.abort(); populationReq?.abort()
   resetFootprints()
   if (settleTimer) clearTimeout(settleTimer)
+  coverageJob++
   saveView()
 })
 
@@ -1369,6 +1396,7 @@ watch(() => [ground.current?.name, ground.pack?.name], () => {
   detail = null; overview = null; overlay.on = false; pin = null
   resetFootprints()
   ways = null; wayBox = null; coverageSurface.on = false; population = null
+  coverageJob++; coverageBusy.value = false
   note.value = ground.problem
   restoreView()
   void fetchOverview()
@@ -1382,7 +1410,7 @@ watch(() => props.display.population, (on) => {
 watch(() => props.display.roads, () => { fetchRoads(); paintOverlay() })
 watch(() => props.display.buildings, () => { resetFootprints(); fetchFootprints(); paintOverlay() })
 watch(() => [props.display.coverage, props.coverage?.version], () => {
-  if ((props.coverage?.version ?? '') !== coverageVersion || !coverageSurface.on) paintCoverage()
+  if ((props.coverage?.version ?? '') !== coverageVersion || !coverageSurface.on) void paintCoverage()
 })
 watch(() => ground.problem, (p) => { if (p) note.value = p })
 watch(() => [props.nodes, props.others, props.offsets, props.selected, props.links, props.pair,

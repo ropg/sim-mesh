@@ -4,6 +4,7 @@ socket and HTTP, coverage through a planner of the test's own, and the
 planner sidecar behind /planner."""
 
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -421,6 +422,60 @@ def test_the_editors_list_open_and_save(stores):
         assert all(a["svg"].startswith("<svg") for a in reply["antennas"])
         sims = await ask(ws, "sims")
         assert "script_runs" in sims and sims["nodesets"] == ["copy", "here", "there"]
+    running_front(check)
+
+
+def test_sizes_sources_indexes_and_files_of_points(stores, monkeypatch):
+    import indexes
+    site = stores / "site"
+    site.mkdir()
+    text = "nodes:\n  a: { id: 1, lat: 0.001, lon: 0.001 }\n"
+    (site / "pair.yaml").write_text(text)
+    (site / "index.yaml").write_text(
+        "index: demos\nnodesets:\n  - { name: pair, url: pair.yaml, sha256: %s, bytes: %d }\n"
+        % (hashlib.sha256(text.encode()).hexdigest(), len(text)))
+    monkeypatch.setattr(indexes, "OWN_ADDRESS", str(site) + "/")
+    monkeypatch.setattr(indexes, "OWN_NAME", "demos")
+    monkeypatch.setattr(indexes, "ADDED_FILE", str(stores / "indexes.yaml"))
+    glo30 = os.path.join(sources.CACHE_DIR, "glo30")
+    os.makedirs(glo30)
+    with open(os.path.join(glo30, "tile.tif"), "wb") as handle:
+        handle.write(b"\0" * 1000)
+
+    async def check(f, session, base, ws):
+        rows = {g["name"]: g for g in (await ask(ws, "geodata_list"))["geodata"]}
+        assert rows["flat"]["bytes"] > 0 and rows["flat"]["from_index"] is None
+        assert rows["flat"]["origin"] == [0, 0]
+        rows = {r["name"]: r for r in (await ask(ws, "nodeset_list"))["nodesets"]}
+        assert rows["here"]["bytes"] == os.path.getsize(os.path.join(store.NODESETS_DIR, "here.yaml"))
+
+        reply = await ask(ws, "geodata_sources")
+        got = {r["source"]: r for r in reply["sources"]}
+        assert got["glo30"]["bytes"] == 1000 and got["worldcover"]["bytes"] == 0
+        reply = await ask(ws, "geodata_source_clear", source="glo30")
+        assert reply["ok"] and not os.path.exists(glo30)
+        reply = await ask(ws, "geodata_source_clear", source="nothing")
+        assert not reply["ok"]
+
+        reply = await ask(ws, "index_list")
+        offered = reply["indexes"][0]["nodesets"]
+        assert [(e["name"], e["installed"], e["bytes"]) for e in offered] == [("pair", False, len(text))]
+        await ws.send_json({"type": "index_install", "index": "demos", "kind": "nodesets",
+                            "name": "pair"})
+        progress = await next_of(ws, "index_progress")
+        assert (progress["name"], progress["state"]) == ("pair", "fetching")
+        reply = await next_of(ws, "index_install")
+        assert reply["ok"] and reply["installed"] == [{"kind": "nodesets", "name": "pair"}]
+        rows = {r["name"]: r for r in (await ask(ws, "nodeset_list"))["nodesets"]}
+        came = rows["pair"]["from_index"]
+        assert came["index"] == "demos" and not came["changed"]
+        reply = await ask(ws, "index_delete", name="demos")
+        assert not reply["ok"] and "always listed" in reply["error"]
+
+        reply = await ask(ws, "nodeset_import", name="pts", source="csv", geodata="flat",
+                          text="y,x,who\n0.002,0.002,One\n52,13,Far\n",
+                          columns={"lat": "y", "lon": "x", "name": "who"})
+        assert reply["ok"] and list(reply["nodeset"]["nodes"]) == ["one"]
     running_front(check)
 
 

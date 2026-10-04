@@ -12,6 +12,7 @@ live, and what a name for any of them may be.
                                       one node's coverage raster, a cache (not kept in git)
     testbed/runs/<name>/              one simulation's output (not kept in git)
     testbed/snapshots/<name>/         a moment of a run, to start another from
+    testbed/indexes.yaml              the addresses of the indexes a person added (indexes.py)
 
 Every one of these is referred to by name, and a name is also a directory, a
 hostname and a proxy label, so one rule serves them all: lower-case letters,
@@ -127,6 +128,37 @@ def flow(value):
     if isinstance(value, (list, tuple)):
         return "[%s]" % ", ".join(flow(v) for v in value)
     return scalar(value)
+
+
+def disk_bytes(*paths):
+    """What files and directories take on disk together, in bytes: every
+    file's size, symbolic links not followed, a path that is not there 0.
+    What the page and the CLI say a row occupies."""
+    total = 0
+    for path in paths:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not os.path.isdir(path) or os.path.islink(path):
+            total += st.st_size
+            continue
+        for top, _dirs, files in os.walk(path):
+            for each in files:
+                try:
+                    total += os.lstat(os.path.join(top, each)).st_size
+                except OSError:
+                    pass
+    return total
+
+
+def human_bytes(n):
+    """A size as the CLI prints it: 1.2 GB, 48 MB, 5.1 kB, 312 B."""
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if n >= scale:
+            value = n / scale
+            return "%.1f %s" % (value, unit) if value < 10 else "%.0f %s" % (value, unit)
+    return "%d B" % n
 
 
 def write_text(path, text):

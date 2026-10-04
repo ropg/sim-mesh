@@ -14,12 +14,22 @@
         snapshot holds cannot be deleted: its state can only be resumed on it.
       </div>
 
+      <SelectBar :sel="sel">
+        <template #default="{ keys }">
+          <q-btn flat dense no-caps size="sm" :icon="matDeleteOutline" label="Delete"
+                 :disable="!keys.some(free)" @click="removeMany(keys)" />
+        </template>
+      </SelectBar>
       <table class="dp-table">
         <thead>
-          <tr><th>Firmware</th><th>Category</th><th>Hardware</th><th>Version</th><th></th></tr>
+          <tr><th class="dp-check"></th><th>Firmware</th><th>Category</th><th>Hardware</th><th>Version</th>
+            <th class="num">Size</th><th></th></tr>
         </thead>
         <tbody>
-          <tr v-for="f in catalog.firmware" :key="f.name" :class="{ 'dp-off': f.error }">
+          <tr v-for="f in catalog.firmware" :key="f.name" :class="{ 'dp-off': f.error, 'dp-chosen': sel.has(f.name) }">
+            <td class="dp-check">
+              <q-checkbox dense size="xs" :model-value="sel.has(f.name)" @update:model-value="sel.toggle(f.name)" />
+            </td>
             <td>
               <div class="dp-name mono">{{ f.name }}</div>
               <div v-if="f.error" class="dp-bad">{{ f.error }}</div>
@@ -32,15 +42,16 @@
               <div v-if="f.radio" class="dp-sub">virtual {{ f.radio.toUpperCase() }}</div>
             </td>
             <td class="mono">{{ when(f.version) }}</td>
+            <td class="num mono">{{ sizeText(f.bytes) }}</td>
             <td class="dp-act">
               <q-btn flat dense round size="sm" :icon="matDeleteOutline"
-                     :disable="!!f.users?.length" @click="remove(f)">
+                     :disable="!!f.users?.length" @click="removeMany([f.name])">
                 <q-tooltip>{{ f.users?.length ? 'Held by a paused run or a snapshot' : 'Delete this firmware' }}</q-tooltip>
               </q-btn>
             </td>
           </tr>
           <tr v-if="!catalog.firmware.length">
-            <td colspan="5" class="dp-sub">No firmware installed: add a zip, or a pre-built one.</td>
+            <td colspan="7" class="dp-sub">No firmware installed: add a zip, or a pre-built one.</td>
           </tr>
         </tbody>
       </table>
@@ -105,8 +116,11 @@
 import { onMounted, ref } from 'vue'
 import { useQuasar } from 'quasar'
 import { matDeleteOutline } from '@quasar/extras/material-icons'
-import { useCatalog, type FirmwareRow } from '../stores/catalog'
+import { useCatalog } from '../stores/catalog'
 import { request, upload } from '../lib/front'
+import { useSelection } from '../lib/selection'
+import { sizeText } from '../lib/size'
+import SelectBar from '../components/SelectBar.vue'
 
 interface PrebuiltRow {
   name: string; url: string; title?: string; category?: string; radio?: string
@@ -115,6 +129,7 @@ interface PrebuiltRow {
 
 const catalog = useCatalog()
 const quasar = useQuasar()
+const sel = useSelection(() => catalog.firmware.map(f => f.name))
 const adding = ref(false)
 const file = ref<File | null>(null)
 const busy = ref(false)
@@ -137,15 +152,30 @@ function fail(error?: string) {
   quasar.notify({ type: 'negative', message: error ?? 'refused', timeout: 8000 })
 }
 
-function remove(f: FirmwareRow) {
-  quasar.dialog({ title: 'Delete firmware', message: `Delete ${f.name}?`, cancel: true, persistent: true })
-    .onOk(() => {
-      void (async () => {
-        const r = await request('firmware_delete', { names: [f.name] })
-        if (!r.ok) fail(r.error)
-        await catalog.refreshFirmware()
-      })()
-    })
+/** A firmware nothing holds, which can be deleted. */
+function free(name: string) {
+  return !catalog.firmware.find(f => f.name === name)?.users?.length
+}
+
+/* Those of the names nothing holds, deleted after one confirmation that
+ * says which are kept. */
+function removeMany(names: string[]) {
+  const go = names.filter(free)
+  if (!go.length) return
+  const kept = names.length - go.length
+  quasar.dialog({
+    title: go.length === 1 ? 'Delete firmware' : `Delete ${go.length} firmware`,
+    message: `Delete ${go.join(', ')}?${kept ? ` ${kept} held by a paused run or a snapshot ${kept === 1 ? 'is' : 'are'} kept.` : ''}`,
+    ok: { label: 'Delete', color: 'negative', flat: true, noCaps: true },
+    cancel: { flat: true, noCaps: true }, persistent: true,
+  }).onOk(() => {
+    void (async () => {
+      const r = await request('firmware_delete', { names: go })
+      if (!r.ok) fail(r.error)
+      sel.none()
+      await catalog.refreshFirmware()
+    })()
+  })
 }
 
 async function doAdd() {
@@ -197,6 +227,9 @@ async function addPrebuilt(p: PrebuiltRow) {
 }
 .dp-table td { padding: 8px 10px; border-bottom: 1px solid #1f242c; vertical-align: top; }
 .dp-act { text-align: right; width: 1%; white-space: nowrap; }
+.dp-table .num { text-align: right; }
+.dp-check { width: 28px; padding-left: 2px !important; padding-right: 0 !important; }
+.dp-chosen td { background: #172030; }
 .dp-name { font-weight: 500; color: #e5e7eb; }
 .dp-sub { font-size: 11px; color: #6b7280; }
 .dp-bad { font-size: 11px; color: #fca5a5; }

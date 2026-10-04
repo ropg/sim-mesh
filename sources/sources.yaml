@@ -1,0 +1,194 @@
+# The sources sim-mesh builds geodata packs from, grouped: `global`, then
+# each continent, its countries by ISO 3166-1 alpha-2 code. A source is data
+# only: it picks one of sim-mesh's methods for finding, fetching and reading
+# its files and fills in their parameters (README, "Sources"). A regional
+# source's coverage is outlines/<id>.geojson, beside this file.
+#
+# To add one: an entry under its country, its outline (`sim source outline`
+# makes one from its feed), and a pull request. The tests read this whole
+# file and refuse one that does not hold together.
+
+global:
+  - id: glo30
+    title: Copernicus GLO-30 surface model
+    holds: >-
+      Surface heights at 30 m: a digital surface model, the ground with
+      buildings and trees on it, in 1° GeoTIFF tiles. A pack's terrain, and
+      its clutter heights where no better source covers the ground.
+    licence: Copernicus DEM licence, attribution required
+    notice: >-
+      © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018
+      provided under COPERNICUS by the European Union and ESA; all rights
+      reserved. Produced using Copernicus WorldDEM-30.
+    redistributable: true
+    layers: { surface: 10 }
+    resolution_m: 30
+    coverage: worldwide
+    find:
+      method: template
+      url: "https://copernicus-dem-30m.s3.amazonaws.com/{tile}/{tile}.tif"
+      tile: "Copernicus_DSM_COG_10_{ns}{lat:02}_00_{ew}{lon:03}_00_DEM"
+      size_deg: 1
+      crs: EPSG:4326
+      missing: no-data
+    read: whole
+    format: { type: geotiff, band: 1 }
+
+  - id: worldcover
+    title: ESA WorldCover 2021 land cover
+    holds: >-
+      Land cover at 10 m, one class a cell (tree cover, shrubland, grassland,
+      cropland, built-up, bare, snow and ice, water, wetland, mangroves,
+      moss), in 3° GeoTIFF tiles. A pack's clutter classes.
+    licence: CC BY 4.0
+    notice: >-
+      © ESA WorldCover project 2021 / Contains modified Copernicus Sentinel
+      data (2021) processed by the ESA WorldCover consortium — CC BY 4.0
+    redistributable: true
+    layers: { landcover: 10 }
+    resolution_m: 10
+    coverage: worldwide
+    find:
+      method: template
+      url: "https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/ESA_WorldCover_10m_2021_v200_{tile}_Map.tif"
+      tile: "{ns}{lat:02}{ew}{lon:03}"
+      size_deg: 3
+      crs: EPSG:4326
+      missing: no-data
+    read: whole
+    format:
+      type: geotiff
+      band: 1
+      classes: { 10: forest, 20: low-vegetation, 30: low-vegetation, 40: open,
+                 50: urban, 60: open, 70: open, 80: water, 90: low-vegetation,
+                 95: low-vegetation, 100: open }
+
+  - id: itu
+    title: ITU-R P.1812-8 ΔN and N0 maps
+    holds: >-
+      ITU-R P.1812-8's radio-climate maps as text grids: ΔN, the refractivity
+      gradient over the lowest kilometre, and N0, the sea-level surface
+      refractivity. A pack takes the two numbers at its centre; the maps stay
+      here.
+    licence: ITU; kept on this machine, only two numbers enter a pack
+    redistributable: false
+    layers: { radio-climate: 10 }
+    coverage: worldwide
+    find:
+      method: file
+      url: "https://www.itu.int/dms_pubrec/itu-r/rec/p/R-REC-P.1812-8-202509-I!!ZIP-E.zip"
+    read: whole
+    format: { type: itu-p1812-maps, members: { delta_n: DN50.TXT, n0: N050.TXT } }
+
+  - id: geofabrik
+    title: OpenStreetMap extract (Geofabrik)
+    holds: >-
+      OpenStreetMap, one extract per region as a PBF file: roads and rail,
+      places, peaks and masts, and building footprints with the heights or
+      levels they are tagged with.
+    licence: ODbL 1.0, © OpenStreetMap contributors
+    notice: © OpenStreetMap contributors, ODbL 1.0 (opendatacommons.org/licenses/odbl)
+    redistributable: true
+    layers: { roads: 10, places: 10, buildings: 10 }
+    coverage: worldwide
+    find:
+      method: regions
+      index: "https://download.geofabrik.de/index-v1.json"
+      index_format: geofabrik
+      file: pbf
+      refresh_days: 7
+    read: whole
+    format: { type: osm-pbf, gives: [roads, places, buildings] }
+
+europe:
+  DE:
+    name: Germany
+    sources:
+      - id: berlin-dgm1
+        title: Berlin DGM1, 1 m terrain
+        holds: >-
+          Berlin's terrain model at 1 m: the bare ground's height, buildings
+          and trees taken off, as XYZ text in 2 km tiles.
+        licence: Datenlizenz Deutschland – Zero – 2.0
+        notice: "Geoportal Berlin: ATKIS® DGM1 — Datenlizenz Deutschland – Zero – Version 2.0 (dl-de/zero-2.0)"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://gdi.berlin.de/data/dgm1/atom/0.atom"
+          name: "(?P<x>\\d{3})_(?P<y>\\d{4})\\.zip$"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25833
+          refresh_days: 7
+        read: whole
+        format: { type: xyz, crs: EPSG:25833, spacing_m: 1, members: "*.xyz" }
+
+      - id: berlin-bdom
+        title: Berlin bDOM, 1 m surface
+        holds: >-
+          Berlin's surface model at 1 m, matched from aerial images: the
+          height of whatever is on top, roofs and tree crowns, as XYZ text in
+          2 km tiles.
+        licence: Datenlizenz Deutschland – Zero – 2.0
+        notice: "Geoportal Berlin: bDOM — Datenlizenz Deutschland – Zero – Version 2.0 (dl-de/zero-2.0)"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://gdi.berlin.de/data/bdom/atom/0.atom"
+          name: "(?P<x>\\d{3})_(?P<y>\\d{4})\\.zip$"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25833
+          refresh_days: 7
+        read: whole
+        format: { type: xyz, crs: EPSG:25833, spacing_m: 1, members: "*.xyz" }
+
+      - id: berlin-lod2
+        title: Berlin LoD2 building models
+        holds: >-
+          Berlin's 3D buildings at level of detail 2 (CityGML): each
+          building's footprint, roof shape and height, in 1 km tiles.
+        licence: Datenlizenz Deutschland – Zero – 2.0
+        notice: "Geoportal Berlin: 3D-Gebäudemodelle LoD2 — Datenlizenz Deutschland – Zero – Version 2.0 (dl-de/zero-2.0)"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://gdi.berlin.de/data/a_lod2/atom/0.atom"
+          name: "(?P<x>\\d{3})_(?P<y>\\d{4})\\.zip$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25833
+          refresh_days: 7
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25833, members: "*.xml" }
+
+      - id: zensus
+        title: Zensus 2022 100 m population grid
+        holds: Germany's 2022 census, people per 100 m grid cell, one CSV for the country.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "© Statistisches Bundesamt (Destatis), Zensus 2022 — Datenlizenz Deutschland – Namensnennung – Version 2.0 (dl-de/by-2-0)"
+        redistributable: true
+        layers: { population: 100 }
+        resolution_m: 100
+        coverage: outline
+        find:
+          method: file
+          url: "https://www.destatis.de/static/DE/zensus/gitterdaten/Zensus2022_Bevoelkerungszahl.zip"
+        read: whole
+        format:
+          type: csv-grid
+          members: "Zensus2022_Bevoelkerungszahl_100m-Gitter.csv"
+          delimiter: ";"
+          x: x_mp_100m
+          y: y_mp_100m
+          value: Einwohner
+          crs: EPSG:3035
+          cell_m: 100

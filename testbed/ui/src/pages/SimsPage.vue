@@ -12,27 +12,50 @@
         --geodata &lt;g&gt; --nodeset &lt;n&gt;</code> from a shell.
       </div>
 
-      <table v-else class="sims-table">
+      <template v-else>
+      <SelectBar :sel="sel">
+        <template #default="{ keys }">
+          <q-btn flat dense no-caps size="sm" :icon="matStop" label="Stop" color="negative"
+                 :disable="!rowsOf(keys).some(stoppable)" @click="askBulk('stop', keys)" />
+          <q-btn flat dense no-caps size="sm" :icon="matPause" label="Pause"
+                 :disable="!rowsOf(keys).some(s => s.state === 'running')" @click="askBulk('pause', keys)" />
+          <q-btn flat dense no-caps size="sm" :icon="matDeleteOutline" label="Delete"
+                 :disable="!keys.length" @click="askBulk('delete', keys)" />
+        </template>
+      </SelectBar>
+      <table class="sims-table">
         <thead>
           <tr>
+            <th class="sims-check"></th>
             <th>Simulation</th>
             <th>Nodeset</th>
             <th>Time</th>
             <th>Plan</th>
             <th>Finish</th>
             <th class="num">Stations</th>
-            <th></th>
+            <th class="num">Size</th>
+            <th class="sims-icon"></th>
+            <th class="sims-icon"></th>
+            <th class="sims-icon"></th>
+            <th class="sims-icon"></th>
+            <th class="sims-icon"></th>
+            <th class="sims-icon"></th>
           </tr>
         </thead>
         <tbody>
-          <template v-for="s in sim.sims" :key="`${s.state === 'ended' ? 'run' : 'sim'}:${s.name}`">
+          <template v-for="s in sim.sims" :key="s.run">
             <tr :class="{ 'sims-selected': s.name === sim.selected, 'sims-exited': s.state === 'exited',
-                          'sims-open': s.state === 'running' }"
+                          'sims-open': s.state === 'running', 'sims-chosen': sel.has(s.run) }"
                 @click="s.state === 'running' && sim.attach(s.name)">
+              <td class="sims-check" @click.stop>
+                <q-checkbox dense size="xs" :model-value="sel.has(s.run)" @update:model-value="sel.toggle(s.run)" />
+              </td>
               <td>
                 <span :class="s.state === 'running' ? 'sims-name' : 'sims-name-off'">{{ s.name }}</span>
-                <div class="sims-state" :class="`sims-state-${s.state}`">
-                  {{ s.state === 'exited' ? `exited (${s.code})` : s.state }}
+                <div class="sims-state" :class="`sims-state-${stateOf(s)}`">
+                  <q-icon v-if="stateOf(s) === 'done'" :name="matCheck" size="12px" />
+                  <q-icon v-else-if="stateOf(s) === 'paused'" :name="matPause" size="12px" />
+                  {{ stateText(s) }}
                 </div>
               </td>
               <td>
@@ -78,7 +101,7 @@
                   </div>
                 </template>
                 <span v-else-if="s.state === 'paused'" class="sims-sub">
-                  paused {{ s.paused_at ? clockTime(Date.parse(s.paused_at) / 1000) : '' }}
+                  {{ stateOf(s) }} {{ s.paused_at ? clockTime(Date.parse(s.paused_at) / 1000) : '' }}
                 </span>
                 <span v-else-if="s.state === 'ended'" class="sims-sub">
                   started {{ s.started_at ? clockTime(Date.parse(s.started_at) / 1000) : '—' }}
@@ -94,16 +117,29 @@
                   <div class="sims-sub">{{ others(s) }}</div>
                 </template>
               </td>
-              <td class="sims-actions" @click.stop>
-                <q-btn v-if="s.report" flat dense no-caps size="sm" label="Report" @click="reportOf = s.run" />
-                <q-btn v-if="s.state === 'paused'" flat dense no-caps size="sm" color="primary"
-                       :icon="matPlayArrow" label="Resume" @click="sim.resumeSim(s.name)">
-                  <q-tooltip>Start it again as it ended, in real time, in a new run directory; a script runs on it from the Scripts tab (on a paused one)</q-tooltip>
+              <td class="num mono">{{ sizeText(s.bytes) }}</td>
+              <td class="sims-icon" @click.stop>
+                <q-btn v-if="s.state === 'paused'" flat dense round size="sm" color="primary"
+                       :icon="matPlayArrow" aria-label="Resume" @click="sim.resumeSim(s.name)">
+                  <q-tooltip>Resume: start it again as it ended, in real time, in a new run directory; a script runs on it from the Scripts tab (on a paused one)</q-tooltip>
                 </q-btn>
-                <q-btn v-if="s.state === 'running'" flat dense no-caps size="sm" color="primary"
-                       :icon="matPause" label="Pause" @click="sim.pauseSim(s.name)">
-                  <q-tooltip>Stop it with its state kept: it stays listed, to be resumed as it ended</q-tooltip>
+              </td>
+              <td class="sims-icon" @click.stop>
+                <q-btn v-if="s.state === 'running'" flat dense round size="sm" color="primary"
+                       :icon="matPause" aria-label="Pause" @click="sim.pauseSim(s.name)">
+                  <q-tooltip>Pause: stop it with its state kept; it stays listed, to be resumed as it ended</q-tooltip>
                 </q-btn>
+              </td>
+              <td class="sims-icon" @click.stop>
+                <q-btn v-if="s.state === 'running' || s.state === 'starting' || s.state === 'stopping' || s.state === 'paused'"
+                       flat dense round size="sm" color="negative" :icon="matStop" aria-label="Stop"
+                       :disable="s.state === 'stopping'" @click="askStop(s)">
+                  <q-tooltip>{{ s.state === 'paused'
+                    ? 'Stop for good: the state it was kept with goes, so it can no longer be resumed'
+                    : 'Stop for good: its run stays on disk, its state is not kept for resuming' }}</q-tooltip>
+                </q-btn>
+              </td>
+              <td class="sims-icon" @click.stop>
                 <q-btn v-if="s.state === 'running'" flat dense round size="sm" aria-label="More">
                   <span class="sims-more">⋯</span>
                   <q-menu auto-close anchor="bottom right" self="top right">
@@ -124,23 +160,26 @@
                     </q-list>
                   </q-menu>
                 </q-btn>
-                <q-btn v-if="s.state === 'paused' || s.state === 'ended'" flat dense round size="sm"
-                       :icon="matDeleteOutline" color="grey-6" aria-label="Delete" @click="askDelete(s)">
-                  <q-tooltip>Delete the run: its directory, logs, report{{ s.state === 'paused' ? ' and saved state' : '' }}</q-tooltip>
+              </td>
+              <td class="sims-icon" @click.stop>
+                <q-btn v-if="s.report" flat dense round size="sm" :icon="matDescription" aria-label="Report"
+                       @click="reportOf = s.run">
+                  <q-tooltip>The run's report</q-tooltip>
                 </q-btn>
-                <q-btn v-if="s.state !== 'ended'" flat dense no-caps size="sm" color="negative"
-                       :icon="s.state === 'exited' ? undefined : matStop"
-                       :label="s.state === 'exited' ? 'Remove' : 'Stop'"
-                       :disable="s.state === 'stopping'" @click="askStop(s.name, s.state)">
-                  <q-tooltip v-if="s.state !== 'exited'">Stop it for good: its run stays on disk, its state is not kept for resuming</q-tooltip>
+              </td>
+              <td class="sims-icon" @click.stop>
+                <q-btn flat dense round size="sm" :icon="matDeleteOutline" color="grey-6" aria-label="Delete"
+                       :disable="s.state === 'stopping'" @click="askBulk('delete', [s.run])">
+                  <q-tooltip>Delete the run: its directory, logs, report{{ s.state === 'paused'
+                    ? ' and kept state' : '' }}{{ live(s) ? '; it is stopped first' : '' }}</q-tooltip>
                 </q-btn>
               </td>
             </tr>
             <tr v-if="s.state === 'exited' && s.tail.length" class="sims-tail-row">
-              <td colspan="7"><pre class="sims-tail">{{ s.tail.join('\n') }}</pre></td>
+              <td /><td colspan="13"><pre class="sims-tail">{{ s.tail.join('\n') }}</pre></td>
             </tr>
             <tr v-else-if="s.errors.length" class="sims-tail-row">
-              <td colspan="7" class="sims-errors">
+              <td /><td colspan="13" class="sims-errors">
                 <div v-for="([at, text], i) in s.errors" :key="i">
                   <span class="mono">{{ clockTime(at) }}</span> {{ text }}
                 </div>
@@ -149,6 +188,7 @@
           </template>
         </tbody>
       </table>
+      </template>
 
       <div class="sims-sub q-mt-lg">
         Each simulation is its own simd with its own ether, stations, network and
@@ -172,7 +212,9 @@
           <q-item v-for="s in catalog.snapshots" :key="s.name" clickable v-close-popup
                   @click="to(restoring!, 'snapshot_load', { name: s.name })">
             <q-item-section>{{ s.name }}</q-item-section>
-            <q-item-section side><span class="text-caption text-grey-6">{{ s.nodeset ?? '' }}</span></q-item-section>
+            <q-item-section side>
+              <span class="text-caption text-grey-6">{{ s.nodeset ?? '' }} · {{ sizeText(s.bytes as number | undefined) }}</span>
+            </q-item-section>
           </q-item>
         </q-list>
         <q-card-actions align="right"><q-btn flat no-caps label="Cancel" v-close-popup /></q-card-actions>
@@ -191,12 +233,91 @@ import { useCatalog } from '../stores/catalog'
 import { useSocket } from '../stores/socket'
 import { clockTime, etaText, phaseText, realText, simText, speedText } from '../components/runtime'
 import ReportDialog from '../components/ReportDialog.vue'
-import { matDeleteOutline, matPause, matPlayArrow, matStop } from '@quasar/extras/material-icons'
+import SelectBar from '../components/SelectBar.vue'
+import { useSelection } from '../lib/selection'
+import { sizeText } from '../lib/size'
+import {
+  matCheck, matDeleteOutline, matDescription, matPause, matPlayArrow, matStop,
+} from '@quasar/extras/material-icons'
 
 const sim = useSim()
 const catalog = useCatalog()
 const socket = useSocket()
 const quasar = useQuasar()
+/** The rows chosen by their checkboxes, by run directory. */
+const sel = useSelection(() => sim.sims.map(s => s.run))
+
+/** A row's state as the list says it: a pause its script asked for is the
+ *  script done, drawn apart from a pause a person asked for. */
+function stateOf(s: SimSummary): string {
+  return s.state === 'paused' && s.paused_by === 'script' ? 'done' : s.state
+}
+
+function stateText(s: SimSummary) {
+  return s.state === 'exited' ? `exited (${s.code})` : stateOf(s)
+}
+
+/** A simulation still on its run: deleting the run stops it first. */
+function live(s: SimSummary) {
+  return s.state === 'running' || s.state === 'starting' || s.state === 'stopping' || s.state === 'exited'
+}
+
+/** What Stop applies to: a running one, a paused or done one (its kept state
+ *  goes), and an exited one, which leaves the registry. */
+function stoppable(s: SimSummary) {
+  return s.state === 'running' || s.state === 'starting' || s.state === 'paused' || s.state === 'exited'
+}
+
+function rowsOf(keys: string[]): SimSummary[] {
+  const chosen = new Set(keys)
+  return sim.sims.filter(s => chosen.has(s.run))
+}
+
+function count(n: number, one: string, many = `${one}s`) { return `${n} ${n === 1 ? one : many}` }
+
+/* One confirmation for what the chosen rows get: each action skips the rows
+ * it does not apply to, and says so. */
+function askBulk(action: 'stop' | 'pause' | 'delete', keys: string[]) {
+  const rows = rowsOf(keys)
+  const fits = rows.filter(action === 'stop' ? stoppable
+    : action === 'pause' ? (s: SimSummary) => s.state === 'running' : () => true)
+  if (!fits.length) return
+  const skipped = rows.length - fits.length
+  const names = fits.map(s => s.state === 'ended' ? s.run.split('/').pop()! : s.name).join(', ')
+  let message: string
+  if (action === 'delete') {
+    const running = fits.filter(live).length
+    const kept = fits.filter(s => s.state === 'paused').length
+    message = `${names}: ${fits.length === 1 ? 'its run directory goes' : 'their run directories go'}, `
+      + 'with logs, record and report.'
+      + (running ? ` ${count(running, 'is', 'are')} still running and stopped first.` : '')
+      + (kept ? ` ${count(kept, 'kept state')} goes, and can no longer be resumed.` : '')
+  } else if (action === 'stop') {
+    const kept = fits.filter(s => s.state === 'paused').length
+    message = `${names}: stopped for good. Each run directory stays; nothing is saved to a `
+      + 'nodeset or as a snapshot.'
+      + (kept ? ` The state ${count(kept, 'paused or done one')} was kept with goes, so `
+        + `${kept === 1 ? 'it' : 'they'} can no longer be resumed.` : '')
+  } else {
+    message = `${names}: stopped with ${fits.length === 1 ? 'its' : 'their'} state kept, to be resumed as `
+      + `${fits.length === 1 ? 'it' : 'they'} ended.`
+  }
+  if (skipped) message += ` ${count(skipped, 'other')} chosen ${skipped === 1 ? 'is' : 'are'} left as ${skipped === 1 ? 'it is' : 'they are'}.`
+  const title = action === 'delete' ? `Delete ${count(fits.length, 'run')}`
+    : `${action === 'stop' ? 'Stop' : 'Pause'} ${count(fits.length, 'simulation')}`
+  quasar.dialog({
+    title, message,
+    ok: { label: title.split(' ')[0], color: action === 'pause' ? 'primary' : 'negative', flat: true, noCaps: true },
+    cancel: { flat: true, noCaps: true }, persistent: true,
+  }).onOk(() => {
+    for (const s of fits) {
+      if (action === 'delete') sim.deleteRun(s.run.split('/').pop()!, true)
+      else if (action === 'stop') sim.stopSim(s.name)
+      else sim.pauseSim(s.name)
+    }
+    if (action === 'delete') sel.none()
+  })
+}
 /** The run whose report is on show. */
 const reportOf = ref<string | null>(null)
 /** The simulation a snapshot is being chosen for, while the dialog is open. */
@@ -251,29 +372,18 @@ function phaseProgress(s: SimSummary) {
   return Math.min(1, Math.max(0, (s.t - from) / Math.max(1, until - from)))
 }
 
-function askDelete(s: SimSummary) {
-  const run = s.run.split('/').pop()!
+function askStop(s: SimSummary) {
   quasar.dialog({
-    title: `Delete ${run}`,
-    message: `Its run directory goes, with its logs, record and report${s.state === 'paused'
-      ? ', and the state it was paused with: it can no longer be resumed' : ''}.`,
-    cancel: true, persistent: true,
-  }).onOk(() => sim.deleteRun(run))
-}
-
-function askStop(simName: string, state: string) {
-  if (state === 'exited') { sim.stopSim(simName); return }
-  quasar.dialog({
-    title: `Stop ${simName}`,
-    message: state === 'paused'
-      ? 'The state it was paused with is deleted, so it can no longer be resumed; '
-        + 'the run directory stays, ended where it paused.'
+    title: `Stop ${s.name}`,
+    message: s.state === 'paused'
+      ? 'The state it was kept with is deleted, so it can no longer be resumed; '
+        + `the run directory stays, ended where it ${stateOf(s) === 'done' ? 'was done' : 'paused'}.`
       : 'Its stations are flushed and stopped and its simd ends. The run '
         + 'directory stays; nothing is saved to the nodeset or as a snapshot, and it cannot '
-        + 'be resumed (Pause keeps it resumable).',
+        + 'be resumed (pause keeps it resumable).',
     cancel: true,
     persistent: true,
-  }).onOk(() => sim.stopSim(simName))
+  }).onOk(() => sim.stopSim(s.name))
 }
 </script>
 
@@ -298,7 +408,11 @@ function askStop(simName: string, state: string) {
 .sims-open { cursor: pointer; }
 .sims-open:hover td { background: #1b2028; }
 .sims-state-paused { color: #a78bfa; }
+.sims-state-done { color: #2dd4bf; }
 .sims-state-ended { color: #6b7280; }
+.sims-check { width: 28px; padding-left: 2px !important; padding-right: 0 !important; }
+.sims-icon { width: 30px; padding-left: 0 !important; padding-right: 0 !important; text-align: center; }
+.sims-chosen td { background: #172030; }
 .sims-name-off { font-weight: 500; }
 .sims-state { font-size: 11px; color: #6b7280; }
 .sims-state-running { color: #22c55e; }
@@ -312,7 +426,6 @@ function askStop(simName: string, state: string) {
 .sims-phase-past { background: #3b82f6; }
 .sims-phase-now { background: #1e3a5f; }
 .sims-phase-fill { position: absolute; left: 0; top: 0; bottom: 0; background: #3b82f6; }
-.sims-actions { white-space: nowrap; text-align: right; }
 .sims-tail-row td { padding-top: 0; }
 .sims-tail {
   margin: 0; padding: 6px 8px; max-height: 180px; overflow: auto;
