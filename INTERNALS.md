@@ -725,20 +725,25 @@ build fetched.
 
 **The front chooses the sources; the compiler takes what it is given.**
 `sources.plan` takes every source of the source files whose coverage meets
-the rectangle (with the shipped ones: Berlin's 1 m pairs and LoD2 where it
-touches Berlin, the Zensus grid where it touches Germany, AHN, 3DBAG and
-CBS where it touches the Netherlands, GLO-30 and OpenStreetMap everywhere)
-and says what each is used for, so the page offers
-no choice and the dialog after **Build** reads the same list. `packbuild`
-hands each chosen source's files to the compiler input its format and layer
-go to (`packbuild.INPUTS`), never by the source's name, and refuses two
-sources for an input that takes one.
+the rectangle (with the shipped ones: the state surveys' terrain, surface
+and LoD2 where it touches Berlin, Brandenburg or Mecklenburg-Vorpommern,
+the Zensus grid where it touches Germany, AHN, 3DBAG and CBS where it
+touches the Netherlands, GLO-30 and OpenStreetMap everywhere) and says what
+each is used for, so the page offers no choice and the dialog after
+**Build** reads the same list. `packbuild` hands each chosen source's files
+to the compiler input its format and layer go to (`packbuild.INPUTS`), never
+by the source's name, and refuses two sources for an input that takes one.
+The 1 m pairs, LoD2 and the GeoTIFF terrain and surface take several, so a
+rectangle across Berlin and Potsdam, or across a state border, takes both
+states'.
 
 **Sources are data; some of the compiler's readers are still fixed.** A
 GeoTIFF terrain or surface comes with its proj string, a population grid
 with its delimiter, columns, projection and cell, CityJSON with its
 projection and height attributes, so those are any source's. XYZ and
-CityGML are read as Berlin's, land cover as WorldCover's classes, a
+CityGML are read as the German state surveys deliver them, in EPSG:25833
+(used as the grid in a zone-33 pack, projected in another), land cover as
+WorldCover's classes, a
 worldwide surface as EPSG:4326 (`sourcefile.COMPILER_READS` and the
 GeoTIFF rules), and `sourcefile.py` refuses a source that asks otherwise
 when the file is read: an entry the compiler would misread fails in
@@ -753,7 +758,11 @@ mean, clutter the representative height of the surface above it. A cell
 whose samples are three quarters missing keeps GLO-30's. The reader opens
 the coarsest level whose pixel is no larger than a quarter of the cell, the
 level a window fetched (below), so a sparse copy is only ever read where it
-holds data.
+holds data. A source's tiles are each opened once for their grid; a worker
+then opens a tile when a sample first lands on it and keeps at most eight
+open, the last one used tried first: a source of 1 km tiles is a hundred
+of them under a 10 km pack, past the 256 open files macOS allows a
+process if every worker opened all.
 
 **A window is a sparse copy of the whole file.** `read: window` fetches a
 cloud-optimised GeoTIFF's first 256 KB, walks its directories (TIFF and

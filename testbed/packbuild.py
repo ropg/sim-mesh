@@ -58,8 +58,10 @@ INPUTS = {
     ("csv-grid", "population", False): "population",
     ("gpkg-grid", "population", False): "population",
 }
-# The inputs that take several sources; every other takes one.
-MANY = ("berlin_1m_dir", "elevation_terrain", "elevation_surface")
+# The inputs that take several sources; every other takes one. LoD2 is one
+# directory of CityGML the compiler reads whole, so a rectangle across two
+# states (Berlin and Potsdam) takes both.
+MANY = ("berlin_1m_dir", "lod2_dir", "elevation_terrain", "elevation_surface")
 
 
 class Build:
@@ -200,14 +202,15 @@ class Build:
             "cityjson": None, "threads": 0,
         }
         shutil.rmtree(self.inputs, ignore_errors=True)
-        if one("lod2_dir"):
-            params["lod2_dir"] = self.link_dir("lod2", extracted(one("lod2_dir")))
+        if given.get("lod2_dir"):
+            params["lod2_dir"] = self.link_dir(
+                "lod2", [p for s in given["lod2_dir"] for p in extracted(s)])
         if given.get("berlin_1m_dir"):
             # Terrain first, as the pairs have always been laid out.
             ids = sorted(given["berlin_1m_dir"], key=lambda s: "terrain" not in reg[s].layers)
             params["berlin_1m_dir"] = self.link_dir(
                 "berlin-1m", [p for s in ids for p in extracted(s)])
-        params["elevation"] = self.elevation(given, reg, have)
+        params["elevation"] = self.elevation(given, reg, have, extracted)
         if one("cityjson"):
             s = reg[one("cityjson")]
             params["cityjson"] = {
@@ -229,28 +232,32 @@ class Build:
                                             notice=s.notice or "")
         return params
 
-    def elevation(self, given, reg, have):
+    def elevation(self, given, reg, have, extracted):
         """Regional terrain and surface GeoTIFFs as the compiler's pairs: the
-        terrain and the surface sources in one system together, read at a
-        quarter of a cell. A system with only one of the two is no pair, and
-        said so."""
+        terrain and the surface sources in one system and with one no-data
+        value together, read at a quarter of a cell. A system with only one
+        of the two is no pair, and said so. A source whose tiles come zipped
+        (Brandenburg's) gives the GeoTIFFs in them."""
         by_proj = {}
         for role in ("terrain", "surface"):
             for source_id in given.get("elevation_" + role, ()):
                 s = reg[source_id]
-                pair = by_proj.setdefault(sourcefile.proj_of(s), {"terrain": [], "surface": []})
+                key = (sourcefile.proj_of(s), s.format.get("nodata"))
+                pair = by_proj.setdefault(key, {"terrain": [], "surface": []})
                 pair[role].append(s)
+        tiffs = lambda s: (extracted if s.format.get("members") else have)(s.id)  # noqa: E731
         out = []
-        for proj, pair in by_proj.items():
+        for (proj, nodata), pair in by_proj.items():
             if not pair["terrain"] or not pair["surface"]:
                 lone = (pair["terrain"] or pair["surface"])[0]
                 raise store.StoreError("%s has no %s to pair with in its system" % (
                     lone.title, "surface" if pair["terrain"] else "terrain"))
             both = pair["terrain"] + pair["surface"]
             out.append({
-                "terrain": [p for s in pair["terrain"] for p in have(s.id)],
-                "surface": [p for s in pair["surface"] for p in have(s.id)],
+                "terrain": [p for s in pair["terrain"] for p in tiffs(s)],
+                "surface": [p for s in pair["surface"] for p in tiffs(s)],
                 "proj": proj, "pixel_m": float(self.spec["res_m"]) / 4.0,
+                "nodata": None if nodata is None else float(nodata),
                 "source": " and ".join(s.title for s in both),
                 "notice": " / ".join(dict.fromkeys(s.notice or "" for s in both))})
         return out

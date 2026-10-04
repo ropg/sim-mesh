@@ -125,13 +125,15 @@ struct PopulationJob {
     notice: String,
 }
 
-/// {terrain: [path], surface: [path], proj, pixel_m, source, notice}
+/// {terrain: [path], surface: [path], proj, pixel_m, nodata?, source, notice}
 #[derive(Debug, Deserialize)]
 struct ElevationJob {
     terrain: Vec<PathBuf>,
     surface: Vec<PathBuf>,
     proj: String,
     pixel_m: f64,
+    #[serde(default)]
+    nodata: Option<f32>,
     source: String,
     notice: String,
 }
@@ -213,6 +215,7 @@ fn pack_build(input: &str) -> Result<Value, String> {
                 surface: e.surface,
                 proj: e.proj,
                 pixel_m: e.pixel_m,
+                nodata: e.nodata,
                 source: e.source,
                 notice: e.notice,
             })

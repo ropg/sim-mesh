@@ -108,6 +108,24 @@ def test_only_the_feed_tiles_meeting_the_rectangle_are_chosen():
     assert sources.atom_files(lod2, FEED, [12.0, 52.5, 12.1, 52.6]) == []
 
 
+def test_a_listing_and_a_download_service_give_whole_addresses_and_names():
+    # Brandenburg's tiles are a directory listing's relative links.
+    listing = '<a href="?C=N;O=D">Name</a><a href="dgm_33367-5806.zip">dgm_33367-5806.zip</a>'
+    got = sources.atom_files(SHIPPED["brandenburg-dgm1"], listing, [13.0492, 52.3904, 13.0563, 52.3950])
+    assert [(f.url, f.name) for f in got] == [
+        ("https://data.geobasis-bb.de/geobasis/daten/dgm/tif/dgm_33367-5806.zip",
+         "dgm_33367-5806.zip")]
+    assert got[0].members == "*.tif"
+    # M-V's are a download service's, XML-escaped, the name in the query.
+    feed = ('<link href="https://www.geodaten-mv.de/dienste/dgm_download?index=1&amp;dataset=x'
+            '&amp;file=dgm1_33_262_5946_2_xyz.zip"/>')
+    got = sources.atom_files(SHIPPED["mv-dgm1"], feed, [11.40, 53.62, 11.42, 53.63])
+    assert [(f.url, f.name) for f in got] == [
+        ("https://www.geodaten-mv.de/dienste/dgm_download?index=1&dataset=x"
+         "&file=dgm1_33_262_5946_2_xyz.zip", "dgm1_33_262_5946_2_xyz.zip")]
+    assert sources.file_name("https://gdi.berlin.de/x/DGM1_390_5818.zip") == "DGM1_390_5818.zip"
+
+
 # ---- a host of the test's own --------------------------------------------------
 
 def host_app(root, calls):
@@ -223,7 +241,8 @@ def serve_sources(root):
 
 def served_sources(tmp_path, base):
     """The shipped source file with every address on the test's host, and
-    its outlines beside it: the sources a build is planned from."""
+    its outlines beside it: the sources a build is planned from, only those
+    the host serves (no test reaches out to a real one)."""
     text = open(sourcefile.SHIPPED, encoding="utf-8").read()
     for old, new in (
             ("https://copernicus-dem-30m.s3.amazonaws.com/{tile}/{tile}.tif", "/glo30/{tile}.tif"),
@@ -244,7 +263,9 @@ def served_sources(tmp_path, base):
     (here / "sources.yaml").write_text(text)
     shutil.copytree(os.path.join(os.path.dirname(sourcefile.SHIPPED), "outlines"),
                     here / "outlines", dirs_exist_ok=True)
-    return sourcefile.load((str(here / "sources.yaml"),))
+    served = ("glo30", "worldcover", "itu", "geofabrik", "berlin-dgm1", "berlin-bdom",
+              "berlin-lod2", "zensus")
+    return {k: v for k, v in sourcefile.load((str(here / "sources.yaml"),)).items() if k in served}
 
 
 def test_each_source_says_what_it_is_used_for():
@@ -265,8 +286,9 @@ def test_each_source_says_what_it_is_used_for():
 
 def test_the_shipped_sources_hold_together():
     assert list(SHIPPED) == ["glo30", "worldcover", "itu", "geofabrik", "berlin-dgm1",
-                             "berlin-bdom", "berlin-lod2", "zensus", "ahn-dtm", "ahn-dsm",
-                             "3dbag", "cbs-population"]
+                             "berlin-bdom", "berlin-lod2", "zensus", "brandenburg-dgm1",
+                             "brandenburg-bdom", "brandenburg-lod2", "mv-dgm1", "mv-dom1",
+                             "mv-lod2", "ahn-dtm", "ahn-dsm", "3dbag", "cbs-population"]
     for source in SHIPPED.values():
         assert source.worldwide == (source.continent == sourcefile.GLOBAL)
         assert source.worldwide or source.outline["type"] in ("Polygon", "MultiPolygon")
@@ -286,6 +308,7 @@ def test_the_shipped_sources_hold_together():
     (lambda e: e.update(read="stream"), "read is whole or window"),
     (lambda e: e.update(read="window"), "a window is read of a regional source's cloud-optimised"),
     (lambda e: e["format"].update(crs="EPSG:4326"), "the compiler reads xyz"),
+    (lambda e: e["format"].update(nodata=-9999), "format.nodata is the number a GeoTIFF"),
     (lambda e: e.update(notice=None), "gives the notice"),
 ])
 def test_a_source_that_does_not_hold_together_is_refused_saying_why(tmp_path, change, why):

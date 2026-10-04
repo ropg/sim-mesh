@@ -55,6 +55,7 @@ import asyncio
 import contextlib
 import gzip
 import hashlib
+import html
 import json
 import math
 import os
@@ -62,6 +63,7 @@ import re
 import shutil
 import struct
 import time
+import urllib.parse
 import zipfile
 
 import aiohttp
@@ -244,14 +246,28 @@ def template_pattern(source):
 HREF_RE = re.compile(r'href="([^"]+)"')
 
 
+def file_name(url):
+    """The name a tile is kept under: the last part of its address, or for
+    a download service's address (M-V's `dgm_download?…&file=<name>`) the
+    last value in its query that is a file name."""
+    parts = urllib.parse.urlsplit(url)
+    named = [v for _k, v in urllib.parse.parse_qsl(parts.query) if "." in v and "/" not in v]
+    return named[-1] if named else parts.path.rsplit("/", 1)[-1]
+
+
 def atom_tiles(source, feed_text):
-    """A feed's tiles: [(url, x, y)], the corner in the feed's units."""
+    """A feed's tiles: [(url, x, y)], the corner in the feed's units. A
+    link is read as XML writes it (M-V's carry `&amp;`), and one relative
+    to the feed's address (a directory listing's, Brandenburg's) is made
+    whole."""
     name = re.compile(source.find["name"])
+    base = source.address("feed")
     out = []
     for href in HREF_RE.findall(feed_text):
-        m = name.search(href)
+        url = urllib.parse.urljoin(base, html.unescape(href))
+        m = name.search(url)
         if m:
-            out.append((href, int(m.group("x")), int(m.group("y"))))
+            out.append((url, int(m.group("x")), int(m.group("y"))))
     return out
 
 
@@ -266,7 +282,7 @@ def atom_files(source, feed_text, bbox):
     """The tiles of a feed that meet the rectangle's grid."""
     x0, y0, x1, y1 = atom_box(source, bbox)
     size = float(source.find["size_m"]) / float(source.find["unit_m"])
-    return [File(source.id, url, url.rsplit("/", 1)[1], source.members(), missing=_missing(source))
+    return [File(source.id, url, file_name(url), source.members(), missing=_missing(source))
             for url, e, n in atom_tiles(source, feed_text)
             if e < x1 and e + size > x0 and n < y1 and n + size > y0]
 
