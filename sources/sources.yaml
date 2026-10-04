@@ -193,6 +193,139 @@ europe:
           crs: EPSG:3035
           cell_m: 100
 
+      - id: brandenburg-dgm1
+        title: Brandenburg DGM, 1 m terrain
+        holds: >-
+          Brandenburg's terrain model from lidar at 1 m: the bare ground's
+          height, as GeoTIFF in 1 km tiles.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "© GeoBasis-DE/LGB, dl-de/by-2-0"
+        redistributable: true
+        layers: { terrain: 90 }             # its outline holds Berlin, whose own come first
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://data.geobasis-bb.de/geobasis/daten/dgm/tif/"
+          name: "dgm_33(?P<x>\\d{3})-(?P<y>\\d{4})\\.zip$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25833
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25833, nodata: -9999, members: "*.tif" }
+
+      - id: brandenburg-bdom
+        title: Brandenburg bDOM, 0.2 m surface
+        holds: >-
+          Brandenburg's surface model at 0.2 m, matched from aerial images:
+          the height of whatever is on top, roofs and tree crowns, as GeoTIFF
+          in 1 km tiles of about 20 MB.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "© GeoBasis-DE/LGB, dl-de/by-2-0"
+        redistributable: true
+        layers: { surface: 90 }
+        resolution_m: 0.2
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://data.geobasis-bb.de/geobasis/daten/bdom/tif/"
+          name: "bdom_33(?P<x>\\d{3})-(?P<y>\\d{4})\\.zip$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25833
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25833, nodata: -9999, members: "*.tif" }
+
+      - id: brandenburg-lod2
+        title: Brandenburg LoD2 building models
+        holds: >-
+          Brandenburg's 3D buildings at level of detail 2 (CityGML): each
+          building's footprint, roof shape and height, in 1 km tiles.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "© GeoBasis-DE/LGB, dl-de/by-2-0"
+        redistributable: true
+        layers: { buildings: 90 }
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://data.geobasis-bb.de/geobasis/daten/3d_gebaeude/lod2_gml/"
+          name: "lod2_33(?P<x>\\d{3})-(?P<y>\\d{4})\\.zip$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25833
+          refresh_days: 30
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25833, members: "*.gml" }
+
+      - id: mv-dgm1
+        title: Mecklenburg-Vorpommern DGM1, 1 m terrain
+        holds: >-
+          Mecklenburg-Vorpommern's terrain model from lidar at 1 m: the bare
+          ground's height, as XYZ text in 2 km tiles.
+        licence: CC BY 4.0
+        notice: "© GeoBasis-DE/M-V (2025), CC BY 4.0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://www.geodaten-mv.de/dienste/dgm_atom?type=dataset&id=ca268792-s2q1-4a39-b34c-9ec5bf9a4469"
+          name: "dgm1_33_(?P<x>\\d{3})_(?P<y>\\d{4})_2_xyz\\.zip$"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25833
+          refresh_days: 30
+        read: whole
+        format: { type: xyz, crs: EPSG:25833, spacing_m: 1, members: "*.xyz" }
+
+      - id: mv-dom1
+        title: Mecklenburg-Vorpommern DOM1, 1 m surface
+        holds: >-
+          Mecklenburg-Vorpommern's surface model from lidar at 1 m: the
+          height of whatever is on top, roofs and tree crowns, as XYZ text in
+          2 km tiles.
+        licence: CC BY 4.0
+        notice: "© GeoBasis-DE/M-V (2025), CC BY 4.0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://www.geodaten-mv.de/dienste/dom_atom?type=dataset&id=us214578-a1n5-4v12-v31c-5tg2az3a2164"
+          name: "dom1_33_(?P<x>\\d{3})_(?P<y>\\d{4})_2_xyz\\.zip$"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25833
+          refresh_days: 30
+        read: whole
+        format: { type: xyz, crs: EPSG:25833, spacing_m: 1, members: "*.xyz" }
+
+      - id: mv-lod2
+        title: Mecklenburg-Vorpommern LoD2 building models
+        holds: >-
+          Mecklenburg-Vorpommern's 3D buildings at level of detail 2
+          (CityGML): each building's footprint, roof shape and height, in
+          2 km tiles.
+        licence: CC BY 4.0
+        notice: "© GeoBasis-DE/M-V (2025), CC BY 4.0"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://www.geodaten-mv.de/dienste/gebaeude_atom?type=dataset&id=8397b554-5cb9-4274-8be8-c20490d9a6e8"
+          name: "lod2_33_(?P<x>\\d{3})_(?P<y>\\d{4})_2_gml\\.zip$"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25833
+          refresh_days: 30
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25833, members: "*.gml" }
+
   NL:
     name: Netherlands
     sources:

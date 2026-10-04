@@ -336,6 +336,9 @@ def _check_format(source):
     if "crs" in fmt and not crs_module.known(fmt["crs"]):
         raise _fault(path, ident, "format.crs %s is not a system sim-mesh knows (%s)"
                      % (fmt["crs"], KNOWN_CRS))
+    if "nodata" in fmt and (kind != "geotiff" or not _number(fmt["nodata"])):
+        raise _fault(path, ident, "format.nodata is the number a GeoTIFF of heights writes "
+                                  "where it has none")
     if kind == "csv-grid" and len(str(fmt["delimiter"])) != 1:
         raise _fault(path, ident, "a csv-grid's delimiter is one character")
     if kind in ("csv-grid", "gpkg-grid") and not (_number(fmt["cell_m"]) and fmt["cell_m"] > 0):

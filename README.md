@@ -534,12 +534,13 @@ The sources are not a choice: the build takes every source whose coverage
 meets the rectangle ([Sources](#sources)), and in each layer the one of the
 highest priority there for each part of it. With the sources sim-mesh ships:
 
-- **terrain and clutter**: Berlin's DGM1 and bDOM (1 m terrain and surface)
-  where the rectangle touches Berlin, AHN's (0.5 m) where it touches the
-  Netherlands, Copernicus GLO-30 everywhere else;
-- **buildings**: Berlin's LoD2 models where the rectangle touches Berlin,
-  3DBAG's where it touches the Netherlands, OpenStreetMap's everywhere else
-  (an OpenStreetMap building on a LoD2 or 3DBAG tile is left out);
+- **terrain and clutter**: the state surveys' 1 m terrain and their surface
+  models where the rectangle touches Berlin, Brandenburg or
+  Mecklenburg-Vorpommern, AHN's (0.5 m) where it touches the Netherlands,
+  Copernicus GLO-30 everywhere else;
+- **buildings**: the same states' LoD2 models, 3DBAG's in the Netherlands,
+  OpenStreetMap's everywhere else (an OpenStreetMap building on a LoD2 or
+  3DBAG tile is left out);
 - **population**: the Zensus 2022 grid where the rectangle touches Germany,
   CBS's 2023 grid where it touches the Netherlands, none elsewhere;
 
@@ -570,6 +571,8 @@ is fetched once, resumed where it stopped, and one its host does not have
 | OpenStreetMap extract (roads, places, sites, buildings) | the world | Geofabrik: the smallest extract whose outline holds the rectangle |
 | P.1812-8 ΔN and N0 maps | the world | `itu.int`, kept here, never packed |
 | DGM1, bDOM, LoD2 | Berlin | `gdi.berlin.de`'s ATOM feeds: only the tiles meeting the rectangle |
+| DGM, bDOM (0.2 m), LoD2 | Brandenburg | `data.geobasis-bb.de`'s directory listings: only the tiles meeting the rectangle |
+| DGM1, DOM1, LoD2 | Mecklenburg-Vorpommern | `geodaten-mv.de`'s ATOM feeds: only the tiles meeting the rectangle; the host does not resume a broken download |
 | Zensus 2022 100 m grid | Germany | `destatis.de` |
 | AHN DTM and DSM, 0.5 m | the Netherlands | PDOK's sheet index (`service.pdok.nl`): only the windows of the sheets meeting the rectangle |
 | 3DBAG buildings | the Netherlands | `data.3dbag.nl`'s tile index: only the tiles meeting the rectangle |
@@ -646,8 +649,11 @@ europe:                             # a continent
   names: each footprint meeting the rectangle is a file, its address the
   `url_property`, its checksum the `sha256_property` when it has one),
   `regions` (Geofabrik's index, the smallest region holding the rectangle)
-  or `file`. Any address may be a list: mirrors, tried in order. A file no
-  host has is no data there (`missing: error` makes it a failed build).
+  or `file`. A feed may also be a web server's directory listing, its
+  links relative (Brandenburg's); a link whose file name is in its query
+  (`…?file=<name>`, M-V's download service) is kept under that name. Any
+  address may be a list: mirrors, tried in order. A file no host has is no
+  data there (`missing: error` makes it a failed build).
 - **Reading** is `whole`, the file, resumed when a fetch breaks off, or
   `window`, for a regional cloud-optimised GeoTIFF: its directories and only
   the chunks the rectangle meets, at the coarsest level whose pixel is no
@@ -656,10 +662,14 @@ europe:                             # a continent
   Delft-sized pack takes about 10 MB of an AHN sheet's 330 MB.
 - **Formats**, with their parameters:
   - `geotiff` (`band`; `crs` when it is not EPSG:4326; `classes` for land
-    cover, which must be WorldCover's). A worldwide one is a surface in
-    EPSG:4326; a regional one is a terrain or a surface in any projection
-    sim-mesh knows.
-  - `xyz` and `citygml`, Berlin's layouts.
+    cover, which must be WorldCover's; `nodata` for heights, the value a
+    file writes where it has none; `members` when the tiles come zipped).
+    A worldwide one is a surface in EPSG:4326; a regional one is a terrain
+    or a surface in any projection sim-mesh knows.
+  - `xyz` and `citygml`, in EPSG:25833 as Berlin, Brandenburg and
+    Mecklenburg-Vorpommern deliver them: XYZ terrain and surface tiles are
+    paired by `dgm1_33_E_N` and `dom1_33_E_N` in their names. A pack outside
+    UTM zone 33 takes them projected into its own zone.
   - `cityjson` (`crs`, and the attributes that hold the `ground` and `roof`
     heights): each Building's LoD0 footprint, as tall as roof less ground.
   - `csv-grid` (`delimiter`, the `x`, `y` and `value` columns, `crs`,
@@ -673,12 +683,15 @@ europe:                             # a continent
   and ETRS89 zones) and RD New (EPSG:28992, and EPSG:7415 for its heights).
 - **Layers** are `surface`, `terrain`, `landcover`, `buildings`,
   `population`, `roads`, `places` and `radio-climate`, each source with its
-  priority in each. Berlin's and the Netherlands' terrain, surface and
-  buildings are 100 to GLO-30's and OpenStreetMap's 10.
+  priority in each. Berlin's, Mecklenburg-Vorpommern's and the Netherlands'
+  terrain, surface and buildings are 100 to GLO-30's and OpenStreetMap's
+  10; Brandenburg's are 90, since its outline holds Berlin, whose own come
+  first there.
 
-Shipped beyond the worldwide set: Germany (Berlin's DGM1, bDOM and LoD2,
-and the Zensus 2022 grid) and the Netherlands (AHN's 0.5 m terrain and
-surface, the 3DBAG buildings and CBS's 100 m population grid).
+Shipped beyond the worldwide set: Germany (Berlin's, Brandenburg's and
+Mecklenburg-Vorpommern's terrain, surface and LoD2, and the Zensus 2022
+grid) and the Netherlands (AHN's 0.5 m terrain and surface, the 3DBAG
+buildings and CBS's 100 m population grid).
 
 An id is one source: a person's file may not take one sim-mesh ships (a
 second address for the same data is a mirror, in the shipped entry). Every
@@ -2587,6 +2600,10 @@ cd sim-mesh/ether   && python3 -m pytest -q      # the medium and both conductor
 cd sim-mesh/radio   && python3 -m pytest -q tests  # the chip model, the conductor, the time shim
 cd sim-mesh/testbed/ui && npx vue-tsc --noEmit && npx quasar build
 ```
+
+No testbed test reaches a host outside this machine: one that fetches
+serves the files itself on loopback, and `testbed/conftest.py` fails any
+lookup of another host at once, naming it.
 
 The testbed's tests run stand-in firmware (`testbed/stub_firmware.py`): a
 shell script for a station and a driver that writes down what it is asked.
