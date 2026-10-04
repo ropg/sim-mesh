@@ -150,8 +150,19 @@ def resolve(address):
         raise IndexFault("an index's address is a URL or a path")
     if is_url(address):
         return address + INDEX_FILE if address.endswith("/") else address
-    path = os.path.abspath(os.path.expanduser(address))
+    path = caller_path(address)
     return os.path.join(path, INDEX_FILE) if os.path.isdir(path) else path
+
+
+def caller_path(path):
+    """A path a person gave, absolute: a relative one is read from where
+    `sim` was run (SIM_MESH_CALLER_DIR, which it passes into its container),
+    else from here."""
+    path = os.path.expanduser(str(path))
+    base = os.environ.get("SIM_MESH_CALLER_DIR")
+    if not os.path.isabs(path) and base:
+        path = os.path.join(base, path)
+    return os.path.abspath(path)
 
 
 def entry_url(address, url):
@@ -543,7 +554,7 @@ HEAD_KEYS = ("index", "title", "description", "release")
 
 def index_file(path):
     """A local index's file: a directory means its index.yaml."""
-    path = os.path.abspath(os.path.expanduser(str(path)))
+    path = caller_path(path)
     if os.path.isdir(path):
         path = os.path.join(path, INDEX_FILE)
     if not os.path.isfile(path):
@@ -907,7 +918,7 @@ def _geodata_cli(args):
     elif args.verb == "add":
         zips = [n for n in args.names if n.endswith(".zip") or os.sep in n]
         for path in zips:
-            gd = geodata_module.import_zip(path)
+            gd = geodata_module.import_zip(caller_path(path))
             print("added geodata %s from %s" % (gd.name, path))
         rest = [n for n in args.names if n not in zips]
         if rest:

@@ -565,7 +565,12 @@ def main(argv=None):
 
     try:
         if args.verb == "add":
+            # A relative path is read from where `sim` was run, which it
+            # passes into its container.
+            base = os.environ.get("SIM_MESH_CALLER_DIR")
             for source in args.zip:
+                if "://" not in source and base and not os.path.isabs(source):
+                    source = os.path.join(base, source)
                 got = asyncio.run(add(source))
                 print("added %s" % got["name"])
         elif args.verb == "list":
