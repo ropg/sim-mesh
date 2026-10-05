@@ -71,7 +71,9 @@ built from `planner/` (by `sim` as it starts) to
 `planner/target/release/planner-web`; not built, a pack is refused with
 NO_PLANNER and synthetic ground works. The page reaches it as `/planner/<geodata>/…`, passed through with
 the prefix stripped; a child is given its URL directly, for recomputing a
-moved node's row.
+moved node's row. It is given the coverage cache (`--coverage-dir`), whose
+rasters it combines into the bands of the view the page shows
+(`/coverage/bands.bin`).
 
 **Script runs.** A script runs as a process of its own (`sim_mesh.runner`),
 its output kept (the last `SCRIPT_LINES` lines) and sent to every page as it
@@ -550,6 +552,7 @@ class Sidecars:
             with open(car.log_path, "ab") as out:
                 car.process = await asyncio.create_subprocess_exec(
                     binary, "--pack", car.pack, "--host", "127.0.0.1", "--port", str(car.port),
+                    "--coverage-dir", store.COVERAGE_DIR,
                     stdin=asyncio.subprocess.DEVNULL, stdout=out, stderr=out,
                     start_new_session=True, preexec_fn=die_with_parent)
         except OSError as err:

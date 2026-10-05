@@ -51,14 +51,19 @@ export function wasm(): Promise<unknown> {
   return ready
 }
 
-/** GET, backing off while the sidecar sheds load with 429. */
-export async function getWithBackoff(url: string, signal?: AbortSignal): Promise<Response> {
+/** A request, asked again after a growing pause while the sidecar sheds load with 429. */
+async function withBackoff(ask: () => Promise<Response>, signal?: AbortSignal): Promise<Response> {
   for (let attempt = 0; ; attempt++) {
-    const r = await fetch(url, { signal })
+    const r = await ask()
     if (r.status !== 429 || attempt >= 6) return r
     await new Promise(res => setTimeout(res, 150 * (attempt + 1)))
     if (signal?.aborted) throw new DOMException('aborted', 'AbortError')
   }
+}
+
+/** GET, backing off while the sidecar sheds load with 429. */
+export function getWithBackoff(url: string, signal?: AbortSignal): Promise<Response> {
+  return withBackoff(() => fetch(url, { signal }), signal)
 }
 
 function boxQuery(b: Box, w: number, h: number, extra: Record<string, string | number> = {}) {
@@ -259,24 +264,6 @@ export async function roads(base: string, box: Box, signal?: AbortSignal): Promi
   return ways
 }
 
-/** The terrain on a grid of w×h cells over `box`, as tile.bin gives it
- *  (it may send fewer cells than asked, never more). */
-export async function terrainGrid(base: string, box: Box, w: number, h: number,
-                                  signal?: AbortSignal): Promise<Grid> {
-  const res = await getWithBackoff(`${base}/tile.bin?${boxQuery(box, w, h, { terrain_only: 1 })}`, signal)
-  if (!res.ok) throw new Error(`tile ${res.status}`)
-  const d = decodeTile(await res.arrayBuffer())
-  return { w: d.w, h: d.h, ox: d.ox, oy: d.oy, rx: d.rx, ry: d.ry, terrain: d.terrain }
-}
-
-/** The terrain of a grid at (x, y), the nearest cell's, or null off it or where it has none. */
-export function terrainAt(g: Grid, x: number, y: number): number | null {
-  const col = Math.round((x - g.ox) / Math.abs(g.rx)), row = Math.round((g.oy - y) / Math.abs(g.ry))
-  if (col < 0 || row < 0 || col >= g.w || row >= g.h) return null
-  const v = g.terrain[row * g.w + col]!
-  return Number.isFinite(v) ? v : null
-}
-
 /** Ground and clutter height at one point, from the pack's rasters. */
 export async function sample(base: string, x: number, y: number,
                              signal?: AbortSignal): Promise<{ ground: number; clutter: number | null }> {
@@ -290,6 +277,56 @@ export async function sample(base: string, x: number, y: number,
   const row = Math.min(d.h - 1, Math.max(0, Math.round((d.oy - y) / Math.abs(d.ry))))
   const k = row * d.w + col
   return { ground: d.terrain[k]!, clutter: d.clutter ? d.clutter[k]! : null }
+}
+
+/** One node of a coverage view: its raster's key, where it stands, what it
+ *  has to spend (its power and the receiver's gain less the decoding
+ *  threshold) and its antenna's pattern and aim, null with none. */
+export interface BandsNode {
+  key: string; x: number; y: number; height_m: number; budget_db: number
+  antenna: {
+    directional: boolean; peak_dbi: number; vbw_deg: number; tilt_deg: number; hbw_deg: number | null
+    floor_db: number; azimuth_deg: number; elevation_deg: number
+  } | null
+}
+
+/** No band reached: below the last one's margin, or no raster there. */
+export const NO_BAND = 255
+
+/**
+ * The coverage band of every `px`-pixel square of a view `w`×`h` CSS pixels
+ * at `at`, over `nodes`, which the sidecar works out from their rasters in
+ * the front's cache: an index into `bands` (each one's least margin, the
+ * best first), NO_BAND where none is reached, rows from the top. Every
+ * number goes as JavaScript writes it, in a string, which the sidecar reads
+ * exactly.
+ */
+export async function coverageBands(base: string, ask: {
+  geodata: string; at: { cx: number; cy: number; mpp: number }; w: number; h: number; px: number
+  bands: number[]; rxH: number; nodes: BandsNode[]
+}, signal?: AbortSignal): Promise<Uint8Array> {
+  const s = String
+  const body = JSON.stringify({
+    geodata: ask.geodata, cx: s(ask.at.cx), cy: s(ask.at.cy), mpp: s(ask.at.mpp),
+    w: s(ask.w), h: s(ask.h), px: s(ask.px), bands: ask.bands.map(s), rx_h: s(ask.rxH),
+    nodes: ask.nodes.map(n => ({
+      key: n.key, x: s(n.x), y: s(n.y), height_m: s(n.height_m), budget_db: s(n.budget_db),
+      antenna: n.antenna && {
+        directional: n.antenna.directional, peak_dbi: s(n.antenna.peak_dbi), vbw_deg: s(n.antenna.vbw_deg),
+        tilt_deg: s(n.antenna.tilt_deg), hbw_deg: n.antenna.hbw_deg === null ? null : s(n.antenna.hbw_deg),
+        floor_db: s(n.antenna.floor_db), azimuth_deg: s(n.antenna.azimuth_deg),
+        elevation_deg: s(n.antenna.elevation_deg),
+      },
+    })),
+  })
+  const r = await withBackoff(() => fetch(`${base}/coverage/bands.bin`, {
+    method: 'POST', body, headers: { 'Content-Type': 'application/json' }, signal,
+  }), signal)
+  if (!r.ok) throw new Error((await r.text()).trim() || `coverage ${r.status}`)
+  const buf = await r.arrayBuffer()
+  const dv = new DataView(buf)
+  if (magic(dv) !== 'PCB1') throw new Error('not a coverage reply')
+  return new Uint8Array(buf, 12, dv.getUint32(4, true) * dv.getUint32(8, true))
 }
 
 /** One building's footprint: its rings in absolute metres, its roof above sea level. */

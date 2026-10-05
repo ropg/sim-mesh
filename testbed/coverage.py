@@ -8,7 +8,8 @@ front ── GET /loss/status … until the sweep is whole ───────
 front ── GET /loss.bin?lat&lon&minx&miny&maxx&maxy&w&h ───────────► planner-web
 front: testbed/coverage/<geodata>/<key>.bin
 front ── coverage_tile {geodata, node, key} ─────────────────────► page       as each lands
-page ── GET /api/coverage?geodata=&key= ─────────────────────────► front      the raster
+page ── POST /planner/<geodata>/coverage/bands.bin {view, nodes} ► planner-web  the view's bands
+planner-web: testbed/coverage/<geodata>/<key>.bin, one per node (--coverage-dir)
 ```
 
 A raster is the planner's own point-to-area sweep (`planner-coverage`) from
@@ -22,8 +23,10 @@ the first cell, 65535 where nothing was evaluated. Its cells are the pack's
 own, up to `CELLS` across the square (planner-web answers no finer than the
 sweep, and no more than 2048 a side): 10 m on a 10 m pack, 30 m on a 30 m
 one, about 10 m on anything finer. It is path loss only:
-the page adds the node's transmit power and antenna gain, and draws the best
-level at each point over the nodes on show.
+the node's transmit power and antenna gain are added for a view, by the
+sidecar from the rasters here (`/coverage/bands.bin`), which the page draws
+as the band of the best margin at each point over the nodes on show.
+`/api/coverage` serves a raster itself.
 
 A raster depends on the pack and the node's position and height alone, so
 its key is those (`key`): moving a node or changing its height is a new
