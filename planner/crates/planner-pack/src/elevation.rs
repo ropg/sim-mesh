@@ -19,6 +19,7 @@ use crate::PackError;
 use planner_core::geo::Xy;
 use planner_terrain::cog::{CogMeta, CogReader};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -76,97 +77,134 @@ fn open(path: &Path, pixel_m: f64) -> Result<CogReader<BufReader<File>>, PackErr
         .map_err(|e| PackError::Invalid(format!("{}: {e}", path.display())))
 }
 
-/// One model's tiles: each one's pixel grid, read once, and the few readers
-/// a worker has open, the last one used first.
-struct Tiles<'a> {
+/// One model's tiles as every worker sees them: each one's pixel grid,
+/// read once, and an index of the tiles meeting each square of the largest
+/// tile's size, so a sample tries the one or few tiles under it rather
+/// than every tile of the source.
+struct Grids<'a> {
     paths: &'a [PathBuf],
     pixel_m: f64,
     nodata: &'a [f32],
     metas: Vec<CogMeta>,
+    /// The index's square, in the tiles' units.
+    side: f64,
+    index: HashMap<(i64, i64), Vec<usize>>,
+}
+
+impl<'a> Grids<'a> {
+    fn new(paths: &'a [PathBuf], pixel_m: f64, nodata: &'a [f32]) -> Result<Self, PackError> {
+        let metas: Vec<CogMeta> = paths
+            .iter()
+            .map(|p| open(p, pixel_m).map(|r| *r.meta()))
+            .collect::<Result<_, _>>()?;
+        let extents: Vec<[f64; 4]> = metas.iter().map(extent).collect();
+        let side = extents
+            .iter()
+            .map(|e| (e[2] - e[0]).max(e[3] - e[1]))
+            .fold(0.0, f64::max);
+        let side = if side > 0.0 { side } else { 1.0 };
+        let square = |x: f64, y: f64| ((x / side).floor() as i64, (y / side).floor() as i64);
+        let mut index: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        for (i, e) in extents.iter().enumerate() {
+            let ((x0, y0), (x1, y1)) = (square(e[0], e[1]), square(e[2], e[3]));
+            for sx in x0..=x1 {
+                for sy in y0..=y1 {
+                    index.entry((sx, sy)).or_default().push(i);
+                }
+            }
+        }
+        Ok(Self {
+            paths,
+            pixel_m,
+            nodata,
+            metas,
+            side,
+            index,
+        })
+    }
+
+    /// The tiles that may hold (x, y), in the order given.
+    fn under(&self, x: f64, y: f64) -> &[usize] {
+        let square = (
+            (x / self.side).floor() as i64,
+            (y / self.side).floor() as i64,
+        );
+        self.index.get(&square).map_or(&[], Vec::as_slice)
+    }
+
+    /// The pixel of tile `i` holding (x, y), if it holds it: the nearest
+    /// pixel centre, a point on the edge two tiles share in the one east or
+    /// south of it.
+    fn pixel_of(&self, i: usize, x: f64, y: f64) -> Option<(u32, u32)> {
+        let m = &self.metas[i];
+        let col = ((x - m.origin.x) / m.dx + 0.5).floor();
+        let row = ((y - m.origin.y) / m.dy + 0.5).floor();
+        // Written to fail for NaN, which no pixel holds.
+        if !(col >= 0.0 && row >= 0.0 && col < m.width as f64 && row < m.height as f64) {
+            return None;
+        }
+        Some((col as u32, row as u32))
+    }
+}
+
+/// The outer edges `[min_x, min_y, max_x, max_y]` of an image's pixels.
+fn extent(m: &CogMeta) -> [f64; 4] {
+    let (x0, y0) = (m.origin.x - 0.5 * m.dx, m.origin.y - 0.5 * m.dy);
+    let (x1, y1) = (x0 + m.width as f64 * m.dx, y0 + m.height as f64 * m.dy);
+    [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]
+}
+
+/// A worker's readers of one model's tiles: the few it has open, the last
+/// one used first.
+struct Tiles<'a> {
+    grids: &'a Grids<'a>,
     open: Vec<(usize, CogReader<BufReader<File>>)>,
     /// Readers kept open at most.
     cap: usize,
 }
 
 impl<'a> Tiles<'a> {
-    fn new(paths: &'a [PathBuf], pixel_m: f64, nodata: &'a [f32]) -> Result<Self, PackError> {
-        let metas = paths
-            .iter()
-            .map(|p| open(p, pixel_m).map(|r| *r.meta()))
-            .collect::<Result<_, _>>()?;
-        Ok(Self {
-            paths,
-            pixel_m,
-            nodata,
-            metas,
+    fn new(grids: &'a Grids<'a>) -> Self {
+        Self {
+            grids,
             open: Vec::new(),
             cap: open_per_worker(),
-        })
-    }
-
-    /// A worker's copy: the grids, no readers yet.
-    fn fresh(&self) -> Self {
-        Self {
-            paths: self.paths,
-            pixel_m: self.pixel_m,
-            nodata: self.nodata,
-            metas: self.metas.clone(),
-            open: Vec::new(),
-            cap: self.cap,
         }
     }
 
-    /// The pixel of tile `i` holding (x, y), if it holds it.
-    fn pixel_of(&self, i: usize, x: f64, y: f64) -> Option<(u32, u32)> {
-        let m = &self.metas[i];
-        let col = ((x - m.origin.x) / m.dx).round();
-        let row = ((y - m.origin.y) / m.dy).round();
-        if col < 0.0 || row < 0.0 || col >= m.width as f64 || row >= m.height as f64 {
-            return None;
-        }
-        Some((col as u32, row as u32))
-    }
-
-    /// The value of the first tile that has one at (x, y), nearest pixel. A
-    /// tile that holds (x, y) and will not open is an error, not a hole: a
-    /// build that ran out of open files would otherwise lose its
-    /// measurements without a word.
+    /// The value of the first tile, in the order given, that has one at
+    /// (x, y), nearest pixel. A tile that holds (x, y) and will not open is
+    /// an error, not a hole: a build that ran out of open files would
+    /// otherwise lose its measurements without a word.
     fn value_at(&mut self, x: f64, y: f64) -> Result<Option<f32>, PackError> {
-        // The tiles open now first, the last used foremost: the next sample
-        // is almost always on one of them.
-        for slot in 0..self.open.len() {
-            let Some((col, row)) = self.pixel_of(self.open[slot].0, x, y) else {
+        let grids = self.grids;
+        for &i in grids.under(x, y) {
+            let Some((col, row)) = grids.pixel_of(i, x, y) else {
                 continue;
             };
-            self.open[..=slot].rotate_right(1);
-            if let Some(v) = self.read(col, row) {
-                return Ok(Some(v));
-            }
-        }
-        for i in 0..self.metas.len() {
-            if self.open.iter().any(|(j, _)| *j == i) {
-                continue;
-            }
-            let Some((col, row)) = self.pixel_of(i, x, y) else {
+            // A chunk a window never fetched does not decode: no data there.
+            let Ok(v) = self.reader(i)?.pixel(col, row) else {
                 continue;
             };
-            let reader = open(&self.paths[i], self.pixel_m)?;
-            if self.open.len() == self.cap {
-                self.open.pop();
-            }
-            self.open.insert(0, (i, reader));
-            if let Some(v) = self.read(col, row) {
+            if v.is_finite() && v.abs() < NO_DATA_ABOVE && !grids.nodata.contains(&v) {
                 return Ok(Some(v));
             }
         }
         Ok(None)
     }
 
-    /// The foremost open tile's value at a pixel, if it is data.
-    fn read(&mut self, col: u32, row: u32) -> Option<f32> {
-        // A chunk a window never fetched does not decode: no data there.
-        let v = self.open[0].1.pixel(col, row).ok()?;
-        (v.is_finite() && v.abs() < NO_DATA_ABOVE && !self.nodata.contains(&v)).then_some(v)
+    /// Tile `i`'s reader, now foremost: the one open, or one opened in place
+    /// of the one used longest ago.
+    fn reader(&mut self, i: usize) -> Result<&mut CogReader<BufReader<File>>, PackError> {
+        match self.open.iter().position(|(j, _)| *j == i) {
+            Some(slot) => self.open[..=slot].rotate_right(1),
+            None => {
+                let reader = open(&self.grids.paths[i], self.grids.pixel_m)?;
+                self.open.truncate(self.cap - 1);
+                self.open.insert(0, (i, reader));
+            }
+        }
+        Ok(&mut self.open[0].1)
     }
 }
 
@@ -183,9 +221,9 @@ pub fn sample(
     let src = System::new(&input.proj)?;
     let alone = input.surface.is_empty();
     // Every tile opened once for its grid; each worker opens its own readers.
-    let terrain_tiles = Tiles::new(&input.terrain, input.pixel_m, &input.nodata)?;
-    let surface_tiles = Tiles::new(&input.surface, input.pixel_m, &input.nodata)?;
-    let pixel = terrain_tiles
+    let terrain_grids = Grids::new(&input.terrain, input.pixel_m, &input.nodata)?;
+    let surface_grids = Grids::new(&input.surface, input.pixel_m, &input.nodata)?;
+    let pixel = terrain_grids
         .metas
         .first()
         .map(|m| m.dy.abs() / src.units_per_metre())
@@ -201,7 +239,7 @@ pub fn sample(
         .zip(count.par_chunks_mut(nx))
         .enumerate()
         .try_for_each_init(
-            || (terrain_tiles.fresh(), surface_tiles.fresh()),
+            || (Tiles::new(&terrain_grids), Tiles::new(&surface_grids)),
             |(ter, sur), (row, ((t_row, c_row), n_row))| -> Result<(), PackError> {
                 let cy = origin.y - row as f64 * res;
                 let mut above = MeanAccum::new(nx);
@@ -325,13 +363,63 @@ mod tests {
             assert_eq!((got.terrain[c], got.clutter[c]), (30.0, 10.0), "cell {c}");
         }
 
-        let mut tiles = Tiles::new(&input.terrain, 7.5, None).unwrap();
+        let grids = Grids::new(&input.terrain, 7.5, &[]).unwrap();
+        let mut tiles = Tiles::new(&grids);
         std::fs::remove_file(&input.terrain[7]).unwrap();
         let err = tiles
             .value_at(302_150.0, 5_800_150.0)
             .unwrap_err()
             .to_string();
         assert!(err.contains("t_7_0.tif"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two 300 m tiles and a 600 m one beside them, indexed by squares of
+    /// the largest: every point is found in the tile that holds it and in no
+    /// other, a point on the edge two tiles share in the one east of it,
+    /// and NaN in none.
+    #[test]
+    fn the_index_finds_each_point_in_the_one_tile_holding_it() {
+        let dir = std::env::temp_dir().join(format!("planner_index_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut paths = Vec::new();
+        for (i, (x0, side)) in [(300_000.0, 30), (300_300.0, 30), (300_600.0, 60)]
+            .into_iter()
+            .enumerate()
+        {
+            let path = dir.join(format!("{i}.tif"));
+            let origin = Xy {
+                x: x0 + 5.0,
+                y: 5_800_000.0 + 10.0 * side as f64 - 5.0,
+            };
+            let g =
+                Grid::with_axes(origin, 10.0, -10.0, side, side, vec![1.0; side * side]).unwrap();
+            write_geotiff_f32(&path, &g).unwrap();
+            paths.push(path);
+        }
+        let grids = Grids::new(&paths, 7.5, &[]).unwrap();
+        assert_eq!(grids.side, 600.0);
+        let holding = |x: f64, y: f64| -> Vec<usize> {
+            let under = grids.under(x, y).iter().copied();
+            under
+                .filter(|&i| grids.pixel_of(i, x, y).is_some())
+                .collect()
+        };
+        for ix in 0..120 {
+            for iy in 0..60 {
+                let (x, y) = (300_005.0 + 10.0 * ix as f64, 5_800_005.0 + 10.0 * iy as f64);
+                let want: Vec<usize> = match (ix, iy) {
+                    (0..30, 0..30) => vec![0],
+                    (30..60, 0..30) => vec![1],
+                    (60.., _) => vec![2],
+                    _ => vec![],
+                };
+                assert_eq!(holding(x, y), want, "({x}, {y})");
+            }
+        }
+        assert_eq!(holding(300_300.0, 5_800_100.0), vec![1]);
+        assert_eq!(holding(300_600.0, 5_800_100.0), vec![2]);
+        assert_eq!(holding(f64::NAN, 5_800_100.0), Vec::<usize>::new());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
