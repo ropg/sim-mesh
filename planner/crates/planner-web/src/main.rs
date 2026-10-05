@@ -65,6 +65,12 @@ struct Cli {
     /// 2 GB VPS.
     #[arg(long, default_value_t = 1)]
     sweep_slots: usize,
+    /// Concurrent point-to-point links (`/link.json`). Default: as the
+    /// render slots, which is also how many a pack's loss table asks at
+    /// once. Their own, so a table's burst of pairs is never what a tile is
+    /// refused for.
+    #[arg(long)]
+    link_slots: Option<usize>,
     /// Threads a propagation sweep runs on. Default: cores minus two, never
     /// below one. On a host shared with others, or one running several
     /// sidecars, the caller says how many are its to use.
@@ -72,11 +78,70 @@ struct Cli {
     sweep_threads: Option<usize>,
 }
 
+/// One raster layer of the pack, readable by any number of requests at once
+/// where its layout allows.
+///
+/// `CogReader` seeks one shared file handle, so it is `&mut` and sits behind
+/// a lock, and every request that read a window waited for the one before it:
+/// a tile waited out a sweep's 40 km window, and a pack table's pairs were
+/// read one at a time however many render slots there were (at 8 slots, 173
+/// nodes, ~15 k pairs, the reads were 58 s of a 61 s build). A layer whose
+/// rows are directly readable is read by positioned reads instead
+/// (`SharedRows`), which need no lock; the grid is the one `CogReader`
+/// returns. `shared` is `None` where a layer's layout allows no such read,
+/// and that layer is read through its lock as before.
+struct Layer {
+    locked: Mutex<CogReader<BufReader<File>>>,
+    #[cfg(unix)]
+    shared: Option<SharedRows>,
+}
+
+impl Layer {
+    fn new(reader: CogReader<BufReader<File>>) -> Self {
+        Layer {
+            #[cfg(unix)]
+            shared: reader.shared_rows(),
+            locked: Mutex::new(reader),
+        }
+    }
+
+    /// `CogReader::window`, read without the lock where the layer allows it.
+    /// Blocking: call it from a blocking thread or under `block_in_place`.
+    fn window(
+        &self,
+        lo: Xy,
+        hi: Xy,
+    ) -> Result<planner_terrain::Grid, planner_terrain::TerrainError> {
+        #[cfg(unix)]
+        if let Some(read) = self.shared.as_ref().and_then(|s| s.window(lo, hi).transpose()) {
+            return read;
+        }
+        self.locked.blocking_lock().window(lo, hi)
+    }
+
+    /// `CogReader::window_max`, likewise.
+    fn window_max(
+        &self,
+        lo: Xy,
+        hi: Xy,
+        max_w: usize,
+        max_h: usize,
+    ) -> Result<planner_terrain::Grid, planner_terrain::TerrainError> {
+        #[cfg(unix)]
+        if let Some(read) =
+            self.shared.as_ref().and_then(|s| s.window_max(lo, hi, max_w, max_h).transpose())
+        {
+            return read;
+        }
+        self.locked.blocking_lock().window_max(lo, hi, max_w, max_h)
+    }
+}
+
 struct Layers {
-    terrain: Mutex<CogReader<BufReader<File>>>,
-    clutter: Option<Mutex<CogReader<BufReader<File>>>>,
-    population: Option<Mutex<CogReader<BufReader<File>>>>,
-    classes: Option<Mutex<CogReader<BufReader<File>>>>,
+    terrain: Layer,
+    clutter: Option<Layer>,
+    population: Option<Layer>,
+    classes: Option<Layer>,
     /// Fraction of each cell covered by a building footprint, 0..1.
     ///
     /// The unblended half of `clutter`. A cell at 0 is street, courtyard,
@@ -87,64 +152,43 @@ struct Layers {
     ///
     /// `None` on any pack built before the layer existed, which is why every
     /// consumer must keep working without it.
-    built_fraction: Option<Mutex<CogReader<BufReader<File>>>>,
+    built_fraction: Option<Layer>,
     /// Representative height of the buildings in a cell, m above ground.
     ///
     /// The obstacle a path crossing the building actually meets, with no
     /// built-fraction scaling applied. `clutter` mixes this with coverage and
     /// is the right input for an area sweep that treats every cell as a
     /// receiver; this is the right input for one specific path.
-    building_top: Option<Mutex<CogReader<BufReader<File>>>>,
-    /// The four layers `/link.json` reads, readable without their locks.
-    ///
-    /// Every request used to queue on `terrain`'s lock for its windows, so a
-    /// pack table's pairs were read one at a time however many render slots
-    /// there were: at 8 slots, 173 nodes, ~15 k pairs, the reads were 58 s of
-    /// a 61 s build. A layer whose rows are directly readable is read here
-    /// by positioned reads instead (see `SharedRows`); the grid is the one
-    /// `CogReader::window` returns. `None` where a layer's layout allows no
-    /// such read, and that layer is read through its lock as before.
-    #[cfg(unix)]
-    unlocked: Unlocked,
-}
-
-#[cfg(unix)]
-struct Unlocked {
-    terrain: Option<SharedRows>,
-    clutter: Option<SharedRows>,
-    building_top: Option<SharedRows>,
-    built_fraction: Option<SharedRows>,
+    building_top: Option<Layer>,
 }
 
 /// `/link.json`'s four windows — terrain, clutter, building top, built
-/// fraction — read without the locks where the layers allow it, all four at
-/// once. `None` for a layer with no lock-free reader, or whose reader could
-/// not read this box; the caller reads that one through its lock.
-#[cfg(unix)]
-fn link_windows_unlocked(layers: &Layers, lo: Xy, hi: Xy) -> [Option<planner_terrain::Grid>; 4] {
-    let u = &layers.unlocked;
-    let read = |s: &Option<SharedRows>| s.as_ref().and_then(|s| s.window(lo, hi).ok().flatten());
-    let ((t, c), (bt, bf)) = rayon::join(
-        || rayon::join(|| read(&u.terrain), || read(&u.clutter)),
-        || rayon::join(|| read(&u.building_top), || read(&u.built_fraction)),
-    );
-    [t, c, bt, bf]
-}
-
-#[cfg(not(unix))]
-fn link_windows_unlocked(_: &Layers, _: Xy, _: Xy) -> [Option<planner_terrain::Grid>; 4] {
-    [None, None, None, None]
-}
-
-/// One layer's window through its lock: the read every request made before
-/// the lock-free readers, and still the one for a layer without one.
-async fn locked_window(
-    layer: &Mutex<CogReader<BufReader<File>>>,
+/// fraction. A side layer the pack lacks, or that could not read this box, is
+/// `None`. Blocking.
+///
+/// Read one after another on the link's own thread. Joined in rayon's global
+/// pool they were faster for one link, but that pool is the tiles', and a
+/// pack table keeps every link slot busy: measured over a 16-way burst of
+/// links, tiles took a median 6.5 ms read in the pool and 5.2 ms read here,
+/// for 3.5% fewer links.
+#[allow(clippy::type_complexity)]
+fn link_windows(
+    layers: &Layers,
     lo: Xy,
     hi: Xy,
-) -> Result<planner_terrain::Grid, planner_terrain::TerrainError> {
-    let mut guard = layer.lock().await;
-    tokio::task::block_in_place(|| guard.window(lo, hi))
+) -> (
+    Result<planner_terrain::Grid, planner_terrain::TerrainError>,
+    Option<planner_terrain::Grid>,
+    Option<planner_terrain::Grid>,
+    Option<planner_terrain::Grid>,
+) {
+    let read = |l: &Option<Layer>| l.as_ref().and_then(|l| l.window(lo, hi).ok());
+    (
+        layers.terrain.window(lo, hi),
+        read(&layers.clutter),
+        read(&layers.building_top),
+        read(&layers.built_fraction),
+    )
 }
 
 struct AppState {
@@ -161,6 +205,15 @@ struct AppState {
     /// After the direct row-read fix a full-screen tile is 11–323 ms, so these
     /// must never queue behind a propagation sweep.
     slots: Semaphore,
+    /// Concurrency for point-to-point LINKS, each a profile and four P.1812
+    /// runs.
+    ///
+    /// They held render slots, and a pack table asks as many pairs at once as
+    /// there are slots, so while a table filled every tile and basemap the
+    /// page asked was refused with 429. Links refuse each other here; a 429
+    /// from `slots` again means the map itself asks more than the machine
+    /// renders.
+    link_slots: Semaphore,
     /// Concurrency for EXPENSIVE requests — the point-to-area sweeps.
     ///
     /// Separate from `slots` because they are now four orders of magnitude
@@ -986,7 +1039,7 @@ async fn view_png(State(st): State<Arc<AppState>>, Query(q): Query<ViewQuery>) -
     };
 
     let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
-    let (base, tint_lock) = match q.layer.as_str() {
+    let (base, tint_layer) = match q.layer.as_str() {
         "clutter" => (BaseLayer::HillshadeClutter, st.layers.clutter.as_ref()),
         "population" => (BaseLayer::HillshadePopulation, st.layers.population.as_ref()),
         _ => (BaseLayer::Hillshade, None),
@@ -996,27 +1049,16 @@ async fn view_png(State(st): State<Arc<AppState>>, Query(q): Query<ViewQuery>) -
     // Read one window per layer, sized to the request.
     let lo = st.clamp(Xy { x: view.min_x, y: view.min_y });
     let hi = st.clamp(Xy { x: view.max_x, y: view.max_y });
-    let terrain = {
-        let mut r = st.layers.terrain.lock().await;
-        match r.window(lo, hi) {
-            Ok(g) => g,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
-    };
-    let tint = match tint_lock {
-        Some(m) => {
-            let mut r = m.lock().await;
-            r.window(lo, hi).ok()
-        }
-        None => None,
-    };
-
-    let classes = match st.layers.classes.as_ref() {
-        Some(m) => {
-            let mut r = m.lock().await;
-            r.window(lo, hi).ok()
-        }
-        None => None,
+    let (terrain, tint, classes) = tokio::task::block_in_place(|| {
+        (
+            st.layers.terrain.window(lo, hi),
+            tint_layer.and_then(|l| l.window(lo, hi).ok()),
+            st.layers.classes.as_ref().and_then(|l| l.window(lo, hi).ok()),
+        )
+    });
+    let terrain = match terrain {
+        Ok(g) => g,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let mut rgba = planner_render::render_base_with_classes(
         &terrain,
@@ -1109,7 +1151,7 @@ async fn coverage_png(State(st): State<Arc<AppState>>, Query(q): Query<CoverageQ
 
     let tx = st.to_xy(q.lat, q.lon);
     let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
-    let (base, tint_lock) = match q.layer.as_str() {
+    let (base, tint_layer) = match q.layer.as_str() {
         "clutter" => (BaseLayer::HillshadeClutter, st.layers.clutter.as_ref()),
         "population" => (BaseLayer::HillshadePopulation, st.layers.population.as_ref()),
         _ => (BaseLayer::Hillshade, None),
@@ -1125,26 +1167,16 @@ async fn coverage_png(State(st): State<Arc<AppState>>, Query(q): Query<CoverageQ
         x: view.max_x.max(tx.x + radius_m),
         y: view.max_y.max(tx.y + radius_m),
     });
-    let terrain = {
-        let mut r = st.layers.terrain.lock().await;
-        match r.window(lo, hi) {
-            Ok(g) => g,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
-    };
-    let clutter = match st.layers.clutter.as_ref() {
-        Some(m) => {
-            let mut r = m.lock().await;
-            r.window(lo, hi).ok()
-        }
-        None => None,
-    };
-    let tint = match tint_lock {
-        Some(m) => {
-            let mut r = m.lock().await;
-            r.window(lo, hi).ok()
-        }
-        None => None,
+    let (terrain, clutter, tint) = tokio::task::block_in_place(|| {
+        (
+            st.layers.terrain.window(lo, hi),
+            st.layers.clutter.as_ref().and_then(|l| l.window(lo, hi).ok()),
+            tint_layer.and_then(|l| l.window(lo, hi).ok()),
+        )
+    });
+    let terrain = match terrain {
+        Ok(g) => g,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
     let mut link = planner_core::model::LinkParams::eu868_defaults();
@@ -1244,13 +1276,9 @@ async fn coverage_png(State(st): State<Arc<AppState>>, Query(q): Query<CoverageQ
     let ms = if hit { 0 } else { cached.compute_ms };
     let loss = &cached.loss;
 
-    let classes = match st.layers.classes.as_ref() {
-        Some(m) => {
-            let mut r = m.lock().await;
-            r.window(lo, hi).ok()
-        }
-        None => None,
-    };
+    let classes = tokio::task::block_in_place(|| {
+        st.layers.classes.as_ref().and_then(|l| l.window(lo, hi).ok())
+    });
     let mut rgba = planner_render::render_base_with_classes(
         &terrain,
         tint.as_ref(),
@@ -1738,43 +1766,17 @@ async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -
     let lo = st.clamp(Xy { x: view.min_x, y: view.min_y });
     let hi = st.clamp(Xy { x: view.max_x, y: view.max_y });
 
-    // Decompress the four layer windows CONCURRENTLY. They live in separate
-    // files behind separate locks, so serialising them just added up four
-    // independent decode costs — the dominant part of a tile fetch, since a
-    // full-screen view can span half the pack.
-    let mut t_guard = st.layers.terrain.lock().await;
-    // Only take the side-layer locks when their blocks will be sent. With
-    // `terrain_only` the page never reads them, and each acquisition here is
-    // a wait on a lock the basemap request running beside this one holds
-    // while it renders.
+    // Read the four layer windows CONCURRENTLY. They live in separate files,
+    // so serialising them just added up four independent read costs — the
+    // dominant part of a tile fetch, since a full-screen view can span half
+    // the pack.
+    //
+    // The side layers only when their blocks will be sent: with
+    // `terrain_only` the page never reads them. In and out the order is
+    // classes, population, clutter, `None` for one this pack lacks.
     let want_side = q.terrain_only == 0;
-    let mut c_guard = match st.layers.classes.as_ref() {
-        Some(m) if want_side => Some(m.lock().await),
-        _ => None,
-    };
-    let mut p_guard = match st.layers.population.as_ref() {
-        Some(m) if want_side => Some(m.lock().await),
-        _ => None,
-    };
-    let mut h_guard = match st.layers.clutter.as_ref() {
-        Some(m) if want_side => Some(m.lock().await),
-        _ => None,
-    };
-    // The optional layers go through one par_iter so their `&mut` borrows are
-    // disjoint by construction; terrain rides alongside on the other half of a
-    // join. Order in/out is classes, population, clutter — filtered by which
-    // layers this pack actually has.
-    let mut side: Vec<&mut CogReader<BufReader<File>>> = Vec::new();
-    let have = [c_guard.is_some(), p_guard.is_some(), h_guard.is_some()];
-    if let Some(g) = c_guard.as_mut() {
-        side.push(g);
-    }
-    if let Some(g) = p_guard.as_mut() {
-        side.push(g);
-    }
-    if let Some(g) = h_guard.as_mut() {
-        side.push(g);
-    }
+    let side = [&st.layers.classes, &st.layers.population, &st.layers.clutter]
+        .map(|l| l.as_ref().filter(|_| want_side));
     // Read at the STRIDE the reply needs, not at full resolution.
     //
     // `window` materialises the whole box: on this pack a zoomed-out request
@@ -1784,12 +1786,12 @@ async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -
     // output) because the resample below is bilinear and wants a neighbour on
     // each side; beyond that the extra cells were being read to be skipped.
     let (rw, rh) = ((tw as usize) * 2, (th as usize) * 2);
-    let (terrain, mut side_out) = tokio::task::block_in_place(|| {
+    let (terrain, side_out) = tokio::task::block_in_place(|| {
         rayon::join(
-            || t_guard.window_max(lo, hi, rw, rh),
+            || st.layers.terrain.window_max(lo, hi, rw, rh),
             || {
-                side.par_iter_mut()
-                    .map(|r| r.window_max(lo, hi, rw, rh).ok())
+                side.par_iter()
+                    .map(|l| l.and_then(|l| l.window_max(lo, hi, rw, rh).ok()))
                     .collect::<Vec<_>>()
             },
         )
@@ -1798,10 +1800,8 @@ async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -
         Ok(g) => g,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let mut take = side_out.drain(..);
-    let classes = if have[0] { take.next().flatten() } else { None };
-    let population = if have[1] { take.next().flatten() } else { None };
-    let clutter = if have[2] { take.next().flatten() } else { None };
+    let [classes, population, clutter]: [Option<planner_terrain::Grid>; 3] =
+        side_out.try_into().expect("one window per side layer");
 
     let n = (tw * th) as usize;
     let mut out: Vec<u8> = Vec::with_capacity(16 + n * 6);
@@ -1926,7 +1926,7 @@ async fn basemap_bin(
     let Ok(_permit) = st.slots.try_acquire() else {
         return (StatusCode::TOO_MANY_REQUESTS, "renderer busy").into_response();
     };
-    let (base, tint_lock) = match q.layer {
+    let (base, tint_layer) = match q.layer {
         1 => (BaseLayer::HillshadePopulation, st.layers.population.as_ref()),
         2 => (BaseLayer::HillshadeClutter, st.layers.clutter.as_ref()),
         _ => (BaseLayer::Hillshade, None),
@@ -1937,26 +1937,16 @@ async fn basemap_bin(
     // a neighbour each side. See `CogReader::window_max`.
     let (rw, rh) = ((tw as usize) * 2, (th as usize) * 2);
 
-    let terrain = {
-        let mut r = st.layers.terrain.lock().await;
-        match tokio::task::block_in_place(|| r.window_max(lo, hi, rw, rh)) {
-            Ok(g) => g,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
-    };
-    let classes = match st.layers.classes.as_ref() {
-        Some(m) => {
-            let mut r = m.lock().await;
-            tokio::task::block_in_place(|| r.window_max(lo, hi, rw, rh)).ok()
-        }
-        None => None,
-    };
-    let tint = match tint_lock {
-        Some(m) => {
-            let mut r = m.lock().await;
-            tokio::task::block_in_place(|| r.window_max(lo, hi, rw, rh)).ok()
-        }
-        None => None,
+    let (terrain, classes, tint) = tokio::task::block_in_place(|| {
+        (
+            st.layers.terrain.window_max(lo, hi, rw, rh),
+            st.layers.classes.as_ref().and_then(|l| l.window_max(lo, hi, rw, rh).ok()),
+            tint_layer.and_then(|l| l.window_max(lo, hi, rw, rh).ok()),
+        )
+    });
+    let terrain = match terrain {
+        Ok(g) => g,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
     let opts = RenderOpts { width: tw, height: th, base, ..Default::default() };
@@ -2132,8 +2122,8 @@ fn merge_building_tops(
     else {
         return Some(c);
     };
-    let top = bt.blocking_lock().window(lo, hi).ok()?;
-    let frac = bf.blocking_lock().window(lo, hi).ok()?;
+    let top = bt.window(lo, hi).ok()?;
+    let frac = bf.window(lo, hi).ok()?;
     if top.data.len() != c.data.len() || frac.data.len() != c.data.len() {
         // Windows must line up cell for cell; if they do not, something about
         // the pack's grids disagrees and silently pairing them by index would
@@ -2198,9 +2188,10 @@ fn run_sweep(
     let (_, tx_lat) = st.to_lonlat(tx);
     let lo = st.clamp(Xy { x: tx.x - radius_m, y: tx.y - radius_m });
     let hi = st.clamp(Xy { x: tx.x + radius_m, y: tx.y + radius_m });
-    let terrain =
-        st.layers.terrain.blocking_lock().window(lo, hi).map_err(|e| e.to_string())?;
-    let clutter = st.layers.clutter.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
+    // Without the layers' locks: a 20 km sweep reads a 40 km box, and held
+    // through it the lock kept every tile of the map waiting for the read.
+    let terrain = st.layers.terrain.window(lo, hi).map_err(|e| e.to_string())?;
+    let clutter = st.layers.clutter.as_ref().and_then(|l| l.window(lo, hi).ok());
     // The obstacle the SWEEP gets, which until now was the blended clutter
     // raster alone — the layer whose own documentation calls it a cell mean
     // and the wrong input for one specific path. /link.json had been using
@@ -2857,8 +2848,8 @@ fn estimate_height_at(st: &AppState, p: Xy) -> serde_json::Value {
     let reach = params.clutter_radius_m.max(params.building_search_radius_m) + 2.0 * terrain_res_hint(st);
     let lo = st.clamp(Xy { x: p.x - reach, y: p.y - reach });
     let hi = st.clamp(Xy { x: p.x + reach, y: p.y + reach });
-    let clutter = st.layers.clutter.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
-    let classes = st.layers.classes.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
+    let clutter = st.layers.clutter.as_ref().and_then(|l| l.window(lo, hi).ok());
+    let classes = st.layers.classes.as_ref().and_then(|l| l.window(lo, hi).ok());
     let (index_state, hints) = {
         let guard = st.buildings.read().unwrap_or_else(|e| e.into_inner());
         let hints = guard
@@ -2890,7 +2881,65 @@ fn estimate_height_at(st: &AppState, p: Xy) -> serde_json::Value {
     })
 }
 
+/// A pair's two ends as `/link.json` takes them, held into the pack.
+#[derive(Clone, Copy)]
+struct LinkEnds {
+    a: Xy,
+    b: Xy,
+    dist: f64,
+    loc_pct: f64,
+}
+
+/// What refuses a pair before any of its ground is read, checked in the
+/// order `/link.json` always checked it.
+fn link_ends(st: &AppState, q: &LinkQuery) -> Result<LinkEnds, (StatusCode, String)> {
+    let loc_pct = resolve_loc_pct(q.loc_pct).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let a = st.clamp(Xy { x: q.ax, y: q.ay });
+    let b = st.clamp(Xy { x: q.bx, y: q.by });
+    let dist = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+    // No longer a refusal. P.1812 is not valid below 0.25 km and this used to
+    // stop there, which made the tool useless for the neighbour-to-neighbour
+    // hop a mesh is actually built from; the near-field model below answers
+    // it instead, and the reply says which model produced the number.
+    //
+    // A floor still exists, because free space diverges at zero range and a
+    // profile of two points has no obstacle to diffract over.
+    if dist < 20.0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the two ends are within 20 m of each other — there is no path to model".into(),
+        ));
+    }
+    if dist > MAX_COVERAGE_RADIUS_KM * 2.0 * 1000.0 {
+        return Err((StatusCode::BAD_REQUEST, "path longer than the pack window cap".into()));
+    }
+    Ok(LinkEnds { a, b, dist, loc_pct })
+}
+
 async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) -> Response {
+    let ends = match link_ends(&st, &q) {
+        Ok(ends) => ends,
+        Err(refused) => return refused.into_response(),
+    };
+    let Ok(_permit) = st.link_slots.try_acquire() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "every link slot is busy").into_response();
+    };
+    // The whole pair off the async workers, not only its reads and its
+    // P.1812 runs: the profile walks the building index at every sample, and
+    // run on a worker it kept the handlers of tiles from being polled while
+    // a pack table filled.
+    match tokio::task::block_in_place(|| link_reply(&st, &q, ends)) {
+        Ok(reply) => axum::Json(reply).into_response(),
+        Err(refused) => refused.into_response(),
+    }
+}
+
+/// `/link.json`'s reply for a pair `link_ends` let through. Blocking.
+fn link_reply(
+    st: &AppState,
+    q: &LinkQuery,
+    ends: LinkEnds,
+) -> Result<serde_json::Value, (StatusCode, String)> {
     // ---- the budget, and where every decibel of it comes from --------------
     //
     // Three cases, in order: an explicit `budget_db` wins; otherwise, if the
@@ -2905,35 +2954,9 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
         rx_gain_dbi: rx_gain,
         gains_given,
     } = resolve_budget(q.budget_db, q.tx_gain_dbi, q.rx_gain_dbi);
-    let loc_pct = match resolve_loc_pct(q.loc_pct) {
-        Ok(p) => p,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
-    };
-    let a = st.clamp(Xy { x: q.ax, y: q.ay });
-    let b = st.clamp(Xy { x: q.bx, y: q.by });
-    let dist = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
-    // No longer a refusal. P.1812 is not valid below 0.25 km and this used to
-    // stop there, which made the tool useless for the neighbour-to-neighbour
-    // hop a mesh is actually built from; the near-field model below answers
-    // it instead, and the reply says which model produced the number.
-    //
-    // A floor still exists, because free space diverges at zero range and a
-    // profile of two points has no obstacle to diffract over.
-    if dist < 20.0 {
-        return (
-            StatusCode::BAD_REQUEST,
-            "the two ends are within 20 m of each other — there is no path to model",
-        )
-            .into_response();
-    }
-    if dist > MAX_COVERAGE_RADIUS_KM * 2.0 * 1000.0 {
-        return (StatusCode::BAD_REQUEST, "path longer than the pack window cap").into_response();
-    }
-    let Ok(_permit) = st.slots.try_acquire() else {
-        return (StatusCode::TOO_MANY_REQUESTS, "renderer busy").into_response();
-    };
+    let LinkEnds { a, b, dist, loc_pct } = ends;
 
-    let res = terrain_res_hint(&st).max(1.0);
+    let res = terrain_res_hint(st).max(1.0);
     let lo = st.clamp(Xy { x: a.x.min(b.x) - res * 4.0, y: a.y.min(b.y) - res * 4.0 });
     let hi = st.clamp(Xy { x: a.x.max(b.x) + res * 4.0, y: a.y.max(b.y) + res * 4.0 });
 
@@ -2946,31 +2969,8 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     // they once were, the locks made every other request wait out this one's
     // profile, both P.1812 runs and the Fresnel trace, so however many render
     // slots there were, one pair was computed at a time.
-    let [terrain, clutter, building_top, built_fraction] =
-        tokio::task::block_in_place(|| link_windows_unlocked(&st.layers, lo, hi));
-    let terrain = match terrain {
-        Some(g) => Ok(g),
-        None => locked_window(&st.layers.terrain, lo, hi).await,
-    };
-    let clutter = match (clutter, st.layers.clutter.as_ref()) {
-        (Some(g), _) => Some(g),
-        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
-        (None, None) => None,
-    };
-    let building_top = match (building_top, st.layers.building_top.as_ref()) {
-        (Some(g), _) => Some(g),
-        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
-        (None, None) => None,
-    };
-    let built_fraction = match (built_fraction, st.layers.built_fraction.as_ref()) {
-        (Some(g), _) => Some(g),
-        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
-        (None, None) => None,
-    };
-    let terrain = match terrain {
-        Ok(g) => g,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    let (terrain, clutter, building_top, built_fraction) = link_windows(&st.layers, lo, hi);
+    let terrain = terrain.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Sample at HALF the raster cell for this one path. A point-to-point link
     // is a single profile, not a whole sweep, so the extra samples are free —
@@ -3018,7 +3018,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
         let t = k as f64 / steps as f64;
         let p = Xy { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
         let Some(h) = terrain.sample_bilinear(p) else {
-            return (StatusCode::BAD_REQUEST, "path leaves the pack").into_response();
+            return Err((StatusCode::BAD_REQUEST, "path leaves the pack".into()));
         };
         let h = h as f64;
         let raster_c =
@@ -3150,7 +3150,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     let rev_g: Vec<f64> = g_masl.iter().rev().copied().collect();
     let (rd_km, rh_masl, rg_masl) = decimate(&rev_h, &rev_g);
     if md_km.len() < 3 {
-        return (StatusCode::BAD_REQUEST, "path too short for a §3.2 profile").into_response();
+        return Err((StatusCode::BAD_REQUEST, "path too short for a §3.2 profile".into()));
     }
 
     let (_, lat) = st.to_lonlat(Xy { x: (a.x + b.x) / 2.0, y: (a.y + b.y) / 2.0 });
@@ -3254,12 +3254,9 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     let mut link_rev = link.clone();
     std::mem::swap(&mut link_rev.tx_h_agl_m, &mut link_rev.rx_h_agl_m);
     let t0 = std::time::Instant::now();
-    let loss = tokio::task::block_in_place(|| {
-        let fwd = planner_propag::p1812::lb_from_arrays(&x, &link)?;
+    let loss = planner_propag::p1812::lb_from_arrays(&x, &link).and_then(|fwd| {
         let rev = planner_propag::p1812::lb_from_arrays(&x_rev, &link_rev)?;
-        Ok::<_, planner_core::model::ModelError>(planner_core::model::Loss {
-            lb_db: (fwd.lb_db + rev.lb_db) / 2.0,
-        })
+        Ok(planner_core::model::Loss { lb_db: (fwd.lb_db + rev.lb_db) / 2.0 })
     });
     let ms = t0.elapsed().as_millis();
     // Under 0.25 km P.1812 refuses (§1). That refusal is not an answer: the
@@ -3287,10 +3284,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
         }))
         .map(|(f, r)| (f + r) / 2.0)
     };
-    let (lb_p1812, model_used) = match link_model(loss.map(|l| l.lb_db), d_total, near_field) {
-        Ok(answer) => answer,
-        Err(refused) => return refused.into_response(),
-    };
+    let (lb_p1812, model_used) = link_model(loss.map(|l| l.lb_db), d_total, near_field)?;
     let lb = lb_p1812 + ah_tx + ah_rx;
 
     // ---- Fresnel clearance -------------------------------------------------
@@ -3660,7 +3654,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
             map.remove("profile");
         }
     }
-    axum::Json(reply).into_response()
+    Ok(reply)
 }
 
 #[derive(Deserialize)]
@@ -3911,10 +3905,9 @@ fn run_census(st: &AppState, q: &NetworkQuery) -> Result<NetworkResult, String> 
     // rather than a view.
     let lo = st.clamp(Xy { x: st.extent.min_x, y: st.extent.min_y });
     let hi = st.clamp(Xy { x: st.extent.max_x, y: st.extent.max_y });
-    let terrain = st.layers.terrain.blocking_lock().window(lo, hi).map_err(|e| e.to_string())?;
-    let clutter = st.layers.clutter.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
-    let population =
-        st.layers.population.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
+    let terrain = st.layers.terrain.window(lo, hi).map_err(|e| e.to_string())?;
+    let clutter = st.layers.clutter.as_ref().and_then(|l| l.window(lo, hi).ok());
+    let population = st.layers.population.as_ref().and_then(|l| l.window(lo, hi).ok());
 
     let mut assumed = 0usize;
     let sites: Vec<planner_coverage::gaps::SiteSpec> = st
@@ -4427,31 +4420,24 @@ async fn main() {
         });
     }
 
+    let render_slots = cli
+        .render_slots
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            cores.saturating_sub(2).max(4)
+        })
+        .max(1);
     let state = Arc::new(AppState {
         centre_lat: c.1.to_degrees(),
         centre_lon: c.0.to_degrees(),
         manifest,
-        layers: {
-            let clutter = clutter_path.and_then(open);
-            let built_fraction = built_fraction_path.and_then(open);
-            let building_top = building_top_path.and_then(open);
-            #[cfg(unix)]
-            let unlocked = Unlocked {
-                terrain: terrain.shared_rows(),
-                clutter: clutter.as_ref().and_then(CogReader::shared_rows),
-                building_top: building_top.as_ref().and_then(CogReader::shared_rows),
-                built_fraction: built_fraction.as_ref().and_then(CogReader::shared_rows),
-            };
-            Layers {
-                terrain: Mutex::new(terrain),
-                clutter: clutter.map(Mutex::new),
-                population: population_path.and_then(open).map(Mutex::new),
-                classes: classes_path.and_then(open).map(Mutex::new),
-                built_fraction: built_fraction.map(Mutex::new),
-                building_top: building_top.map(Mutex::new),
-                #[cfg(unix)]
-                unlocked,
-            }
+        layers: Layers {
+            terrain: Layer::new(terrain),
+            clutter: clutter_path.and_then(open).map(Layer::new),
+            population: population_path.and_then(open).map(Layer::new),
+            classes: classes_path.and_then(open).map(Layer::new),
+            built_fraction: built_fraction_path.and_then(open).map(Layer::new),
+            building_top: building_top_path.and_then(open).map(Layer::new),
         },
         roads,
         places,
@@ -4460,10 +4446,8 @@ async fn main() {
         extent,
         utm,
         ll,
-        slots: Semaphore::new(cli.render_slots.unwrap_or_else(|| {
-            let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-            cores.saturating_sub(2).max(4)
-        }).max(1)),
+        slots: Semaphore::new(render_slots),
+        link_slots: Semaphore::new(cli.link_slots.unwrap_or(render_slots).max(1)),
         sweep_slots: Semaphore::new(cli.sweep_slots.max(1)),
         sweep_pool: {
             let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);

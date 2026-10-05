@@ -41,6 +41,24 @@ pub struct CogMeta {
     pub dy: f64,
 }
 
+impl CogMeta {
+    /// Pixel box for a world bbox: `(c0, r0, width, height)`, rounded as
+    /// every window read rounds it, so readers that share it read the same
+    /// cells.
+    pub fn window_box(&self, min: Xy, max: Xy) -> Result<(u32, u32, usize, usize), TerrainError> {
+        let to_col = |x: f64| ((x - self.origin.x) / self.dx).round();
+        let to_row = |y: f64| ((y - self.origin.y) / self.dy).round();
+        let (ca, cb) = (to_col(min.x), to_col(max.x));
+        let (ra, rb) = (to_row(min.y), to_row(max.y));
+        let (c0, c1) = (ca.min(cb).max(0.0) as u32, ca.max(cb) as u32);
+        let (r0, r1) = (ra.min(rb).max(0.0) as u32, ra.max(rb) as u32);
+        if c1 >= self.width || r1 >= self.height {
+            return Err(TerrainError::OutOfBounds(max.x, max.y));
+        }
+        Ok((c0, r0, (c1 - c0 + 1) as usize, (r1 - r0 + 1) as usize))
+    }
+}
+
 /// One decoded chunk: pixel values plus the buffer's actual row width
 /// (edge chunks from the high-level decoder are clipped; raw palette tiles
 /// stay padded to the full tile width per the TIFF spec).
@@ -93,6 +111,30 @@ impl RawRows {
         let within = (r % self.rows_per_strip) as u64;
         let bps = self.bytes_per_sample as u64;
         Some(*self.offsets.get(strip)? + (within * width as u64 + c0 as u64) * bps)
+    }
+
+    /// Row `r`'s samples from column `c0`, as many as `out` holds, read by a
+    /// positioned read (`pread`) that needs no cursor and so no lock.
+    /// `Ok(false)` where the strip table does not cover the row. `bytes` is
+    /// the caller's scratch, `out.len()` samples long.
+    #[cfg(unix)]
+    fn read_row_at(
+        &self,
+        r: u32,
+        c0: u32,
+        width: u32,
+        bytes: &mut [u8],
+        out: &mut [f32],
+    ) -> Result<bool, TerrainError> {
+        use std::os::unix::fs::FileExt as _;
+        let Some(off) = self.offset_of(r, c0, width) else {
+            return Ok(false);
+        };
+        self.file
+            .read_exact_at(bytes, off)
+            .map_err(|e| TerrainError::Cog(format!("row {r}: {e}")))?;
+        self.decode_into(bytes, out)?;
+        Ok(true)
     }
 
     fn decode_into(&self, bytes: &[u8], out: &mut [f32]) -> Result<(), TerrainError> {
@@ -604,7 +646,7 @@ impl<R: Read + Seek> CogReader<R> {
         max_w: usize,
         max_h: usize,
     ) -> Result<Grid, TerrainError> {
-        let (c0, r0, w, h) = self.window_box(min, max)?;
+        let (c0, r0, w, h) = self.meta.window_box(min, max)?;
         let sc = w.div_ceil(max_w.max(1)).max(1);
         let sr = h.div_ceil(max_h.max(1)).max(1);
         if sc == 1 && sr == 1 {
@@ -632,20 +674,6 @@ impl<R: Read + Seek> CogReader<R> {
             oh,
             data,
         )
-    }
-
-    /// Pixel box for a world bbox: `(c0, r0, width, height)`.
-    fn window_box(&self, min: Xy, max: Xy) -> Result<(u32, u32, usize, usize), TerrainError> {
-        let to_col = |x: f64| ((x - self.meta.origin.x) / self.meta.dx).round();
-        let to_row = |y: f64| ((y - self.meta.origin.y) / self.meta.dy).round();
-        let (ca, cb) = (to_col(min.x), to_col(max.x));
-        let (ra, rb) = (to_row(min.y), to_row(max.y));
-        let (c0, c1) = (ca.min(cb).max(0.0) as u32, ca.max(cb) as u32);
-        let (r0, r1) = (ra.min(rb).max(0.0) as u32, ra.max(rb) as u32);
-        if c1 >= self.meta.width || r1 >= self.meta.height {
-            return Err(TerrainError::OutOfBounds(max.x, max.y));
-        }
-        Ok((c0, r0, (c1 - c0 + 1) as usize, (r1 - r0 + 1) as usize))
     }
 
     /// As `read_rows_direct`, but seeking only to every `sr`-th row and
@@ -695,16 +723,7 @@ impl<R: Read + Seek> CogReader<R> {
     /// both axes, pixel-center coordinates), decoding only the chunks it
     /// touches.
     pub fn window(&mut self, min: Xy, max: Xy) -> Result<Grid, TerrainError> {
-        let to_col = |x: f64| ((x - self.meta.origin.x) / self.meta.dx).round();
-        let to_row = |y: f64| ((y - self.meta.origin.y) / self.meta.dy).round();
-        let (ca, cb) = (to_col(min.x), to_col(max.x));
-        let (ra, rb) = (to_row(min.y), to_row(max.y));
-        let (c0, c1) = (ca.min(cb).max(0.0) as u32, ca.max(cb) as u32);
-        let (r0, r1) = (ra.min(rb).max(0.0) as u32, ra.max(rb) as u32);
-        if c1 >= self.meta.width || r1 >= self.meta.height {
-            return Err(TerrainError::OutOfBounds(max.x, max.y));
-        }
-        let (w, h) = ((c1 - c0 + 1) as usize, (r1 - r0 + 1) as usize);
+        let (c0, r0, w, h) = self.meta.window_box(min, max)?;
         let mut data = vec![0f32; w * h];
         // Read exactly the rows asked for when the layout allows it. The
         // fallback below is correct but pays for whole 10 MB bands it barely
@@ -770,36 +789,57 @@ impl SharedRows {
     /// row of it, where `CogReader` falls back to its decoder: the caller
     /// asks `CogReader` then.
     pub fn window(&self, min: Xy, max: Xy) -> Result<Option<Grid>, TerrainError> {
-        use std::os::unix::fs::FileExt as _;
-        // The box exactly as `CogReader::window` computes it.
-        let to_col = |x: f64| ((x - self.meta.origin.x) / self.meta.dx).round();
-        let to_row = |y: f64| ((y - self.meta.origin.y) / self.meta.dy).round();
-        let (ca, cb) = (to_col(min.x), to_col(max.x));
-        let (ra, rb) = (to_row(min.y), to_row(max.y));
-        let (c0, c1) = (ca.min(cb).max(0.0) as u32, ca.max(cb) as u32);
-        let (r0, r1) = (ra.min(rb).max(0.0) as u32, ra.max(rb) as u32);
-        if c1 >= self.meta.width || r1 >= self.meta.height {
-            return Err(TerrainError::OutOfBounds(max.x, max.y));
-        }
-        let (w, h) = ((c1 - c0 + 1) as usize, (r1 - r0 + 1) as usize);
+        let (c0, r0, w, h) = self.meta.window_box(min, max)?;
         let mut data = vec![0f32; w * h];
-        let bps = self.raw.bytes_per_sample as usize;
-        let mut bytes = vec![0u8; w * bps];
+        let mut bytes = vec![0u8; w * self.raw.bytes_per_sample as usize];
         for r in 0..h {
-            let Some(off) = self.raw.offset_of(r0 + r as u32, c0, self.meta.width) else {
+            let out = &mut data[r * w..(r + 1) * w];
+            if !self.raw.read_row_at(r0 + r as u32, c0, self.meta.width, &mut bytes, out)? {
                 return Ok(None);
-            };
-            self.raw
-                .file
-                .read_exact_at(&mut bytes, off)
-                .map_err(|e| TerrainError::Cog(format!("row {}: {e}", r0 + r as u32)))?;
-            self.raw.decode_into(&bytes, &mut data[r * w..(r + 1) * w])?;
+            }
         }
         let origin = Xy {
             x: self.meta.origin.x + c0 as f64 * self.meta.dx,
             y: self.meta.origin.y + r0 as f64 * self.meta.dy,
         };
         Grid::with_axes(origin, self.meta.dx, self.meta.dy, w, h, data).map(Some)
+    }
+
+    /// [`CogReader::window_max`] of this layer: the same box at the same
+    /// stride, each kept row read whole and decimated as it decimates it.
+    /// `Ok(None)` where [`SharedRows::window`] gives it.
+    pub fn window_max(
+        &self,
+        min: Xy,
+        max: Xy,
+        max_w: usize,
+        max_h: usize,
+    ) -> Result<Option<Grid>, TerrainError> {
+        let (c0, r0, w, h) = self.meta.window_box(min, max)?;
+        let sc = w.div_ceil(max_w.max(1)).max(1);
+        let sr = h.div_ceil(max_h.max(1)).max(1);
+        if sc == 1 && sr == 1 {
+            return self.window(min, max);
+        }
+        let (ow, oh) = (w.div_ceil(sc), h.div_ceil(sr));
+        let mut data = vec![0f32; ow * oh];
+        let mut bytes = vec![0u8; w * self.raw.bytes_per_sample as usize];
+        let mut row_f = vec![0f32; w];
+        for r in 0..oh {
+            let src_row = r0 + (r * sr) as u32;
+            if !self.raw.read_row_at(src_row, c0, self.meta.width, &mut bytes, &mut row_f)? {
+                return Ok(None);
+            }
+            for c in 0..ow {
+                data[r * ow + c] = row_f[c * sc];
+            }
+        }
+        let origin = Xy {
+            x: self.meta.origin.x + c0 as f64 * self.meta.dx,
+            y: self.meta.origin.y + r0 as f64 * self.meta.dy,
+        };
+        Grid::with_axes(origin, self.meta.dx * sc as f64, self.meta.dy * sr as f64, ow, oh, data)
+            .map(Some)
     }
 }
 
@@ -1341,5 +1381,48 @@ mod tests {
         }
         assert!(shared.window(at(0.0, 0.0), at(97.0, 10.0)).is_err(), "past the edge, as window");
         assert!(locked.window(at(0.0, 0.0), at(97.0, 10.0)).is_err());
+    }
+
+    /// The shared reader's strided window is `window_max`'s, cell for cell
+    /// and stride for stride, whether or not a stride applies: the tiles read
+    /// through it, and a tile must not move by a cell for having skipped the
+    /// lock.
+    #[cfg(unix)]
+    #[test]
+    fn shared_rows_read_what_window_max_reads() {
+        let g = Grid::with_axes(
+            Xy { x: 399_000.0, y: 5_800_000.0 },
+            5.0,
+            -5.0,
+            97,
+            300,
+            (0..97 * 300).map(|i| (i as f32 * 0.37).cos() * 40.0 + 20.0).collect(),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join("planner_cog_sharedrows_max");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("srm.tif");
+        write_geotiff_f32(&path, &g).unwrap();
+
+        let mut locked = CogReader::open(&path).unwrap();
+        let shared = locked.shared_rows().expect("a strip TIFF is directly readable");
+        let m = *locked.meta();
+        let at = |c: f64, r: f64| Xy { x: m.origin.x + c * m.dx, y: m.origin.y + r * m.dy };
+        for (c0, r0, c1, r1) in [
+            (0.0, 0.0, 96.0, 299.0),
+            (13.2, 5.7, 61.4, 122.1),
+            (40.0, 250.0, 70.0, 262.0), // across the strip boundary at row 256
+            (61.4, 299.0, 13.2, 5.7),   // corners given the other way round
+        ] {
+            for (mw, mh) in [(9usize, 9usize), (13, 40), (40, 13), (1, 1), (4096, 4096)] {
+                let want = locked.window_max(at(c0, r0), at(c1, r1), mw, mh).unwrap();
+                let got =
+                    shared.window_max(at(c0, r0), at(c1, r1), mw, mh).unwrap().expect("covered");
+                assert_eq!((got.width, got.height), (want.width, want.height));
+                assert_eq!((got.origin, got.dx_m, got.dy_m), (want.origin, want.dx_m, want.dy_m));
+                assert_eq!(got.data, want.data, "box ({c0},{r0})-({c1},{r1}) at {mw}x{mh}");
+            }
+        }
+        assert!(shared.window_max(at(0.0, 0.0), at(97.0, 10.0), 9, 9).is_err(), "past the edge");
     }
 }
