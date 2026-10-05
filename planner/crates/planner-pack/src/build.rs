@@ -247,6 +247,28 @@ fn to_lonlat(proj: &Proj, ll: &Proj, x: f64, y: f64) -> Result<(f64, f64), PackE
     Ok((pt.0.to_degrees(), pt.1.to_degrees()))
 }
 
+/// A point from one system into another, each in its own units: proj4rs
+/// takes and gives a longitude and latitude in radians, where a source in
+/// EPSG:4326 states them in degrees.
+pub(crate) fn reproject(src: &Proj, dst: &Proj, x: f64, y: f64) -> Result<(f64, f64), PackError> {
+    let mut pt = if src.is_latlong() {
+        (x.to_radians(), y.to_radians(), 0.0)
+    } else {
+        (x, y, 0.0)
+    };
+    proj4rs::transform::transform(src, dst, &mut pt).map_err(|e| PackError::Proj(e.to_string()))?;
+    Ok(if dst.is_latlong() {
+        (pt.0.to_degrees(), pt.1.to_degrees())
+    } else {
+        (pt.0, pt.1)
+    })
+}
+
+/// Metres a degree is taken as where a source in EPSG:4326 gives a size in
+/// degrees: a degree along a meridian, within a percent, near enough to
+/// choose a level or a sampling by.
+pub(crate) const M_PER_DEGREE: f64 = 111_320.0;
+
 /// Build the v0 pack. Returns the manifest (also written to
 /// `<out>/manifest.json`).
 pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
@@ -673,11 +695,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                         crate::cityjson::parse_cityjson(
                             std::io::BufReader::new(std::fs::File::open(path)?),
                             &cj.heights,
-                            |x, y| {
-                                let mut p = (x, y, 0.0);
-                                proj4rs::transform::transform(&src, &utm, &mut p).ok()?;
-                                Some((p.0, p.1))
-                            },
+                            |x, y| reproject(&src, &utm, x, y).ok(),
                         )
                     })
                     .collect();
@@ -1117,11 +1135,19 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
             PopulationGrid::Csv { csv, layout } => {
                 let grid_proj = Proj::from_proj_string(&input.proj)
                     .map_err(|e| PackError::Proj(format!("{}: {e}", input.proj)))?;
+                // A grid in degrees (EPSG:4326) gives its cells' centres and
+                // size in them, so a cell is spread over the pack's at their
+                // size in degrees.
+                let in_degrees = grid_proj.is_latlong();
                 crate::zensus::accumulate_population(
                     std::fs::File::open(csv)?,
                     layout,
                     |x, y| {
-                        let mut pt = (x, y, 0.0);
+                        let mut pt = if in_degrees {
+                            (x.to_radians(), y.to_radians(), 0.0)
+                        } else {
+                            (x, y, 0.0)
+                        };
                         proj4rs::transform::transform(&grid_proj, &ll, &mut pt)
                             .map_err(|e| PackError::Proj(format!("grid→ll: {e}")))?;
                         proj4rs::transform::transform(&ll, &utm, &mut pt)
@@ -1129,7 +1155,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                         Ok((pt.0, pt.1))
                     },
                     cell_of,
-                    res,
+                    if in_degrees { res / M_PER_DEGREE } else { res },
                     &mut pop,
                 )?
             }
@@ -1693,6 +1719,128 @@ mod tests {
         let t = reproject_extent([e33 - 1000.0, n33 - 1000.0, e33 + 1000.0, n33 + 1000.0], from_33)
             .unwrap();
         assert!(t[0] < e32 && e32 < t[2] && t[1] < n32 && n32 < t[3], "{t:?}");
+    }
+
+    /// proj4rs works in radians: a system of degrees (EPSG:4326) is given
+    /// degrees, and gets them back.
+    #[test]
+    fn a_point_in_degrees_goes_in_and_comes_back_in_degrees() {
+        let (ll, u33) = (longlat_proj().unwrap(), utm_proj(33).unwrap());
+        let (e, n) = reproject(&ll, &u33, 13.4, 52.5).unwrap();
+        assert_eq!((e, n), to_utm(&u33, &ll, 13.4, 52.5).unwrap());
+        let (lon, lat) = reproject(&u33, &ll, e, n).unwrap();
+        assert!(
+            (lon - 13.4).abs() < 1e-9 && (lat - 52.5).abs() < 1e-9,
+            "{lon} {lat}"
+        );
+    }
+
+    /// A flat stand-in for GLO-30: one EPSG:4326 tile of 0.0005° pixels over
+    /// `bbox` and 0.01° beyond it, `z` m everywhere.
+    fn flat_dsm(path: &Path, bbox: [f64; 4], z: f32) {
+        let d = 0.0005;
+        let w = ((bbox[2] - bbox[0]) / d).ceil() as usize + 40;
+        let h = ((bbox[3] - bbox[1]) / d).ceil() as usize + 40;
+        let origin = Xy {
+            x: bbox[0] - 20.0 * d + d / 2.0,
+            y: bbox[3] + 20.0 * d - d / 2.0,
+        };
+        let g = Grid::with_axes(origin, d, -d, w, h, vec![z; w * h]).unwrap();
+        write_geotiff_f32(path, &g).unwrap();
+    }
+
+    /// A pack of 10 m cells at Schwerin (11.40 to 11.42° E, 53.625 to
+    /// 53.635° N, UTM zone 32) on a flat 40 m surface, built in `dir`.
+    fn schwerin_pack(dir: &Path) -> BuildParams {
+        let bbox = [11.40, 53.625, 11.42, 53.635];
+        flat_dsm(&dir.join("dsm.tif"), bbox, 40.0);
+        let mut p = BuildParams::berlin_test(vec![dir.join("dsm.tif")], dir.join("pack"));
+        p.bbox_wgs84 = Some(bbox);
+        p.res_m = 10.0;
+        p.utm_zone = 32;
+        p
+    }
+
+    /// CityJSON buildings and a population grid in EPSG:4326, in degrees: the
+    /// building stands where its longitude and latitude put it, and the
+    /// grid's 100 people are counted, spread over the pack cells their
+    /// 0.001° cell covers.
+    #[test]
+    fn sources_in_degrees_are_placed_where_they_lie() {
+        let dir = std::env::temp_dir().join(format!("planner_pack_degrees_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cityjson")).unwrap();
+        let mut p = schwerin_pack(&dir);
+        p.lod2_geometry = true;
+        let degrees = "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs";
+        // A footprint 0.0001° each way about 11.41° E, 53.63° N, 12 m tall.
+        std::fs::write(
+            dir.join("cityjson/b.json"),
+            r#"{"type":"CityJSON","transform":{"scale":[1e-7,1e-7,0.001],"translate":[11.41,53.63,0]},
+              "vertices":[[-1000,-1000,0],[1000,-1000,0],[1000,1000,0],[-1000,1000,0]],
+              "CityObjects":{"B":{"type":"Building","attributes":{"g":30.0,"r":42.0},
+                "geometry":[{"type":"MultiSurface","lod":"0","boundaries":[[[0,1,2,3]]]}]}}}"#,
+        )
+        .unwrap();
+        p.cityjson = Some(CityJsonInput {
+            dir: dir.join("cityjson"),
+            proj: degrees.into(),
+            heights: crate::cityjson::Heights {
+                ground: "g".into(),
+                roof: "r".into(),
+            },
+            source: "test".into(),
+            notice: "test".into(),
+        });
+        std::fs::write(dir.join("people.csv"), "lon,lat,people\n11.41,53.63,100\n").unwrap();
+        p.population = Some(PopulationInput {
+            grid: PopulationGrid::Csv {
+                csv: dir.join("people.csv"),
+                layout: crate::zensus::GridCsv {
+                    delimiter: ',',
+                    x: "lon".into(),
+                    y: "lat".into(),
+                    value: "people".into(),
+                    cell_m: 0.001,
+                },
+            },
+            proj: degrees.into(),
+            source: "test".into(),
+            notice: "test".into(),
+        });
+        build(&p).unwrap();
+
+        // Its corners, projected, about where 11.41° E, 53.63° N is.
+        let (ll, u32_) = (longlat_proj().unwrap(), utm_proj(32).unwrap());
+        let (e, n) = to_utm(&u32_, &ll, 11.41, 53.63).unwrap();
+        let line = std::fs::read_to_string(dir.join("pack/buildings.jsonl")).unwrap();
+        let b: crate::lod2::Lod2Building = serde_json::from_str(line.trim()).unwrap();
+        let ring = &b.rings[0].exterior;
+        let (x, y) = ring
+            .iter()
+            .fold((0.0, 0.0), |(x, y), p| (x + p.0 / 4.0, y + p.1 / 4.0));
+        assert!(
+            (x - e).abs() < 0.01 && (y - n).abs() < 0.01,
+            "{x} {y}, not {e} {n}"
+        );
+        assert!((b.height_m - 12.0).abs() < 1e-9, "{}", b.height_m);
+
+        let mut pop = CogReader::open(&dir.join("pack/population.tif")).unwrap();
+        let m = *pop.meta();
+        let mut people = Vec::new();
+        for row in 0..m.height {
+            for col in 0..m.width {
+                let v = pop.pixel(col, row).unwrap();
+                if v > 0.0 {
+                    people.push(v);
+                }
+            }
+        }
+        let total: f32 = people.iter().sum();
+        assert!((total - 100.0).abs() < 1e-3, "{total}");
+        // The grid's cell, about 66 by 111 m, over some 70 of the pack's.
+        assert!(people.len() > 20, "in {} cells", people.len());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
