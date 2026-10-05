@@ -57,6 +57,12 @@ impl CogMeta {
         }
         Ok((c0, r0, (c1 - c0 + 1) as usize, (r1 - r0 + 1) as usize))
     }
+
+    /// The centre of the first cell of a window starting at column `c0`, row
+    /// `r0`: the origin every window read gives its grid.
+    pub fn window_origin(&self, c0: u32, r0: u32) -> Xy {
+        Xy { x: self.origin.x + c0 as f64 * self.dx, y: self.origin.y + r0 as f64 * self.dy }
+    }
 }
 
 /// One decoded chunk: pixel values plus the buffer's actual row width
@@ -662,10 +668,7 @@ impl<R: Read + Seek> CogReader<R> {
                 }
             }
         }
-        let origin = Xy {
-            x: self.meta.origin.x + c0 as f64 * self.meta.dx,
-            y: self.meta.origin.y + r0 as f64 * self.meta.dy,
-        };
+        let origin = self.meta.window_origin(c0, r0);
         Grid::with_axes(
             origin,
             self.meta.dx * sc as f64,
@@ -737,10 +740,7 @@ impl<R: Read + Seek> CogReader<R> {
                 }
             }
         }
-        let origin = Xy {
-            x: self.meta.origin.x + c0 as f64 * self.meta.dx,
-            y: self.meta.origin.y + r0 as f64 * self.meta.dy,
-        };
+        let origin = self.meta.window_origin(c0, r0);
         Grid::with_axes(origin, self.meta.dx, self.meta.dy, w, h, data)
     }
 }
@@ -798,10 +798,7 @@ impl SharedRows {
                 return Ok(None);
             }
         }
-        let origin = Xy {
-            x: self.meta.origin.x + c0 as f64 * self.meta.dx,
-            y: self.meta.origin.y + r0 as f64 * self.meta.dy,
-        };
+        let origin = self.meta.window_origin(c0, r0);
         Grid::with_axes(origin, self.meta.dx, self.meta.dy, w, h, data).map(Some)
     }
 
@@ -834,10 +831,7 @@ impl SharedRows {
                 data[r * ow + c] = row_f[c * sc];
             }
         }
-        let origin = Xy {
-            x: self.meta.origin.x + c0 as f64 * self.meta.dx,
-            y: self.meta.origin.y + r0 as f64 * self.meta.dy,
-        };
+        let origin = self.meta.window_origin(c0, r0);
         Grid::with_axes(origin, self.meta.dx * sc as f64, self.meta.dy * sr as f64, ow, oh, data)
             .map(Some)
     }
