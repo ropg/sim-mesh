@@ -66,7 +66,8 @@ from its script's `.firmware(…)` declarations.
 
 **The planner sidecar.** One `planner-web` per pack in use, on
 `127.0.0.1:<free>`: started when the first simulation or page socket opens
-geodata on that pack, stopped when the last one lets go. It is sim-mesh's own,
+geodata on that pack, stopped SIDECAR_GRACE_S after the last one lets go
+unless one holds it again by then, as a reloaded page does. It is sim-mesh's own,
 built from `planner/` (by `sim` as it starts) to
 `planner/target/release/planner-web`; not built, a pack is refused with
 NO_PLANNER and synthetic ground works. The page reaches it as `/planner/<geodata>/…`, passed through with
@@ -327,6 +328,8 @@ NET_LOCK_DIR = os.path.join(tempfile.gettempdir(), "sim-mesh-nets")   # one lock
 READY_TIMEOUT_S = 30.0              # how long a child has to open its port
 STOP_TIMEOUT_S = 15.0               # how long a child has to stop before it is killed
 SIDECAR_READY_S = 60.0              # how long a planner-web has to answer /api/pack
+SIDECAR_GRACE_S = 30.0              # how long one nobody holds is kept: a page reloading
+                                    # lets go of it and opens it again a moment later
 SIDECAR_POLL_S = 0.2
 REPORT_S = 1.0                      # how often every socket hears the registry
 PACE_WINDOW_S = 120.0               # the wall the estimate's pace is taken over
@@ -497,6 +500,8 @@ class Sidecar:
         self.url = "http://127.0.0.1:%d" % port
         self.process = None
         self.holders = set()
+        # Its stop, while nobody holds it: called off when somebody does again.
+        self.idle = None
         self.ready = asyncio.get_running_loop().create_future()
         self.log_path = os.path.join(store.RUNS_DIR, "planner-%s.log"
                                      % store.slug(os.path.basename(pack), "pack"))
@@ -532,6 +537,9 @@ class Sidecars:
             return None
         self.release(holder, keep=gd.pack_dir)
         car = self.by_pack.get(gd.pack_dir)
+        if car is not None and car.idle is not None:
+            car.idle.cancel()
+            car.idle = None
         if car is None:
             binary = planner_web()
             if binary is None:
@@ -591,14 +599,24 @@ class Sidecars:
             car.ready.exception()           # retrieved: a failure nobody awaited is not news
 
     def release(self, holder, keep=None):
-        """`holder` lets go of every pack but `keep`; a sidecar nobody holds stops."""
+        """`holder` lets go of every pack but `keep`; a sidecar nobody holds
+        stops SIDECAR_GRACE_S later, unless somebody holds it again first: a
+        page reloaded opens its geodata again before then, and finds the
+        sidecar up, its building index loaded."""
         for pack, car in list(self.by_pack.items()):
             if pack == keep or holder not in car.holders:
                 continue
             car.holders.discard(holder)
-            if not car.holders:
-                del self.by_pack[pack]
-                asyncio.ensure_future(self.stop(car))
+            if not car.holders and car.idle is None:
+                car.idle = asyncio.get_running_loop().call_later(SIDECAR_GRACE_S, self.expire, car)
+
+    def expire(self, car):
+        """A sidecar nobody held again in its grace, stopped."""
+        car.idle = None
+        if car.holders or self.by_pack.get(car.pack) is not car:
+            return
+        del self.by_pack[car.pack]
+        asyncio.ensure_future(self.stop(car))
 
     async def stop(self, car):
         if not car.ready.done():
@@ -620,6 +638,9 @@ class Sidecars:
     async def close(self):
         cars = list(self.by_pack.values())
         self.by_pack.clear()
+        for car in cars:
+            if car.idle is not None:
+                car.idle.cancel()
         await asyncio.gather(*(self.stop(car) for car in cars), return_exceptions=True)
 
 

@@ -298,6 +298,33 @@ def test_a_pack_without_a_planner_is_refused_with_the_sentence(monkeypatch):
     asyncio.run(go())
 
 
+def test_a_sidecar_nobody_holds_is_kept_for_a_while_for_a_page_coming_back(monkeypatch):
+    """A page reloading lets go of its geodata's sidecar and holds it again a
+    moment later: the same sidecar, still up. One nobody holds again within
+    SIDECAR_GRACE_S is stopped."""
+    class Pack:
+        is_pack, pack_dir, name = True, "/packs/berlin", "berlin"
+
+    monkeypatch.setattr(front, "SIDECAR_GRACE_S", 0.05)
+
+    async def go():
+        cars = front.Sidecars(None)
+        car = front.Sidecar(Pack.pack_dir, 1)
+        car.ready.set_result(car.url)
+        cars.by_pack[car.pack] = car
+        assert await cars.hold("conn:1", Pack()) == car.url
+        cars.release("conn:1")
+        assert cars.by_pack[car.pack] is car and car.idle is not None
+        assert await cars.hold("conn:2", Pack()) == car.url
+        assert car.idle is None
+        await asyncio.sleep(0.1)
+        assert cars.by_pack[car.pack] is car and car.holders == {"conn:2"}
+        cars.release("conn:2")
+        await asyncio.sleep(0.1)
+        assert car.pack not in cars.by_pack
+    asyncio.run(go())
+
+
 def test_a_pack_is_refused_for_no_planner_before_its_manifest_is_read(tmp_path, monkeypatch):
     """With no planner the pack is typically gone with it: the reason given
     is the planner, not the manifest. With a planner, an unreadable manifest
@@ -758,6 +785,7 @@ def test_the_planner_is_started_for_a_pack_and_passed_through(tmp_path, monkeypa
     geodata.write(geodata.geodata_path("berlin"), {"pack": BERLIN_PACK})
     geodata.write(geodata.geodata_path("flat"), {"synthetic": {"exponent": 3.0}})
     monkeypatch.setattr(store, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(front, "SIDECAR_GRACE_S", 0.1)
 
     async def check(f, session, base, ws):
         async with session.get(base + "/planner/berlin/api/pack") as resp:
