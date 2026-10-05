@@ -27,11 +27,20 @@ use std::path::{Path, PathBuf};
 pub const MAX_SAMPLES_SIDE: usize = 8;
 /// A value past this is a raster's no-data (AHN's is the largest f32).
 const NO_DATA_ABOVE: f32 = 1.0e20;
-/// Readers a worker keeps open per model. A row of samples crosses a few
-/// tiles at a time, and a source of 1 km tiles (Brandenburg's) is a hundred
-/// of them under a 10 km pack: opened all at once by every worker, they
-/// pass the 256 open files macOS allows a process.
-const OPEN_PER_WORKER: usize = 8;
+/// Files the sampler keeps open, all its workers together: half the 256 a
+/// macOS process may open by default. A row of samples crosses a few tiles
+/// at a time, and a source of 1 km tiles (Brandenburg's) is a hundred of
+/// them under a 10 km pack, so a worker keeps only the last few it read.
+const OPEN_FILES: usize = 128;
+
+/// Readers a worker keeps open per model, its share of `OPEN_FILES`: a
+/// reader holds a file, or two for an uncompressed strip image (`cog.rs`'s
+/// direct rows), and a worker reads two models. At most eight, and at least
+/// two, one either side of a tile's edge, so that past 16 workers the share
+/// is exceeded rather than a cell's samples reopening tiles in turn.
+fn open_per_worker() -> usize {
+    (OPEN_FILES / (4 * rayon::current_num_threads())).clamp(2, 8)
+}
 
 /// One source pair's tiles, and the system they are in (a proj string). No
 /// surface tiles: the terrain stands alone.
@@ -75,6 +84,8 @@ struct Tiles<'a> {
     nodata: &'a [f32],
     metas: Vec<CogMeta>,
     open: Vec<(usize, CogReader<BufReader<File>>)>,
+    /// Readers kept open at most.
+    cap: usize,
 }
 
 impl<'a> Tiles<'a> {
@@ -89,6 +100,7 @@ impl<'a> Tiles<'a> {
             nodata,
             metas,
             open: Vec::new(),
+            cap: open_per_worker(),
         })
     }
 
@@ -100,6 +112,7 @@ impl<'a> Tiles<'a> {
             nodata: self.nodata,
             metas: self.metas.clone(),
             open: Vec::new(),
+            cap: self.cap,
         }
     }
 
@@ -114,8 +127,11 @@ impl<'a> Tiles<'a> {
         Some((col as u32, row as u32))
     }
 
-    /// The value of the first tile that has one at (x, y), nearest pixel.
-    fn value_at(&mut self, x: f64, y: f64) -> Option<f32> {
+    /// The value of the first tile that has one at (x, y), nearest pixel. A
+    /// tile that holds (x, y) and will not open is an error, not a hole: a
+    /// build that ran out of open files would otherwise lose its
+    /// measurements without a word.
+    fn value_at(&mut self, x: f64, y: f64) -> Result<Option<f32>, PackError> {
         // The tiles open now first, the last used foremost: the next sample
         // is almost always on one of them.
         for slot in 0..self.open.len() {
@@ -124,7 +140,7 @@ impl<'a> Tiles<'a> {
             };
             self.open[..=slot].rotate_right(1);
             if let Some(v) = self.read(col, row) {
-                return Some(v);
+                return Ok(Some(v));
             }
         }
         for i in 0..self.metas.len() {
@@ -134,18 +150,16 @@ impl<'a> Tiles<'a> {
             let Some((col, row)) = self.pixel_of(i, x, y) else {
                 continue;
             };
-            let Ok(reader) = open(&self.paths[i], self.pixel_m) else {
-                continue;
-            };
-            if self.open.len() == OPEN_PER_WORKER {
+            let reader = open(&self.paths[i], self.pixel_m)?;
+            if self.open.len() == self.cap {
                 self.open.pop();
             }
             self.open.insert(0, (i, reader));
             if let Some(v) = self.read(col, row) {
-                return Some(v);
+                return Ok(Some(v));
             }
         }
-        None
+        Ok(None)
     }
 
     /// The foremost open tile's value at a pixel, if it is data.
@@ -180,14 +194,15 @@ pub fn sample(
     let mut terrain = vec![f32::NAN; nx * ny];
     let mut clutter = vec![f32::NAN; nx * ny];
     let mut count = vec![0u32; nx * ny];
+    // The first error any worker meets ends the sampling and is the build's.
     terrain
         .par_chunks_mut(nx)
         .zip(clutter.par_chunks_mut(nx))
         .zip(count.par_chunks_mut(nx))
         .enumerate()
-        .for_each_init(
+        .try_for_each_init(
             || (terrain_tiles.fresh(), surface_tiles.fresh()),
-            |(ter, sur), (row, ((t_row, c_row), n_row))| {
+            |(ter, sur), (row, ((t_row, c_row), n_row))| -> Result<(), PackError> {
                 let cy = origin.y - row as f64 * res;
                 let mut above = MeanAccum::new(nx);
                 for col in 0..nx {
@@ -201,9 +216,9 @@ pub fn sample(
                             let Some((sx, sy)) = transform(pack, &src, x, y) else {
                                 continue;
                             };
-                            let Some(t) = ter.value_at(sx, sy) else { continue };
+                            let Some(t) = ter.value_at(sx, sy)? else { continue };
                             if !alone {
-                                let Some(s) = sur.value_at(sx, sy) else { continue };
+                                let Some(s) = sur.value_at(sx, sy)? else { continue };
                                 above.add(col, (s - t).max(0.0));
                             }
                             t_sum += t;
@@ -222,12 +237,101 @@ pub fn sample(
                     t_row[col] = t_sum / t_n as f32;
                     n_row[col] = t_n;
                 }
+                Ok(())
             },
-        );
+        )?;
     Ok(CellValues {
         terrain,
         clutter,
         count,
         per_cell: (k * k) as u32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use planner_terrain::cog::write_geotiff_f32;
+    use planner_terrain::Grid;
+
+    /// The pack's system, and the test tiles' too.
+    const UTM33: &str = "+proj=utm +zone=33 +ellps=WGS84 +datum=WGS84 +units=m +no_defs";
+
+    /// A 300 m tile of 10 m pixels, its south-west corner at (x0, y0), each
+    /// pixel `v` but a no-data −9999 at `hole` (column, row).
+    fn tile(path: &Path, x0: f64, y0: f64, v: f32, hole: Option<(usize, usize)>) {
+        let mut data = vec![v; 30 * 30];
+        if let Some((c, r)) = hole {
+            data[r * 30 + c] = -9999.0;
+        }
+        let origin = Xy {
+            x: x0 + 5.0,
+            y: y0 + 295.0,
+        };
+        let g = Grid::with_axes(origin, 10.0, -10.0, 30, 30, data).unwrap();
+        write_geotiff_f32(path, &g).unwrap();
+    }
+
+    /// Twelve tiles across, more than a worker keeps open, and two down:
+    /// every pack cell they cover is measured by all nine of its samples,
+    /// but the one cell with a sample on a no-data pixel, by eight. A tile
+    /// that will not open is the build's error, not a hole in it.
+    #[test]
+    fn elevation_sample_keeps_every_tile() {
+        let dir = std::env::temp_dir().join(format!("planner_elevation_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut terrain, mut surface) = (Vec::new(), Vec::new());
+        for j in 0..2 {
+            for i in 0..12 {
+                let (x0, y0) = (300_000.0 + 300.0 * i as f64, 5_800_000.0 + 300.0 * j as f64);
+                let (t, s) = (
+                    dir.join(format!("t_{i}_{j}.tif")),
+                    dir.join(format!("s_{i}_{j}.tif")),
+                );
+                tile(&t, x0, y0, 30.0, ((i, j) == (5, 1)).then_some((3, 4)));
+                tile(&s, x0, y0, 40.0, None);
+                terrain.push(t);
+                surface.push(s);
+            }
+        }
+        let input = ElevationInput {
+            terrain,
+            surface,
+            proj: UTM33.into(),
+            pixel_m: 7.5,
+            nodata: vec![-9999.0],
+            source: "test".into(),
+            notice: "test".into(),
+        };
+        let pack = System::new(UTM33).unwrap();
+        // 30 m cells over the 3.6 × 0.6 km the tiles cover, 3 × 3 samples each.
+        let got = sample(
+            &input,
+            Xy {
+                x: 300_015.0,
+                y: 5_800_585.0,
+            },
+            30.0,
+            120,
+            20,
+            &pack,
+        )
+        .unwrap();
+        assert_eq!(got.per_cell, 9);
+        // The no-data pixel's centre (301_535, 5_800_555) is in row 1, column 51.
+        let hole = 120 + 51;
+        for c in 0..120 * 20 {
+            assert_eq!(got.count[c], if c == hole { 8 } else { 9 }, "cell {c}");
+            assert_eq!((got.terrain[c], got.clutter[c]), (30.0, 10.0), "cell {c}");
+        }
+
+        let mut tiles = Tiles::new(&input.terrain, 7.5, None).unwrap();
+        std::fs::remove_file(&input.terrain[7]).unwrap();
+        let err = tiles
+            .value_at(302_150.0, 5_800_150.0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("t_7_0.tif"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
