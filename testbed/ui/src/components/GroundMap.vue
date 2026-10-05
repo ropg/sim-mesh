@@ -156,6 +156,18 @@ const FLASH_MS = 400
 const BLDG_MAX_VIEW_M = 9000
 const BLDG_FILL_VIEW_M = 4000
 const SETTLE_MS = 160
+/* After the wheel, what the view needs is fetched later than its repaint,
+ * as the planner's map waits: a wheel gesture delivers notches 100-300 ms
+ * apart on many mice, and at less each notch aborted the fetch before it,
+ * whose basemap the sidecar then rendered for nobody (measured there: six
+ * notches put six renders in flight, two refused with 429, the rest 1.6-2.0
+ * s each instead of 0.2 s). The map redraws from what it holds meanwhile.
+ * A drag let go has nothing after it to wait for. */
+const WHEEL_SETTLE_MS = 300
+/* A ground update abandoned after this, so that one request that never
+ * answers cannot hold the map: far above a warm update's ~0.3 s and a cold
+ * tile from disk, a tripwire, not a budget (the planner's). */
+const GROUND_DEADLINE_MS = 20_000
 const DRAG_SEND_HZ = 6
 const COVERAGE_PX = 4
 /** Device pixels per CSS pixel at most, as the planner's map has it: past
@@ -424,15 +436,22 @@ function covers(outer: Box, inner: Box) {
 }
 
 let settleTimer: ReturnType<typeof setTimeout> | null = null
-/** The view has moved: redraw now, fetch and paint what it needs once it stops. */
-function settled() {
+let fetchTimer: ReturnType<typeof setTimeout> | null = null
+/** The view has moved: redraw now, paint what it holds once it stops, and
+ *  fetch what it needs then, or, after the wheel, a little later. */
+function settled(wheel = false) {
   redrawWanted = true
   if (settleTimer) clearTimeout(settleTimer)
-  settleTimer = setTimeout(() => {
-    settleTimer = null
-    fetchGround(); fetchFootprints(); fetchRoads(); paintOverlay(); void paintCoverage()
-    void fetchPopulation()
-  }, SETTLE_MS)
+  if (fetchTimer) { clearTimeout(fetchTimer); fetchTimer = null }
+  // Asked for before the overlay is painted, which would hold the requests back.
+  settleTimer = setTimeout(() => { settleTimer = null; if (!wheel) fetchView(); paintOverlay() }, SETTLE_MS)
+  if (wheel) fetchTimer = setTimeout(() => { fetchTimer = null; fetchView() }, WHEEL_SETTLE_MS)
+}
+
+/** What the view needs, asked for. */
+function fetchView() {
+  fetchGround(); fetchFootprints(); fetchRoads(); void paintCoverage()
+  void fetchPopulation()
 }
 
 /** Whether a heatmap is on show: population, or coverage with something painted. */
@@ -498,6 +517,7 @@ async function fetchGround() {
   groundReq?.abort()
   const ctrl = new AbortController()
   groundReq = ctrl
+  const deadline = setTimeout(() => ctrl.abort(), GROUND_DEADLINE_MS)
   const box = viewBox(0.6)
   const w = Math.round(size.w * 1.6), h = Math.round(size.h * 1.6)
   busy.value = true
@@ -511,6 +531,7 @@ async function fetchGround() {
   } catch (e) {
     if ((e as Error).name !== 'AbortError') note.value = `ground: ${(e as Error).message}`
   } finally {
+    clearTimeout(deadline)
     if (groundReq === ctrl) { groundReq = null; busy.value = false }
   }
 }
@@ -1443,7 +1464,7 @@ function onWheel(event: WheelEvent) {
   view.value.cx = bx - (at.x - size.w / 2) * view.value.mpp
   view.value.cy = by + (at.y - size.h / 2) * view.value.mpp
   saveView()
-  settled()
+  settled(true)
 }
 
 function onContext(event: MouseEvent) {
@@ -1493,6 +1514,7 @@ onUnmounted(() => {
   groundReq?.abort(); overviewReq?.abort(); wayReq?.abort(); populationReq?.abort()
   resetFootprints()
   if (settleTimer) clearTimeout(settleTimer)
+  if (fetchTimer) clearTimeout(fetchTimer)
   coverageReq?.abort()
   saveView()
 })
