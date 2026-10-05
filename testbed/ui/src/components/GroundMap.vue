@@ -158,6 +158,9 @@ const BLDG_FILL_VIEW_M = 4000
 const SETTLE_MS = 160
 const DRAG_SEND_HZ = 6
 const COVERAGE_PX = 4
+/** Device pixels per CSS pixel at most, as the planner's map has it: past
+ *  1.5 the canvas costs more to fill than the eye gains from it. */
+const DPR_CAP = 1.5
 
 /* ── the view: centre in ground metres, metres per CSS pixel ── */
 const view = ref({ cx: 0, cy: 0, mpp: 20 })
@@ -319,7 +322,15 @@ let overviewReq: AbortController | null = null
  * FOOT_TILES_KEPT of them). The sidecar caps a reply's vertices and fills
  * it in the pack's order, not the reply box's, so a reply that says it was
  * cut short is thrown away and its square asked for again as four. A
- * building across a square's edge comes in both, and is drawn once. */
+ * building across a square's edge comes in both, and is held and drawn once.
+ *
+ * What the squares hold is one cache of buildings by the sidecar's id, as
+ * the planner's own map keeps them: a building already held keeps its
+ * geometry, and the squares holding it are counted, so it goes when the
+ * last of them does. A coarse index finds the buildings under a box:
+ * buckets FOOT_BUCKET_M on a side, each building in every bucket its box
+ * touches, so drawing a view visits the few dozen buckets under it rather
+ * than every building held. */
 const FOOT_TILE_M = 1000
 const FOOT_TILE_MIN_M = 125
 const FOOT_TILES_KEPT = 600
@@ -332,8 +343,51 @@ let footGeneration = 0
 /** The pack has no footprints (or the sidecar is still indexing them). */
 let footNone = false
 let footPaintTimer: ReturnType<typeof setTimeout> | null = null
+/** Squares landed since the overlay was last painted, in the order they landed. */
+let footLanded: FootTile[] = []
 let footprintTries = 0
 const FOOTPRINT_TRIES = 30
+const FOOT_BUCKET_M = 500
+/** Every building held, by id, with how many held squares have it. */
+const footHeld = new Map<number, { f: Footprint; squares: number }>()
+/** Bucket key to the ids of the buildings in that bucket. */
+const footIndex = new Map<number, Set<number>>()
+const bucketKey = (bx: number, by: number) => bx * 1048576 + by
+
+/** Each bucket a building's box touches. */
+function forBuckets(b: Box, each: (key: number) => void) {
+  const bx1 = Math.floor(b.maxx / FOOT_BUCKET_M), by1 = Math.floor(b.maxy / FOOT_BUCKET_M)
+  for (let bx = Math.floor(b.minx / FOOT_BUCKET_M); bx <= bx1; bx++) {
+    for (let by = Math.floor(b.miny / FOOT_BUCKET_M); by <= by1; by++) each(bucketKey(bx, by))
+  }
+}
+
+/** A square's buildings into the cache; those held already keep their geometry. */
+function holdSquare(t: FootTile) {
+  for (const f of t.list) {
+    const held = footHeld.get(f.id)
+    if (held) { held.squares++; continue }
+    footHeld.set(f.id, { f, squares: 1 })
+    forBuckets(f.box, (k) => {
+      let ids = footIndex.get(k)
+      if (!ids) { ids = new Set(); footIndex.set(k, ids) }
+      ids.add(f.id)
+    })
+  }
+}
+
+/** A square let go: its buildings that no other held square has go with it. */
+function dropSquare(t: FootTile) {
+  for (const f of t.list) {
+    const held = footHeld.get(f.id)
+    if (!held || --held.squares > 0) continue
+    footHeld.delete(f.id)
+    forBuckets(held.f.box, (k) => {
+      const ids = footIndex.get(k)
+      if (ids) { ids.delete(f.id); if (!ids.size) footIndex.delete(k) }
+    })
+  }
+}
 
 function footKey(size: number, ix: number, iy: number) { return `${size}:${ix}:${iy}` }
 function footBox(t: { size: number; ix: number; iy: number }): Box {
@@ -343,17 +397,18 @@ function meets(a: Box, b: Box) {
   return a.minx < b.maxx && a.maxx > b.minx && a.miny < b.maxy && a.maxy > b.miny
 }
 
-/** Every footprint held that meets `box`, each once. */
-function* footprintsIn(box: Box): Generator<Footprint> {
-  const seen = new Set<number>()
-  for (const t of footTiles.values()) {
-    if (t.state !== 'done' || !meets(footBox(t), box)) continue
-    for (const f of t.list) {
-      if (seen.has(f.id)) continue
-      seen.add(f.id)
-      yield f
+/** Every footprint held whose box meets `box`, each once. */
+function footprintsIn(box: Box): Footprint[] {
+  const out: Footprint[] = [], seen = new Set<number>()
+  forBuckets(box, (k) => {
+    for (const id of footIndex.get(k) ?? []) {
+      if (seen.has(id)) continue
+      seen.add(id)
+      const f = footHeld.get(id)!.f
+      if (f.box.maxx >= box.minx && f.box.minx <= box.maxx && f.box.maxy >= box.miny && f.box.miny <= box.maxy) out.push(f)
     }
-  }
+  })
+  return out
 }
 let pin: [number, number] | null = null
 
@@ -451,8 +506,8 @@ async function fetchGround() {
     if (ctrl.signal.aborted) return
     detail = { image, grid: image.grid, key, res: (box.maxx - box.minx) / image.canvas.width }
     redrawWanted = true
-    // Footprints are coloured by height over this tile's terrain.
-    paintOverlay()
+    // Filled footprints are coloured by height over this tile's terrain.
+    if (props.display.buildings && viewWidthM() <= BLDG_FILL_VIEW_M) paintOverlay()
   } catch (e) {
     if ((e as Error).name !== 'AbortError') note.value = `ground: ${(e as Error).message}`
   } finally {
@@ -546,7 +601,8 @@ async function loadTile(base: string, tile: FootTile, key: string, generation: n
     }
     tile.state = 'done'
     tile.list = got.list
-    schedulePaint()
+    holdSquare(tile)
+    schedulePaint(tile)
   } catch (e) {
     if (generation !== footGeneration) return
     footTiles.delete(key)
@@ -556,10 +612,11 @@ async function loadTile(base: string, tile: FootTile, key: string, generation: n
   }
 }
 
-/** Squares land a few at a time: one repaint for each burst. */
-function schedulePaint() {
+/** Squares land a few at a time: each burst is painted onto the overlay at once. */
+function schedulePaint(tile: FootTile) {
+  footLanded.push(tile)
   if (footPaintTimer) return
-  footPaintTimer = setTimeout(() => { footPaintTimer = null; paintOverlay() }, 80)
+  footPaintTimer = setTimeout(() => { footPaintTimer = null; paintLanded() }, 80)
 }
 
 /** Keep the FOOT_TILES_KEPT squares nearest the view. */
@@ -568,13 +625,19 @@ function evictFootTiles(cx: number, cy: number) {
   const done = [...footTiles.entries()].filter(([, t]) => t.state === 'done' || t.state === 'split')
   done.sort((a, b) => Math.hypot((b[1].ix + 0.5) * b[1].size - cx, (b[1].iy + 0.5) * b[1].size - cy)
                     - Math.hypot((a[1].ix + 0.5) * a[1].size - cx, (a[1].iy + 0.5) * a[1].size - cy))
-  for (const [key] of done.slice(0, footTiles.size - FOOT_TILES_KEPT)) footTiles.delete(key)
+  for (const [key, t] of done.slice(0, footTiles.size - FOOT_TILES_KEPT)) {
+    if (t.state === 'done') dropSquare(t)
+    footTiles.delete(key)
+  }
 }
 
 /** Forget every square: different ground, or the layer turned off. */
 function resetFootprints() {
   footGeneration++
   footTiles.clear()
+  footHeld.clear()
+  footIndex.clear()
+  footLanded = []
   footQueue = []
   footActive = 0
   footNone = false
@@ -626,8 +689,20 @@ function heightColour(m: number): string {
   return `rgba(${r}, ${g}, ${b}, 0.75)`
 }
 
+/* What the overlay holds of the footprints: whether it has them, filled or
+ * as outlines, the box they were kept to, and the buildings on it. A square
+ * that lands after the overlay was painted is painted onto it as it is (at
+ * the view it is of, only the buildings it does not hold), so a burst of
+ * squares costs their own footprints, not every one in view again; once the
+ * last square wanted is in, the overlay is painted whole once more, so what
+ * it shows does not depend on the order the squares landed in. */
+const overlayFoot = { on: false, fill: false, box: { minx: 0, miny: 0, maxx: 0, maxy: 0 } as Box, ids: new Set<number>() }
+
+/** The overlay, whole, at the view as it is now. */
 function paintOverlay() {
   overlay.on = false
+  overlayFoot.on = false
+  footLanded = []
   redrawWanted = true
   const showWays = ground.isPack && props.display.roads && ways
   const showFootprints = ground.isPack && props.display.buildings && footTiles.size > 0
@@ -636,8 +711,25 @@ function paintOverlay() {
   const c = beginSurface(overlay, 1)
   const box = viewBox(0.05)
   if (showWays) paintWays(c, box)
-  if (showFootprints) paintFootprints(c, box)
+  if (showFootprints) {
+    Object.assign(overlayFoot, { on: true, fill: viewWidthM() <= BLDG_FILL_VIEW_M, box, ids: new Set() })
+    paintFootprints(c, footprintsIn(box))
+  }
   overlay.on = true
+}
+
+/** The squares landed since the overlay was painted, onto it; or, once the
+ *  last square wanted is in, the overlay whole. */
+function paintLanded() {
+  const landed = footLanded
+  footLanded = []
+  if (!overlay.on || !overlayFoot.on) return
+  if (!footQueue.length && !footActive) { paintOverlay(); return }
+  const list = landed.filter(t => t.state === 'done' && footTiles.get(footKey(t.size, t.ix, t.iy)) === t)
+    .flatMap(t => t.list)
+  paintFootprints(overlay.canvas.getContext('2d')!, list)
+  overlay.grey = null
+  redrawWanted = true
 }
 
 function beginSurface(s: Surface, scale: number): CanvasRenderingContext2D {
@@ -682,28 +774,49 @@ function paintWays(c: CanvasRenderingContext2D, box: Box) {
   c.globalAlpha = 1
 }
 
-function paintFootprints(c: CanvasRenderingContext2D, box: Box) {
-  const fill = viewWidthM() <= BLDG_FILL_VIEW_M
-  c.lineWidth = 0.8
-  c.strokeStyle = 'rgba(210, 214, 222, 0.55)'
-  for (const f of footprintsIn(box)) {
-    if (f.box.maxx < box.minx || f.box.minx > box.maxx || f.box.maxy < box.miny || f.box.miny > box.maxy) continue
-    c.beginPath()
+/* Footprints as the planner's map draws them: all the outlines one path,
+ * stroked once, and the fills one path a colour, under them. A ring is
+ * closed by a line back to its first point, not by closePath(), which in
+ * Chrome costs as many steps as the path has rings, so that closing n rings
+ * costs n² (measured by the planner on a 3 km view of Berlin, 12 589 rings:
+ * 2 566 ms with closePath(), 5.7 ms without). */
+function paintFootprints(c: CanvasRenderingContext2D, all: Footprint[]) {
+  const { fill, box, ids } = overlayFoot
+  const list = all.filter(f => !ids.has(f.id) && f.box.maxx >= box.minx && f.box.minx <= box.maxx
+    && f.box.maxy >= box.miny && f.box.miny <= box.maxy)
+  for (const f of list) ids.add(f.id)
+  // toScreen's arithmetic at the view the overlay is of, without an array a point.
+  const { cx, cy, mpp } = overlay.view, hw = overlay.w / 2, hh = overlay.h / 2
+  const path = (f: Footprint) => {
     for (const ring of f.rings) {
       const n = ring.length / 2
-      for (let k = 0; k < n; k++) {
-        const [sx, sy] = toScreen(ring[k * 2]!, ring[k * 2 + 1]!)
-        if (k === 0) c.moveTo(sx, sy); else c.lineTo(sx, sy)
-      }
-      c.closePath()
+      if (n < 2) continue
+      const x0 = hw + (ring[0]! - cx) / mpp, y0 = hh - (ring[1]! - cy) / mpp
+      c.moveTo(x0, y0)
+      for (let k = 1; k < n; k++) c.lineTo(hw + (ring[k * 2]! - cx) / mpp, hh - (ring[k * 2 + 1]! - cy) / mpp)
+      c.lineTo(x0, y0)
     }
-    if (fill) {
+  }
+  if (fill) {
+    const byColour = new Map<string, Footprint[]>()
+    for (const f of list) {
       const g = groundAt((f.box.minx + f.box.maxx) / 2, (f.box.miny + f.box.maxy) / 2)
-      c.fillStyle = g === null ? 'rgba(120, 128, 140, 0.55)' : heightColour(f.top - g)
+      const colour = g === null ? 'rgba(120, 128, 140, 0.55)' : heightColour(f.top - g)
+      const same = byColour.get(colour)
+      if (same) same.push(f); else byColour.set(colour, [f])
+    }
+    for (const [colour, fs] of byColour) {
+      c.beginPath()
+      for (const f of fs) path(f)
+      c.fillStyle = colour
       c.fill('evenodd')
     }
-    c.stroke()
   }
+  c.beginPath()
+  for (const f of list) path(f)
+  c.lineWidth = 0.8
+  c.strokeStyle = 'rgba(210, 214, 222, 0.55)'
+  c.stroke()
 }
 
 /* Coverage: the source's margin every COVERAGE_PX pixels, in the band it
@@ -1356,7 +1469,7 @@ const scale = computed(() => {
 function resize() {
   const element = wrap.value, surface = canvas.value
   if (!element || !surface) return
-  const dpr = window.devicePixelRatio || 1
+  const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP)
   const shown = size.w === 0 && element.clientWidth > 0
   size = { w: element.clientWidth, h: element.clientHeight, dpr }
   // Coming on show (its tab chosen): where the other map sharing the view left it.
