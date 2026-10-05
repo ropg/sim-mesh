@@ -13,6 +13,7 @@ use crate::{
     RegionMeta,
 };
 use planner_core::geo::Xy;
+use planner_core::memory::next_batch;
 use planner_terrain::cog::{write_geotiff_f32, CogReader};
 use planner_terrain::Grid;
 use proj4rs::Proj;
@@ -152,6 +153,22 @@ pub fn init_threads(requested: usize) -> usize {
     let n = if requested == 0 { avail.min(100) } else { requested };
     let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
     n
+}
+
+/// Memory a parse holds in flight per byte of the file it reads. An XYZ
+/// line of ~40 bytes becomes a 24-byte point and then a 4-byte cell, and a
+/// pair holds one tile's grid while it parses the other: about 0.4 of the
+/// pair's bytes, doubled for a points vector that outgrows its first size.
+const XYZ_BYTES_PER_BYTE: u64 = 1;
+/// CityGML streams; what stays is each building's footprint, smaller than
+/// the text it came from.
+const CITYGML_BYTES_PER_BYTE: u64 = 1;
+/// CityJSON is read whole into a `serde_json::Value`: a vertex of ~20
+/// bytes of text is an array of three 32-byte values.
+const CITYJSON_BYTES_PER_BYTE: u64 = 8;
+
+fn file_bytes(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
 }
 
 impl BuildParams {
@@ -551,10 +568,13 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                         && crate::lod2::tile_extent(name).map_or(true, |t| meets(t, grid_extent_33))
                 })
                 .collect();
-            // Parse in parallel, chunked to bound in-flight memory; scatter
+            // Parse in parallel, as many at once as memory holds; scatter
             // serially (fast) to keep the shared accumulator race-free.
             let mut parsed_files = 0u64;
-            for chunk in files.chunks(n_threads.max(1)) {
+            let mut rest = &files[..];
+            while !rest.is_empty() {
+                let chunk = next_batch(rest, |p| file_bytes(p) * CITYGML_BYTES_PER_BYTE, n_threads);
+                rest = &rest[chunk.len()..];
                 let parsed: Result<Vec<_>, PackError> = chunk
                     .par_iter()
                     .map(|path| {
@@ -605,7 +625,10 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 .collect();
             let mut skipped = 0usize;
             let mut parsed_files = 0u64;
-            for chunk in files.chunks(n_threads.max(1)) {
+            let mut rest = &files[..];
+            while !rest.is_empty() {
+                let chunk = next_batch(rest, |p| file_bytes(p) * CITYJSON_BYTES_PER_BYTE, n_threads);
+                rest = &rest[chunk.len()..];
                 let parsed: Result<Vec<_>, PackError> = chunk
                     .par_iter()
                     .map(|path| {
@@ -756,11 +779,18 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         if !pairs.is_empty() {
             let mut dtm_acc = crate::berlin1m::MeanAccum::new(nx * ny);
             let mut clut_acc = crate::berlin1m::MeanAccum::new(nx * ny);
-            // Parse tile pairs in parallel (the expensive part: two ~116 MB
-            // XYZ texts each), scatter serially per chunk; chunking bounds
-            // in-flight grids to ~32 MB × threads.
+            // Parse tile pairs in parallel (the expensive part: two XYZ
+            // texts of 100–160 MB each), as many at once as memory holds;
+            // scatter serially per batch.
             let mut pairs_done = 0u64;
-            for chunk in pairs.chunks(n_threads.max(1)) {
+            let mut rest = &pairs[..];
+            while !rest.is_empty() {
+                let chunk = next_batch(
+                    rest,
+                    |(_, dgm1, dom1)| (file_bytes(dgm1) + file_bytes(dom1)) * XYZ_BYTES_PER_BYTE,
+                    n_threads,
+                );
+                rest = &rest[chunk.len()..];
                 let parsed: Result<Vec<_>, PackError> = chunk
                     .par_iter()
                     .map(|(key, dgm1, dom1)| {
