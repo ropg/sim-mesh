@@ -548,8 +548,9 @@ UPLOAD_TIMEOUT_S = 3600
 
 
 def zip_facts(path):
-    """(name, facts) of a firmware zip about to be published: its node.yaml's
-    facts and its size, the zip's file name checked against them."""
+    """(name, facts) of a firmware zip about to be published: the name its
+    node.yaml gives it, whatever the file is called, and its node.yaml's facts
+    and its size."""
     name = os.path.basename(path)
     try:
         with zipfile.ZipFile(path) as zf:
@@ -558,13 +559,13 @@ def zip_facts(path):
         raise FirmwareError("%s: %s" % (path, err)) from err
     if not isinstance(node, dict):
         raise FirmwareError("%s: its node.yaml is no mapping" % name)
-    want = "%s.zip" % make_name(str(node.get("base")), str(node.get("arch")),
-                                str(node.get("version")))
-    if name != want:
-        raise FirmwareError("%s: its node.yaml names it %s" % (name, want))
+    try:
+        want = make_name(str(node.get("base")), str(node.get("arch")), str(node.get("version")))
+    except FirmwareError as err:
+        raise FirmwareError("%s: its node.yaml: %s" % (name, err)) from err
     facts = {k: str(node[k]) for k in PUBLISHED_FACTS if node.get(k) not in (None, "")}
     facts["size"] = os.path.getsize(path)
-    return name[:-4], facts
+    return want, facts
 
 
 def index_html(entries):
@@ -679,12 +680,13 @@ class _GitHub:
 
 
 async def publish(zips, delete=(), dry_run=False, repo=PUBLISH_REPO, site=PUBLISH_SITE,
-                  say=print):
+                  say=print, keep_older=False):
     """Firmware zips put on the pre-built list, and named ones taken off it.
 
     The list is the `firmware` release of `repo`: every zip, `firmware.yaml`
     (each zip's node.yaml facts, by name) and the `index.html` made from it.
-    A zip of a name already there is replaced. The zips go up first and the
+    A zip of a name already there is replaced, and, unless `keep_older`, the
+    listed versions of its base and arch older than it come off. The zips go up first and the
     listing last, so the listing never names a zip that is not there; then
     `site` is told to redeploy (`firmware-published`), since a browser cannot
     fetch a release's assets across origins and the site serves a copy."""
@@ -705,10 +707,21 @@ async def publish(zips, delete=(), dry_run=False, repo=PUBLISH_REPO, site=PUBLIS
         if "firmware.yaml" in assets:
             listed = yaml.safe_load(await hub.asset(repo, assets["firmware.yaml"])) or {}
             entries = listed.get("firmware") or {}
+        delete = list(delete)
         for name in delete:
             if name not in entries:
                 raise FirmwareError("%s is not on the list" % name)
             del entries[name]
+        if not keep_older:
+            for new in adding:
+                base, arch, version = parse_name(new)
+                for old in sorted(entries):
+                    got = parse_name(old)
+                    if got and old not in adding and got[:2] == (base, arch) and \
+                            scheme(got[2]) == scheme(version) and \
+                            version_key(got[2]) < version_key(version):
+                        del entries[old]
+                        delete.append(old)
         entries.update(adding)
         for name in sorted(adding):
             say("add     %s" % name)
@@ -768,6 +781,8 @@ def main(argv=None):
     p.add_argument("zip", nargs="*")
     p.add_argument("--delete", nargs="+", default=[], metavar="NAME",
                    help="take these off the list")
+    p.add_argument("--keep-older", action="store_true",
+                   help="leave the older versions of each zip's base and arch listed")
     p.add_argument("-n", "--dry-run", action="store_true", help="say what it would do")
     p.add_argument("--repo", default=PUBLISH_REPO, help="whose `firmware` release is the list")
     p.add_argument("--site", default=PUBLISH_SITE, help="the site told to redeploy")
@@ -791,7 +806,7 @@ def main(argv=None):
             if not args.zip and not args.delete:
                 ap.error("publish: name zips to add, or --delete names")
             asyncio.run(publish([caller(z) for z in args.zip], args.delete, args.dry_run,
-                                args.repo, args.site))
+                                args.repo, args.site, keep_older=args.keep_older))
         elif args.verb == "list":
             _print_rows(listing(args.substring))
         elif args.verb == "prebuilt":
