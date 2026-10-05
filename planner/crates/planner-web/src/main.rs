@@ -2496,12 +2496,28 @@ fn terrain_decimetres(v: f32, dst: &mut [u8]) {
 /// | i16 terrain[w*h] (decimetres) | u8 classes[w*h]? | u16 pop[w*h]? (×10 clamped)
 /// | u16 clutter[w*h]? (decimetres)
 async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -> Response {
-    let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
-    let res_hint = terrain_res_hint(&st);
-    let (tw, th) = tile_dims(&view, q.w, q.h, res_hint, res_hint);
     let Ok(_permit) = st.slots.try_acquire() else {
         return (StatusCode::TOO_MANY_REQUESTS, "renderer busy").into_response();
     };
+    match tokio::task::block_in_place(|| tile_reply(&st, &q)) {
+        Ok(out) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            out,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// `tile.bin`'s reply for `q`. Blocking.
+fn tile_reply(st: &AppState, q: &TileQuery) -> Result<Vec<u8>, String> {
+    let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
+    let res_hint = terrain_res_hint(st);
+    let (tw, th) = tile_dims(&view, q.w, q.h, res_hint, res_hint);
     // Both axes, independently. Deriving one square `res` from the width and
     // applying it vertically as well silently stretches the raster whenever the
     // view aspect and the pixel aspect disagree (e.g. after a window resize) —
@@ -2531,20 +2547,15 @@ async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -
     // output) because the resample below is bilinear and wants a neighbour on
     // each side; beyond that the extra cells were being read to be skipped.
     let (rw, rh) = ((tw as usize) * 2, (th as usize) * 2);
-    let (terrain, side_out) = tokio::task::block_in_place(|| {
-        rayon::join(
-            || st.layers.terrain.window_max(lo, hi, rw, rh),
-            || {
-                side.par_iter()
-                    .map(|l| l.and_then(|l| l.window_max(lo, hi, rw, rh).ok()))
-                    .collect::<Vec<_>>()
-            },
-        )
-    });
-    let terrain = match terrain {
-        Ok(g) => g,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    let (terrain, side_out) = rayon::join(
+        || st.layers.terrain.window_max(lo, hi, rw, rh),
+        || {
+            side.par_iter()
+                .map(|l| l.and_then(|l| l.window_max(lo, hi, rw, rh).ok()))
+                .collect::<Vec<_>>()
+        },
+    );
+    let terrain = terrain.map_err(|e| e.to_string())?;
     let [classes, population, clutter]: [Option<planner_terrain::Grid>; 3] =
         side_out.try_into().expect("one window per side layer");
 
@@ -2591,15 +2602,97 @@ async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -
     for b in [class_block, pop_block, clut_block].into_iter().flatten() {
         out.extend_from_slice(&b);
     }
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        out,
-    )
-        .into_response()
+    Ok(out)
+}
+
+/// `POST /tiles.bin`'s body: `tile.bin` queries, each box's numbers a string
+/// read exactly (`exact`), as a query string's are.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TilesRequest {
+    tiles: Vec<TilesQuery>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TilesQuery {
+    #[serde(deserialize_with = "exact")]
+    minx: f64,
+    #[serde(deserialize_with = "exact")]
+    miny: f64,
+    #[serde(deserialize_with = "exact")]
+    maxx: f64,
+    #[serde(deserialize_with = "exact")]
+    maxy: f64,
+    w: u32,
+    h: u32,
+    #[serde(default)]
+    terrain_only: u8,
+}
+
+/// Many `tile.bin` replies at once, each what that route answers its query,
+/// after its length as a u32: "PTLS" | u32 count | (u32 len, tile)…
+///
+/// For the ground under each of a set of nodes, which the page asked as one
+/// tile a node, four at a time: 41 requests for the 40 nodes of a
+/// berlin-centre plan. One render slot for them all, the tiles built side by
+/// side, and at most `MAX_PIXELS` cells among them.
+async fn tiles_bin(
+    State(st): State<Arc<AppState>>,
+    axum::Json(req): axum::Json<TilesRequest>,
+) -> Response {
+    let queries: Vec<TileQuery> = req
+        .tiles
+        .iter()
+        .map(|t| TileQuery {
+            minx: t.minx,
+            miny: t.miny,
+            maxx: t.maxx,
+            maxy: t.maxy,
+            w: t.w,
+            h: t.h,
+            terrain_only: t.terrain_only,
+        })
+        .collect();
+    let res_hint = terrain_res_hint(&st);
+    let cells: u64 = queries
+        .iter()
+        .map(|q| {
+            let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
+            let (w, h) = tile_dims(&view, q.w, q.h, res_hint, res_hint);
+            u64::from(w) * u64::from(h)
+        })
+        .sum();
+    if cells > u64::from(MAX_PIXELS) {
+        return (StatusCode::BAD_REQUEST, "more cells than one reply holds").into_response();
+    }
+    let Ok(_permit) = st.slots.try_acquire() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "renderer busy").into_response();
+    };
+    let replies = tokio::task::block_in_place(|| {
+        queries.par_iter().map(|q| tile_reply(&st, q)).collect::<Result<Vec<_>, _>>()
+    });
+    match replies {
+        Ok(replies) => {
+            let mut out = Vec::with_capacity(8 + replies.iter().map(|r| 4 + r.len()).sum::<usize>());
+            out.extend_from_slice(b"PTLS");
+            out.extend_from_slice(&(replies.len() as u32).to_le_bytes());
+            for r in &replies {
+                out.extend_from_slice(&(r.len() as u32).to_le_bytes());
+                out.extend_from_slice(r);
+            }
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                out,
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -5669,6 +5762,8 @@ async fn pack_info(State(st): State<Arc<AppState>>) -> Response {
         "loss_options": ["whole", "key"],
         // Where many pairs are asked at once, on a sidecar that has the route.
         "link_batch": "/links.json",
+        // And many tiles.
+        "tile_batch": "/tiles.bin",
         "licenses": st.manifest.licenses.iter()
             .map(|l| serde_json::json!({"source": l.source, "notice": l.notice}))
             .collect::<Vec<_>>(),
@@ -5909,6 +6004,7 @@ async fn main() {
         .route("/coverage.png", get(coverage_png))
         // Data endpoints for the browser-side renderer.
         .route("/tile.bin", get(tile_bin))
+        .route("/tiles.bin", axum::routing::post(tiles_bin))
         .route("/basemap.bin", get(basemap_bin))
         .route("/roads.bin", get(roads_bin))
         .route("/buildings.bin", get(buildings_bin))
