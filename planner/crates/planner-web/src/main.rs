@@ -12,7 +12,8 @@
 //! - a semaphore caps concurrent renders, so load sheds instead of thrashing
 //! - render size and coverage radius are hard-capped per request
 //! - responses are PNG, decoded by the browser's own image path
-//! - nothing is cached in RAM beyond the open COG readers' bounded caches
+//! - nothing is cached in RAM beyond the open COG readers' bounded caches,
+//!   and the coverage rasters `/coverage/bands.bin` combines (bounded too)
 
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -83,6 +84,11 @@ struct Cli {
     /// pack starts with its footprints rather than parsing for them.
     #[arg(long)]
     index_buildings: bool,
+    /// The coverage rasters sim-mesh's front caches (its testbed/coverage),
+    /// which `/coverage/bands.bin` combines for a view, as
+    /// `<dir>/<geodata>/<key>.bin`. Without it that route answers 404.
+    #[arg(long)]
+    coverage_dir: Option<PathBuf>,
 }
 
 /// One raster layer of the pack, readable by any number of requests at once
@@ -401,6 +407,12 @@ struct AppState {
     /// means heavy work happens exactly when the user changes a transmitter
     /// parameter, and never on navigation.
     coverage_cache: Mutex<Option<CachedCoverage>>,
+    /// `--coverage-dir`.
+    coverage_dir: Option<PathBuf>,
+    /// The front's coverage rasters `/coverage/bands.bin` has read, by file,
+    /// each with the terrain under it, the most recently used last, up to
+    /// `COVERAGE_KEPT_BYTES`.
+    coverage_rasters: std::sync::Mutex<Vec<(String, Arc<CoverageRaster>)>>,
     /// A sweep growing outward from the transmitter.
     ///
     /// The single-shot `/loss.bin` was fine when a sweep took seconds. At the
@@ -2048,6 +2060,19 @@ fn window_raster<S: ViewSource + Sync + ?Sized>(
     how: Resample,
 ) -> (u32, u32, f64, f64, Xy, Vec<f32>) {
     let (w, h) = tile_dims(view, want_w, want_h, src.dx_m().abs(), src.dy_m().abs());
+    window_cells(src, view, w, h, how)
+}
+
+/// `window_raster` on exactly `w`×`h` cells over `view`, however much finer
+/// than the source's own they are: for a caller whose picture is drawn a
+/// cell of its own at a time, the coverage bands.
+fn window_cells<S: ViewSource + Sync + ?Sized>(
+    src: &S,
+    view: &ViewRect,
+    w: u32,
+    h: u32,
+    how: Resample,
+) -> (u32, u32, f64, f64, Xy, Vec<f32>) {
     let res_x = view.width_m() / w as f64;
     let res_y = view.height_m() / h as f64;
 
@@ -2413,6 +2438,40 @@ async fn buildings_status(State(st): State<Arc<AppState>>) -> Response {
     axum::Json(st.buildings_progress.json(state)).into_response()
 }
 
+/// One layer resampled onto a tile's `tw`×`th` cells: each cell's bilinear
+/// sample at its centre, encoded by `enc` into `bpc` bytes.
+///
+/// Rows run in parallel. A screen-sized tile is ~1.8 M cells per layer and
+/// four layers of serial bilinear sampling was the whole cost of a tile fetch
+/// (~1.8 s), which in turn is what made refetching at a finer zoom level feel
+/// expensive. The buffer is allocated once and each row writes only its own
+/// slice, so no locking and no per-row allocation.
+fn tile_block(
+    g: &planner_terrain::Grid,
+    view: &ViewRect,
+    tw: u32,
+    th: u32,
+    bpc: usize,
+    enc: &(dyn Fn(f32, &mut [u8]) + Sync),
+) -> Vec<u8> {
+    let mut buf = vec![0u8; (tw * th) as usize * bpc];
+    buf.par_chunks_mut(tw as usize * bpc).enumerate().for_each(|(row, line)| {
+        for col in 0..tw as usize {
+            let p = view.px_to_world(col as u32, row as u32, tw, th);
+            let v = g.sample_bilinear(p).unwrap_or(f32::NAN);
+            enc(v, &mut line[col * bpc..col * bpc + bpc]);
+        }
+    });
+    buf
+}
+
+/// Terrain as a tile carries it: decimetres, ±3200 m at 0.1 m, plenty for
+/// any terrain, and `i16::MIN` where there is none.
+fn terrain_decimetres(v: f32, dst: &mut [u8]) {
+    let dm = if v.is_finite() { (v * 10.0).clamp(-32000.0, 32000.0) as i16 } else { i16::MIN };
+    dst.copy_from_slice(&dm.to_le_bytes());
+}
+
 /// Compact binary tile: everything the browser needs to render this region
 /// itself, fetched once and reused for every subsequent frame.
 ///
@@ -2496,29 +2555,10 @@ async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -
     let flags = (classes.is_some() as u8) | ((population.is_some() as u8) << 1)
         | ((clutter.is_some() as u8) << 2);
     out.push(flags);
-    // Resample every layer in parallel over rows. A screen-sized tile is
-    // ~1.8 M cells per layer and four layers of serial bilinear sampling was
-    // the whole cost of a tile fetch (~1.8 s), which in turn is what made
-    // refetching at a finer zoom level feel expensive.
-    //
-    // block(bytes_per_cell, encode) fills a preallocated buffer; each row
-    // writes only its own slice, so no locking and no per-row allocation.
     let block = |g: &planner_terrain::Grid, bpc: usize, enc: &(dyn Fn(f32, &mut [u8]) + Sync)| {
-        let mut buf = vec![0u8; n * bpc];
-        buf.par_chunks_mut(tw as usize * bpc).enumerate().for_each(|(row, line)| {
-            for col in 0..tw as usize {
-                let p = view.px_to_world(col as u32, row as u32, tw, th);
-                let v = g.sample_bilinear(p).unwrap_or(f32::NAN);
-                enc(v, &mut line[col * bpc..col * bpc + bpc]);
-            }
-        });
-        buf
+        tile_block(g, &view, tw, th, bpc, enc)
     };
-    // Terrain as decimetres: ±3200 m at 0.1 m, plenty for any terrain.
-    let terrain_block = block(&terrain, 2, &|v, dst| {
-        let dm = if v.is_finite() { (v * 10.0).clamp(-32000.0, 32000.0) as i16 } else { i16::MIN };
-        dst.copy_from_slice(&dm.to_le_bytes());
-    });
+    let terrain_block = block(&terrain, 2, &terrain_decimetres);
     let class_block = classes.as_ref().map(|g| {
         block(g, 1, &|v, dst| {
             dst[0] = if v.is_finite() { v.round().clamp(0.0, 255.0) as u8 } else { 255 };
@@ -3280,6 +3320,530 @@ fn sweep_status(
         }),
         ProgressiveSweep::Failed(e) => serde_json::json!({ "state": "failed", "error": e }),
     }
+}
+
+/// A number the page sends as JavaScript writes it, in a string, read
+/// exactly. serde_json's own reading of a 17-digit number can land an ulp
+/// away (see `LinksRequest`), and a view or a node an ulp away can be
+/// another cell.
+fn exact<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let text = String::deserialize(d)?;
+    text.parse().map_err(serde::de::Error::custom)
+}
+
+fn exact_opt<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    match Option::<String>::deserialize(d)? {
+        None => Ok(None),
+        Some(text) => text.parse().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+/// `POST /coverage/bands.bin`'s body: a view, the bands, and the nodes whose
+/// coverage it shows. Every number is a string (`exact`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BandsRequest {
+    /// The geodata whose rasters these are: the front caches them as
+    /// `<coverage-dir>/<geodata>/<key>.bin`.
+    geodata: String,
+    /// The view: its centre in the pack's metres, metres per CSS pixel, its
+    /// size in CSS pixels, and the side of a cell in them.
+    #[serde(deserialize_with = "exact")]
+    cx: f64,
+    #[serde(deserialize_with = "exact")]
+    cy: f64,
+    #[serde(deserialize_with = "exact")]
+    mpp: f64,
+    #[serde(deserialize_with = "exact")]
+    w: f64,
+    #[serde(deserialize_with = "exact")]
+    h: f64,
+    #[serde(deserialize_with = "exact")]
+    px: f64,
+    /// Each band's least margin in dB, the best band first.
+    bands: Vec<String>,
+    /// The receiver's height above the ground, the one the rasters were
+    /// swept to.
+    #[serde(deserialize_with = "exact")]
+    rx_h: f64,
+    nodes: Vec<BandsNode>,
+}
+
+/// One node: its raster's key, where it stands, what it has to spend and
+/// its antenna.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BandsNode {
+    key: String,
+    #[serde(deserialize_with = "exact")]
+    x: f64,
+    #[serde(deserialize_with = "exact")]
+    y: f64,
+    /// The antenna's height above the ground under it.
+    #[serde(deserialize_with = "exact")]
+    height_m: f64,
+    /// Transmit power plus the receiver's gain, less the decoding threshold:
+    /// the margin at a point is this, plus the antenna's gain toward it,
+    /// less the loss.
+    #[serde(deserialize_with = "exact")]
+    budget_db: f64,
+    /// Its pattern, `None` for an antenna the catalogue does not have.
+    antenna: Option<BandsAntenna>,
+}
+
+/// An antenna's pattern, as sim-mesh's catalogue gives it (testbed/antennas.py,
+/// the page's lib/antennas.ts), and its aim.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BandsAntenna {
+    directional: bool,
+    #[serde(deserialize_with = "exact")]
+    peak_dbi: f64,
+    #[serde(deserialize_with = "exact")]
+    vbw_deg: f64,
+    #[serde(deserialize_with = "exact")]
+    tilt_deg: f64,
+    #[serde(default, deserialize_with = "exact_opt")]
+    hbw_deg: Option<f64>,
+    #[serde(deserialize_with = "exact")]
+    floor_db: f64,
+    #[serde(deserialize_with = "exact")]
+    azimuth_deg: f64,
+    #[serde(deserialize_with = "exact")]
+    elevation_deg: f64,
+}
+
+/// What `/coverage/bands.bin` answers for a cell where no band is reached.
+const NO_BAND: u8 = 255;
+/// A raster cell nothing was evaluated for.
+const NEVER_LOSS: u16 = u16::MAX;
+/// The cells of one view, at most.
+const MAX_BAND_CELLS: f64 = 4_000_000.0;
+/// What the read rasters may hold, the terrain under them included. About
+/// what the page itself held for 20 nodes on a 2048-cell raster each, when
+/// it combined them.
+const COVERAGE_KEPT_BYTES: usize = 512 << 20;
+
+impl BandsRequest {
+    fn check(&self) -> Result<Vec<f64>, String> {
+        if !valid_name(&self.geodata) {
+            return Err(format!("{:?} is not a geodata name", self.geodata));
+        }
+        if let Some(n) = self.nodes.iter().find(|n| !valid_key(&n.key)) {
+            return Err(format!("{:?} is not a coverage key", n.key));
+        }
+        let good = |v: f64| v.is_finite() && v > 0.0;
+        if !(good(self.mpp) && good(self.w) && good(self.h) && good(self.px)) || !self.cx.is_finite()
+            || !self.cy.is_finite()
+        {
+            return Err("the view needs a finite centre and positive scale, size and cell".into());
+        }
+        if (self.w / self.px).ceil() * (self.h / self.px).ceil() > MAX_BAND_CELLS {
+            return Err("the view has more cells than one reply holds".into());
+        }
+        let bands: Vec<f64> =
+            self.bands.iter().map(|b| b.parse::<f64>()).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+        if bands.is_empty() || bands.len() >= usize::from(NO_BAND) {
+            return Err("name between one and 254 bands".into());
+        }
+        Ok(bands)
+    }
+}
+
+/// A geodata name as sim-mesh's store has them (store.NAME_RE).
+fn valid_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    let inner = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-';
+    let end = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    !b.is_empty() && b.len() <= 32 && end(&b[0]) && end(&b[b.len() - 1]) && b.iter().all(inner)
+}
+
+/// A coverage key as the front makes them (coverage.key): 16 hex digits.
+fn valid_key(key: &str) -> bool {
+    key.len() == 16 && key.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// `Math.round`: the nearest whole number, a half rounding up, as the page
+/// rounds. `f64::round` takes a half away from zero instead.
+fn js_round(x: f64) -> f64 {
+    let f = x.floor();
+    if x - f >= 0.5 {
+        f + 1.0
+    } else {
+        f
+    }
+}
+
+/// `Math.hypot` of two, as V8 computes it: each scaled by the larger, the
+/// squares summed with Kahan's compensation, the root scaled back.
+fn js_hypot(a: f64, b: f64) -> f64 {
+    let (a, b) = (a.abs(), b.abs());
+    if a.is_infinite() || b.is_infinite() {
+        return f64::INFINITY;
+    }
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    let max = a.max(b);
+    if max == 0.0 {
+        return 0.0;
+    }
+    let (mut sum, mut compensation) = (0.0f64, 0.0f64);
+    for v in [a, b] {
+        let n = v / max;
+        let summand = n * n - compensation;
+        let preliminary = sum + summand;
+        compensation = (preliminary - sum) - summand;
+        sum = preliminary;
+    }
+    sum.sqrt() * max
+}
+
+/// `Math.min` of two: NaN when either is.
+fn js_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if b < a {
+        b
+    } else {
+        a
+    }
+}
+
+impl BandsAntenna {
+    /// Gain in dBi toward azimuth `az` (clockwise from grid north) and
+    /// elevation `el`, degrees: the page's `gain` (lib/antennas.ts). The loss
+    /// below the peak is 12·((el − tilt)/vbw)², plus for a directional
+    /// antenna 12·(az/hbw)², together never more than the floor.
+    fn gain(&self, az: f64, el: f64) -> f64 {
+        let wrap180 = |deg: f64| ((deg + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
+        let (mut tilt, mut off) = (self.tilt_deg, 0.0);
+        if self.directional {
+            tilt += self.elevation_deg;
+            off = wrap180(az - self.azimuth_deg);
+        }
+        let v = (el - tilt) / self.vbw_deg;
+        let mut down = 12.0 * (v * v);
+        if let Some(hbw) = self.hbw_deg.filter(|&h| self.directional && h != 0.0 && !h.is_nan()) {
+            let o = off / hbw;
+            down += 12.0 * (o * o);
+        }
+        self.peak_dbi - js_min(down, self.floor_db)
+    }
+}
+
+/// Azimuth and elevation in degrees of the line from one antenna tip to
+/// another, the far one dropped by the earth's curvature at k = 4/3: the
+/// page's `direction` (lib/antennas.ts).
+fn tip_direction(ax: f64, ay: f64, a_top: f64, bx: f64, by: f64, b_top: f64) -> (f64, f64) {
+    const EARTH_RADIUS_M: f64 = 6371008.8;
+    const K_FACTOR: f64 = 4.0 / 3.0;
+    let (dx, dy) = (bx - ax, by - ay);
+    let d = js_hypot(dx, dy);
+    let az = ((dx.atan2(dy) * 180.0 / std::f64::consts::PI) % 360.0 + 360.0) % 360.0;
+    let drop = d * d / (2.0 * K_FACTOR * EARTH_RADIUS_M);
+    let el = (b_top - a_top - drop).atan2(d.max(1e-6)) * 180.0 / std::f64::consts::PI;
+    (az, el)
+}
+
+/// A tile's terrain as the page reads it: rows south from the top-left
+/// cell's centre, a cell `dm * 0.1` metres held as an f32.
+struct TerrainTile {
+    w: usize,
+    h: usize,
+    ox: f64,
+    oy: f64,
+    rx: f64,
+    ry: f64,
+    dm: Vec<i16>,
+}
+
+impl TerrainTile {
+    /// The terrain `tile.bin?…&terrain_only=1` sends for `view` at `w`×`h`
+    /// cells, as that route computes it. Blocking.
+    fn read(st: &AppState, view: &ViewRect, w: u32, h: u32) -> Result<Self, String> {
+        let res_hint = terrain_res_hint(st);
+        let (tw, th) = tile_dims(view, w, h, res_hint, res_hint);
+        let lo = st.clamp(Xy { x: view.min_x, y: view.min_y });
+        let hi = st.clamp(Xy { x: view.max_x, y: view.max_y });
+        let g = st
+            .layers
+            .terrain
+            .window_max(lo, hi, (tw as usize) * 2, (th as usize) * 2)
+            .map_err(|e| e.to_string())?;
+        let bytes = tile_block(&g, view, tw, th, 2, &terrain_decimetres);
+        let (rx, ry) = (view.width_m() / tw as f64, view.height_m() / th as f64);
+        Ok(TerrainTile {
+            w: tw as usize,
+            h: th as usize,
+            ox: view.min_x + 0.5 * rx,
+            oy: view.max_y - 0.5 * ry,
+            rx,
+            ry,
+            dm: bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect(),
+        })
+    }
+
+    /// The nearest cell's terrain at (x, y), `None` off the tile or where it
+    /// has none: the page's `terrainAt`.
+    fn at(&self, x: f64, y: f64) -> Option<f64> {
+        let col = js_round((x - self.ox) / self.rx.abs());
+        let row = js_round((self.oy - y) / self.ry.abs());
+        if col < 0.0 || row < 0.0 || col >= self.w as f64 || row >= self.h as f64 {
+            return None;
+        }
+        let dm = self.dm[row as usize * self.w + col as usize];
+        (dm != i16::MIN).then(|| (f64::from(dm) * 0.1) as f32 as f64)
+    }
+}
+
+/// A node's coverage raster as the front caches it (sim-mesh's
+/// testbed/coverage.py): "PLS2" | u32 w | u32 h | f64 ox | f64 oy | f64 rx |
+/// f64 ry | u16 loss·100 [w·h], row-major from the north-west, (ox, oy) the
+/// first cell's centre, 65535 where nothing was evaluated. With it the
+/// terrain under it, on its own grid: what the page fetched beside each
+/// raster for each cell's elevation, `None` where that could not be read.
+struct CoverageRaster {
+    w: usize,
+    h: usize,
+    ox: f64,
+    oy: f64,
+    rx: f64,
+    ry: f64,
+    loss: Vec<u16>,
+    terrain: Option<TerrainTile>,
+}
+
+impl CoverageRaster {
+    fn parse(data: &[u8]) -> Option<(usize, usize, [f64; 4], Vec<u16>)> {
+        if data.len() < 44 || &data[..4] != b"PLS2" {
+            return None;
+        }
+        let u32_at = |i: usize| u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
+        let f64_at = |i: usize| f64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        let (w, h) = (u32_at(4), u32_at(8));
+        let cells = data.get(44..44 + w * h * 2)?;
+        let loss = cells.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        Some((w, h, [f64_at(12), f64_at(20), f64_at(28), f64_at(36)], loss))
+    }
+
+    fn bytes(&self) -> usize {
+        self.loss.len() * 2 + self.terrain.as_ref().map_or(0, |t| t.dm.len() * 2)
+    }
+}
+
+/// The raster of `key` on `geodata` with its terrain: from those read
+/// before, else from the front's cache; `None` when the cache does not have
+/// it (yet). Blocking.
+fn coverage_raster(
+    st: &AppState,
+    dir: &Path,
+    geodata: &str,
+    key: &str,
+) -> Result<Option<Arc<CoverageRaster>>, String> {
+    let path = dir.join(geodata).join(format!("{key}.bin"));
+    let name = path.display().to_string();
+    {
+        let mut held = st.coverage_rasters.lock().expect("coverage rasters lock");
+        if let Some(i) = held.iter().position(|(n, _)| *n == name) {
+            let hit = held.remove(i);
+            let raster = Arc::clone(&hit.1);
+            held.push(hit);
+            return Ok(Some(raster));
+        }
+    }
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{name}: {e}")),
+    };
+    let Some((w, h, [ox, oy, rx, ry], loss)) = CoverageRaster::parse(&data) else {
+        return Err(format!("{name} is not a PLS2 raster"));
+    };
+    // The box the page asked `tile.bin` for: the raster's cells, out to their edges.
+    let view = ViewRect {
+        min_x: ox - rx / 2.0,
+        max_x: ox + (w as f64 - 0.5) * rx,
+        max_y: oy + ry / 2.0,
+        min_y: oy - (h as f64 - 0.5) * ry,
+    };
+    let terrain = TerrainTile::read(st, &view, w as u32, h as u32).ok();
+    let raster = Arc::new(CoverageRaster { w, h, ox, oy, rx, ry, loss, terrain });
+    let mut held = st.coverage_rasters.lock().expect("coverage rasters lock");
+    held.retain(|(n, _)| *n != name);
+    held.push((name, Arc::clone(&raster)));
+    let mut total: usize = held.iter().map(|(_, r)| r.bytes()).sum();
+    while total > COVERAGE_KEPT_BYTES && held.len() > 1 {
+        total -= held.remove(0).1.bytes();
+    }
+    Ok(Some(raster))
+}
+
+/// One node's margin over its raster's cells, read as a raster: a cell's is
+/// the node's budget plus its antenna's gain toward the cell (from the tip
+/// to a receiver `rx_h` above the terrain there) less the cell's loss; NaN
+/// where the raster evaluated nothing. Read NEAREST, as the page read it: a
+/// point's margin is its cell's, the gain worked out for the cell's centre.
+struct NodeMargins<'a> {
+    raster: &'a CoverageRaster,
+    node: &'a BandsNode,
+    rx_h: f64,
+    /// The ground under the node, from the raster's terrain (0 where there
+    /// is none), and its antenna's tip above sea level.
+    ground: f64,
+    top: f64,
+}
+
+impl<'a> NodeMargins<'a> {
+    fn new(raster: &'a CoverageRaster, node: &'a BandsNode, rx_h: f64) -> Self {
+        let ground = raster.terrain.as_ref().and_then(|t| t.at(node.x, node.y)).unwrap_or(0.0);
+        NodeMargins { raster, node, rx_h, ground, top: ground + node.height_m }
+    }
+}
+
+impl ViewSource for NodeMargins<'_> {
+    fn origin(&self) -> Xy {
+        Xy { x: self.raster.ox, y: self.raster.oy }
+    }
+    fn dx_m(&self) -> f64 {
+        self.raster.rx
+    }
+    fn dy_m(&self) -> f64 {
+        -self.raster.ry
+    }
+    fn width(&self) -> usize {
+        self.raster.w
+    }
+    fn height(&self) -> usize {
+        self.raster.h
+    }
+    /// The nearest cell, found as `Grid::sample_nearest` finds it.
+    fn sample(&self, p: Xy, _how: Resample) -> Option<f32> {
+        let r = self.raster;
+        let fx = (p.x - r.ox) / r.rx;
+        let fy = (p.y - r.oy) / -r.ry;
+        let eps = 1e-9;
+        if fx < -0.5 - eps || fy < -0.5 - eps || fx > r.w as f64 - 0.5 + eps || fy > r.h as f64 - 0.5 + eps
+        {
+            return None;
+        }
+        let col = (fx.round() as isize).clamp(0, r.w as isize - 1) as usize;
+        let row = (fy.round() as isize).clamp(0, r.h as isize - 1) as usize;
+        let v = r.loss[row * r.w + col];
+        if v == NEVER_LOSS {
+            return Some(f32::NAN);
+        }
+        let (x, y) = (r.ox + col as f64 * r.rx, r.oy - row as f64 * r.ry);
+        let gain = match &self.node.antenna {
+            None => 0.0,
+            Some(a) => {
+                let rx_ground = r.terrain.as_ref().and_then(|t| t.at(x, y)).unwrap_or(self.ground);
+                let (az, el) =
+                    tip_direction(self.node.x, self.node.y, self.top, x, y, rx_ground + self.rx_h);
+                a.gain(az, el)
+            }
+        };
+        Some((self.node.budget_db + gain - f64::from(v) / 100.0) as f32)
+    }
+}
+
+/// The coverage band of every cell of a view over a set of nodes, each
+/// node's margin from its raster in the front's cache.
+///
+/// The page did this itself: it fetched each node's raster (3.4 MB on the
+/// berlin-centre pack) and the terrain under it (as much again), kept both
+/// for the page's life, and combined them into one grid of the best margin,
+/// an antenna gain worked out per cell, before it could draw anything: 6 s
+/// of its main thread for two nodes. Here the rasters stay beside the
+/// planner, and a view is a few hundred thousand cells whatever the pack.
+///
+/// Each node's margins are resampled onto the view's cells as a coverage
+/// window is (`window_cells`, read nearest), and a cell's margin is the best
+/// of them, held as an f32 as the page's grid held it. Its band is the first
+/// whose least margin it reaches; below 0 dB, or where no raster reaches,
+/// there is none. The cells are the page's, `px` CSS pixels square from the
+/// view's top-left corner, so the page draws exactly the picture it drew.
+///
+/// Reply: "PCB1" | u32 cols | u32 rows | u8 band[cols·rows], rows from the
+/// top, 255 for none. A node whose raster the cache does not have is left
+/// out, as the page left it out until its raster came.
+async fn coverage_bands(
+    State(st): State<Arc<AppState>>,
+    axum::Json(req): axum::Json<BandsRequest>,
+) -> Response {
+    let Some(dir) = st.coverage_dir.clone() else {
+        return (StatusCode::NOT_FOUND, "no coverage cache: planner-web runs without --coverage-dir")
+            .into_response();
+    };
+    let bands = match req.check() {
+        Ok(bands) => bands,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let Ok(_permit) = st.slots.try_acquire() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "renderer busy").into_response();
+    };
+    match tokio::task::block_in_place(|| band_grid(&st, &dir, &req, &bands)) {
+        Ok(out) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            out,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// `/coverage/bands.bin`'s reply. Blocking.
+fn band_grid(st: &AppState, dir: &Path, req: &BandsRequest, bands: &[f64]) -> Result<Vec<u8>, String> {
+    let rasters: Vec<Option<Arc<CoverageRaster>>> = req
+        .nodes
+        .par_iter()
+        .map(|n| coverage_raster(st, dir, &req.geodata, &n.key))
+        .collect::<Result<_, _>>()?;
+    let (cols, rows) = ((req.w / req.px).ceil() as u32, (req.h / req.px).ceil() as u32);
+    // The page's cells: their centres `(i + 0.5)·px` CSS pixels from the
+    // view's top-left corner.
+    let (left, top) = (req.cx - req.w / 2.0 * req.mpp, req.cy + req.h / 2.0 * req.mpp);
+    let view = ViewRect {
+        min_x: left,
+        max_x: left + f64::from(cols) * req.px * req.mpp,
+        max_y: top,
+        min_y: top - f64::from(rows) * req.px * req.mpp,
+    };
+    let (w, h) = (cols as usize, rows as usize);
+    let mut best = vec![f32::NAN; w * h];
+    for (node, raster) in req.nodes.iter().zip(&rasters) {
+        let Some(raster) = raster else { continue };
+        let margins = NodeMargins::new(raster, node, req.rx_h);
+        let (ow, oh, res_x, res_y, origin, data) =
+            window_cells(&margins, &view, cols, rows, Resample::Nearest);
+        // Where the window, cut to the raster, starts among the view's cells.
+        let c0 = ((origin.x - view.min_x) / res_x - 0.5).round() as usize;
+        let r0 = ((view.max_y - origin.y) / res_y - 0.5).round() as usize;
+        for row in 0..oh as usize {
+            let line = &mut best[(r0 + row) * w + c0..(r0 + row) * w + c0 + ow as usize];
+            for (b, &m) in line.iter_mut().zip(&data[row * ow as usize..(row + 1) * ow as usize]) {
+                if !m.is_nan() && (b.is_nan() || m > *b) {
+                    *b = m;
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(12 + w * h);
+    out.extend_from_slice(b"PCB1");
+    out.extend_from_slice(&cols.to_le_bytes());
+    out.extend_from_slice(&rows.to_le_bytes());
+    out.extend(best.iter().map(|&m| {
+        if !(m >= 0.0) {
+            return NO_BAND;
+        }
+        let m = f64::from(m);
+        bands.iter().position(|&from| m >= from).unwrap_or(bands.len() - 1) as u8
+    }));
+    Ok(out)
 }
 
 /// Radio presets with the link budget SPELLED OUT.
@@ -5274,6 +5838,8 @@ async fn main() {
         pack_dir: cli.pack.clone(),
         network: Mutex::new(NetworkCensus::default()),
         coverage_cache: Mutex::new(None),
+        coverage_dir: cli.coverage_dir.clone(),
+        coverage_rasters: std::sync::Mutex::new(Vec::new()),
         sweep: Mutex::new(ProgressiveSweep::default()),
     });
 
@@ -5300,6 +5866,7 @@ async fn main() {
             "/links.json",
             axum::routing::post(links_json).layer(axum::extract::DefaultBodyLimit::max(32 << 20)),
         )
+        .route("/coverage/bands.bin", axum::routing::post(coverage_bands))
         .route("/height.json", get(height_json))
         .route("/api/presets", get(presets_json))
         .route("/nodes.json", get(nodes_json))
@@ -6174,5 +6741,100 @@ mod tests {
         let bytes = pack(&adata);
         assert!(bytes.iter().any(|b| *b == 255), "some cell is not evaluated");
         assert!(bytes.iter().any(|b| *b > 0 && *b < 255), "and some cell is a real count");
+    }
+
+    /// The page rounds with `Math.round`, a half up; the sidecar, standing
+    /// in for its arithmetic, must too, or a view cell exactly between two
+    /// raster cells would read the other one.
+    #[test]
+    fn a_half_rounds_up_as_the_page_rounds_it() {
+        assert_eq!(js_round(2.5), 3.0);
+        assert_eq!(js_round(-2.5), -2.0);
+        assert_eq!(js_round(-0.4), 0.0);
+        assert_eq!(js_round(0.499_999_999_999_999_94), 0.0);
+        assert_eq!(js_round(7.5), 8.0);
+        assert_eq!(js_hypot(3.0, 4.0), 5.0);
+        assert_eq!(js_hypot(0.0, 0.0), 0.0);
+        assert!(js_hypot(f64::NAN, 1.0).is_nan());
+    }
+
+    /// A cell's terrain is read as the page read its tile.bin: the nearest
+    /// cell, its decimetres a tenth held as an f32, nothing off the tile or
+    /// where it has none.
+    #[test]
+    fn a_terrain_tile_is_read_at_its_nearest_cell() {
+        let t = TerrainTile { w: 2, h: 2, ox: 100.0, oy: 200.0, rx: 10.0, ry: 10.0,
+                              dm: vec![345, i16::MIN, -7, 0] };
+        assert_eq!(t.at(104.0, 196.0), Some(f64::from((345.0f64 * 0.1) as f32)));
+        assert_eq!(t.at(106.0, 199.0), None, "no terrain there");
+        assert_eq!(t.at(101.0, 189.0), Some(f64::from((-7.0f64 * 0.1) as f32)));
+        assert_eq!(t.at(80.0, 200.0), None, "off the tile");
+    }
+
+    fn a_raster() -> CoverageRaster {
+        let (w, h) = (4usize, 3usize);
+        let loss = (0..w * h).map(|i| if i == 5 { NEVER_LOSS } else { 10_000 + 100 * i as u16 }).collect();
+        CoverageRaster { w, h, ox: 1000.0, oy: 5000.0, rx: 10.0, ry: 10.0, loss, terrain: None }
+    }
+
+    fn a_node(antenna: Option<BandsAntenna>) -> BandsNode {
+        BandsNode { key: "0123456789abcdef".into(), x: 1015.0, y: 4990.0, height_m: 10.0, budget_db: 140.0, antenna }
+    }
+
+    /// A node's margin at a point is its nearest raster cell's: the budget
+    /// and the antenna's gain toward that cell's centre, less the cell's
+    /// loss; nothing where the raster evaluated nothing, and outside it no
+    /// answer at all.
+    #[test]
+    fn a_nodes_margin_is_its_nearest_cells() {
+        let r = a_raster();
+        let plain = a_node(None);
+        let m = NodeMargins::new(&r, &plain, 2.0);
+        // Cell (2, 1): 3 m off its centre still reads it.
+        assert_eq!(m.sample(Xy { x: 1023.0, y: 4988.0 }, Resample::Nearest), Some((140.0 - 106.0) as f32));
+        assert!(m.sample(Xy { x: 1011.0, y: 4991.0 }, Resample::Nearest).unwrap().is_nan(), "cell 5 is never");
+        assert_eq!(m.sample(Xy { x: 1100.0, y: 4990.0 }, Resample::Nearest), None);
+        // With an antenna, its gain toward the cell's centre (a receiver 2 m
+        // over the ground at 0 m, the tip 10 m up), whatever point in it.
+        let whip = BandsAntenna { directional: false, peak_dbi: 2.0, vbw_deg: 75.0, tilt_deg: 10.0, hbw_deg: None,
+                                  floor_db: 18.0, azimuth_deg: 0.0, elevation_deg: 0.0 };
+        let node = a_node(Some(whip));
+        let m = NodeMargins::new(&r, &node, 2.0);
+        let (_, el) = tip_direction(1015.0, 4990.0, 10.0, 1020.0, 4990.0, 2.0);
+        let gain = node.antenna.as_ref().unwrap().gain(0.0, el);
+        let want = (140.0 + gain - 106.0) as f32;
+        assert_eq!(m.sample(Xy { x: 1023.0, y: 4988.0 }, Resample::Nearest), Some(want));
+        assert_eq!(m.sample(Xy { x: 1017.0, y: 4994.0 }, Resample::Nearest), Some(want));
+    }
+
+    /// `window_cells` is `window_raster` on the cells it is given: where the
+    /// screen asks no finer than the source, the two are one window.
+    #[test]
+    fn a_window_of_given_cells_is_the_window_raster_gives() {
+        let src = ramp(Xy { x: 1000.0, y: 2000.0 }, 5.0, 400, 400);
+        let view = ViewRect { min_x: 900.0, min_y: 0.0, max_x: 2900.0, max_y: 2200.0 };
+        let (w, h) = tile_dims(&view, 200, 220, 5.0, 5.0);
+        let a = window_raster(&src, &view, 200, 220, Resample::Bilinear);
+        let b = window_cells(&src, &view, w, h, Resample::Bilinear);
+        assert_eq!((a.0, a.1, a.2, a.3, a.4.x, a.4.y), (b.0, b.1, b.2, b.3, b.4.x, b.4.y));
+        assert!(a.5.iter().zip(&b.5).all(|(p, q)| p.to_bits() == q.to_bits()));
+        // And it keeps cells finer than the source's when asked for them.
+        let (fw, ..) = window_cells(&src, &view, 4000, 220, Resample::Nearest);
+        assert!(fw > 2000, "{fw}");
+    }
+
+    /// The names the bands route reads files by are the store's, so a
+    /// request cannot walk out of the coverage cache.
+    #[test]
+    fn a_bands_request_names_only_store_names_and_keys() {
+        assert!(valid_name("berlin-centre") && valid_name("a") && valid_name("x9"));
+        let long = "a".repeat(33);
+        for bad in ["", "-a", "a-", "A", "a/b", "..", "a.b", long.as_str()] {
+            assert!(!valid_name(bad), "{bad:?}");
+        }
+        assert!(valid_key("0123456789abcdef"));
+        for bad in ["0123456789abcde", "0123456789abcdeg", "0123456789ABCDEF", "../../etc/passwd"] {
+            assert!(!valid_key(bad), "{bad:?}");
+        }
     }
 }
