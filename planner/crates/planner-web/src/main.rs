@@ -409,6 +409,9 @@ struct AppState {
     coverage_cache: Mutex<Option<CachedCoverage>>,
     /// `--coverage-dir`.
     coverage_dir: Option<PathBuf>,
+    /// What `tile.bin` and `basemap.bin` replies are made of besides their
+    /// query, for their validators (`ground_etag`).
+    ground_stamp: Option<u64>,
     /// The coverage rasters `/coverage/bands.bin` has read, each with the
     /// terrain under it, the most recently used last, up to
     /// `COVERAGE_KEPT_BYTES`: the front's, by file, and the bands of a sweep
@@ -2495,22 +2498,63 @@ fn terrain_decimetres(v: f32, dst: &mut [u8]) {
 /// | f64 res_m | u8 flags(bit0 classes, bit1 population, bit2 clutter)
 /// | i16 terrain[w*h] (decimetres) | u8 classes[w*h]? | u16 pop[w*h]? (×10 clamped)
 /// | u16 clutter[w*h]? (decimetres)
-async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -> Response {
+async fn tile_bin(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<TileQuery>,
+) -> Response {
+    let etag = ground_etag(
+        st.ground_stamp,
+        b"PTL2",
+        &[q.minx.to_bits(), q.miny.to_bits(), q.maxx.to_bits(), q.maxy.to_bits(),
+          u64::from(q.w), u64::from(q.h), u64::from(q.terrain_only)],
+    );
+    if etag.as_deref().is_some_and(|e| etag_matches(&headers, e)) {
+        return with_validator(StatusCode::NOT_MODIFIED.into_response(), etag.as_deref());
+    }
     let Ok(_permit) = st.slots.try_acquire() else {
         return (StatusCode::TOO_MANY_REQUESTS, "renderer busy").into_response();
     };
     match tokio::task::block_in_place(|| tile_reply(&st, &q)) {
-        Ok(out) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, "application/octet-stream"),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            out,
-        )
-            .into_response(),
+        Ok(out) => with_validator(
+            ([(header::CONTENT_TYPE, "application/octet-stream")], out).into_response(),
+            etag.as_deref(),
+        ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+/// What `tile.bin` and `basemap.bin` replies are made of besides their
+/// query: the pack's layer files and this program, each as its size and
+/// mtime, hashed once at start; `None` where one of them has no mtime.
+fn ground_stamp(layers: &[PathBuf]) -> Option<u64> {
+    let mut words = Vec::new();
+    for p in layers.iter().cloned().chain(std::env::current_exe().ok()) {
+        let s = FileStamp::of(&std::fs::metadata(&p).ok()?).ok()?;
+        words.extend([s.bytes, s.mtime_s, u64::from(s.mtime_ns)]);
+    }
+    Some(fnv1a(&words))
+}
+
+/// The validator of a `tile.bin` or `basemap.bin` reply: a hash of the
+/// ground stamp, the route's magic and everything in its query. A page
+/// that has drawn a box asks whether it changed, and a revisit or the other
+/// tab's map on the same view costs a 304 rather than the tile again.
+fn ground_etag(stamp: Option<u64>, magic: &[u8; 4], query: &[u64]) -> Option<String> {
+    let stamp = stamp?;
+    let words: Vec<u64> =
+        std::iter::once(u64::from(u32::from_le_bytes(*magic))).chain([stamp]).chain(query.iter().copied()).collect();
+    Some(format!("\"{}-{:016x}\"", String::from_utf8_lossy(magic).to_lowercase(), fnv1a(&words)))
+}
+
+/// FNV-1a over words' little-endian bytes: the same on every build and
+/// machine, so a page keeps its validators across sidecar restarts.
+fn fnv1a(words: &[u64]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in words.iter().flat_map(|w| w.to_le_bytes()) {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 /// `tile.bin`'s reply for `q`. Blocking.
@@ -2734,11 +2778,21 @@ struct BasemapQuery {
 /// f64 max_y | w*h*4 RGBA.
 async fn basemap_bin(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<BasemapQuery>,
 ) -> Response {
     let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
     if !(view.width_m() > 0.0 && view.height_m() > 0.0) {
         return (StatusCode::BAD_REQUEST, "degenerate box").into_response();
+    }
+    let etag = ground_etag(
+        st.ground_stamp,
+        b"PBM1",
+        &[q.minx.to_bits(), q.miny.to_bits(), q.maxx.to_bits(), q.maxy.to_bits(),
+          u64::from(q.w), u64::from(q.h), u64::from(q.layer), u64::from(q.roads)],
+    );
+    if etag.as_deref().is_some_and(|e| etag_matches(&headers, e)) {
+        return with_validator(StatusCode::NOT_MODIFIED.into_response(), etag.as_deref());
     }
     let res_hint = terrain_res_hint(&st);
     let (tw, th) = tile_dims(&view, q.w, q.h, res_hint, res_hint);
@@ -2803,15 +2857,10 @@ async fn basemap_bin(
     out.extend_from_slice(&view.max_x.to_le_bytes());
     out.extend_from_slice(&view.max_y.to_le_bytes());
     out.append(&mut rgba);
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        out,
+    with_validator(
+        ([(header::CONTENT_TYPE, "application/octet-stream")], out).into_response(),
+        etag.as_deref(),
     )
-        .into_response()
 }
 
 /// Road geometry for a region, flattened for the WASM renderer:
@@ -5790,6 +5839,8 @@ async fn main() {
     let path_of = |k: LayerKind| -> Option<PathBuf> {
         manifest.layers.iter().find(|l| l.kind == k).map(|l| cli.pack.join(&l.path))
     };
+    let manifest_layer_paths: Vec<PathBuf> =
+        manifest.layers.iter().map(|l| cli.pack.join(&l.path)).collect();
     let terrain_path = path_of(LayerKind::TerrainDtm)
         .or_else(|| path_of(LayerKind::SurfaceDsm))
         .expect("pack has a terrain layer");
@@ -5992,6 +6043,7 @@ async fn main() {
         network: Mutex::new(NetworkCensus::default()),
         coverage_cache: Mutex::new(None),
         coverage_dir: cli.coverage_dir.clone(),
+        ground_stamp: ground_stamp(&manifest_layer_paths),
         coverage_rasters: std::sync::Mutex::new(Vec::new()),
         sweep: Mutex::new(ProgressiveSweep::default()),
     });
@@ -6990,5 +7042,23 @@ mod tests {
         for bad in ["0123456789abcde", "0123456789abcdeg", "0123456789ABCDEF", "../../etc/passwd"] {
             assert!(!valid_key(bad), "{bad:?}");
         }
+    }
+
+    /// A tile's validator follows the ground it is made of and every word
+    /// of its query, and is the same on every machine for the same ones.
+    #[test]
+    fn a_tile_validator_follows_the_ground_and_the_query() {
+        let q = [1.5f64.to_bits(), 2.0f64.to_bits(), 3.0f64.to_bits(), 4.0f64.to_bits(), 100, 50, 1];
+        let e = ground_etag(Some(7), b"PTL2", &q).unwrap();
+        assert_eq!(e, ground_etag(Some(7), b"PTL2", &q).unwrap());
+        assert!(e.starts_with("\"ptl2-") && e.ends_with('"'));
+        assert_ne!(e, ground_etag(Some(8), b"PTL2", &q).unwrap(), "another pack or program");
+        assert_ne!(e, ground_etag(Some(7), b"PBM1", &q).unwrap(), "the other route");
+        for k in 0..q.len() {
+            let mut other = q;
+            other[k] ^= 1;
+            assert_ne!(e, ground_etag(Some(7), b"PTL2", &other).unwrap(), "word {k}");
+        }
+        assert_eq!(ground_etag(None, b"PTL2", &q), None, "no stamp, no validator");
     }
 }
