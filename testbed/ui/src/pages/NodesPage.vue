@@ -513,7 +513,11 @@ const coverageLabel = computed(() => {
   const sel = nodes.selection
   const parts = [sel.length === 0 ? 'coverage of the whole network'
     : sel.length === 1 ? `coverage of ${sel[0]}` : `coverage of the ${sel.length} selected`]
-  if (coverage.pending.length) parts.push(`computing ${coverage.pending.length}…`)
+  if (coverage.pending.length) {
+    // The node being edited grows band by band: how far out it has got.
+    const km = Math.max(0, ...Object.values(coverage.growing))
+    parts.push(`computing ${coverage.pending.length}…${km ? `, out to ${km.toFixed(1)} km` : ''}`)
+  }
   if (coverage.problem) parts.push(coverage.problem)
   if (!catalog.globals) parts.push(`no radio to cover with: ${catalog.globalsError ?? 'scripts/globals.py gives none'}`)
   return parts.join(' · ')

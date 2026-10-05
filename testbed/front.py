@@ -228,6 +228,7 @@ front → all sockets   index_progress {index, kind, name, state, now, fetched, 
                                                                    name being fetched (a
                                                                    nodeset's geodata first)
 front → asker         coverage_tile {geodata, node, key} · coverage_error {geodata, node, error}
+                      · coverage_band {geodata, node, key, km}: the edited node's sweep, out to km
 anything else         → the child named by `sim`, or the selected one
 child → socket        the child's own message, with `sim` added
 ```
@@ -2019,7 +2020,10 @@ class Front:
     async def coverage(self, conn, msg):
         """Each node's coverage raster: those in the cache said at once, the
         rest computed one at a time through the sidecar and sent to this
-        socket as `coverage_tile` as each lands."""
+        socket as `coverage_tile` as each lands. The one node a request
+        lacks a raster for is the node being edited: it is swept band by
+        band, each band said as `coverage_band` as it lands, so the page
+        shows its coverage growing rather than nothing until it is whole."""
         gd = load_geodata(msg["geodata"])
         if not gd.is_pack:
             raise ValueError("geodata %s is synthetic: its coverage is worked out on the page"
@@ -2034,11 +2038,18 @@ class Front:
         if todo:
             sidecar = await self.sidecars.hold(conn.holder, gd)
 
+            def growing(node, raster_key):
+                async def said(km):
+                    await conn.send({"type": "coverage_band", "geodata": gd.name,
+                                     "node": node["name"], "key": raster_key, "km": km})
+                return said if len(todo) == 1 else None
+
             async def work():
                 for node, raster_key in todo:
                     self.sweeps.busy.add((gd.name, raster_key))
                     try:
-                        await self.sweeps.raster(sidecar, gd, node)
+                        await self.sweeps.raster(sidecar, gd, node,
+                                                 on_band=growing(node, raster_key))
                         await conn.send({"type": "coverage_tile", "geodata": gd.name,
                                          "node": node["name"], "key": raster_key})
                     except store.StoreError as err:

@@ -16,7 +16,9 @@ import { NO_RADIO, type NodeView } from './nodes'
  * front has the planner sweep (coverage.py), cached by the node's position
  * and height. The page holds none of them: for the view on show the planner
  * combines the rasters of the nodes asked about into the band of each
- * square of it (/coverage/bands.bin), with the arithmetic below. On
+ * square of it (/coverage/bands.bin), with the arithmetic below. A node
+ * being edited is swept band by band, and shown from the band finished
+ * last while its sweep grows (`coverage_band`). On
  * synthetic ground the loss is the log-distance formula, worked out here,
  * on flat ground at 0 m. Either way the level at a point is the node's
  * maximum power at its connector (lib/boards.ts) plus its antenna's gain
@@ -103,6 +105,8 @@ export const useCoverage = defineStore('coverage', {
     keys: {} as Record<string, { key: string; at: string }>,
     /** The keys whose raster is in the front's cache, for the planner to combine. */
     ready: {} as Record<string, true>,
+    /** The keys whose sweep is growing band by band, and how far out it has got, km. */
+    growing: {} as Record<string, number>,
     /** The last ask, whose answer alone says what is still being swept. */
     asked: 0,
     geodata: null as string | null,
@@ -119,7 +123,7 @@ export const useCoverage = defineStore('coverage', {
       const ask = ++this.asked
       const nodes = withRadio(all)
       if (!gd || gd.kind !== 'pack' || !nodes.length || !useSocket().front) { this.pending = []; return }
-      if (this.geodata !== gd.name) { this.keys = {}; this.ready = {}; this.geodata = gd.name }
+      if (this.geodata !== gd.name) { this.keys = {}; this.ready = {}; this.growing = {}; this.geodata = gd.name }
       const at = Object.fromEntries(nodes.map(n => [n.name, placeKey(n)]))
       const r = await request('coverage', {
         geodata: gd.name,
@@ -143,7 +147,12 @@ export const useCoverage = defineStore('coverage', {
     receive(msg: Record<string, unknown>) {
       if (msg.type === 'coverage_tile') {
         this.pending = this.pending.filter(n => n !== msg.node)
+        delete this.growing[msg.key as string]
         if (msg.geodata === this.geodata) this.ready[msg.key as string] = true
+        this.version++
+      } else if (msg.type === 'coverage_band') {
+        if (msg.geodata !== this.geodata) return
+        this.growing[msg.key as string] = msg.km as number
         this.version++
       } else if (msg.type === 'coverage_error') {
         this.pending = this.pending.filter(n => n !== msg.node)
@@ -172,15 +181,17 @@ export const useCoverage = defineStore('coverage', {
         const beam: Beam = { x, y, ground: 0, top: n.height_m, spec, antenna: n.antenna }
         // Past this the formula's loss exceeds the budget at the antenna's peak: nothing to ask.
         const reach = Math.pow(10, (budget + (spec?.peak_dbi ?? 0) - anchor) / (10 * exponent))
-        return { node: n, x, y, budget, anchor, reach, key, ready: !!key && !!this.ready[key], spec, beam }
+        // Asked of the planner once its raster is cached, or while its sweep grows.
+        const growing = key && !this.ready[key] ? this.growing[key] : undefined
+        return { node: n, x, y, budget, anchor, reach, key, ready: !!key && !!this.ready[key], growing, spec, beam }
       })
       const antennaKey = (n: NodeView) => `${JSON.stringify(n.antenna)}${n.max_dbm ?? ''}`
       const version = `${gd.name}|${radioKey}|${Object.keys(antennas).length}|${nodes.map((n, i) =>
         `${n.name}:${n.lat},${n.lon},${n.height_m},${antennaKey(n)}`
-        + `:${each[i]!.key}:${each[i]!.ready ? 1 : 0}`).join(';')}`
+        + `:${each[i]!.key}:${each[i]!.ready ? 1 : each[i]!.growing ?? 0}`).join(';')}`
       if (gd.kind === 'pack') {
         // The planner combines the rasters; a node whose raster has not come is left out.
-        const asked: BandsNode[] = each.filter(e => e.ready).map(e => ({
+        const asked: BandsNode[] = each.filter(e => e.ready || e.growing).map(e => ({
           key: e.key, x: e.x, y: e.y, height_m: e.node.height_m, budget_db: e.budget,
           antenna: e.spec && {
             directional: e.spec.kind === 'directional', peak_dbi: e.spec.peak_dbi, vbw_deg: e.spec.vbw_deg,
