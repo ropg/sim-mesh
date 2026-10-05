@@ -409,9 +409,10 @@ struct AppState {
     coverage_cache: Mutex<Option<CachedCoverage>>,
     /// `--coverage-dir`.
     coverage_dir: Option<PathBuf>,
-    /// The front's coverage rasters `/coverage/bands.bin` has read, by file,
-    /// each with the terrain under it, the most recently used last, up to
-    /// `COVERAGE_KEPT_BYTES`.
+    /// The coverage rasters `/coverage/bands.bin` has read, each with the
+    /// terrain under it, the most recently used last, up to
+    /// `COVERAGE_KEPT_BYTES`: the front's, by file, and the bands of a sweep
+    /// still growing, by file and band.
     coverage_rasters: std::sync::Mutex<Vec<(String, Arc<CoverageRaster>)>>,
     /// A sweep growing outward from the transmitter.
     ///
@@ -1501,6 +1502,20 @@ struct CachedCoverage {
     /// Shared, as the census raster is, for the footprint routes.
     loss: Arc<planner_terrain::Grid>,
     compute_ms: u128,
+    /// The caller's name for the sweep this band is of, when it gave one.
+    tag: Option<Arc<SweepTag>>,
+}
+
+/// A sweep a caller named, and the raster it will ask `/loss.bin` for once
+/// the sweep is whole: sim-mesh's front caches a node's coverage by its key,
+/// and while the ladder grows, `/coverage/bands.bin` reads the node's
+/// coverage out of the band finished last, cut and sampled as that raster
+/// will be.
+struct SweepTag {
+    key: String,
+    view: ViewRect,
+    w: u32,
+    h: u32,
 }
 
 /// Inverse-project one pack-CRS point to `(lon, lat)` in degrees.
@@ -1811,6 +1826,7 @@ async fn coverage_png(State(st): State<Arc<AppState>>, Query(q): Query<CoverageQ
                     key,
                     loss: Arc::new(c.loss),
                     compute_ms: t0.elapsed().as_millis(),
+                    tag: None,
                 })
             }
             // A transmitter outside the pack (or any other sweep refusal) is
@@ -2779,6 +2795,12 @@ struct LossQuery {
     /// asks this and is spared the rest of the ladder.
     #[serde(default)]
     whole: bool,
+    /// `/loss/start` only: the caller's name for this sweep, with the view
+    /// and cells (`minx`…`h`) it will ask `/loss.bin` for once the sweep is
+    /// whole. sim-mesh's front names a node's sweep by its coverage key, and
+    /// `/coverage/bands.bin` then shows the node's coverage while the ladder
+    /// grows (`SweepTag`).
+    key: Option<String>,
     /// Radials to sweep. Omit for the resolution-matched count.
     ///
     /// Exposed because the right value is a MEASUREMENT, not a constant: the
@@ -3055,6 +3077,16 @@ fn run_sweep(
 /// Never computes. A sweep is started by `/loss/start` and this serves what
 /// has landed, so the map can paint a finished inner band while the outer
 /// ones are still running.
+/// A loss as `/loss.bin` sends it: decibels ×100 as u16, 0–655 dB covering
+/// everything, and NaN as the maximum.
+fn loss_centibels(v: f32) -> u16 {
+    if v.is_finite() {
+        (v * 100.0).clamp(0.0, 65534.0) as u16
+    } else {
+        u16::MAX
+    }
+}
+
 async fn loss_bin(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>) -> Response {
     let tx = match (q.x, q.y) {
         (Some(x), Some(y)) => Xy { x, y },
@@ -3111,10 +3143,8 @@ async fn loss_bin(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>) -
     out.extend_from_slice(&origin.y.to_le_bytes());
     out.extend_from_slice(&res_x.to_le_bytes());
     out.extend_from_slice(&res_y.to_le_bytes());
-    // Loss in decibels ×100 as u16: 0–655 dB covers everything; NaN → max.
-    for v in data.iter() {
-        let u = if v.is_finite() { (v * 100.0).clamp(0.0, 65534.0) as u16 } else { u16::MAX };
-        out.extend_from_slice(&u.to_le_bytes());
+    for &v in data.iter() {
+        out.extend_from_slice(&loss_centibels(v).to_le_bytes());
     }
     let mut resp = (
         StatusCode::OK,
@@ -3193,6 +3223,12 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started = std::time::Instant::now();
     let bands: &'static [f64] = if q.whole { &[1.0] } else { SWEEP_BANDS };
+    let tag = match (&q.key, requested_view(q.minx, q.miny, q.maxx, q.maxy), q.w, q.h) {
+        (Some(k), Some(view), Some(w), Some(h)) if valid_key(k) => {
+            Some(Arc::new(SweepTag { key: k.clone(), view, w, h }))
+        }
+        _ => None,
+    };
     {
         let mut g = st.sweep.lock().await;
         *g = ProgressiveSweep::Running {
@@ -3242,6 +3278,7 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
                         key: band_key,
                         loss: Arc::new(loss),
                         compute_ms: t0.elapsed().as_millis(),
+                        tag: tag.clone(),
                     });
                     // Same guard: a band that finished just as this sweep
                     // was superseded must not publish itself over the new
@@ -3633,8 +3670,9 @@ impl CoverageRaster {
 }
 
 /// The raster of `key` on `geodata` with its terrain: from those read
-/// before, else from the front's cache; `None` when the cache does not have
-/// it (yet). Blocking.
+/// before, else from the front's cache, else, while this sidecar's sweep for
+/// that key grows, from the band it finished last; `None` when there is none
+/// of these (yet). Blocking.
 fn coverage_raster(
     st: &AppState,
     dir: &Path,
@@ -3642,23 +3680,43 @@ fn coverage_raster(
     key: &str,
 ) -> Result<Option<Arc<CoverageRaster>>, String> {
     let path = dir.join(geodata).join(format!("{key}.bin"));
-    let name = path.display().to_string();
-    {
+    let held = |name: &str| {
         let mut held = st.coverage_rasters.lock().expect("coverage rasters lock");
-        if let Some(i) = held.iter().position(|(n, _)| *n == name) {
-            let hit = held.remove(i);
-            let raster = Arc::clone(&hit.1);
-            held.push(hit);
-            return Ok(Some(raster));
-        }
-    }
-    let data = match std::fs::read(&path) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{name}: {e}")),
+        let i = held.iter().position(|(n, _)| n == name)?;
+        let hit = held.remove(i);
+        let raster = Arc::clone(&hit.1);
+        held.push(hit);
+        Some(raster)
     };
-    let Some((w, h, [ox, oy, rx, ry], loss)) = CoverageRaster::parse(&data) else {
-        return Err(format!("{name} is not a PLS2 raster"));
+    let name = path.display().to_string();
+    if let Some(raster) = held(&name) {
+        return Ok(Some(raster));
+    }
+    let (name, (w, h, [ox, oy, rx, ry], loss)) = match std::fs::read(&path) {
+        Ok(data) => match CoverageRaster::parse(&data) {
+            Some(parsed) => (name, parsed),
+            None => return Err(format!("{name} is not a PLS2 raster")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Not cached yet: the band of its sweep finished last, when this
+            // sidecar is sweeping it, as `/loss.bin` will cut and send it.
+            let Some(band) = st.coverage_cache.blocking_lock().as_ref().and_then(|c| {
+                let tag = c.tag.as_ref().filter(|t| t.key == key)?;
+                Some((Arc::clone(&c.loss), Arc::clone(tag), c.key.radius_km))
+            }) else {
+                return Ok(None);
+            };
+            let (grid, tag, band_km) = band;
+            let name = format!("{name}@{band_km}");
+            if let Some(raster) = held(&name) {
+                return Ok(Some(raster));
+            }
+            let (w, h, rx, ry, o, data) =
+                window_raster(&*grid, &tag.view, tag.w, tag.h, Resample::Bilinear);
+            let loss = data.into_iter().map(loss_centibels).collect();
+            (name, (w as usize, h as usize, [o.x, o.y, rx, ry], loss))
+        }
+        Err(e) => return Err(format!("{name}: {e}")),
     };
     // The box the page asked `tile.bin` for: the raster's cells, out to their edges.
     let view = ViewRect {
@@ -5608,7 +5666,7 @@ async fn pack_info(State(st): State<Arc<AppState>>) -> Response {
         // it does not know.
         "link_options": ["lean"],
         // And what `/loss/start` takes beyond the page's.
-        "loss_options": ["whole"],
+        "loss_options": ["whole", "key"],
         // Where many pairs are asked at once, on a sidecar that has the route.
         "link_batch": "/links.json",
         "licenses": st.manifest.licenses.iter()
