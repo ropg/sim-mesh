@@ -6,7 +6,8 @@ import { DEFAULT_ANTENNA, type Antenna } from '../lib/antennas'
 
 /* The Nodes tab: the nodeset on its geodata, the selection, and every edit.
  *
- * Standalone, nothing is shown until a geodata is chosen (chooseGeodata).
+ * Standalone, nothing is shown until a geodata is chosen (chooseGeodata);
+ * the one chosen last in this browser is chosen again when the page loads.
  * Every nodeset with a node on it is a **layer**, a row of the Layers
  * panel, shown or hidden; a layer's nodes off the geodata are neither loaded
  * nor drawn, and the active one's are put `aside` and written back on
@@ -116,6 +117,15 @@ function within(bbox: Bbox | null, n: { lat: number; lon: number }): boolean {
   return n.lat >= lat0 && n.lat <= lat1 && n.lon >= lon0 && n.lon <= lon1
 }
 
+/** Where the geodata chosen last is kept, per browser, to be chosen again
+ *  when the page is loaded while it is still installed. */
+const CHOSEN_KEY = 'sim-mesh.geodata'
+
+/** The geodata chosen last in this browser, if any. */
+export function chosenBefore(): string | null {
+  try { return localStorage.getItem(CHOSEN_KEY) } catch { return null }
+}
+
 /** The colours other layers are drawn in, hollow, by their place in the panel. */
 export const LAYER_COLOURS = ['#f472b6', '#34d399', '#60a5fa', '#fbbf24', '#c084fc', '#f87171', '#2dd4bf', '#fb923c']
 
@@ -135,7 +145,7 @@ export const useNodes = defineStore('nodes', {
      *  not loaded, and written back as they were on Save. */
     aside: {} as Record<string, NodeRecord>,
     /** The geodata the Nodes tab stands on, by name: none until one is
-     *  chosen on the Geodata tab (chooseGeodata). */
+     *  chosen, on the Geodata tab or the Nodes tab's own list (chooseGeodata). */
     geodata: null as string | null,
     selection: [] as string[],
     /** The two nodes the pair inspector shows. */
@@ -380,6 +390,9 @@ export const useNodes = defineStore('nodes', {
     async chooseGeodata(name: string | null) {
       if (name === this.geodata) return
       this.geodata = name
+      try {
+        if (name) localStorage.setItem(CHOSEN_KEY, name); else localStorage.removeItem(CHOSEN_KEY)
+      } catch { /* private window */ }
       this.nodeset = null
       this.aside = {}
       this.others = {}
