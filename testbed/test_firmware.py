@@ -161,15 +161,21 @@ def test_publishing_replaces_a_zip_lists_it_last_and_the_listing_reads_back(tmp_
                                                                            monkeypatch):
     """`sim firmware publish` against a GitHub of the test's own: the zips go
     up before the listing, a zip of a name already there is replaced, a
-    deleted one comes off, the site is told, and the index.html it writes is
-    what the pre-built list reads."""
+    deleted one comes off, an older version of a published zip's base and
+    arch comes off with it while another arch's stays, the site is told, and
+    the index.html it writes is what the pre-built list reads."""
     import asyncio
 
     from aiohttp import web
 
     calls, assets, ids = [], {}, [0]
+    older = "relay-sx1262_%s_20251201000000" % ARCH
+    other_arch = "relay-sx1262_riscv64_20251201000000"
     listed = {"firmware": {"old-sx1262_%s_20250101000000" % ARCH: {
-        "base": "old-sx1262", "arch": ARCH, "version": "20250101000000", "size": 1}}}
+        "base": "old-sx1262", "arch": ARCH, "version": "20250101000000", "size": 1},
+        older: {"base": "relay-sx1262", "arch": ARCH, "version": "20251201000000", "size": 1},
+        other_arch: {"base": "relay-sx1262", "arch": "riscv64", "version": "20251201000000",
+                     "size": 1}}}
 
     def asset(name, data):
         ids[0] += 1
@@ -177,6 +183,8 @@ def test_publishing_replaces_a_zip_lists_it_last_and_the_listing_reads_back(tmp_
 
     asset("firmware.yaml", yaml.safe_dump(listed).encode())
     asset("old-sx1262_%s_20250101000000.zip" % ARCH, b"old")
+    asset(older + ".zip", b"older")
+    asset(other_arch + ".zip", b"other")
     asset("relay-sx1262_%s_20260101000000.zip" % ARCH, b"stale")
 
     def release_json():
@@ -229,6 +237,7 @@ def test_publishing_replaces_a_zip_lists_it_last_and_the_listing_reads_back(tmp_
             got = await firmware.publish([relay], ["old-sx1262_%s_20250101000000" % ARCH],
                                          True, "o/r", "o/site", said.append)
             assert calls == [] and said[0].startswith("add     relay-sx1262")
+            assert "delete  %s" % older in said
             await firmware.publish([relay], ["old-sx1262_%s_20250101000000" % ARCH],
                                    False, "o/r", "o/site", said.append)
             return got
@@ -237,18 +246,20 @@ def test_publishing_replaces_a_zip_lists_it_last_and_the_listing_reads_back(tmp_
 
     got = asyncio.run(go())
     relay_zip = "relay-sx1262_%s_20260101000000.zip" % ARCH
-    assert list(got) == ["relay-sx1262_%s_20260101000000" % ARCH]
+    assert sorted(got) == sorted([other_arch, relay_zip[:-4]])
     assert calls == [("delete", relay_zip), ("upload", relay_zip),
                      ("delete", "firmware.yaml"), ("upload", "firmware.yaml"),
                      ("upload", "index.html"),
                      ("delete", "old-sx1262_%s_20250101000000.zip" % ARCH),
+                     ("delete", older + ".zip"),
                      ("dispatch", "firmware-published")]
+    assert other_arch + ".zip" in assets
     assert assets[relay_zip]["data"] == open(relay, "rb").read()
     rows = firmware.parse_index(assets["index.html"]["data"].decode(), "https://x/firmware/")
     assert [(r["name"], r["title"]) for r in rows] == [(relay_zip[:-4], "Relay")]
-    with pytest.raises(firmware.FirmwareError, match="names it"):
-        firmware.zip_facts(zip_file(tmp_path, "relay-sx1262", "20260101000000",
-                                    filename="renamed.zip"))
+    name, _ = firmware.zip_facts(zip_file(tmp_path, "relay-sx1262", "20260101000000",
+                                          filename="renamed.zip"))
+    assert name == relay_zip[:-4]
 
 
 def test_a_zip_can_be_made_in_memory_for_the_page():

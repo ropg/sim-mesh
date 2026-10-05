@@ -2019,7 +2019,9 @@ which sim-mesh.net's site serves under `/firmware/` with an `index.html` that
 lists every zip with its `node.yaml`'s facts:
 
 ```sh
-sim firmware publish ZIP…                   # add or replace these, then redeploy the site
+sim firmware publish ZIP…                   # add or replace these, drop their older versions,
+                                            # then redeploy the site
+sim firmware publish --keep-older ZIP…      # the same, leaving the older versions listed
 sim firmware publish --delete NAME…         # take these off it
 sim firmware publish --dry-run ZIP…         # say what it would do
 ```
@@ -2033,9 +2035,12 @@ sim ── repository_dispatch firmware-published ──► sim-mesh/sim-mesh.gi
 It runs where every `sim` verb does, in sim-mesh's image, so it needs
 nothing installed beside `sim`; the token is the one of the `gh` logged in
 where `sim` runs (or `GH_TOKEN`), with the right to upload to
-sim-mesh/sim-mesh and to dispatch to the site's repository. A zip is checked
-before it goes: its node.yaml must name it as its file is named. A zip of a
-name already listed is replaced. `--repo` and `--site` name others.
+sim-mesh/sim-mesh and to dispatch to the site's repository. A zip goes up
+under the name its node.yaml gives it, whatever its file is called, so a
+build catalogue's zip publishes as it is. A zip of a
+name already listed is replaced, and every listed firmware of the same base
+and arch with an older version of the same scheme comes off the list with it,
+unless `--keep-older`. `--repo` and `--site` name others.
 
 ## The firmware contract
 
