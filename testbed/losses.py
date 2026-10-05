@@ -362,24 +362,37 @@ async def grounds(gd, ns, sidecar, names=None, session=None):
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
     out = {}
     try:
+        boxes = {}
         for name in names:
             node = ns.nodes.get(name)
             if node is None:
                 continue
             x, y = gd.to_xy(node["lat"], node["lon"])
-            params = {"minx": "%.3f" % (x - 2), "miny": "%.3f" % (y - 2),
-                      "maxx": "%.3f" % (x + 2), "maxy": "%.3f" % (y + 2), "w": "1", "h": "1",
-                      "terrain_only": "1"}
-            for _ in range(6):
-                async with session.get(sidecar + "/tile.bin", params=params) as resp:
-                    if resp.status == 429:
-                        await asyncio.sleep(0.2)
-                        continue
-                    if resp.status == 200:
-                        value = terrain_of_tile(await resp.read())
-                        if value is not None:
-                            out[name] = value
-                    break
+            boxes[name] = {"minx": "%.3f" % (x - 2), "miny": "%.3f" % (y - 2),
+                           "maxx": "%.3f" % (x + 2), "maxy": "%.3f" % (y + 2), "w": "1", "h": "1",
+                           "terrain_only": "1"}
+        async with session.get(sidecar + "/api/pack") as resp:
+            batch = (await resp.json(content_type=None)).get("tile_batch") \
+                if resp.status == 200 else None
+        if batch and boxes:
+            # One request for every node's tile, each as tile.bin answers it.
+            replies = zip(boxes, await batch_tiles(session, sidecar + batch,
+                                                   list(boxes.values())))
+        else:
+            replies = []
+            for name, params in boxes.items():
+                for _ in range(6):
+                    async with session.get(sidecar + "/tile.bin", params=params) as resp:
+                        if resp.status == 429:
+                            await asyncio.sleep(0.2)
+                            continue
+                        if resp.status == 200:
+                            replies.append((name, await resp.read()))
+                        break
+        for name, data in replies:
+            value = terrain_of_tile(data)
+            if value is not None:
+                out[name] = value
     except (aiohttp.ClientError, asyncio.TimeoutError):
         pass
     finally:
@@ -427,6 +440,35 @@ async def estimated_heights(gd, points, base_url, session=None, notice=None):
     finally:
         if own:
             await session.close()
+
+
+async def batch_tiles(session, url, queries):
+    """`/tiles.bin`: each of `queries` (tile.bin's query, as strings) as
+    tile.bin answers it, in order; [] when the sidecar sheds the request."""
+    import struct
+
+    body = {"tiles": [dict(q, w=int(q["w"]), h=int(q["h"]),
+                           terrain_only=int(q.get("terrain_only", 0))) for q in queries]}
+    for _ in range(6):
+        async with session.post(url, json=body) as resp:
+            if resp.status == 429:
+                await asyncio.sleep(0.2)
+                continue
+            if resp.status != 200:
+                return []
+            data = await resp.read()
+            break
+    else:
+        return []
+    if data[:4] != b"PTLS":
+        return []
+    count = struct.unpack_from("<I", data, 4)[0]
+    out, at = [], 8
+    for _ in range(count):
+        size = struct.unpack_from("<I", data, at)[0]
+        out.append(data[at + 4:at + 4 + size])
+        at += 4 + size
+    return out
 
 
 def terrain_of_tile(data):

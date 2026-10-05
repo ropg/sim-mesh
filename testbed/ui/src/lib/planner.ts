@@ -21,7 +21,7 @@
  * the result with drawImage, so panning and zooming cost nothing until the
  * view leaves it. Footprints and roads are the page's own to draw. */
 import type { GroundAsk, GroundDone, GroundJob } from './ground.worker'
-import { decodeTile, magic } from './tile'
+import { decodeTile, magic, type DecodedTile } from './tile'
 
 /** The ground under everything. Population is not one: it is a heatmap of
  *  its own over whichever ground (`populationImage`). */
@@ -205,19 +205,50 @@ export async function roads(base: string, box: Box, signal?: AbortSignal): Promi
   return ways
 }
 
-/** Ground and clutter height at one point, from the pack's rasters. */
-export async function sample(base: string, x: number, y: number,
-                             signal?: AbortSignal): Promise<{ ground: number; clutter: number | null }> {
-  const r = 2
-  const q = boxQuery({ minx: x - r, miny: y - r, maxx: x + r, maxy: y + r }, 1, 1)
-  const res = await getWithBackoff(`${base}/tile.bin?${q}`, signal)
-  if (!res.ok) throw new Error(`tile ${res.status}`)
-  const d = decodeTile(await res.arrayBuffer())
+/** What stands at a point: the ground and the clutter height there. */
+export interface Sample { ground: number; clutter: number | null }
+
+/** The box a point's tile is asked for: two metres round it, one cell asked. */
+const SAMPLE_R = 2
+
+/** A point's values off the tile asked for it: its nearest cell's. */
+function sampleOf(d: DecodedTile, x: number, y: number): Sample {
   /* The origin is the top-left cell's centre, rows running south. */
   const col = Math.min(d.w - 1, Math.max(0, Math.round((x - d.ox) / Math.abs(d.rx))))
   const row = Math.min(d.h - 1, Math.max(0, Math.round((d.oy - y) / Math.abs(d.ry))))
   const k = row * d.w + col
   return { ground: d.terrain[k]!, clutter: d.clutter ? d.clutter[k]! : null }
+}
+
+/** Ground and clutter height at one point, from the pack's rasters. */
+export async function sample(base: string, x: number, y: number, signal?: AbortSignal): Promise<Sample> {
+  const r = SAMPLE_R
+  const q = boxQuery({ minx: x - r, miny: y - r, maxx: x + r, maxy: y + r }, 1, 1)
+  const res = await getWithBackoff(`${base}/tile.bin?${q}`, signal)
+  if (!res.ok) throw new Error(`tile ${res.status}`)
+  return sampleOf(decodeTile(await res.arrayBuffer()), x, y)
+}
+
+/** `sample` at many points, their tiles in one /tiles.bin request, each as
+ *  tile.bin answers it; the box's numbers go as strings, read exactly. */
+export async function samples(base: string, points: [number, number][],
+                              signal?: AbortSignal): Promise<Sample[]> {
+  const r = SAMPLE_R, s = String
+  const tiles = points.map(([x, y]) => ({ minx: s(x - r), miny: s(y - r), maxx: s(x + r), maxy: s(y + r), w: 1, h: 1 }))
+  const res = await withBackoff(() => fetch(`${base}/tiles.bin`, {
+    method: 'POST', body: JSON.stringify({ tiles }), headers: { 'Content-Type': 'application/json' }, signal,
+  }), signal)
+  if (!res.ok) throw new Error(`tiles ${res.status}`)
+  const buf = await res.arrayBuffer()
+  const dv = new DataView(buf)
+  if (magic(dv) !== 'PTLS' || dv.getUint32(4, true) !== points.length) throw new Error('not a tile batch')
+  const out: Sample[] = []
+  for (let i = 0, at = 8; i < points.length; i++) {
+    const n = dv.getUint32(at, true)
+    out.push(sampleOf(decodeTile(buf.slice(at + 4, at + 4 + n)), points[i]![0], points[i]![1]))
+    at += 4 + n
+  }
+  return out
 }
 
 /** One node of a coverage view: its raster's key, where it stands, what it
