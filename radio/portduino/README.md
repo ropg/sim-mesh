@@ -10,7 +10,8 @@ whole.
 firmware ── SPI.transfer(frame) ─────► SimChip ── simradio_transfer ──► chip model
 firmware ── digitalWrite(RESET) ─────► ResetPin: rising edge ── simradio_reset
 firmware ◄── digitalRead(BUSY/DIO1) ── LevelPin ◄── on_pin ── chip model
-firmware ── rnode_idle(max_ms) ──────► wait until max_ms, DIO1 rises or rnode_wake() (node time)
+firmware ── rnode_idle(max_ms) ──────► poll() until max_ms, DIO1 rises, rnode_wake(), or a watched socket is readable (node time)
+firmware ── listen/accept/close ─────► the socket watched while it is open (with -Wl,--wrap=…)
 ```
 
 ## What a firmware calls
@@ -24,13 +25,43 @@ definition is here:
   `SIM_MESH_BIND_ADDR`, `SIM_MESH_ETHER`) and chip slot 0, installs its
   `SPIChip` into the global `SPI`, and binds the chip's lines with `gpioBind`.
 - `void rnode_idle(uint32_t max_ms)`, where the firmware has nothing to do
-  for up to `max_ms`. It waits on a condition variable until then or until
-  DIO1 rises; in a virtual-time run the time shim answers the wait in node
-  time, and Portduino's next `gpioIdle()` runs the DIO1 interrupt handler.
-  `max_ms == 0` returns at once.
+  for up to `max_ms`. It is a `poll()` on an eventfd and the watched
+  descriptors (below), until then, until DIO1 rises, or until one of them is
+  readable; in a virtual-time run the time shim answers the wait in node
+  time, and counts the descriptors it waits on, so a station with bytes
+  waiting for it is never idle. Portduino's next `gpioIdle()` runs the DIO1
+  interrupt handler. `max_ms == 0` returns at once.
 - `void rnode_wake()`, from any thread that has work for the firmware's loop
   (a reader thread that took console input, say): the idle in progress
   returns at once, or the next one does.
+
+and, declared by a firmware that uses them:
+
+- `void rnode_idle_radio(uint32_t max_ms)`: the same wait without the
+  watched descriptors, for a wait inside a radio operation (RadioLib's
+  `yield()` during channel activity detection) that input must not end.
+- `void rnode_watch_fd(int)`, `void rnode_unwatch_fd(int)`: a descriptor
+  whose readability ends `rnode_idle`, at most 16.
+- `int rnode_idle_fd_ready()`: whether the last `rnode_idle` ended on a
+  watched descriptor; asking clears it. A firmware that polls its sockets on
+  timers makes them due at once when it is set.
+
+A watched descriptor whose peer has gone (`POLLRDHUP`, `POLLHUP`, `POLLERR`
+or `POLLNVAL`) is reported ready once and then no longer watched: at end of
+stream it is readable for ever, and a firmware that never notices (Portduino's
+`WiFiClient` does not) would end every idle at once and T would not move.
+The idle never reads a watched descriptor to find this out, since the shim
+counts what a station takes from a connection.
+
+**The link wraps.** A firmware linked with `-Wl,--wrap=bind
+-Wl,--wrap=listen -Wl,--wrap=accept -Wl,--wrap=close` gets them from here:
+a bind of an IPv4 socket to `INADDR_ANY` binds `SIM_MESH_BIND_ADDR` instead,
+when that is set, so every station keeps its port on its own address; a
+socket that `listen` or `accept` succeeds on is watched; `close` unwatches.
+Their `__real_*` are weak, so a firmware linked without the wraps links this
+library too. The idle and the wraps are `idle.cpp`, POSIX alone, which
+`radio/tests/test_portduino_idle.py` compiles with a stand-in on the host's
+g++.
 
 The firmware must hand every SPI transaction to `SPI.transfer` as one frame,
 NSS low to NSS high, which is what a driver written for spidev already does.

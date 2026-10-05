@@ -21,8 +21,8 @@
  * 100 ms sleep between loop() calls, so the firmware's own idle is the only
  * wait in its loop.
  *
- * The idle waits on a condition variable until max_ms has passed or DIO1 has
- * risen; the time shim answers the wait in node time, and Portduino's next
+ * The idle (idle.cpp) ends when max_ms has passed or DIO1 has risen, which
+ * wakes it; the time shim answers the wait in node time, and Portduino's next
  * gpioIdle() runs the DIO1 interrupt handler.
  *
  * Environment: SIM_MESH_NODE_ID, SIM_MESH_BIND_ADDR and SIM_MESH_ETHER (the
@@ -34,7 +34,8 @@
 #include <PortduinoGPIO.h>
 #include <SPIChip.h>
 
-#include "simradio.h"
+// By its path: a firmware may have a simradio.h of its own on the include path (Meshtastic does).
+#include "../include/simradio.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -52,8 +53,6 @@ namespace {
 simradio_t* s_chip;
 
 pthread_mutex_t s_mu = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t  s_cv = PTHREAD_COND_INITIALIZER;   /* on the wall clock, as the shim reads it */
-bool s_rose;                    /* DIO1 has risen, or a wake was asked, since the last idle returned */
 unsigned s_rises;               /* DIO1's rising edges, ever */
 volatile int s_dio1;
 volatile int s_busy;
@@ -67,13 +66,13 @@ void onPin(void*, int pin, int level)
     if (pin != SIMRADIO_PIN_DIO1)
         return;
     pthread_mutex_lock(&s_mu);
-    if (level && !s_dio1) {
-        s_rose = true;
+    bool rose = level && !s_dio1;
+    if (rose)
         s_rises++;
-        pthread_cond_signal(&s_cv);
-    }
     s_dio1 = level;
     pthread_mutex_unlock(&s_mu);
+    if (rose)
+        rnode_wake();
 }
 
 int envInt(const char* name, int fallback)
@@ -204,30 +203,4 @@ void native_radio_backend_init()
     gpioBind(new ResetPin(envInt("SIMRADIO_PIN_RESET", 2)));
     gpioBind(new LevelPin(envInt("SIMRADIO_PIN_BUSY", 3), "BUSY", &s_busy));
     gpioBind(new Dio1Pin(envInt("SIMRADIO_PIN_DIO1", 4)));
-}
-
-void rnode_wake()
-{
-    pthread_mutex_lock(&s_mu);
-    s_rose = true;
-    pthread_cond_signal(&s_cv);
-    pthread_mutex_unlock(&s_mu);
-}
-
-void rnode_idle(uint32_t max_ms)
-{
-    if (max_ms == 0)
-        return;
-    struct timeval now;
-    gettimeofday(&now, nullptr);
-    int64_t end_us = (int64_t)now.tv_sec * 1000000 + now.tv_usec + (int64_t)max_ms * 1000;
-    struct timespec end = {(time_t)(end_us / 1000000), (long)(end_us % 1000000) * 1000};
-
-    pthread_mutex_lock(&s_mu);
-    while (!s_rose) {
-        if (pthread_cond_timedwait(&s_cv, &s_mu, &end) == ETIMEDOUT)
-            break;
-    }
-    s_rose = false;
-    pthread_mutex_unlock(&s_mu);
 }
