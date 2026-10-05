@@ -119,6 +119,47 @@ class Stub(MeshcoreDriver):
 DRIVER = Stub
 '''
 
+MESHTASTIC_DRIVER = '''
+import os
+from sim_mesh.meshtastic.driver import MeshtasticDriver, tagged
+
+
+def note(station, line):
+    with open(os.path.join(station.dir, "lines"), "a") as out:
+        out.write(line + "\\n")
+    return "did %s" % line
+
+
+class Stub(MeshtasticDriver):
+    async def wait_up(self, station, timeout):
+        return True
+
+    async def run(self, station, line, timeout=None):
+        return note(station, line)
+
+    def configured(self, station):
+        return os.path.exists(os.path.join(station.dir, "lines"))
+
+    async def name(self, station, name):
+        note(station, "name %s" % name)
+
+    async def role(self, station, role):
+        note(station, "role %s" % role)
+
+    async def sendtext(self, station, text, mid, dest=None, ch_index=0, want_ack=True):
+        note(station, "sendtext %s %d %s" % (dest or "^all", ch_index, tagged(text, mid)))
+        self.msg_status(station, mid, "sent")
+
+    async def traceroute(self, station, dest):
+        return {"route": [dest], "snr_towards": [6.0], "route_back": [], "snr_back": [5.5]}
+
+    async def current_role(self, station):
+        return "client"
+
+
+DRIVER = Stub
+'''
+
 STATION = "#!/bin/sh\nexec sleep 60\n"
 
 
