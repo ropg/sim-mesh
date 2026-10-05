@@ -2627,7 +2627,9 @@ async function fetchBuildings() {
   const ctrl = new AbortController(); bldgReq = ctrl;
   try {
     const b = bldgBox();
-    const q = new URLSearchParams({ minx: b.minx, miny: b.miny, maxx: b.maxx, maxy: b.maxy, w: 1, h: 1 });
+    // values: this page colours footprints by loss and census, which the
+    // sidecar fills in only when asked.
+    const q = new URLSearchParams({ minx: b.minx, miny: b.miny, maxx: b.maxx, maxy: b.maxy, w: 1, h: 1, values: 1 });
     const r = await fetch(`/buildings.bin?${q}`, { signal: ctrl.signal });
     if (r.status === 204 || !r.ok) return;
     const buf = await r.arrayBuffer(), dv = new DataView(buf);

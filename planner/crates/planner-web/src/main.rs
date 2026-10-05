@@ -439,6 +439,9 @@ struct BuildingIndex {
     /// height estimator takes of a building (`/height.json`), kept beside the
     /// records a path reads rather than in them.
     area_height: Vec<[f32; 2]>,
+    /// The building file this index was built from, where its mtime could be
+    /// read: what a `/buildings.bin` validator rests on.
+    stamp: Option<FileStamp>,
 }
 
 const BLDG_CELL_M: f32 = 100.0;
@@ -452,7 +455,8 @@ const BLDG_CELL_M: f32 = 100.0;
 enum BuildingsIndexState {
     /// A background thread is parsing. Links use the clutter raster meanwhile.
     Loading,
-    Ready(BuildingIndex),
+    /// Shared, so a request can take the index and let the lock go.
+    Ready(Arc<BuildingIndex>),
     /// No Buildings layer in the manifest, or the file could not be read.
     Absent,
 }
@@ -462,6 +466,14 @@ impl BuildingsIndexState {
     fn get(&self) -> Option<&BuildingIndex> {
         match self {
             BuildingsIndexState::Ready(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// The index to keep past the lock, if it is usable.
+    fn ready(&self) -> Option<Arc<BuildingIndex>> {
+        match self {
+            BuildingsIndexState::Ready(b) => Some(Arc::clone(b)),
             _ => None,
         }
     }
@@ -1247,7 +1259,8 @@ fn building_index(
         },
     };
     match loaded {
-        Ok((idx, suspect)) => {
+        Ok((mut idx, suspect)) => {
+            idx.stamp = stamp;
             println!(
                 "buildings: {} LoD2 record(s) loaded from {} in {:.3} s — {} with real \
                  footprints ({} vertices), {} as equal-area discs",
@@ -1268,7 +1281,8 @@ fn building_index(
     }
     progress.bytes_total.store(stamp.map_or(0, |s| s.bytes), Ordering::Relaxed);
     progress.phase(IndexPhase::Parsing);
-    let (idx, bad, suspect) = parse_buildings(f, origin, progress);
+    let (mut idx, bad, suspect) = parse_buildings(f, origin, progress);
+    idx.stamp = stamp;
     // Say whether the footprints are REAL or approximated. A pack
     // built without --lod2-geometry answers every containment test
     // with an equal-area disc, which is a different and much coarser
@@ -1347,7 +1361,10 @@ struct NetworkResult {
     /// cells — 392 MB as the f32 `Grid` it used to be, 98 MB as counts. The
     /// wire format `/network.bin` already spoke was u8; only the server's own
     /// copy was four times wider than the numbers in it.
-    served: planner_coverage::gaps::CountGrid,
+    ///
+    /// Shared, so the footprint routes read values from it without holding
+    /// the census lock while they build a reply.
+    served: Arc<planner_coverage::gaps::CountGrid>,
     k_target: u8,
     sites: usize,
     skipped: usize,
@@ -1367,7 +1384,8 @@ struct NetworkResult {
 
 struct CachedCoverage {
     key: CoverageKey,
-    loss: planner_terrain::Grid,
+    /// Shared, as the census raster is, for the footprint routes.
+    loss: Arc<planner_terrain::Grid>,
     compute_ms: u128,
 }
 
@@ -1677,7 +1695,7 @@ async fn coverage_png(State(st): State<Arc<AppState>>, Query(q): Query<CoverageQ
             Ok(c) => {
                 *st.coverage_cache.lock().await = Some(CachedCoverage {
                     key,
-                    loss: c.loss,
+                    loss: Arc::new(c.loss),
                     compute_ms: t0.elapsed().as_millis(),
                 })
             }
@@ -2045,42 +2063,163 @@ fn building_values(
     )
 }
 
-async fn buildings_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -> Response {
-    // A hard vertex budget rather than a zoom rule. Berlin has 8.4 M
-    // vertices; a whole-city request would be hundreds of megabytes and the
-    // outlines would be invisible anyway. The reply says when it truncated so
-    // the page can show that it is not drawing everything, instead of quietly
-    // drawing half a city.
-    const MAX_VERTS: usize = 900_000;
-    let lo = Xy { x: q.minx.min(q.maxx), y: q.miny.min(q.maxy) };
-    let hi = Xy { x: q.minx.max(q.maxx), y: q.miny.max(q.maxy) };
-    // The coverage cache and the census are behind ASYNC mutexes and the
-    // building index behind a std RwLock. Taking them in this order matters: a
-    // std guard held across an `.await` makes the whole handler non-Send, and
-    // axum rejects it at compile time with an error that names the route
-    // rather than the lock. Await first, then take the sync guard and never
-    // yield.
-    let cache = st.coverage_cache.lock().await;
-    let net = st.network.lock().await;
-    let guard = st.buildings.read().expect("buildings lock");
-    let Some(ix) = guard.get() else {
-        return (StatusCode::NO_CONTENT, "no building geometry in this pack").into_response();
-    };
-    let loss_g = cache.as_ref().map(|c| &c.loss);
-    let census_g = match &*net {
-        NetworkCensus::Ready(r) => Some(&r.served),
+/// `/buildings.bin`'s query: the box, and whether to fill in each building's
+/// values.
+#[derive(Deserialize)]
+struct BuildingsQuery {
+    minx: f64,
+    miny: f64,
+    maxx: f64,
+    maxy: f64,
+    /// Non-zero: each ring carries its building's loss and census values,
+    /// from the latest sweep band and the census. Otherwise both are NaN,
+    /// "not evaluated". Off by default: sim-mesh's map draws footprints by
+    /// height and never reads them, and computing them tied every reply to
+    /// the sweep and census locks and to state no cache could validate.
+    #[serde(default)]
+    values: u8,
+}
+
+/// A hard vertex budget for one `/buildings.bin` reply rather than a zoom
+/// rule. Berlin has 8.4 M vertices; a whole-city request would be hundreds of
+/// megabytes and the outlines would be invisible anyway. The reply says when
+/// it truncated so the page can show that it is not drawing everything,
+/// instead of quietly drawing half a city.
+const MAX_FOOTPRINT_VERTS: usize = 900_000;
+
+/// The rasters per-building values are read from, as they are now: the
+/// latest sweep band and the census. Each is taken from under its lock and
+/// the lock let go at once, so a reply is built while sweeps and the census
+/// publish beside it, and replies are built side by side.
+async fn value_rasters(
+    st: &AppState,
+) -> (Option<Arc<planner_terrain::Grid>>, Option<Arc<planner_coverage::gaps::CountGrid>>) {
+    let loss = st.coverage_cache.lock().await.as_ref().map(|c| Arc::clone(&c.loss));
+    let census = match &*st.network.lock().await {
+        NetworkCensus::Ready(r) => Some(Arc::clone(&r.served)),
         _ => None,
     };
-    let (verts, lens, tops, ids, truncated) = ix.outlines_in(lo, hi, MAX_VERTS);
+    (loss, census)
+}
 
-    // Layout: "PBO3" | u32 ring_count | u8 truncated | f64 origin_x |
-    // f64 origin_y | per ring: u32 building_id, u32 vertex_count, f32 top_masl,
-    // f32 loss_db, f32 census_count, then vertex_count x (f32 dx, f32 dy).
-    //
-    // Vertices are OFFSETS from the origin in the header. Sending absolute UTM
-    // as f32 would quantise northings to 0.5 m -- the roads layer accepts that
-    // because it only needs to look like a street, but this layer exists to
-    // tell two adjacent buildings apart at a metre.
+/// The validator of a `/buildings.bin` reply without values: a hash of all
+/// it is made from, which is the building file the index was built from (its
+/// size and mtime), the grid the coordinates are relative to, the box and
+/// the vertex budget. `None` for an index whose file had no mtime.
+fn footprints_etag(ix: &BuildingIndex, lo: Xy, hi: Xy) -> Option<String> {
+    let stamp = ix.stamp?;
+    let words = [
+        u64::from(INDEX_VERSION),
+        stamp.bytes,
+        stamp.mtime_s,
+        u64::from(stamp.mtime_ns),
+        ix.origin.0.to_bits(),
+        ix.origin.1.to_bits(),
+        lo.x.to_bits(),
+        lo.y.to_bits(),
+        hi.x.to_bits(),
+        hi.y.to_bits(),
+        MAX_FOOTPRINT_VERTS as u64,
+    ];
+    // FNV-1a: the same on every build and machine, so a page keeps its
+    // validators across sidecar restarts, which std's hasher does not
+    // promise.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in b"PBO3".iter().copied().chain(words.iter().flat_map(|w| w.to_le_bytes())) {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    Some(format!("\"pbo3-{h:016x}\""))
+}
+
+/// Whether a request's `If-None-Match` names `etag`, or is `*`.
+fn etag_matches(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == etag)
+}
+
+/// `resp` with its validator: an ETag and `no-cache`, so a browser keeps the
+/// reply and asks whether it changed; `no-store` where there is none.
+fn with_validator(mut resp: Response, etag: Option<&str>) -> Response {
+    use axum::http::HeaderValue;
+    let h = resp.headers_mut();
+    match etag.and_then(|e| HeaderValue::from_str(e).ok()) {
+        Some(v) => {
+            h.insert(header::ETAG, v);
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        }
+        None => {
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
+    }
+    resp
+}
+
+/// Footprint outlines in a box, for the page to draw and to place nodes on.
+///
+/// Built under no lock: the index is taken from under its own and the lock
+/// let go, and values are read from rasters taken the same way. These
+/// replies once held the sweep and census locks while they were built, so
+/// the squares of a map were built one at a time, and a sweep band waited
+/// for them to publish.
+async fn buildings_bin(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<BuildingsQuery>,
+) -> Response {
+    let lo = Xy { x: q.minx.min(q.maxx), y: q.miny.min(q.maxy) };
+    let hi = Xy { x: q.minx.max(q.maxx), y: q.miny.max(q.maxy) };
+    let Some(ix) = st.buildings.read().expect("buildings lock").ready() else {
+        return (StatusCode::NO_CONTENT, "no building geometry in this pack").into_response();
+    };
+    if q.values == 0 {
+        // Geometry alone is a function of the index and the box, so a page
+        // that has drawn this box asks whether it changed instead of
+        // fetching it again.
+        let etag = footprints_etag(&ix, lo, hi);
+        if etag.as_deref().is_some_and(|e| etag_matches(&headers, e)) {
+            return with_validator(StatusCode::NOT_MODIFIED.into_response(), etag.as_deref());
+        }
+        let out = tokio::task::block_in_place(|| footprints_reply(&ix, lo, hi, None, None));
+        let resp = ([(header::CONTENT_TYPE, "application/octet-stream")], out).into_response();
+        return with_validator(resp, etag.as_deref());
+    }
+    let (loss, census) = value_rasters(&st).await;
+    let out = tokio::task::block_in_place(|| {
+        footprints_reply(&ix, lo, hi, loss.as_deref(), census.as_deref())
+    });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream"), (header::CACHE_CONTROL, "no-store")],
+        out,
+    )
+        .into_response()
+}
+
+/// `/buildings.bin`'s reply for a box: each footprint ring in it, carrying
+/// its building's values read from `loss` and `census`, NaN where there is
+/// no raster. Blocking.
+///
+/// Layout: "PBO3" | u32 ring_count | u8 truncated | f64 origin_x |
+/// f64 origin_y | per ring: u32 building_id, u32 vertex_count, f32 top_masl,
+/// f32 loss_db, f32 census_count, then vertex_count x (f32 dx, f32 dy).
+///
+/// Vertices are OFFSETS from the origin in the header. Sending absolute UTM
+/// as f32 would quantise northings to 0.5 m -- the roads layer accepts that
+/// because it only needs to look like a street, but this layer exists to
+/// tell two adjacent buildings apart at a metre.
+fn footprints_reply(
+    ix: &BuildingIndex,
+    lo: Xy,
+    hi: Xy,
+    loss: Option<&planner_terrain::Grid>,
+    census: Option<&planner_coverage::gaps::CountGrid>,
+) -> Vec<u8> {
+    let (verts, lens, tops, ids, truncated) = ix.outlines_in(lo, hi, MAX_FOOTPRINT_VERTS);
     let mut out = Vec::with_capacity(25 + verts.len() * 8 + lens.len() * 20);
     out.extend_from_slice(b"PBO3");
     out.extend_from_slice(&(lens.len() as u32).to_le_bytes());
@@ -2096,7 +2235,7 @@ async fn buildings_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuer
             Some((lid, l, c)) if lid == id => (l, c),
             _ => {
                 let (x, y) = ix.centroid(id);
-                let lc = building_values(loss_g, census_g, x, y);
+                let lc = building_values(loss, census, x, y);
                 last = Some((id, lc.0, lc.1));
                 lc
             }
@@ -2112,18 +2251,7 @@ async fn buildings_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuer
         }
         v += n as usize;
     }
-    drop(guard);
-    drop(net);
-    drop(cache);
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        out,
-    )
-        .into_response()
+    out
 }
 
 /// Values only -- no geometry -- for every building in a box.
@@ -2134,6 +2262,8 @@ async fn buildings_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuer
 /// 5.2 MB at 6 km of outlines it already held, decoded again, for 12 bytes
 /// per building of actual news. This route is those 12 bytes.
 ///
+/// Built under no lock, as `/buildings.bin` is.
+///
 /// Layout: "PBV1" | u32 count | per building: u32 id, f32 loss_db,
 /// f32 census_count.
 async fn buildings_values_bin(
@@ -2142,31 +2272,24 @@ async fn buildings_values_bin(
 ) -> Response {
     let lo = Xy { x: q.minx.min(q.maxx), y: q.miny.min(q.maxy) };
     let hi = Xy { x: q.minx.max(q.maxx), y: q.miny.max(q.maxy) };
-    let cache = st.coverage_cache.lock().await;
-    let net = st.network.lock().await;
-    let guard = st.buildings.read().expect("buildings lock");
-    let Some(ix) = guard.get() else {
+    let Some(ix) = st.buildings.read().expect("buildings lock").ready() else {
         return (StatusCode::NO_CONTENT, "no building geometry in this pack").into_response();
     };
-    let loss_g = cache.as_ref().map(|c| &c.loss);
-    let census_g = match &*net {
-        NetworkCensus::Ready(r) => Some(&r.served),
-        _ => None,
-    };
-    let ids = ix.ids_in(lo, hi);
-    let mut out = Vec::with_capacity(8 + ids.len() * 12);
-    out.extend_from_slice(b"PBV1");
-    out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
-    for id in ids {
-        let (x, y) = ix.centroid(id);
-        let (loss, census) = building_values(loss_g, census_g, x, y);
-        out.extend_from_slice(&id.to_le_bytes());
-        out.extend_from_slice(&loss.to_le_bytes());
-        out.extend_from_slice(&census.to_le_bytes());
-    }
-    drop(guard);
-    drop(net);
-    drop(cache);
+    let (loss, census) = value_rasters(&st).await;
+    let out = tokio::task::block_in_place(|| {
+        let ids = ix.ids_in(lo, hi);
+        let mut out = Vec::with_capacity(8 + ids.len() * 12);
+        out.extend_from_slice(b"PBV1");
+        out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in ids {
+            let (x, y) = ix.centroid(id);
+            let (loss, census) = building_values(loss.as_deref(), census.as_deref(), x, y);
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&loss.to_le_bytes());
+            out.extend_from_slice(&census.to_le_bytes());
+        }
+        out
+    });
     (
         StatusCode::OK,
         [
@@ -2804,7 +2927,7 @@ async fn loss_bin(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>) -
     let band_km = cached.key.radius_km;
     let (_, tx_lat) = st.to_lonlat(tx);
     let _ = tx_lat;
-    let g = &cached.loss;
+    let g: &planner_terrain::Grid = &cached.loss;
     // Cut to the view when the page asked for one. See `window_raster` for the
     // measured reason: the whole raster is 128 MB at 20 km and 288 MB at 30 km,
     // per band, all of it sampled down to one value per screen pixel on
@@ -2975,7 +3098,7 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
                     band_key.radius_km = band_m / 1000.0;
                     *st2.coverage_cache.blocking_lock() = Some(CachedCoverage {
                         key: band_key,
-                        loss,
+                        loss: Arc::new(loss),
                         compute_ms: t0.elapsed().as_millis(),
                     });
                     // Same guard: a band that finished just as this sweep
@@ -4494,7 +4617,7 @@ fn run_census(st: &AppState, q: &NetworkQuery) -> Result<NetworkResult, String> 
         .collect();
 
     Ok(NetworkResult {
-        served: rep.served,
+        served: Arc::new(rep.served),
         k_target: gp.k_target,
         sites: rep.sites.len(),
         skipped: rep.skipped.len(),
@@ -4533,7 +4656,7 @@ async fn network_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>
     let NetworkCensus::Ready(r) = &*g else {
         return (StatusCode::NOT_FOUND, "no census computed yet").into_response();
     };
-    let s = &r.served;
+    let s: &planner_coverage::gaps::CountGrid = &r.served;
     let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
     // Same rule as loss_bin: rayon work under block_in_place, never bare on a
     // tokio worker.
@@ -4777,7 +4900,7 @@ async fn main() {
         let origin = (m.origin.x, m.origin.y);
         std::thread::spawn(move || {
             let state = match building_index(&p, origin, &progress) {
-                Ok(idx) => BuildingsIndexState::Ready(idx),
+                Ok(idx) => BuildingsIndexState::Ready(Arc::new(idx)),
                 Err(e) => {
                     eprintln!(
                         "buildings layer {}: {e} — links fall back to the clutter raster",
@@ -5129,12 +5252,12 @@ mod tests {
     fn a_loading_index_is_reported_as_neither_ready_nor_absent() {
         assert_eq!(BuildingsIndexState::Loading.label(), "loading");
         assert_eq!(BuildingsIndexState::Absent.label(), "absent");
-        assert_eq!(BuildingsIndexState::Ready(BuildingIndex::default()).label(), "ready");
+        assert_eq!(BuildingsIndexState::Ready(Arc::default()).label(), "ready");
         // Only Ready hands out an index; the other two must fall back rather
         // than answer from a half-filled one.
         assert!(BuildingsIndexState::Loading.get().is_none());
         assert!(BuildingsIndexState::Absent.get().is_none());
-        assert!(BuildingsIndexState::Ready(BuildingIndex::default()).get().is_some());
+        assert!(BuildingsIndexState::Ready(Arc::default()).get().is_some());
     }
 
     /// The background thread parses through `BuildingRecord`, not `Value`.
@@ -5356,6 +5479,93 @@ mod tests {
         assert_eq!(lens.len(), 2, "two footprints, one ring each");
         assert_eq!(ids, vec![0, 1]);
         assert_eq!(ids, from_outlines);
+    }
+
+    /// A reply without values is the reply with values, geometry for
+    /// geometry, with NaN ("not evaluated") where the values were: readers
+    /// that skip them, as sim-mesh's page does, read the same bytes.
+    #[test]
+    fn a_footprint_reply_without_values_is_the_same_geometry_with_nan_values() {
+        let mut ix = BuildingIndex { origin: (1000.0, 2000.0), ..Default::default() };
+        for k in 0..3u32 {
+            let base = ix.verts.len() as u32;
+            for (dx, dy) in [(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)] {
+                ix.verts.push([dx, dy]);
+            }
+            ix.rings.push(base + 4);
+            ix.polys.push(ix.rings.len() as u32);
+            let (start, end) = (ix.polys.len() as u32 - 1, ix.polys.len() as u32);
+            let x = 50.0 + 100.0 * k as f32;
+            let b = Bldg {
+                x,
+                y: 50.0,
+                r: 5.0,
+                br: 7.1,
+                top_masl: 40.0,
+                poly_start: start,
+                poly_end: end,
+            };
+            assert!(!ix.insert(b));
+        }
+        let (lo, hi) = (Xy { x: 1000.0, y: 2000.0 }, Xy { x: 1300.0, y: 2100.0 });
+        let loss = ramp(Xy { x: 1000.0, y: 2100.0 }, 5.0, 60, 21);
+        let with = footprints_reply(&ix, lo, hi, Some(&loss), None);
+        let without = footprints_reply(&ix, lo, hi, None, None);
+        assert_eq!(with.len(), without.len());
+        // Header, then per ring: id, count, top, loss, census, 4 vertices.
+        let ring = 20 + 4 * 8;
+        assert_eq!(with.len(), 25 + 3 * ring);
+        for k in 0..3 {
+            let at = 25 + k * ring;
+            assert_eq!(with[at..at + 12], without[at..at + 12], "id, vertex count and top");
+            assert_eq!(with[at + 20..at + ring], without[at + 20..at + ring], "the outline");
+            let f = |b: &[u8], o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            assert_eq!(f(&with, at + 12), 1050.0 + 100.0 * k as f32, "the loss at the centroid");
+            assert!(f(&with, at + 16).is_nan(), "no census was run");
+            assert!(f(&without, at + 12).is_nan() && f(&without, at + 16).is_nan());
+        }
+        assert_eq!(with[..25], without[..25]);
+    }
+
+    /// The validator changes with anything a reply is made from, and only
+    /// with that: the file the index was built from, the grid, the box.
+    #[test]
+    fn a_footprint_validator_follows_the_file_the_grid_and_the_box() {
+        let stamp = FileStamp { bytes: 1234, mtime_s: 1_790_000_000, mtime_ns: 5 };
+        let ix =
+            BuildingIndex { origin: (1000.0, 2000.0), stamp: Some(stamp), ..Default::default() };
+        let (lo, hi) = (Xy { x: 1000.0, y: 2000.0 }, Xy { x: 2000.0, y: 3000.0 });
+        let etag = footprints_etag(&ix, lo, hi).unwrap();
+        assert!(etag.starts_with("\"pbo3-") && etag.ends_with('"'), "{etag}");
+        assert_eq!(footprints_etag(&ix, lo, hi).unwrap(), etag, "the same reply, the same tag");
+        let other_box = footprints_etag(&ix, lo, Xy { x: 2000.0, y: 3000.5 }).unwrap();
+        let rewritten = BuildingIndex {
+            stamp: Some(FileStamp { mtime_ns: 6, ..stamp }),
+            origin: ix.origin,
+            ..Default::default()
+        };
+        let regridded =
+            BuildingIndex { stamp: Some(stamp), origin: (1000.0, 2000.5), ..Default::default() };
+        for other in [
+            other_box,
+            footprints_etag(&rewritten, lo, hi).unwrap(),
+            footprints_etag(&regridded, lo, hi).unwrap(),
+        ] {
+            assert_ne!(other, etag);
+        }
+        assert!(footprints_etag(&BuildingIndex::default(), lo, hi).is_none(), "no stamp, no tag");
+
+        let ask = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(header::IF_NONE_MATCH, axum::http::HeaderValue::from_str(v).unwrap());
+            etag_matches(&h, &etag)
+        };
+        assert!(ask(&etag));
+        assert!(ask(&format!("W/{etag}")), "a weak match is a match for a GET");
+        assert!(ask(&format!("\"pbo3-0\", {etag}")), "one of a list");
+        assert!(ask("*"));
+        assert!(!ask("\"pbo3-0\""));
+        assert!(!etag_matches(&axum::http::HeaderMap::new(), &etag), "no header, no match");
     }
 
     /// `/height.json`'s building evidence: the buildings whose centroid is
