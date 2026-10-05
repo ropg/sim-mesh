@@ -2477,7 +2477,9 @@ class Front:
                                                "Content-Type": "text/markdown; charset=utf-8"})
 
     async def api_coverage(self, request):
-        """One node's coverage raster, by geodata and key, from the cache."""
+        """One node's coverage raster, by geodata and key, from the cache. A
+        key names what its raster is made of (coverage.key), so the raster
+        at a key never changes and a browser may keep it for good."""
         try:
             path = coverage_module.cached(request.query.get("geodata", ""),
                                           request.query.get("key", ""))
@@ -2485,7 +2487,9 @@ class Front:
             raise web.HTTPNotFound(text=str(err)) from err
         if path is None:
             raise web.HTTPNotFound(text="no such coverage raster")
-        return web.FileResponse(path, headers={"Content-Type": "application/octet-stream"})
+        return web.FileResponse(path, headers={
+            "Content-Type": "application/octet-stream",
+            "Cache-Control": "private, max-age=31536000, immutable"})
 
     async def upload(self, request, suffix=".zip"):
         """A request's body into a temporary file beside the store, streamed:
