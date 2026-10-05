@@ -24,6 +24,12 @@
       <div v-else-if="legend === 'population'" class="wmap-legend">
         population <i class="wmap-ramp" /> dense
       </div>
+      <div v-if="indexing" class="wmap-note wmap-index">
+        building footprints: the planner is {{ indexing.phase }}{{ indexing.buildings
+          ? `, ${indexing.buildings.toLocaleString()} so far` : '' }}
+        <q-linear-progress :value="indexing.fraction ?? 0" :indeterminate="indexing.fraction === null"
+                           color="primary" size="3px" class="q-mt-xs" />
+      </div>
       <div v-if="note" class="wmap-note">{{ note }}</div>
     </div>
     <div v-if="credits.length" class="wmap-credits" :title="creditsOpen ? '' : 'the sources’ notices'"
@@ -360,6 +366,12 @@ let footPaintTimer: ReturnType<typeof setTimeout> | null = null
 let footLanded: FootTile[] = []
 let footprintTries = 0
 const FOOTPRINT_TRIES = 30
+/** The sidecar indexing the pack's buildings, as /buildings/status says it,
+ *  while the footprints wait for it; null when they do not. */
+const indexing = ref<{ phase: string; fraction: number | null; buildings: number } | null>(null)
+let indexWatch = false
+let indexPoll: ReturnType<typeof setTimeout> | null = null
+const INDEX_POLL_MS = 500
 const FOOT_BUCKET_M = 500
 /** Every building held, by id, with how many held squares have it. */
 const footHeld = new Map<number, { f: Footprint; squares: number }>()
@@ -605,17 +617,10 @@ async function loadTile(base: string, tile: FootTile, key: string, generation: n
     if (got === null) {
       footTiles.delete(key)
       // The sidecar answers the same while it is still indexing the
-      // footprints as when the pack has none, so ask again for a while.
-      if (footprintTries++ < FOOTPRINT_TRIES) {
-        note.value = 'building footprints: waiting for the planner to index them'
-        setTimeout(fetchFootprints, 2000)
-      } else {
-        footNone = true
-        note.value = 'this pack has no building footprints (built without --lod2-geometry)'
-      }
+      // footprints as when the pack has none: its status says which.
+      if (!indexWatch) { indexWatch = true; void watchIndex(base, generation) }
       return
     }
-    if (note.value?.startsWith('building footprints: waiting')) note.value = null
     if (got.truncated && tile.size > FOOT_TILE_MIN_M) {
       tile.state = 'split'
       fetchFootprints()
@@ -631,6 +636,36 @@ async function loadTile(base: string, tile: FootTile, key: string, generation: n
     note.value = `footprints: ${(e as Error).message}`
   } finally {
     if (generation === footGeneration) { footActive--; pumpFootprints() }
+  }
+}
+
+/* How far the sidecar has got indexing the buildings, every INDEX_POLL_MS
+ * until it is ready (the squares are asked for again) or says the pack has
+ * none. A sidecar that does not answer the status is asked for the squares
+ * again every two seconds for a while, as before it had one. */
+async function watchIndex(base: string, generation: number) {
+  indexPoll = null
+  let status: { state: string; phase: string; bytes_read: number; bytes_total: number; buildings: number } | null = null
+  try {
+    const r = await fetch(`${base}/buildings/status`)
+    if (r.ok) status = await r.json()
+  } catch { /* asked again below */ }
+  if (generation !== footGeneration) return
+  if (status?.state === 'loading') {
+    indexing.value = { phase: status.phase, buildings: status.buildings,
+                       fraction: status.bytes_total ? Math.min(1, status.bytes_read / status.bytes_total) : null }
+    indexPoll = setTimeout(() => void watchIndex(base, generation), INDEX_POLL_MS)
+    return
+  }
+  indexing.value = null
+  indexWatch = false
+  if (status?.state === 'absent' || (!status && footprintTries++ >= FOOTPRINT_TRIES)) {
+    footNone = true
+    note.value = 'this pack has no building footprints (built without --lod2-geometry)'
+  } else if (status) {
+    fetchFootprints()
+  } else {
+    indexPoll = setTimeout(() => { indexPoll = null; fetchFootprints() }, 2000)
   }
 }
 
@@ -656,6 +691,9 @@ function evictFootTiles(cx: number, cy: number) {
 /** Forget every square: different ground, or the layer turned off. */
 function resetFootprints() {
   footGeneration++
+  if (indexPoll) { clearTimeout(indexPoll); indexPoll = null }
+  indexWatch = false
+  indexing.value = null
   footTiles.clear()
   footHeld.clear()
   footIndex.clear()
@@ -1569,6 +1607,7 @@ watch(() => [props.nodes, props.others, props.offsets, props.selected, props.lin
   background: rgba(18, 20, 23, 0.8); padding: 2px 6px; border-radius: 3px;
 }
 .wmap-legend { display: flex; align-items: center; gap: 10px; color: #d1d5db; }
+.wmap-index { min-width: 260px; }
 .wmap-legend span { display: flex; align-items: center; gap: 4px; }
 .wmap-legend b { font-weight: 500; color: #e5e7eb; }
 .wmap-legend i { display: inline-block; width: 12px; height: 10px; border-radius: 2px; }
