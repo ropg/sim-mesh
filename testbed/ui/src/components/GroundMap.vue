@@ -499,11 +499,15 @@ async function fetchPopulation() {
   }
 }
 
+/* A map not on show, the other tab's, asks for nothing, as for the detail
+ * tile: both tabs' maps are mounted, and the hidden one's overview, roads
+ * and footprints came to 1.3 MB of every pack opened. It asks when it
+ * comes on show. */
 async function fetchOverview() {
   const base = ground.sidecar, pack = ground.pack
   overviewReq?.abort()
   overview = null
-  if (!base || !pack) return
+  if (!base || !pack || size.w < 40) return
   const ctrl = new AbortController()
   overviewReq = ctrl
   const key = groundKey()
@@ -551,6 +555,7 @@ async function fetchGround() {
 
 async function fetchFootprints() {
   const base = ground.sidecar
+  if (size.w < 40) return
   if (!base || !props.display.buildings || viewWidthM() > BLDG_MAX_VIEW_M) {
     note.value = base && props.display.buildings && viewWidthM() > BLDG_MAX_VIEW_M
       ? 'zoom in to see buildings' : ground.problem
@@ -706,7 +711,7 @@ function resetFootprints() {
 
 async function fetchRoads() {
   const base = ground.sidecar
-  if (!base || !props.display.roads) return
+  if (!base || !props.display.roads || size.w < 40) return
   const want = viewBox()
   // A held set is kept while it covers the view and was fetched at about
   // this scale: the sidecar's byte budget makes a wide view's set partial.
@@ -1526,8 +1531,9 @@ function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP)
   const shown = size.w === 0 && element.clientWidth > 0
   size = { w: element.clientWidth, h: element.clientHeight, dpr }
-  // Coming on show (its tab chosen): where the other map sharing the view left it.
-  if (shown) adoptShared()
+  // Coming on show (its tab chosen): where the other map sharing the view
+  // left it, and the overview it did not ask for while hidden.
+  if (shown) { adoptShared(); if (!overview) void fetchOverview() }
   surface.width = Math.round(size.w * dpr)
   surface.height = Math.round(size.h * dpr)
   surface.style.width = `${size.w}px`
@@ -1544,7 +1550,6 @@ onMounted(async () => {
   observer = new ResizeObserver(resize)
   if (wrap.value) observer.observe(wrap.value)
   restoreView()
-  void fetchOverview()
   frame = requestAnimationFrame(tick)
 })
 onUnmounted(() => {
