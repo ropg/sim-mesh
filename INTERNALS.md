@@ -52,8 +52,8 @@ virtual time.
 
 ## Its own launcher, and its own container
 
-sim-mesh simulates whatever firmware brings a driver, Reticulum and MeshCore
-firmware today and Meshtastic nodes as much its business tomorrow. So it
+sim-mesh simulates whatever firmware brings a driver: Reticulum, MeshCore and
+Meshtastic firmware are all its business. So it
 is no verb of the tool that builds any one of them: it has its own launcher
 (`sim`), its own image and its own site of pre-built firmware, and a
 clone runs with no firmware tree beside it.
@@ -1690,6 +1690,28 @@ and the role poll, and a framed-RPC query's timeout. With the same seed and
 epoch, two runs of the same network put the same frames on the air at the
 same instants.
 
+A script takes turns with T the same way: simd holds T from each answer it
+gives the script until the script yields, and a yield names the turn it
+gives back (`sim_mesh/sim.py`, *Turns*). One that crossed an answer on the
+wire, sent before the script saw it, would hand back the floor that answer
+gave, and the script's next command would land at whatever T the host had
+reached meanwhile. For the same reason a script's call counts as waiting
+only until its coroutine ends on the loop, not until its thread has taken
+the result.
+
+**A station whose input is a socket idles on it.** A firmware that polls
+its sockets on timers and idles in a plain sleep is never woken by what is
+written to it: the ether holds T while the bytes are unread, and the sleep
+waits for T. A Portduino firmware's idle is therefore a `poll()` on its
+watched sockets (`radio/portduino`), which ends when one is readable. And no
+wait the firmware does between its idles may take T while input could be
+pending: a radio driver's sub-millisecond settling wait after each SPI
+transfer (RadioLib's `delayMicroseconds(1)`) is a sleep on T as well, and on
+a pass of the main loop with a command just written it stands the station
+until the ether's one-second grace lets T go, at a wall-clock instant. A
+chip that is never busy needs no settling, so in the simulation such a wait
+takes none.
+
 What is still outside: a TCP connection from something that is not a station
 (the page's proxy to a station's web UI), a station's UDP to another, the
 files it shares with the testbed (a pty a tool its driver runs talks on),
@@ -1791,9 +1813,9 @@ change.
   firmware and rules only), so a simulation loaded from one logs at the
   default level.
 
-- **The `meshtastic` category**: its driver interface beside `reticulum`'s
-  and `meshcore`'s, and a `messages` layer in the scripting library that
-  compares delivery from one node to another across the three.
+- **A `messages` layer** in the scripting library that compares delivery
+  from one node to another across the `reticulum`, `meshcore` and
+  `meshtastic` categories.
 - **The mixed-firmware walkthrough** in the README: announces crossing both
   ways, a path through another firmware's transports, a two-frame split both
   ways, carrier sense under contention, and the hidden terminal, each with

@@ -50,6 +50,13 @@ and every call names a `station`, which offers:
 station prints, in order, as sim-mesh reads it; a driver that tells sim-mesh
 what happened (a message delivered) does it from there with `report`.
 
+**Messages.** A category whose messages carry sim-mesh's id in their text
+(`meshcore`, `meshtastic`) reports them with `msg_status(station, mid,
+status, why=None)`, the event `msg.status` (`STATUSES`), and
+`msg_received(station, mid, text, sender=None, chan=None)`, the event
+`msg.received`; `tagged(text, mid)` puts the id in a text and `untagged`
+reads it back out.
+
 **Errors.** Anything that could not be done raises `CommandError`, whose
 text is shown as it is.
 """
@@ -57,6 +64,7 @@ text is shown as it is.
 import asyncio
 import contextlib
 import os
+import re
 
 import boards as _boards
 import rpc as _rpc
@@ -72,6 +80,25 @@ PROBE = _rpc.PROBE
 QUERY_TIMEOUT_S = _rpc.QUERY_TIMEOUT_S
 EXEC_BOUND_S = _rpc.EXEC_BOUND_S
 UP = "up"
+
+STATUSES = ("sent", "delivered", "failed")
+STATUS_EVENT = "msg.status"
+RECEIVED_EVENT = "msg.received"
+MID_MARK = " #"
+UNTAG = re.compile(r"^(.*?) #([A-Za-z0-9_.-]+)\s*$", re.S)
+
+
+def tagged(text, mid):
+    """A message's text with sim-mesh's id at its end."""
+    return "%s%s%s" % (text, MID_MARK, mid)
+
+
+def untagged(text):
+    """(text, mid) out of a tagged text; (text, None) when it carries none."""
+    found = UNTAG.match(text or "")
+    if not found:
+        return text, None
+    return found.group(1), found.group(2)
 
 
 def parse_setting(reply, key):
@@ -275,6 +302,25 @@ class Driver:
     def cannot(self, verb):
         return CommandError("%s has no way to %s" % (self.firmware.get("title", "this firmware"),
                                                      verb))
+
+    # ---- what became of a message ----------------------------------------
+
+    def msg_status(self, station, mid, status, why=None):
+        """Report a message's status under sim-mesh's id."""
+        fields = {"mid": mid, "status": status}
+        if why:
+            fields["why"] = why
+        station.report(STATUS_EVENT, **fields)
+
+    def msg_received(self, station, mid, text, sender=None, chan=None):
+        """Report a message the station received: from a node (as its
+        category names one) or on a channel."""
+        fields = {"mid": mid, "text": text}
+        if sender is not None:
+            fields["sender"] = sender
+        if chan is not None:
+            fields["chan"] = chan
+        station.report(RECEIVED_EVENT, **fields)
 
 
 def method_of(verb):

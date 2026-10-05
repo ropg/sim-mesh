@@ -12,10 +12,16 @@ RADIOS = ~nodes(tag="no-radio")
 
 # A node tagged with a role is told it; nothing to a firmware of another category.
 nodes(tag="transport").on_first_boot(Node.reticulum.role("transport"))
+nodes(tag="router").on_first_boot(Node.meshtastic.role("router"))
 
 # Every node's radio, bar those tagged no-radio, at the node's own maximum power.
-RADIOS.on_first_boot(Node.radio(freq_mhz=FREQ_MHZ, sf=SF, bw_khz=BW_KHZ, cr=CR, sync=SYNC,
-                                tx_dbm="max"))
+# Reticulum's sync word is said only to Reticulum nodes: other firmware has
+# its own, fixed.
+RETICULUM = nodes(category="reticulum")
+(RADIOS & RETICULUM).on_first_boot(
+    Node.radio(freq_mhz=FREQ_MHZ, sf=SF, bw_khz=BW_KHZ, cr=CR, sync=SYNC, tx_dbm="max"))
+(RADIOS - RETICULUM).on_first_boot(
+    Node.radio(freq_mhz=FREQ_MHZ, sf=SF, bw_khz=BW_KHZ, cr=CR, tx_dbm="max"))
 
 # What only one nodeset's nodes need, from its own nodesets/<name>.py.
 for nodeset in sim_nodesets():

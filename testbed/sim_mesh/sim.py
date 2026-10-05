@@ -24,6 +24,20 @@ waiting on a call). So what a driver does about an answer, it does at the
 answer's T, and its waits (`until`, `sleep`, `all_up`, `ready`) are simd's,
 ending at an instant of the run. `sim.t` is the T of the last answer.
 
+```
+driver ── wait {id} ──► simd                         turn n: the driver yields
+driver ── yield {turn: n} ──► simd                   (answer n+1 already on its way)
+simd   ── command_result {id} ──► driver             the floor again: turn n+1
+simd   ignores yield {turn: n}: it is behind n+1     T stands for the driver
+driver ── yield {turn: n+1} ──► simd                 once it has acted on the answer
+```
+
+A yield names the turn it gives back, the floors counted from `drive`, one
+per answer; simd lets go only of the turn it is on. A yield that crossed an
+answer on the wire would otherwise give back the floor that answer handed
+over, and T would run while the driver acted on it, for however long the
+host took.
+
 **A selection** is some of the stations: `sim.nodes(tag=, firmware=, base=,
 category=, role=, names=)`, or `sim.node(name)` for one. What is done to a
 selection is done to each member that is up, spread over `spread` seconds and
@@ -177,6 +191,7 @@ class Sim:
         self.reader = None
         self.firmware_tasks = []         # firmware said and not yet awaited
         self.has_floor = False           # simd holds T for us until we yield
+        self.turn = 0                    # the floors simd has given us: `drive`, and each answer
         self.may_yield = lambda: True    # a script's runtime: its thread is waiting on a call
         self._settling = False
         self._turns = 0
@@ -234,6 +249,7 @@ class Sim:
                     # Ours: simd gave us the floor with it, at its T.
                     if isinstance(m.get("t"), int):
                         self.t = max(self.t, m["t"])
+                    self.turn += 1
                     self.has_floor = True
                     self.poke()
                     if not waiter.done():
@@ -279,6 +295,7 @@ class Sim:
     async def drive(self):
         """Take turns with T (see *Turns*): we have the floor from here."""
         await self.send({"type": "drive"})
+        self.turn += 1
         self.has_floor = True
         self.poke()
 
@@ -299,7 +316,7 @@ class Sim:
         self._settling = False
         if self.has_floor and self.may_yield():
             self.has_floor = False
-            asyncio.ensure_future(self.send({"type": "yield"}))
+            asyncio.ensure_future(self.send({"type": "yield", "turn": self.turn}))
 
     async def _wait(self, msg):
         """One of simd's waits: done at the instant it ends."""

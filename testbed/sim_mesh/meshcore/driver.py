@@ -41,31 +41,13 @@ receiver's driver, from what the station fetched:
 
 which is the event `msg.received`. `mid` travels in the message's text, put
 there with `tagged(text, mid)` and read back with `untagged(text)`, so the
-receiving station's driver knows it with nothing of the sender's.
+receiving station's driver knows it with nothing of the sender's. These are
+`sim_mesh.driver`'s, shared with the `meshtastic` category, and importable
+from here as well.
 """
 
-import re
-
-from sim_mesh.driver import CommandError, Driver  # noqa: F401 - a driver's imports
-
-STATUSES = ("sent", "delivered", "failed")
-STATUS_EVENT = "msg.status"
-RECEIVED_EVENT = "msg.received"
-MID_MARK = " #"
-UNTAG = re.compile(r"^(.*?) #([A-Za-z0-9_.-]+)\s*$", re.S)
-
-
-def tagged(text, mid):
-    """A message's text with sim-mesh's id at its end."""
-    return "%s%s%s" % (text, MID_MARK, mid)
-
-
-def untagged(text):
-    """(text, mid) out of a tagged text; (text, None) when it carries none."""
-    found = UNTAG.match(text or "")
-    if not found:
-        return text, None
-    return found.group(1), found.group(2)
+from sim_mesh.driver import (CommandError, Driver, MID_MARK, RECEIVED_EVENT,  # noqa: F401
+                             STATUS_EVENT, STATUSES, UNTAG, tagged, untagged)
 
 
 class MeshcoreDriver(Driver):
@@ -96,22 +78,3 @@ class MeshcoreDriver(Driver):
 
     async def reset_path(self, station, dest):
         raise self.cannot("reset_path")
-
-    # ---- what became of a message ----------------------------------------
-
-    def msg_status(self, station, mid, status, why=None):
-        """Report a message's status under sim-mesh's id."""
-        fields = {"mid": mid, "status": status}
-        if why:
-            fields["why"] = why
-        station.report(STATUS_EVENT, **fields)
-
-    def msg_received(self, station, mid, text, sender=None, chan=None):
-        """Report a message the station received: from a contact (its
-        public-key prefix) or on a channel."""
-        fields = {"mid": mid, "text": text}
-        if sender is not None:
-            fields["sender"] = sender
-        if chan is not None:
-            fields["chan"] = chan
-        station.report(RECEIVED_EVENT, **fields)

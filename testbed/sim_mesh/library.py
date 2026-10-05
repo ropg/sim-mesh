@@ -109,8 +109,18 @@ to be up first; a node with no firmware refuses):
   message's id}.
 - `.meshcore.path(to)`: each node's path to the contact `to`, its hops, or
   None for flood; `.meshcore.reset_path(to)`: back to flood.
+- `.meshtastic.role(role)`: its device role, Meshtastic's in lower case
+  (`client`, `router`, `router_late`, …).
+- `.meshtastic.hop_limit(n)`: the hops a packet it originates may take, 0–7.
+- `.meshtastic.sendtext(text, to=None, ch_index=0, want_ack=True)`: a text
+  message to the node `to` (its name), or on channel `ch_index` when `to` is
+  None: {node: the message's id}.
+- `.meshtastic.traceroute(to)`: each node's route to `to` and back, {route,
+  snr_towards, route_back, snr_back}.
+- `.meshtastic.nodes()`: each node's [(name, id, hops away, snr, last
+  heard)]; `.meshtastic.nodeinfo()`: a NodeInfo broadcast now.
 
-A command under `.reticulum` or `.meshcore` is for a selection's nodes of
+A command under `.reticulum`, `.meshcore` or `.meshtastic` is for a selection's nodes of
 that category and nothing to the others; a selection with none of them
 refuses it. Every
 command that acts takes `after=` (seconds on the run's clock before it is
@@ -266,6 +276,7 @@ class Runtime:
         self.thread = None
         self.lock = threading.Lock()
         self.blocked = 0            # the script's thread is waiting on this many calls
+        self.count_lock = threading.Lock()
 
     def configure(self, script_name=None, **world):
         self.world = {k: v for k, v in world.items() if v is not None}
@@ -280,19 +291,29 @@ class Runtime:
             self.thread = threading.Thread(target=self.loop.run_forever, name="sim-mesh-loop",
                                            daemon=True)
             self.thread.start()
-        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
         if not wait:
-            return future
+            return asyncio.run_coroutine_threadsafe(coro, self.loop)
         # While the script's thread waits here, its simulation may yield the
         # floor; between two calls the script is deciding what to do next, at
-        # the T of the answer it got, and T waits for it.
-        self.blocked += 1
+        # the T of the answer it got, and T waits for it. The call stops
+        # counting on the loop, as its coroutine ends: counted until the
+        # script's thread took the result, a look at the floor in between
+        # would yield it with the script about to act, and T would run on for
+        # however long the host took to wake the thread.
+        with self.count_lock:
+            self.blocked += 1
+
+        async def counted():
+            try:
+                return await coro
+            finally:
+                with self.count_lock:
+                    self.blocked -= 1
+
+        future = asyncio.run_coroutine_threadsafe(counted(), self.loop)
         if self.sim is not None:
             self.loop.call_soon_threadsafe(self.sim.poke)
-        try:
-            return future.result()
-        finally:
-            self.blocked -= 1
+        return future.result()
 
     def held(self):
         """The simulation, started (or attached to) on first need."""
@@ -687,6 +708,47 @@ class _Meshcore(_Layer):
         return {"to": str(to)}
 
 
+class _Meshtastic(_Layer):
+    """Meshtastic, on a selection's Meshtastic nodes: `.meshtastic`. Each verb
+    is named as the Meshtastic CLI's option of that name."""
+
+    category = "meshtastic"
+
+    @verb("role")
+    def role(self, role):
+        """Its device role: "client", "router", "router_late", "client_mute"
+        and the rest of Meshtastic's roles, in lower case."""
+        return {"role": str(role)}
+
+    @verb("hop_limit")
+    def hop_limit(self, n):
+        """The hops a packet it originates may take, 0 to 7."""
+        return {"n": int(n)}
+
+    @verb("sendtext")
+    def sendtext(self, text, to=None, ch_index=0, want_ack=True):
+        """A text message to the node `to`, or on channel `ch_index` when `to`
+        is None: {node: the message's id}."""
+        return _given(text=str(text), to=None if to is None else str(to),
+                      ch_index=int(ch_index), want_ack=bool(want_ack))
+
+    @verb("traceroute")
+    def traceroute(self, to):
+        """The route to the node `to` and back: {route, snr_towards,
+        route_back, snr_back}."""
+        return {"to": str(to)}
+
+    @verb("nodes")
+    def nodes(self):
+        """Each node's [(name, id, hops away, snr, last heard)]."""
+        return {}
+
+    @verb("nodeinfo")
+    def nodeinfo(self):
+        """A NodeInfo broadcast now."""
+        return {}
+
+
 class Nodes(select_module.Nodes):
     """Some nodes (sim_mesh.select), and what can be done to them; see the
     module's docstring. On the class, `Node`, a firmware's command is a
@@ -695,6 +757,7 @@ class Nodes(select_module.Nodes):
     category = None
     reticulum = _Accessor(_Reticulum)
     meshcore = _Accessor(_Meshcore)
+    meshtastic = _Accessor(_Meshtastic)
 
     def _names(self):
         return self.pick(_sim().facts())

@@ -170,7 +170,8 @@ newest by stamp or by semantic version; a base keeps to one of the two.
 
 **A category** says what kind of mesh a firmware's stations make, and which
 driver interface its driver implements: `reticulum`, `meshcore`
-([§7a](#7a-the-meshcore-category)), and `meshtastic` to come. A script's
+([§7a](#7a-the-meshcore-category)) and `meshtastic`
+([§7b](#7b-the-meshtastic-category)). A script's
 verbs are its category's (below), and the traffic and delivery analyses are
 the `reticulum` category's own.
 
@@ -1013,8 +1014,13 @@ to be up first (a node with no firmware refuses), and answering
   `meshcore` verbs ([§7a](#7a-the-meshcore-category)): `.meshcore.repeat(on)`,
   `.advert()`, `.floodadv()`, `.contacts()`, `.msg(to, text)` and
   `.chan(nb, text)` answering each message's id, `.path(to)` and
-  `.reset_path(to)`, `to` a contact's name. These take `spread=`, the nodes
-  spread over that many seconds.
+  `.reset_path(to)`, `to` a contact's name; and under `.meshtastic`, for a
+  selection's Meshtastic nodes, the `meshtastic` verbs
+  ([§7b](#7b-the-meshtastic-category)): `.meshtastic.role(role)`,
+  `.hop_limit(n)`, `.sendtext(text, to=None, ch_index=0, want_ack=True)`
+  answering each message's id (`to` a node's name; none, the channel),
+  `.traceroute(to)`, `.nodes()` and `.nodeinfo()`. These take `spread=`, the
+  nodes spread over that many seconds.
 
 **The simulation**: `sim_wait(seconds)`, `sim_until(seconds)`, `sim_now()`,
 the run's clock in seconds since the script's simulation began;
@@ -2103,7 +2109,7 @@ A YAML mapping at the archive's root.
 | `base` | yes | as in the name |
 | `arch` | yes | as in the name |
 | `version` | yes | as in the name, a string |
-| `category` | yes | the driver interface its driver implements, and so the verbs it answers: `reticulum` (§7), `meshcore` (§7a); `meshtastic` to come |
+| `category` | yes | the driver interface its driver implements, and so the verbs it answers: `reticulum` (§7), `meshcore` (§7a), `meshtastic` (§7b) |
 | `exec` | yes | the executable's path in the archive |
 | `driver` | yes | the driver's path in the archive, a Python file (§6) |
 | `radio` | no | the virtual radio it is linked with, by the library's name: `sx1262` is `libsimradio-sx1262.so` (§9). Absent: sim-mesh provides none, and the station speaks the ether's protocol itself (§8) or has no radio |
@@ -2385,9 +2391,53 @@ self.msg_received(station, mid, text, sender=<public-key prefix>)   # or chan=<n
 The receiving station's driver reports every message the station received
 as the event `msg.received`, with `mid`, the text, and the sender's
 public-key prefix or the channel. `mid` travels in the message's text,
-put there with `sim_mesh.meshcore.driver.tagged(text, mid)` (`<text>
-#<mid>`) and read back with `untagged`, so a receiver knows it with nothing
-of the sender's.
+put there with `sim_mesh.driver.tagged(text, mid)` (`<text> #<mid>`) and
+read back with `untagged`, so a receiver knows it with nothing of the
+sender's. `msg_status`, `msg_received`, `tagged` and `untagged` are every
+driver's (`sim_mesh.driver`), shared with the `meshtastic` category, and
+`sim_mesh.meshcore.driver` offers them under the same names.
+
+### 7b. The `meshtastic` category
+
+```
+script ── node(n).meshtastic.sendtext(text, to) ──► simd: mid ──► sendtext(text, mid, dest) ──► station
+sender ── queued, then its routing answer ──► its driver ──► msg.status {mid, status}
+receiver ── the text, mid in it ──► its driver ──► msg.received {mid, text, sender | chan}
+```
+
+A firmware of category `meshtastic` is a Meshtastic node. Its `DRIVER`
+subclasses `sim_mesh.meshtastic.driver.MeshtasticDriver` and implements
+every firmware's verbs and the category's, each taking the station first; a
+verb it cannot do raises `CommandError` (`self.cannot(verb)`), which the
+default does. A script reaches them as `<selection>.meshtastic.<verb>`.
+They carry the Meshtastic CLI's option names (`--sendtext`,
+`--traceroute`, `--nodes`) and mean what those mean.
+
+| Verb | Means | Returns |
+|---|---|---|
+| `role(role)` | its device role, Meshtastic's in lower case: `client`, `client_mute`, `client_hidden`, `client_base`, `router`, `router_late`, `tracker`, `sensor`, `tak`, `tak_tracker`, `lost_and_found` | |
+| `hop_limit(n)` | the hops a packet it originates may take, 0–7 | |
+| `sendtext(text, mid, dest=None, ch_index=0, want_ack=True)` | a text message to the node named `dest`, or on channel `ch_index` when `dest` is None; `mid` is sim-mesh's id | |
+| `traceroute(dest)` | | `{route, snr_towards, route_back, snr_back}`, hops as node names where known |
+| `nodes()` | | `[(name, id, hops_away, snr, last_heard)]` |
+| `nodeinfo()` | a NodeInfo broadcast now | |
+
+`current_role(station)` says `router` for `router` and `router_late`,
+`client` otherwise. A script names the other end of `sendtext` and
+`traceroute` with `to`, a node's name (its Meshtastic long name, which its
+driver sets to the node's own); simd passes it as it is. A `sendtext`
+without `to` is a channel message; a `traceroute` without it is refused.
+`sendtext` is answered with the message's id.
+
+**Events**, as for `meshcore` (§7a): the sender's driver reports
+`msg.status` `sent` once the firmware has queued the message, or `failed`
+with `why` when it refused it; a direct message then ends `delivered` (its
+acknowledgement came back from its destination) or `failed` (the routing
+error, `MAX_RETRANSMIT` among them); a channel message ends at `sent`,
+unless the firmware refused it after all (a rate limit). A message still
+open when its station restarts is reported `failed`, `why: "station
+restarted"`. The receiver's driver reports `msg.received` with the sender's
+`!id` or the channel, `mid` read back out of the text.
 
 ### 8. The ether's protocol
 
@@ -2701,7 +2751,10 @@ The model's tests load `libsimradio-sx1262.so` with ctypes, drive it frame by
 frame the way a driver does, and play the ether on a UDP socket of their
 own; the conductor's tests do the same in virtual time, and the shim's run a
 small C stand-in station (`radio/tests/standin.c`), linked with the radio by
-name as a firmware is, under `libsimclock.so`. The
+name as a firmware is, under `libsimclock.so`; the Portduino idle's
+(`radio/tests/idle_standin.cpp`) is compiled with `radio/portduino/idle.cpp`
+by the host's g++, with the link wraps and without, and run on the wall
+clock. The
 testbed's pack tests run against a real `planner-web` when it is built in
 `planner/` and there is `berlin-city` geodata, and are skipped otherwise.
 The builds from sources and the node-map imports are tested against a host and
@@ -2725,7 +2778,7 @@ tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 | `radio/` | the virtual SX1262 and the station's UDP link to the ether, as a shared library |
 | `radio/src/conductor.cpp` | the station's side of virtual time: T, node time, wakes, the idle |
 | `radio/shim/simclock.c` | `libsimclock.so`, the C library's time in node time (its sleeps, descriptor waits, condition and semaphore waits), the seeded randomness, the console and TCP counts, the listening sockets and the watchdog's hold; `radio/include/simclock.h` is what it is handed |
-| [`radio/portduino/`](radio/portduino/README.md) | the virtual radio for a Portduino firmware: a PlatformIO library standing in for spidev and libgpiod, and the firmware's idle wait |
+| [`radio/portduino/`](radio/portduino/README.md) | the virtual radio for a Portduino firmware: a PlatformIO library standing in for spidev and libgpiod, the firmware's idle wait and the sockets that end it |
 | [`ether/`](ether/README.md) | the medium: the loss tables, who hears a frame and how it comes out; `slt.py` reads and writes a table |
 | `testbed/front.py` | several simulations behind one port: the registry, the editors' verbs, the imports, the planner sidecars, the loss tables before a start, one simd per simulation, script runs, coverage, station hostnames by simulation, the WebRTC relay one level up, the finish estimate |
 | `testbed/simd.py` | one simulation: the ether, the stations and their setup, the proxy, the control server, commands and verbs on chosen stations, a moved node's row |
@@ -2746,7 +2799,7 @@ tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 | `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, links, edits, the geometry hash, the merge of shown layers, the imports (the planner's CSVs, any CSV, GeoJSON, KML, GPX, a Meshtastic node list) |
 | `planner/` | the Rust workspace: `planner-web` (the sidecar), `planner-job` (a pack's build, a node map's import), `planner-pack` (the compiler, OpenStreetMap from a PBF extract), `planner-buildings`, `planner-import`, and the ground, propagation and coverage crates |
 | `testbed/script.py` | scripts: listing, checking, loading, a script's inputs read without running it |
-| `testbed/sim_mesh/library.py`, `testbed/sim_mesh/select.py` | the script library: `script_…`, `sim_…`, and `nodes()`/`node()` selections with what is done to them (`.firmware`, `.on_first_boot`, `.exec`, `.radio`, `.reticulum…`, `.meshcore…`), `Node` for first-boot rules, and `scripts.log` |
+| `testbed/sim_mesh/library.py`, `testbed/sim_mesh/select.py` | the script library: `script_…`, `sim_…`, and `nodes()`/`node()` selections with what is done to them (`.firmware`, `.on_first_boot`, `.exec`, `.radio`, `.reticulum…`, `.meshcore…`, `.meshtastic…`), `Node` for first-boot rules, and `scripts.log` |
 | `testbed/losses.py` | a loss table, on synthetic ground or through the sidecar; the cache; links, shadowing, antennas and offsets as layers, the ground under each node; one node's row |
 | `testbed/coverage.py` | a node's coverage raster on a pack, through the sidecar, cached |
 | `testbed/runs.py` | a run directory, and snapshots taken from and loaded into one |
@@ -2756,9 +2809,9 @@ tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 | `testbed/webrtc.py` | the WebRTC relay: the signalling rewritten, and one UDP port in front of every station's DataChannel |
 | `testbed/ui/` | the page (Quasar 2 on Vue 3; Pinia stores `catalog`, `geodata`, `nodes`, `sim`, `coverage`, `display`, `socket`); `vendor/planner-wasm` is the planner's built planner-wasm, copied in by `vendor/update-planner-wasm.mjs` so the page builds with no planner beside it |
 | `testbed/seq.py`, `compare.py`, `airtime.py`, `links.py`, `delivery.py`, `compliance.py`, `referee.py` | the analysis tools ([Reading a run](#reading-a-run)) |
-| `testbed/sim_mesh/` | the library: `library` (what a script says, synchronously), `select` (`nodes()`), `driver` (what a firmware's driver is, and what sim-mesh hands it), `traffic` (the LXMF traffic driver), `sim` (the async hold on a simulation the library runs on), `runner` (a script run, its simulation started, its report), `view` (a run opened for analysis), `record`; `sim_mesh/reticulum/` holds Reticulum's parts: the category's driver interface, frame reading (Reticulum packets, SUPE), delivery analysis; `sim_mesh/meshcore/` the `meshcore` category's driver interface |
+| `testbed/sim_mesh/` | the library: `library` (what a script says, synchronously), `select` (`nodes()`), `driver` (what a firmware's driver is, and what sim-mesh hands it), `traffic` (the LXMF traffic driver), `sim` (the async hold on a simulation the library runs on), `runner` (a script run, its simulation started, its report), `view` (a run opened for analysis), `record`; `sim_mesh/reticulum/` holds Reticulum's parts: the category's driver interface, frame reading (Reticulum packets, SUPE), delivery analysis; `sim_mesh/meshcore/` and `sim_mesh/meshtastic/` the `meshcore` and `meshtastic` categories' driver interfaces |
 | `testbed/boards.py` | the one board, an SX1262 with a GC1109 front end above 22 dBm; a node's maximum power; what a station is told of it |
-| `testbed/scripts/` | the scripts: `realtime.py`, `lxmf-traffic.py`; `startup.py`, which every script includes; `globals.py`, the settings they share and the page reads |
+| `testbed/scripts/` | the scripts: `realtime.py`, `lxmf-traffic.py`, `meshtastic-check.py`; `startup.py`, which every script includes; `globals.py`, the settings they share and the page reads |
 | `testbed/geodata/`, `testbed/nodesets/` | your geodata and nodesets (not committed) |
 | `testbed/testdata/` | what the tests stand on: the four stations `four.yaml` on the synthetic ground `plain-27.yaml` |
 

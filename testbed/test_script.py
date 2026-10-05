@@ -16,6 +16,7 @@ import nodeset  # noqa: E402
 import script  # noqa: E402
 import stations  # noqa: E402
 import store  # noqa: E402
+import stub_firmware  # noqa: E402
 from sim_mesh import library  # noqa: E402
 
 
@@ -156,14 +157,15 @@ def test_the_repositorys_scripts_all_parse_and_declare_what_they_run(runtime, mo
             continue                    # included or imported by the others
         fresh = library.Runtime()
         fresh.configure(geodata="berlin-city", nodesets=["gw"])
-        # Every input a value, as the page or --set gives them.
-        fresh.given = {row["name"]: "some_latest" for row in info["inputs"]}
+        # Every input a value, as the page or --set gives them: its default,
+        # else a firmware's name.
+        fresh.given = {row["name"]: row.get("default") or "some_latest" for row in info["inputs"]}
         library.runtime = fresh
         path = script.script_path(name)
         # Only the declarations: everything before the first thing done.
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
-        head = re.split(r"\n(?:traffic\.run\(|nodes\(\)\.up\()", text)[0]
+        head = re.split(r"\n(?:traffic\.run\(|(?:\w+ = )?nodes\(\)\.up\()", text)[0]
         exec(compile(head, path, "exec"), {"__name__": "check_" + name})   # noqa: S102
         assert fresh.firmware_rules, "%s says no firmware" % name
         assert fresh.speed in ("real", "max"), name
@@ -172,20 +174,27 @@ def test_the_repositorys_scripts_all_parse_and_declare_what_they_run(runtime, mo
         said = [line["verb"] if isinstance(line, dict) else line
                 for rule in fresh.first_boot_rules for line in rule["lines"]]
         order = ["role", "radio", "tcp peer add {addr:internet}:4965", "radio_up"]
-        assert [s for s in said if s in order] == order, name
+        seen = [s for s in said if s in order]
+        assert [s for i, s in enumerate(seen) if i == 0 or seen[i - 1] != s] == order, name
 
 
 def test_the_startup_script_sets_every_radio_but_the_no_radio_ones(runtime, monkeypatch):
+    """Reticulum's sync word goes to Reticulum nodes alone."""
     monkeypatch.syspath_prepend(store.SCRIPTS_DIR)
     runtime.configure(geodata="berlin-city", nodesets=["fachhochschule"])
     library.script_include("scripts/startup.py")   # fachhochschule has no setup of its own
     shared = script.shared()
     radio = [rule for rule in runtime.first_boot_rules
              if any(isinstance(l, dict) and l["verb"] == "radio" for l in rule["lines"])]
-    assert radio == [{"which": {"not": {"where": {"tag": "no-radio"}}}, "lines": [
-        {"verb": "radio", "args": {"freq_mhz": shared["FREQ_MHZ"], "sf": shared["SF"],
-                                   "bw_khz": shared["BW_KHZ"], "cr": shared["CR"],
-                                   "sync": 0x12, "tx_dbm": "max"}}]}]
+    figures = {"freq_mhz": shared["FREQ_MHZ"], "sf": shared["SF"], "bw_khz": shared["BW_KHZ"],
+               "cr": shared["CR"], "tx_dbm": "max"}
+    radios = {"not": {"where": {"tag": "no-radio"}}}
+    reticulum = {"where": {"category": "reticulum"}}
+    assert radio == [
+        {"which": {"and": [radios, reticulum]},
+         "lines": [{"verb": "radio", "args": dict(figures, sync=0x12)}]},
+        {"which": {"and": [radios, {"not": reticulum}]},
+         "lines": [{"verb": "radio", "args": figures}]}]
     with pytest.raises(library.ScriptError, match="no file"):
         library.script_include("nodesets/nowhere.py")
     library.script_include("nodesets/nowhere.py", missing_ok=True)
@@ -239,19 +248,43 @@ def test_commands_said_on_node_are_data_for_the_drivers_verbs():
         {"verb": "floodadv", "args": {}, "category": "meshcore"}]
     assert set(drivers.verbs()) | {"repeat", "advert", "floodadv", "contacts", "msg", "chan",
                                    "path", "reset_path"} == set(drivers.verbs("meshcore"))
+    assert library.lines_of([Node.meshtastic.role("router"), Node.meshtastic.hop_limit(5),
+                             Node.meshtastic.sendtext("hi"),
+                             Node.meshtastic.sendtext("yo", to="b", want_ack=False),
+                             Node.meshtastic.traceroute("c")]) == [
+        {"verb": "role", "args": {"role": "router"}, "category": "meshtastic"},
+        {"verb": "hop_limit", "args": {"n": 5}, "category": "meshtastic"},
+        {"verb": "sendtext", "args": {"text": "hi", "ch_index": 0, "want_ack": True},
+         "category": "meshtastic"},
+        {"verb": "sendtext", "args": {"text": "yo", "to": "b", "ch_index": 0, "want_ack": False},
+         "category": "meshtastic"},
+        {"verb": "traceroute", "args": {"to": "c"}, "category": "meshtastic"}]
+    assert set(drivers.verbs()) | {"role", "hop_limit", "sendtext", "traceroute", "nodes",
+                                   "nodeinfo"} == set(drivers.verbs("meshtastic"))
 
 
-def test_a_meshcore_message_carries_its_id_in_its_text():
-    from sim_mesh.meshcore.driver import tagged, untagged
+def test_a_message_carries_its_id_in_its_text():
+    from sim_mesh.driver import tagged, untagged
+    from sim_mesh.meshcore import driver as meshcore
+    from sim_mesh.meshtastic import driver as meshtastic
     assert tagged("hello there", "alpha.1200") == "hello there #alpha.1200"
     assert untagged("hello there #alpha.1200") == ("hello there", "alpha.1200")
     assert untagged("hello #2 there #bravo.5.1") == ("hello #2 there", "bravo.5.1")
     assert untagged("no id here") == ("no id here", None)
+    assert meshcore.tagged is meshtastic.tagged is tagged
+    assert meshcore.untagged is untagged
 
 
 def test_an_unknown_category_is_named():
-    with pytest.raises(drivers.CommandError, match="category 'meshtastic'"):
-        drivers.load({"firmware": "mt", "category": "meshtastic", "driver": "/nowhere.py"})
+    with pytest.raises(drivers.CommandError, match="category 'nosuch'"):
+        drivers.load({"firmware": "x", "category": "nosuch", "driver": "/nowhere.py"})
+
+
+def test_a_meshtastic_firmware_loads(tmp_path):
+    (tmp_path / "driver.py").write_text(stub_firmware.MESHTASTIC_DRIVER)
+    driver = drivers.load({"firmware": "mt", "category": "meshtastic",
+                           "driver": str(tmp_path / "driver.py")})
+    assert driver.category == "meshtastic" and "sendtext" in driver.VERBS
 
 
 def test_inputs_are_read_without_running_and_given_when_run(scripts_dir, runtime):
