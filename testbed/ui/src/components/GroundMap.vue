@@ -85,7 +85,7 @@ import { computed, onMounted, onUnmounted, ref, watch, nextTick } from 'vue'
 import { useGeodata } from '../stores/geodata'
 import { useSim } from '../stores/sim'
 import type { Display } from '../stores/display'
-import { COVERAGE_BANDS, SLICE_MS, yieldToPage, type CoverageSource } from '../stores/coverage'
+import { COVERAGE_BANDS, type CoverageSource } from '../stores/coverage'
 import type { Offset } from '../stores/nodes'
 import { M_PER_DEGREE } from '../lib/proj'
 import { forwardingRole, type GroundPoint, type LinkMark, type MapNode, type OtherNode, type Pick } from '../lib/marks'
@@ -819,26 +819,19 @@ function paintFootprints(c: CanvasRenderingContext2D, all: Footprint[]) {
   c.stroke()
 }
 
-/* Coverage: the source's margin every COVERAGE_PX pixels, in the band it
- * falls in (COVERAGE_BANDS: green indoors too, yellow outdoors only, red
- * the edge), nothing where it does not decode. */
-function marginColour(m: number): readonly number[] {
-  for (const band of COVERAGE_BANDS) if (m >= band.from) return band.rgba
-  return COVERAGE_BANDS[COVERAGE_BANDS.length - 1]!.rgba
-}
-
-/* A paint is a job: the source made ready and the image painted a slice at
- * a time (SLICE_MS), yielding to the page between slices, into a canvas of
- * its own that replaces the one on show only when it is whole. A newer
- * paint (an aim, a move of the view) makes the older one stale, and it
- * stops at its next slice; meanwhile the last coverage stays drawn and
- * `coverageBusy` puts up "redrawing coverage". */
-let coverageJob = 0
+/* Coverage: the band of every COVERAGE_PX square of the view, as the
+ * source gives it (COVERAGE_BANDS: green indoors too, yellow outdoors only,
+ * red the edge), nothing where it does not decode. A paint is a job: the
+ * bands asked for the view as it is, and drawn into a canvas of its own
+ * that replaces the one on show only when it is whole. A newer paint (an
+ * aim, a move of the view) aborts the older one; meanwhile the last
+ * coverage stays drawn and `coverageBusy` puts up "redrawing coverage". */
+let coverageReq: AbortController | null = null
 const coverageBusy = ref(false)
 
 async function paintCoverage() {
-  const job = ++coverageJob
-  const stale = () => job !== coverageJob
+  coverageReq?.abort()
+  coverageReq = null
   const src = props.coverage
   coverageVersion = src?.version ?? ''
   if (!src || !props.display.coverage || !size.w) {
@@ -847,32 +840,33 @@ async function paintCoverage() {
     redrawWanted = true
     return
   }
+  const ctrl = new AbortController()
+  coverageReq = ctrl
   coverageBusy.value = true
-  if (!await src.prepare(stale)) return
   // The view as it is now: the image is of it, wherever the view goes meanwhile.
   const at = { ...view.value }, w = size.w, h = size.h
+  let bands: Uint8Array
+  try {
+    bands = await src.bands(at, w, h, COVERAGE_PX, ctrl.signal)
+  } catch (e) {
+    if (coverageReq !== ctrl) return
+    coverageReq = null
+    coverageBusy.value = false
+    if ((e as Error).name !== 'AbortError') note.value = `coverage: ${(e as Error).message}`
+    return
+  }
+  if (coverageReq !== ctrl) return
+  coverageReq = null
   const cols = Math.ceil(w / COVERAGE_PX), rows = Math.ceil(h / COVERAGE_PX)
   const canvas = document.createElement('canvas')
   canvas.width = cols
   canvas.height = rows
   const c = canvas.getContext('2d')!
   const img = c.createImageData(cols, rows)
-  let since = performance.now()
-  for (let row = 0; row < rows; row++) {
-    if (performance.now() - since > SLICE_MS) {
-      await yieldToPage()
-      if (stale()) return
-      since = performance.now()
-    }
-    const y = at.cy - ((row + 0.5) * COVERAGE_PX - h / 2) * at.mpp
-    for (let col = 0; col < cols; col++) {
-      const x = at.cx + ((col + 0.5) * COVERAGE_PX - w / 2) * at.mpp
-      const m = src.marginAt(x, y)
-      if (m === null || m < 0) continue
-      img.data.set(marginColour(m), (row * cols + col) * 4)
-    }
+  for (let i = 0; i < cols * rows; i++) {
+    const band = COVERAGE_BANDS[bands[i]!]
+    if (band) img.data.set(band.rgba, i * 4)
   }
-  if (stale()) return
   c.putImageData(img, 0, 0)
   Object.assign(coverageSurface, { canvas, w, h, view: at, on: true, grey: null })
   coverageBusy.value = false
@@ -1499,7 +1493,7 @@ onUnmounted(() => {
   groundReq?.abort(); overviewReq?.abort(); wayReq?.abort(); populationReq?.abort()
   resetFootprints()
   if (settleTimer) clearTimeout(settleTimer)
-  coverageJob++
+  coverageReq?.abort()
   saveView()
 })
 
@@ -1509,7 +1503,7 @@ watch(() => [ground.current?.name, ground.pack?.name], () => {
   detail = null; overview = null; overlay.on = false; pin = null
   resetFootprints()
   ways = null; wayBox = null; coverageSurface.on = false; population = null
-  coverageJob++; coverageBusy.value = false
+  coverageReq?.abort(); coverageReq = null; coverageBusy.value = false
   note.value = ground.problem
   restoreView()
   void fetchOverview()
