@@ -241,6 +241,10 @@ impl CogReader<BufReader<File>> {
     /// A file fetched as a window (only the chunks a rectangle needs, the
     /// rest a sparse hole) reads the same way: a chunk never fetched fails to
     /// decode, and the caller takes it as no data there.
+    ///
+    /// A transparency mask (NewSubfileType with bit 4 set: GDAL's internal
+    /// masks, each after the image it masks and the same size) holds 0 or
+    /// 255 rather than values, and is passed over.
     pub fn open_level(path: &Path, want_m: f64) -> Result<Self, TerrainError> {
         let mut this = Self::open(path)?;
         if this.raw_palette.is_some() {
@@ -250,6 +254,14 @@ impl CogReader<BufReader<File>> {
         let mut best: Option<(usize, CogMeta)> = None;
         let mut index = 1usize;
         while this.decoder.seek_to_image(index).is_ok() {
+            let subfile = this.decoder.get_tag(Tag::NewSubfileType).ok();
+            if subfile
+                .and_then(|v| v.into_u32().ok())
+                .is_some_and(|t| t & 4 != 0)
+            {
+                index += 1;
+                continue;
+            }
             let Ok((w, h)) = this.decoder.dimensions() else { break };
             let (fx, fy) = (full.width as f64 / w as f64, full.height as f64 / h as f64);
             let (dx, dy) = (full.dx * fx, full.dy * fy);
@@ -1418,5 +1430,47 @@ mod tests {
             }
         }
         assert!(shared.window_max(at(0.0, 0.0), at(97.0, 10.0), 9, 9).is_err(), "past the edge");
+    }
+
+    /// GDAL's internal mask follows the image it masks, the same size, with
+    /// NewSubfileType 4: a reader choosing a level must not take it for one.
+    #[test]
+    fn a_mask_is_never_taken_for_a_level() {
+        use tiff::encoder::{colortype, TiffEncoder};
+        let path = std::env::temp_dir().join(format!("planner_masked_{}.tif", std::process::id()));
+        {
+            let mut enc = TiffEncoder::new(File::create(&path).unwrap()).unwrap();
+            // The image: 4 × 4 pixels of 1 m, each 10.
+            let mut image = enc.new_image::<colortype::Gray32Float>(4, 4).unwrap();
+            let scale = [1.0f64, 1.0, 0.0];
+            let tie = [0.0f64, 0.0, 0.0, 1000.0, 2000.0, 0.0];
+            image
+                .encoder()
+                .write_tag(Tag::Unknown(TAG_MODEL_PIXEL_SCALE), &scale[..])
+                .unwrap();
+            image
+                .encoder()
+                .write_tag(Tag::Unknown(TAG_MODEL_TIEPOINT), &tie[..])
+                .unwrap();
+            image.write_data(&[10.0f32; 16]).unwrap();
+            // Its mask, 255 where the image is valid.
+            let mut mask = enc.new_image::<colortype::Gray8>(4, 4).unwrap();
+            mask.encoder().write_tag(Tag::NewSubfileType, 4u32).unwrap();
+            mask.write_data(&[255u8; 16]).unwrap();
+            // An overview at 2 m, each pixel 20.
+            let mut overview = enc.new_image::<colortype::Gray32Float>(2, 2).unwrap();
+            overview
+                .encoder()
+                .write_tag(Tag::NewSubfileType, 1u32)
+                .unwrap();
+            overview.write_data(&[20.0f32; 4]).unwrap();
+        }
+        // Finer than the overview: the image itself, not its mask.
+        let mut r = CogReader::open_level(&path, 1.5).unwrap();
+        assert_eq!((r.meta().width, r.pixel(0, 0).unwrap()), (4, 10.0));
+        // Where the overview suits, the overview.
+        let mut r = CogReader::open_level(&path, 2.0).unwrap();
+        assert_eq!((r.meta().width, r.pixel(0, 0).unwrap()), (2, 20.0));
+        std::fs::remove_file(&path).unwrap();
     }
 }
