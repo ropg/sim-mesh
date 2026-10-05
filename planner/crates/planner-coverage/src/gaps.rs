@@ -28,6 +28,7 @@
 
 use crate::{coverage, CoverageError, CoverageParams, DEFAULT_STOP_AFTER_M};
 use planner_core::geo::Xy;
+use planner_core::memory::{jobs_that_fit, usable_memory_bytes};
 use planner_core::model::LinkParams;
 use planner_propag::p1812::{lb_from_arrays, ArrayInputs};
 use planner_terrain::Grid;
@@ -341,11 +342,9 @@ pub fn per_site_bytes(radius_m: f64, res_m: f64, n_az: usize) -> u64 {
 /// How many sweeps a memory budget affords, capped by the worker count.
 ///
 /// `available` is what `usable_memory_bytes()` reports; 70 % of it is the
-/// share this run may claim, which leaves the other 30 % for the allocator's
-/// own fragmentation, the pack's memory-mapped layers, and — on the
-/// deployment target — the rest of a multi-tenant VPS. `fixed_floor` is what
-/// the run holds for its whole duration regardless of the batch: the pack
-/// windows the caller passed in plus the census raster.
+/// share this run may claim (`planner_core::memory::jobs_that_fit`).
+/// `fixed_floor` is what the run holds for its whole duration regardless of
+/// the batch: the pack windows the caller passed in plus the census raster.
 ///
 /// Never returns 0: one site at a time is the smallest unit of work there is,
 /// and refusing to run is not better than swapping.
@@ -355,70 +354,7 @@ pub fn sweep_batch_for(
     per_site_bytes: u64,
     num_threads: usize,
 ) -> usize {
-    let budget = (available_bytes as f64 * 0.7) as u64;
-    let spare = budget.saturating_sub(fixed_floor_bytes);
-    let fits = spare / per_site_bytes.max(1);
-    (fits as usize).clamp(1, num_threads.max(1))
-}
-
-/// Memory this process may plan against, in bytes.
-///
-/// No `sysinfo`: the workspace has no such dependency and this is the only
-/// caller, so the crate reads the two platforms that run the census.
-///
-///  * Linux (the deployment target) — `/proc/meminfo`'s `MemAvailable`, the
-///    kernel's own estimate of what can be allocated without swapping. That
-///    is the figure the 0.7 factor above is written against.
-///  * Windows (the workstation) — `GetPhysicallyInstalledSystemMemory`, which
-///    reports INSTALLED memory, not free memory. The number is therefore an
-///    over-estimate of what is really available, and the 0.7 factor is doing
-///    more work here than on Linux. Accepted because the workstation is where
-///    the pack is large and the memory is plentiful, and because the
-///    alternative (`GlobalMemoryStatusEx`) buys a second FFI declaration for a
-///    figure that swings with whatever else happens to be open.
-///  * anything else, or either probe failing — 2 GiB, the smallest machine
-///    this is deployed on. Guessing high on an unknown platform is how a
-///    planner gets OOM-killed; guessing low only makes it slower.
-pub fn usable_memory_bytes() -> u64 {
-    const FALLBACK: u64 = 2 * 1024 * 1024 * 1024;
-    platform_memory_bytes().filter(|b| *b > 0).unwrap_or(FALLBACK)
-}
-
-#[cfg(target_os = "linux")]
-fn platform_memory_bytes() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    // MemAvailable first; MemTotal only if the kernel is too old to publish
-    // it (pre-3.14), where it is the only figure on offer.
-    for key in ["MemAvailable:", "MemTotal:"] {
-        if let Some(line) = text.lines().find(|l| l.starts_with(key)) {
-            if let Some(kb) = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()) {
-                return Some(kb * 1024);
-            }
-        }
-    }
-    None
-}
-
-#[cfg(windows)]
-fn platform_memory_bytes() -> Option<u64> {
-    // The only FFI in this workspace. std has no memory-size API, and pulling
-    // in a Windows binding crate for one call would put a platform dependency
-    // into a crate that is otherwise pure arithmetic over grids. The call
-    // writes one u64 and returns a BOOL; there is no allocation, no handle and
-    // no lifetime involved, which is the whole reason it is the one worth
-    // making.
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetPhysicallyInstalledSystemMemory(total_kb: *mut u64) -> i32;
-    }
-    let mut kb: u64 = 0;
-    let ok = unsafe { GetPhysicallyInstalledSystemMemory(&mut kb) };
-    (ok != 0).then(|| kb * 1024)
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-fn platform_memory_bytes() -> Option<u64> {
-    None
+    jobs_that_fit(available_bytes, fixed_floor_bytes, per_site_bytes, num_threads)
 }
 
 impl GapParams {
@@ -2131,8 +2067,8 @@ mod tests {
     /// Whatever the platform probe does, the batch built on it must be usable.
     ///
     /// Deliberately NOT asserting a lower bound of 2 GiB: on Linux the probe
-    /// reports `MemAvailable`, and a busy CI container legitimately has less
-    /// than that. What must hold on every platform is that the figure is a
+    /// reports what `MemAvailable` and the container's limit leave, and a
+    /// busy CI container legitimately has less than that. What must hold on every platform is that the figure is a
     /// plausible number of bytes and that a batch derived from it still runs.
     #[test]
     fn the_memory_probe_reports_something_a_batch_can_be_built_on() {

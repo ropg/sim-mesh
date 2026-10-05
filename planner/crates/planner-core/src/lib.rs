@@ -9,6 +9,7 @@
 pub mod entry_loss;
 pub mod geo;
 pub mod hex;
+pub mod memory;
 pub mod model;
 pub mod preset;
 pub mod profile;
