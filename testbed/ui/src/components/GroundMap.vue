@@ -43,9 +43,10 @@
  * synthetic ground's nautical-mile metres around 0°, 0°), in layers from the
  * ground up:
  *
- *   base       a pack's ground, planner-wasm composing tile.bin with the
- *              server's bake of terrain or clutter height; synthetic
- *              ground's grid, in metres or degrees
+ *   base       a pack's ground, the server's bake of terrain or clutter
+ *              height over tile.bin's terrain, made into an image off the
+ *              main thread (lib/ground.worker.ts); synthetic ground's
+ *              grid, in metres or degrees
  *   roads      roads.bin's ways as lines, by class, railways dashed
  *   buildings  footprints from buildings.bin: outlines under 9 km across,
  *              filled by height above the ground under 4 km
@@ -477,7 +478,7 @@ async function fetchPopulation() {
     const image = await populationImage(base, box, w, h, ctrl.signal)
     if (ctrl.signal.aborted) return
     if (!image) { note.value = 'this pack has no population layer'; return }
-    population = { image, key, res: (box.maxx - box.minx) / image.canvas.width }
+    population = { image, key, res: (box.maxx - box.minx) / image.bitmap.width }
     redrawWanted = true
   } catch (e) {
     if ((e as Error).name !== 'AbortError') note.value = `population: ${(e as Error).message}`
@@ -524,7 +525,7 @@ async function fetchGround() {
   try {
     const image = await baseImage(base, box, w, h, props.display.base, ctrl.signal)
     if (ctrl.signal.aborted) return
-    detail = { image, grid: image.grid, key, res: (box.maxx - box.minx) / image.canvas.width }
+    detail = { image, grid: image.grid, key, res: (box.maxx - box.minx) / image.bitmap.width }
     redrawWanted = true
     // Filled footprints are coloured by height over this tile's terrain.
     if (props.display.buildings && viewWidthM() <= BLDG_FILL_VIEW_M) paintOverlay()
@@ -934,18 +935,18 @@ function draw() {
 /** Whether this frame is drawn grey under a heatmap. */
 let mono = false
 
-function drawImageAt(canvas: HTMLCanvasElement, b: Box) {
+function drawImageAt(image: HTMLCanvasElement | ImageBitmap, b: Box) {
   const [x0, y0] = toScreen(b.minx, b.maxy)
   const [x1, y1] = toScreen(b.maxx, b.miny)
-  ctx!.drawImage(canvas, x0, y0, x1 - x0, y1 - y0)
+  ctx!.drawImage(image, x0, y0, x1 - x0, y1 - y0)
 }
 
 function drawHeld(held: Held) {
-  if (mono && !held.grey) held.grey = greyed(held.image.canvas)
-  drawImageAt(mono ? held.grey! : held.image.canvas, held.image.bounds)
+  if (mono && !held.grey) held.grey = greyed(held.image.bitmap)
+  drawImageAt(mono ? held.grey! : held.image.bitmap, held.image.bounds)
 }
 
-function drawHeatmap(img: Heatmap) { drawImageAt(img.canvas, img.bounds) }
+function drawHeatmap(img: Heatmap) { drawImageAt(img.bitmap, img.bounds) }
 
 function drawGround() {
   if (!ctx) return
