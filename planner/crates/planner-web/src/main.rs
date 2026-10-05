@@ -23,6 +23,7 @@ use clap::Parser;
 use planner_core::geo::Xy;
 use planner_pack::{LayerKind, PackManifest};
 use planner_render::{BaseLayer, RenderOpts, ViewRect};
+use planner_terrain::cog::CogMeta;
 use planner_terrain::cog::CogReader;
 #[cfg(unix)]
 use planner_terrain::cog::SharedRows;
@@ -66,10 +67,10 @@ struct Cli {
     /// 2 GB VPS.
     #[arg(long, default_value_t = 1)]
     sweep_slots: usize,
-    /// Concurrent point-to-point links (`/link.json`). Default: as the
-    /// render slots, which is also how many a pack's loss table asks at
-    /// once. Their own, so a table's burst of pairs is never what a tile is
-    /// refused for.
+    /// Concurrent point-to-point link requests, a `/link.json` pair or a
+    /// `/links.json` batch each. Default: as the render slots, which is also
+    /// how many pairs a pack's loss table asks at once. Their own, so a
+    /// table's burst of pairs is never what a tile is refused for.
     #[arg(long)]
     link_slots: Option<usize>,
     /// Threads a propagation sweep runs on. Default: cores minus two, never
@@ -100,6 +101,9 @@ struct Layer {
     locked: Mutex<CogReader<BufReader<File>>>,
     #[cfg(unix)]
     shared: Option<SharedRows>,
+    /// The layer's grid, as the reader opened it, for working out which
+    /// cells a window holds without asking the reader.
+    meta: CogMeta,
 }
 
 impl Layer {
@@ -107,6 +111,7 @@ impl Layer {
         Layer {
             #[cfg(unix)]
             shared: reader.shared_rows(),
+            meta: *reader.meta(),
             locked: Mutex::new(reader),
         }
     }
@@ -168,33 +173,129 @@ struct Layers {
     building_top: Option<Layer>,
 }
 
-/// `/link.json`'s four windows — terrain, clutter, building top, built
-/// fraction. A side layer the pack lacks, or that could not read this box, is
-/// `None`. Blocking.
-///
-/// Read one after another on the link's own thread. Joined in rayon's global
-/// pool they were faster for one link, but that pool is the tiles', and a
-/// pack table keeps every link slot busy: measured over a 16-way burst of
-/// links, tiles took a median 6.5 ms read in the pool and 5.2 ms read here,
-/// for 3.5% fewer links.
-#[allow(clippy::type_complexity)]
-fn link_windows(
-    layers: &Layers,
-    lo: Xy,
-    hi: Xy,
-) -> (
-    Result<planner_terrain::Grid, planner_terrain::TerrainError>,
-    Option<planner_terrain::Grid>,
-    Option<planner_terrain::Grid>,
-    Option<planner_terrain::Grid>,
-) {
-    let read = |l: &Option<Layer>| l.as_ref().and_then(|l| l.window(lo, hi).ok());
-    (
-        layers.terrain.window(lo, hi),
-        read(&layers.clutter),
-        read(&layers.building_top),
-        read(&layers.built_fraction),
-    )
+/// `/link.json`'s four windows over a pair's box — terrain, clutter,
+/// building top, built fraction. A side layer the pack lacks, or that could
+/// not read the box, is `None`.
+struct LinkWindows {
+    terrain: planner_terrain::Grid,
+    clutter: Option<planner_terrain::Grid>,
+    building_top: Option<planner_terrain::Grid>,
+    built_fraction: Option<planner_terrain::Grid>,
+}
+
+impl LinkWindows {
+    /// The windows over `(lo, hi)`. Blocking.
+    ///
+    /// Read one after another on the link's own thread. Joined in rayon's
+    /// global pool they were faster for one link, but that pool is the
+    /// tiles', and a pack table keeps every link slot busy: measured over a
+    /// 16-way burst of links, tiles took a median 6.5 ms read in the pool and
+    /// 5.2 ms read here, for 3.5% fewer links.
+    fn read(
+        layers: &Layers,
+        (lo, hi): (Xy, Xy),
+    ) -> Result<LinkWindows, planner_terrain::TerrainError> {
+        let read = |l: &Option<Layer>| l.as_ref().and_then(|l| l.window(lo, hi).ok());
+        Ok(LinkWindows {
+            terrain: layers.terrain.window(lo, hi)?,
+            clutter: read(&layers.clutter),
+            building_top: read(&layers.building_top),
+            built_fraction: read(&layers.built_fraction),
+        })
+    }
+
+    fn views(&self) -> LinkViews<'_> {
+        LinkViews {
+            terrain: self.terrain.view(),
+            clutter: self.clutter.as_ref().map(planner_terrain::Grid::view),
+            building_top: self.building_top.as_ref().map(planner_terrain::Grid::view),
+            built_fraction: self.built_fraction.as_ref().map(planner_terrain::Grid::view),
+        }
+    }
+}
+
+/// One layer read once for a batch of pairs, over the box that holds all of
+/// theirs.
+struct SharedWindow {
+    grid: planner_terrain::Grid,
+    meta: CogMeta,
+    /// The read's first column and row in the layer.
+    c0: u32,
+    r0: u32,
+}
+
+impl SharedWindow {
+    /// The layer's window over `(lo, hi)`. Blocking.
+    fn read(layer: &Layer, (lo, hi): (Xy, Xy)) -> Result<Self, planner_terrain::TerrainError> {
+        let (c0, r0, _, _) = layer.meta.window_box(lo, hi)?;
+        Ok(SharedWindow { grid: layer.window(lo, hi)?, meta: layer.meta, c0, r0 })
+    }
+
+    /// What the layer's own window over `(lo, hi)` would have been: the same
+    /// cells, at the origin that window would have had. `None` where this
+    /// read does not hold them.
+    fn view(&self, (lo, hi): (Xy, Xy)) -> Option<planner_terrain::GridView<'_>> {
+        let (c0, r0, w, h) = self.meta.window_box(lo, hi).ok()?;
+        let (dc, dr) = (c0.checked_sub(self.c0)?, r0.checked_sub(self.r0)?);
+        self.grid.sub_view(dc as usize, dr as usize, w, h, self.meta.window_origin(c0, r0))
+    }
+}
+
+/// Cells per layer a batch reads once and shares among its pairs: 16 M, a
+/// 64 MB read a layer, the whole of a 20 km city at 5 m. A batch whose pairs
+/// span more reads each pair's own windows, as `/link.json` does.
+const BATCH_SHARED_CELLS: usize = 16 << 20;
+
+/// `/link.json`'s four layers, each read once for a batch of pairs.
+struct SharedLinkWindows {
+    terrain: SharedWindow,
+    clutter: Option<SharedWindow>,
+    building_top: Option<SharedWindow>,
+    built_fraction: Option<SharedWindow>,
+}
+
+impl SharedLinkWindows {
+    /// The layers over `(lo, hi)`, when that box is within
+    /// `BATCH_SHARED_CELLS` and every layer the pack has reads it; else
+    /// `None`, and the pairs read their own. Blocking.
+    fn read(layers: &Layers, (lo, hi): (Xy, Xy)) -> Option<Self> {
+        let (_, _, w, h) = layers.terrain.meta.window_box(lo, hi).ok()?;
+        if w * h > BATCH_SHARED_CELLS {
+            return None;
+        }
+        // A side layer that cannot read the whole box may still read a pair's
+        // own, which a shared `None` would hide: then nothing is shared.
+        let side = |l: &Option<Layer>| match l {
+            None => Ok(None),
+            Some(l) => SharedWindow::read(l, (lo, hi)).map(Some),
+        };
+        Some(SharedLinkWindows {
+            terrain: SharedWindow::read(&layers.terrain, (lo, hi)).ok()?,
+            clutter: side(&layers.clutter).ok()?,
+            building_top: side(&layers.building_top).ok()?,
+            built_fraction: side(&layers.built_fraction).ok()?,
+        })
+    }
+
+    /// A pair's views, those of its own windows over `bx`; `None` where any
+    /// is not held here.
+    fn views(&self, bx: (Xy, Xy)) -> Option<LinkViews<'_>> {
+        fn side(
+            s: &Option<SharedWindow>,
+            bx: (Xy, Xy),
+        ) -> Option<Option<planner_terrain::GridView<'_>>> {
+            match s {
+                None => Some(None),
+                Some(s) => s.view(bx).map(Some),
+            }
+        }
+        Some(LinkViews {
+            terrain: self.terrain.view(bx)?,
+            clutter: side(&self.clutter, bx)?,
+            building_top: side(&self.building_top, bx)?,
+            built_fraction: side(&self.built_fraction, bx)?,
+        })
+    }
 }
 
 struct AppState {
@@ -212,7 +313,8 @@ struct AppState {
     /// must never queue behind a propagation sweep.
     slots: Semaphore,
     /// Concurrency for point-to-point LINKS, each a profile and four P.1812
-    /// runs.
+    /// runs, and for batches of them (`/links.json`), whose pairs run in
+    /// `sweep_pool`.
     ///
     /// They held render slots, and a pack table asks as many pairs at once as
     /// there are slots, so while a table filled every tile and basemap the
@@ -3291,6 +3393,9 @@ fn resolve_loc_pct(loc_pct: Option<f64>) -> Result<f64, String> {
     }
 }
 
+/// The model a link reply names when P.1812 answered it.
+const P1812_MODEL: &str = "ITU-R P.1812-8";
+
 /// The loss a link reply gives, and the model it came from: P.1812's own
 /// answer, or on a path inside its 0.25 km floor the near-field model's.
 ///
@@ -3305,7 +3410,7 @@ fn link_model(
     near_field: impl FnOnce() -> Option<f64>,
 ) -> Result<(f64, &'static str), (StatusCode, String)> {
     match p1812 {
-        Ok(lb) => Ok((lb, "ITU-R P.1812-8")),
+        Ok(lb) => Ok((lb, P1812_MODEL)),
         Err(planner_core::model::ModelError::OutOfRange(_)) if d_total_km < 0.25 => near_field()
             .map(|v| (v, "free space + P.526 diffraction (inside P.1812's 0.25 km floor)"))
             .ok_or_else(|| (StatusCode::BAD_REQUEST, "path too short to evaluate".into())),
@@ -3496,17 +3601,57 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     // P.1812 runs: the profile walks the building index at every sample, and
     // run on a worker it kept the handlers of tiles from being polled while
     // a pack table filled.
-    match tokio::task::block_in_place(|| link_reply(&st, &q, ends)) {
+    let reply = tokio::task::block_in_place(|| {
+        // The windows over the pair's box, read for it alone.
+        let windows = LinkWindows::read(&st.layers, link_box(&st, ends))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Read-locked ONCE for the whole profile, not per sample: forty
+        // thousand lock acquisitions would cost more than the lookups, and —
+        // more to the point — a profile half-sampled before the background
+        // index lands and half after would mix two obstacle sources with one
+        // `from_lod2` count to describe them. One guard means one answer from
+        // one state.
+        let index = st.buildings.read().expect("buildings lock");
+        link_reply(&st, &q, ends, windows.views(), index.get(), index.label())
+    });
+    match reply {
         Ok(reply) => axum::Json(reply).into_response(),
         Err(refused) => refused.into_response(),
     }
 }
 
-/// `/link.json`'s reply for a pair `link_ends` let through. Blocking.
+/// The box `/link.json` reads for a pair: both ends and four cells around
+/// them, held into the pack.
+fn link_box(st: &AppState, ends: LinkEnds) -> (Xy, Xy) {
+    let LinkEnds { a, b, .. } = ends;
+    let res = terrain_res_hint(st).max(1.0);
+    (
+        st.clamp(Xy { x: a.x.min(b.x) - res * 4.0, y: a.y.min(b.y) - res * 4.0 }),
+        st.clamp(Xy { x: a.x.max(b.x) + res * 4.0, y: a.y.max(b.y) + res * 4.0 }),
+    )
+}
+
+/// The four layers a pair's profile samples, each as the window over the
+/// pair's box: terrain, clutter, building top, built fraction.
+#[derive(Clone, Copy)]
+struct LinkViews<'a> {
+    terrain: planner_terrain::GridView<'a>,
+    clutter: Option<planner_terrain::GridView<'a>>,
+    building_top: Option<planner_terrain::GridView<'a>>,
+    built_fraction: Option<planner_terrain::GridView<'a>>,
+}
+
+/// `/link.json`'s reply for a pair `link_ends` let through, from its layers'
+/// windows and the building index as it stands, `bldg` (`None` while it
+/// loads or where the pack has none), whose state is `index_label`.
+/// Blocking.
 fn link_reply(
     st: &AppState,
     q: &LinkQuery,
     ends: LinkEnds,
+    views: LinkViews<'_>,
+    bldg: Option<&BuildingIndex>,
+    index_label: &'static str,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     // ---- the budget, and where every decibel of it comes from --------------
     //
@@ -3523,22 +3668,12 @@ fn link_reply(
         gains_given,
     } = resolve_budget(q.budget_db, q.tx_gain_dbi, q.rx_gain_dbi);
     let LinkEnds { a, b, dist, loc_pct } = ends;
-
-    let res = terrain_res_hint(st).max(1.0);
-    let lo = st.clamp(Xy { x: a.x.min(b.x) - res * 4.0, y: a.y.min(b.y) - res * 4.0 });
-    let hi = st.clamp(Xy { x: a.x.max(b.x) + res * 4.0, y: a.y.max(b.y) + res * 4.0 });
-
     // The two unblended layers. `building_top` is the obstacle a path
     // crossing a building actually meets; `built_fraction` says how much of
     // the cell that building covers, which is what separates "this sample is
     // inside a Vorderhaus" from "this sample is on the street beside one".
-    //
-    // No lock is held past its own read. Held to the end of the request, as
-    // they once were, the locks made every other request wait out this one's
-    // profile, both P.1812 runs and the Fresnel trace, so however many render
-    // slots there were, one pair was computed at a time.
-    let (terrain, clutter, building_top, built_fraction) = link_windows(&st.layers, lo, hi);
-    let terrain = terrain.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let LinkViews { terrain, clutter, building_top, built_fraction } = views;
+    let res = terrain_res_hint(st).max(1.0);
 
     // Sample at HALF the raster cell for this one path. A point-to-point link
     // is a single profile, not a whole sweep, so the extra samples are free —
@@ -3564,13 +3699,6 @@ fn link_reply(
     // bare ground. The advice differs completely: a rooftop can be gone round
     // or over, a hill cannot.
     let mut bf_at: Vec<f32> = Vec::with_capacity(steps + 1);
-    // Read-locked ONCE for the whole profile, not per sample: forty thousand
-    // lock acquisitions would cost more than the lookups, and — more to the
-    // point — a profile half-sampled before the background index lands and
-    // half after would mix two obstacle sources with one `from_lod2` count to
-    // describe them. One guard means one answer from one state.
-    let bldg_guard = st.buildings.read().expect("buildings lock");
-    let bldg = bldg_guard.get();
     // An end whose antenna is inside a building: its own building is not an
     // obstacle on the path out of it (the walls are its entry loss, below).
     let f_ghz = planner_core::model::LinkParams::eu868_defaults().freq_mhz / 1000.0;
@@ -4160,7 +4288,7 @@ fn link_reply(
             // being read both answer from the clutter raster and both look
             // identical in the counts above — but one is the best this pack can
             // do and the other is a number that will change in a few seconds.
-            "buildings_index": bldg_guard.label(),
+            "buildings_index": index_label,
             // Which §3.2 branch this path was evaluated under, and therefore
             // which spacing floor applied. Reported because the two give
             // different answers and nothing else in the reply says which was
@@ -4223,6 +4351,187 @@ fn link_reply(
         }
     }
     Ok(reply)
+}
+
+/// `POST /links.json`'s body: the nodes, and the pairs among them to answer.
+/// `deny_unknown_fields` for `LinkQuery`'s reason: a misspelled field is
+/// refused rather than answered with its default.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinksRequest {
+    /// Each node as `[x, y, h]`: the pack's CRS metres, and its antenna's
+    /// height above ground in metres, as `/link.json`'s `tx_h` or `rx_h`.
+    ///
+    /// Coordinates given to the millimetre, as the front gives
+    /// `/link.json`'s (`%.3f`), are read here as `/link.json` reads them
+    /// from its query. One of 17 significant digits can be read an ulp away:
+    /// serde_json's default reading of long numbers is not correctly
+    /// rounded, and its exact one would change how every JSON file here is
+    /// read, the buildings among them.
+    nodes: Vec<[f64; 3]>,
+    /// The pairs, as `[a, b]` indices into `nodes`, `a` the end
+    /// `/link.json` calls `a`.
+    #[serde(default)]
+    pairs: Vec<[u32; 2]>,
+    /// Instead of `pairs`: this node against every other, in node order.
+    from: Option<u32>,
+    /// As `/link.json`'s.
+    loc_pct: Option<f64>,
+}
+
+impl LinksRequest {
+    /// The pairs asked for, each naming two of the nodes.
+    fn pairs(&self) -> Result<Vec<[u32; 2]>, String> {
+        let n = self.nodes.len();
+        let pairs = match (self.from, self.pairs.is_empty()) {
+            (Some(_), false) => return Err("name the `pairs` or a node `from`, not both".into()),
+            (None, true) => return Err("name the `pairs` to answer, or a node `from`".into()),
+            (Some(f), true) if f as usize >= n => {
+                return Err(format!("node {f} is not among the {n} nodes"))
+            }
+            (Some(f), true) => (0..n as u32).filter(|&k| k != f).map(|k| [f, k]).collect(),
+            (None, false) => self.pairs.clone(),
+        };
+        match pairs.iter().flatten().find(|&&i| i as usize >= n) {
+            Some(bad) => Err(format!("node {bad} is not among the {n} nodes")),
+            None => Ok(pairs),
+        }
+    }
+}
+
+/// Many pairs at once, each answered as `/link.json` answers it: a pack's
+/// loss table, or one node against the rest.
+///
+/// A table asked `/link.json` twice for every pair, once each way, and each
+/// ask read four windows over its pair's box: on the berlin-centre pack a
+/// long pair's box is the whole pack. Here each pair is computed once, and
+/// its loss is the table's both ways: `/link.json` gives a pair the mean of
+/// P.1812 run in both directions plus both ends' terminal terms, the same
+/// whichever end asks. The layers are read once for the batch, over the box
+/// holding every pair's, and each pair samples the part its own window would
+/// have held, at that window's origin (`GridView`), so its numbers are
+/// `/link.json`'s for the same query, to the bit. Past `BATCH_SHARED_CELLS`
+/// each pair reads its own windows, as many at once as one shared read would
+/// hold. A batch takes one link slot, and its pairs run in the sweep pool,
+/// never the tiles'.
+///
+/// Reply: `buildings_index` as `/link.json`'s (the batch waits out a loading
+/// index, as a sweep does), `read` "once" or "per pair", `compute_ms`, and
+/// one entry per pair in the order asked in each of `lb_db` (`/link.json`'s,
+/// `null` for a pair it refuses) and `flags` (1: the near-field model
+/// answered, inside P.1812's 0.25 km floor; 2: the Fresnel verdict is
+/// "clear"). `refused` lists `[pair, status, text]`, what `/link.json`
+/// answers that pair.
+async fn links_json(
+    State(st): State<Arc<AppState>>,
+    axum::Json(req): axum::Json<LinksRequest>,
+) -> Response {
+    let pairs = match req.pairs() {
+        Ok(pairs) => pairs,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    if let Err(e) = resolve_loc_pct(req.loc_pct) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    let Ok(_permit) = st.link_slots.try_acquire() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "every link slot is busy").into_response();
+    };
+    let st2 = Arc::clone(&st);
+    match tokio::task::spawn_blocking(move || link_rows(&st2, &req, &pairs)).await {
+        Ok(reply) => axum::Json(reply).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `/links.json`'s reply. Blocking.
+fn link_rows(st: &AppState, req: &LinksRequest, pairs: &[[u32; 2]]) -> serde_json::Value {
+    let t0 = std::time::Instant::now();
+    // Never a row from the clutter raster while the index loads: that is a
+    // different number from the same row a moment later, and a table keeps
+    // what it is given.
+    let _ = wait_for_index(&st.buildings, &AtomicBool::new(false));
+    let (index, index_label) = {
+        let state = st.buildings.read().expect("buildings lock");
+        (state.ready(), state.label())
+    };
+    let queries: Vec<LinkQuery> = pairs
+        .iter()
+        .map(|&[i, j]| {
+            let ([ax, ay, tx_h], [bx, by, rx_h]) = (req.nodes[i as usize], req.nodes[j as usize]);
+            LinkQuery {
+                ax,
+                ay,
+                bx,
+                by,
+                tx_h,
+                rx_h,
+                budget_db: None,
+                tx_gain_dbi: None,
+                rx_gain_dbi: None,
+                loc_pct: req.loc_pct,
+                lean: true,
+            }
+        })
+        .collect();
+    let ends: Vec<_> = queries.iter().map(|q| link_ends(st, q)).collect();
+    let union = ends.iter().flatten().map(|&e| link_box(st, e)).reduce(|(lo, hi), (l, h)| {
+        (Xy { x: lo.x.min(l.x), y: lo.y.min(l.y) }, Xy { x: hi.x.max(h.x), y: hi.y.max(h.y) })
+    });
+    let shared = union.and_then(|bx| SharedLinkWindows::read(&st.layers, bx));
+    let row = |k: usize| -> Result<serde_json::Value, (StatusCode, String)> {
+        let ends = ends[k].clone()?;
+        let bx = link_box(st, ends);
+        match shared.as_ref().and_then(|s| s.views(bx)) {
+            Some(views) => link_reply(st, &queries[k], ends, views, index.as_deref(), index_label),
+            None => {
+                let windows = LinkWindows::read(&st.layers, bx)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                link_reply(st, &queries[k], ends, windows.views(), index.as_deref(), index_label)
+            }
+        }
+    };
+    // Pairs reading their own windows hold them while they compute: no more
+    // of them at once than would hold what one shared read holds.
+    let at_once = if shared.is_some() {
+        queries.len().max(1)
+    } else {
+        let cells = |&e: &LinkEnds| {
+            let (lo, hi) = link_box(st, e);
+            st.layers.terrain.meta.window_box(lo, hi).map_or(1, |(_, _, w, h)| w * h)
+        };
+        let most = ends.iter().flatten().map(cells).max().unwrap_or(1);
+        (BATCH_SHARED_CELLS / most.max(1)).max(1)
+    };
+    let all: Vec<usize> = (0..queries.len()).collect();
+    let rows: Vec<Result<serde_json::Value, (StatusCode, String)>> = st.sweep_pool.install(|| {
+        all.chunks(at_once)
+            .flat_map(|c| c.par_iter().map(|&k| row(k)).collect::<Vec<_>>())
+            .collect()
+    });
+    let (mut lb_db, mut flags, mut refused) = (Vec::new(), Vec::new(), Vec::new());
+    for (k, row) in rows.into_iter().enumerate() {
+        match row {
+            Ok(reply) => {
+                let near_field = reply["profile_evidence"]["model"] != P1812_MODEL;
+                let clear = reply["fresnel"]["verdict"] == "clear";
+                lb_db.push(reply["lb_db"].clone());
+                flags.push(u8::from(near_field) | u8::from(clear) << 1);
+            }
+            Err((status, text)) => {
+                lb_db.push(serde_json::Value::Null);
+                flags.push(0);
+                refused.push(serde_json::json!([k, status.as_u16(), text]));
+            }
+        }
+    }
+    serde_json::json!({
+        "buildings_index": index_label,
+        "read": if shared.is_some() { "once" } else { "per pair" },
+        "compute_ms": t0.elapsed().as_millis(),
+        "lb_db": lb_db,
+        "flags": flags,
+        "refused": refused,
+    })
 }
 
 #[derive(Deserialize)]
@@ -4736,6 +5045,8 @@ async fn pack_info(State(st): State<Arc<AppState>>) -> Response {
         "link_options": ["lean"],
         // And what `/loss/start` takes beyond the page's.
         "loss_options": ["whole"],
+        // Where many pairs are asked at once, on a sidecar that has the route.
+        "link_batch": "/links.json",
         "licenses": st.manifest.licenses.iter()
             .map(|l| serde_json::json!({"source": l.source, "notice": l.notice}))
             .collect::<Vec<_>>(),
@@ -4985,6 +5296,10 @@ async fn main() {
         .route("/search", get(search))
         .route("/area.bin", get(area_bin))
         .route("/link.json", get(link_json))
+        .route(
+            "/links.json",
+            axum::routing::post(links_json).layer(axum::extract::DefaultBodyLimit::max(32 << 20)),
+        )
         .route("/height.json", get(height_json))
         .route("/api/presets", get(presets_json))
         .route("/nodes.json", get(nodes_json))
@@ -5566,6 +5881,75 @@ mod tests {
         assert!(ask("*"));
         assert!(!ask("\"pbo3-0\""));
         assert!(!etag_matches(&axum::http::HeaderMap::new(), &etag), "no header, no match");
+    }
+
+    /// A pair answered from a batch's shared read samples exactly what its
+    /// own window would have given it: every box inside the shared one, at
+    /// points along and around it, to the bit.
+    #[test]
+    fn a_shared_read_gives_each_pair_its_own_window() {
+        let g = planner_terrain::Grid::with_axes(
+            Xy { x: 382_644.288_685_023_9, y: 5_824_457.805_585_69 },
+            10.0,
+            -10.0,
+            130,
+            300,
+            (0..130 * 300).map(|i| ((i as f32) * 0.37).cos() * 25.0 + 35.0).collect(),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("planner_web_shared_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.tif");
+        planner_terrain::cog::write_geotiff_f32(&path, &g).unwrap();
+        let layer = Layer::new(CogReader::open(&path).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+        let m = layer.meta;
+        let at = |c: f64, r: f64| Xy { x: m.origin.x + c * m.dx, y: m.origin.y + r * m.dy };
+        // The batch's box, and pairs' boxes inside it, one across the strip
+        // boundary at row 256 and one its whole size.
+        let union = (at(3.3, 2.6), at(121.7, 290.2));
+        let shared = SharedWindow::read(&layer, union).unwrap();
+        for (lo, hi) in [union, (at(10.4, 250.1), at(40.6, 270.3)), (at(80.0, 3.0), at(81.0, 4.0))]
+        {
+            let own = layer.window(lo, hi).unwrap();
+            let view = shared.view((lo, hi)).expect("inside the shared read");
+            assert_eq!((view.origin, view.width, view.height), (own.origin, own.width, own.height));
+            for k in 0..=500 {
+                let t = k as f64 / 500.0;
+                let p = Xy { x: lo.x + (hi.x - lo.x) * t + 3.1, y: lo.y + (hi.y - lo.y) * t - 2.9 };
+                assert_eq!(
+                    view.sample_bilinear(p).map(f32::to_bits),
+                    own.sample_bilinear(p).map(f32::to_bits),
+                    "box {lo:?}-{hi:?} at {p:?}"
+                );
+            }
+        }
+        assert!(shared.view((at(0.0, 0.0), at(5.0, 5.0))).is_none(), "outside the shared read");
+    }
+
+    /// `/links.json` asks exactly the pairs named, or one node against every
+    /// other, and refuses a request that names neither, both, or a node it
+    /// does not have.
+    #[test]
+    fn a_batch_asks_the_pairs_it_names() {
+        let req = |pairs: Vec<[u32; 2]>, from: Option<u32>| LinksRequest {
+            nodes: vec![[1.0, 2.0, 3.0]; 4],
+            pairs,
+            from,
+            loc_pct: None,
+        };
+        assert_eq!(req(vec![[0, 3], [2, 1]], None).pairs().unwrap(), vec![[0, 3], [2, 1]]);
+        assert_eq!(req(vec![], Some(2)).pairs().unwrap(), vec![[2, 0], [2, 1], [2, 3]]);
+        assert!(req(vec![], None).pairs().is_err(), "nothing asked");
+        assert!(req(vec![[0, 1]], Some(2)).pairs().is_err(), "both asked");
+        assert!(req(vec![[0, 4]], None).pairs().unwrap_err().contains("node 4"));
+        assert!(req(vec![], Some(4)).pairs().unwrap_err().contains("node 4"));
+        // As axum reads the body: a misspelled field is refused, not ignored.
+        assert!(serde_json::from_str::<LinksRequest>(r#"{"nodes":[],"from":0,"loc":50}"#).is_err());
+        let r: LinksRequest =
+            serde_json::from_str(r#"{"nodes":[[1,2,3],[4,5,6]],"pairs":[[0,1]],"loc_pct":50}"#)
+                .unwrap();
+        assert_eq!((r.pairs().unwrap(), r.loc_pct), (vec![[0, 1]], Some(50.0)));
     }
 
     /// `/height.json`'s building evidence: the buildings whose centroid is
