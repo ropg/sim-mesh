@@ -115,16 +115,20 @@ struct Ctx {
     in_ground: bool,
 }
 
-/// Shoelace area (absolute) and centroid of one ring.
+/// Shoelace area (absolute) and centroid of one ring, summed about its first
+/// point. Summed over the coordinates themselves, millions of metres in UTM,
+/// the products lose the centimetres a small footprint's centroid is made
+/// of: up to 3 m on buildings of Berlin's size.
 fn ring_area_centroid(ring: &[(f64, f64)]) -> (f64, f64, f64) {
     let n = ring.len();
     if n < 3 {
         return (0.0, 0.0, 0.0);
     }
+    let (ox, oy) = ring[0];
     let (mut a2, mut cx, mut cy) = (0.0, 0.0, 0.0);
     for i in 0..n {
-        let (x0, y0) = ring[i];
-        let (x1, y1) = ring[(i + 1) % n];
+        let (x0, y0) = (ring[i].0 - ox, ring[i].1 - oy);
+        let (x1, y1) = (ring[(i + 1) % n].0 - ox, ring[(i + 1) % n].1 - oy);
         let cross = x0 * y1 - x1 * y0;
         a2 += cross;
         cx += (x0 + x1) * cross;
@@ -133,7 +137,7 @@ fn ring_area_centroid(ring: &[(f64, f64)]) -> (f64, f64, f64) {
     if a2.abs() < 1e-9 {
         return (0.0, ring[0].0, ring[0].1);
     }
-    (a2.abs() / 2.0, cx / (3.0 * a2), cy / (3.0 * a2))
+    (a2.abs() / 2.0, ox + cx / (3.0 * a2), oy + cy / (3.0 * a2))
 }
 
 /// Net area and area-weighted centroid `(area, e, n)` of a footprint.
@@ -419,6 +423,29 @@ mod tests {
         assert_eq!(tile_extent("lod2_33_250_5886_2_gml.gml").map(|e| e[2]), Some(252_000.0));
         assert_eq!(tile_extent("lod2_33410_5656_2_sn.gml"), Some([410_000.0, 5_656_000.0, 412_000.0, 5_658_000.0]));
         assert_eq!(tile_extent("792_5318.gml"), None);
+    }
+
+    /// A 12 by 9 m footprint at Berlin's coordinates, turned 30°, its corners
+    /// to the millimetre as LoD2 gives them: its centroid within a
+    /// millimetre of its middle, where summed over the coordinates
+    /// themselves it was 2 m off.
+    #[test]
+    fn a_footprint_far_from_the_origin_keeps_its_centroid() {
+        let p = Polygon {
+            exterior: vec![
+                (392_342.732, 5_820_116.559),
+                (392_353.124, 5_820_122.559),
+                (392_348.624, 5_820_130.353),
+                (392_338.232, 5_820_124.353),
+            ],
+            interiors: Vec::new(),
+        };
+        let (area, e, n) = footprint(&[p]);
+        assert!((area - 108.0).abs() < 0.01, "{area}");
+        assert!(
+            (e - 392_345.678).abs() < 0.001 && (n - 5_820_123.456).abs() < 0.001,
+            "{e} {n}"
+        );
     }
 
     #[test]
