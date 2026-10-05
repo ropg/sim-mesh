@@ -370,10 +370,11 @@ function choose(n: string) {
   whenSaved(quasar, () => { void show(n) })
 }
 
+/* The nodesets on it and its sidecar are asked for together: neither waits
+ * for the other. */
 async function show(n: string) {
-  await nodes.chooseGeodata(n)
   preview.value = n
-  const error = await ground.open(n)
+  const [, error] = await Promise.all([nodes.chooseGeodata(n), ground.open(n)])
   if (error) quasar.notify({ type: 'negative', message: error, timeout: 6000 })
 }
 
