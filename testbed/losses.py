@@ -32,10 +32,9 @@ with d measured on the ground's plane, heights playing no part on flat
 terrain. The table is symmetric and its model is "log-distance".
 
 Packs are computed through a running planner sidecar's `/link.json`,
-one request per ordered pair: the answer is not reciprocal, because the
-terminal clutter and heights at the two ends enter P.1812 differently (2.5 dB
-apart on a 300 m Mitte path with antennas at 38 m and 30 m), so each
-direction's cell is what `link.json` says of that direction. Each
+one request per ordered pair, or through its `/links.json` where it lists
+that route (`link_batch`): many pairs a request, each computed once, its
+row serving both directions (below). Each
 request gives both ends' antenna heights from the nodeset, in the pack's own
 CRS, and takes `lb_db`, the loss with the terminal clutter at both ends.
 Gains are not sent: they are the antenna layer's to add. What the sidecar cannot
@@ -52,7 +51,8 @@ answer is decided here, without asking:
   FLAG_NEAR_FIELD.
 
 From a reply, FLAG_NEAR_FIELD when its model is the near-field one rather
-than P.1812, and FLAG_LOS_CLEAR when its Fresnel verdict is "clear". A
+than P.1812, and FLAG_LOS_CLEAR when its Fresnel verdict is "clear" (a
+`/links.json` row says both in its flags). A
 refusal for a path that leaves the pack or exceeds the sidecar's window cap
 is never heard with the matching flag; "path too short for a §3.2 profile",
 which the sidecar says of pairs a few tens of metres apart whose profile
@@ -68,6 +68,15 @@ and each pair is asked both ways. A sidecar that lists `lean` among its
 page, which a cell does not keep. 173 Berlin nodes, 14,878 pairs within
 the radius, took 200 s on 8 slots when the layers were read under their
 locks, and take 22-26 s.
+
+`link.json` gives a pair the mean of P.1812 run both ways plus both ends'
+terminal terms, the same number whichever end asks, so a sidecar with
+`/links.json` is asked each pair once, from its first end, `BATCH_PAIRS` a
+request, and the row is put in both directions' cells. A row is what
+`/link.json` answers from that end, to the bit, for the same query: the
+coordinates to the millimetre and the heights as `%g`, as the per-pair
+query has them. The other end's own `/link.json` differs from it by at
+most 1.5e-9 dB, on a few pairs in a hundred.
 
 A sidecar indexes its pack's buildings in the background after it starts
 (a second for the berlin-city pack, half a minute for all of Berlin), and
@@ -127,6 +136,7 @@ LINK_P_TIME_PCT = 50.0
 LINK_P_LOC_PCT = 90.0
 PACK_BANDS = ("868",)
 RETRY_FIRST_S, RETRY_MAX_S = 0.05, 2.0
+BATCH_PAIRS = 4096                  # pairs a /links.json request: progress moves a few times a second
 # The sidecar's building index: a reply given while it is "loading" rests on
 # the clutter raster alone and is a different number from the same request
 # once it is "ready" ("absent": the pack has none, and never will).
@@ -493,6 +503,8 @@ class Sidecar:
         # a sidecar that lists the option is asked it: the query refuses a
         # name it does not know.
         self.lean = False
+        # Its /links.json, where it lists one: many pairs a request.
+        self.batch = None
 
     async def pack(self):
         async with self.session.get(self.base + "/api/pack") as resp:
@@ -500,6 +512,7 @@ class Sidecar:
                 raise LossError("sidecar %s: /api/pack answered %d" % (self.base, resp.status))
             info = await resp.json(content_type=None)
         self.lean = "lean" in (info.get("link_options") or ())
+        self.batch = info.get("link_batch")
         ext = info["extent"]
         self.extent = (ext["minx"], ext["miny"], ext["maxx"], ext["maxy"])
         return info
@@ -528,6 +541,36 @@ class Sidecar:
                         return resp.status, text
             await asyncio.sleep(pause)
             pause = min(pause * 2, RETRY_MAX_S)
+
+    async def link_rows(self, nodes, pairs):
+        """`/links.json` for `pairs` (index pairs into `nodes`, each `[x, y,
+        h]`): per pair, (loss, near field, Fresnel clear) or /link.json's
+        refusal as (status, text). A batch answered while the building index
+        was still loading is asked again once it is in, as a pair is."""
+        body = {"nodes": nodes, "pairs": pairs}
+        if self.loc_pct is not None:
+            body["loc_pct"] = float(self.loc_pct)
+        while True:
+            pause = RETRY_FIRST_S
+            while True:
+                async with self.session.post(self.base + self.batch, json=body) as resp:
+                    if resp.status == 200:
+                        reply = await resp.json(content_type=None)
+                        break
+                    text = await resp.text()
+                    if resp.status != 429:
+                        raise LossError("links.json answered %d: %s"
+                                        % (resp.status, text.strip()[:200]))
+                await asyncio.sleep(pause)
+                pause = min(pause * 2, RETRY_MAX_S)
+            if reply.get("buildings_index") != INDEX_LOADING:
+                break
+            self.indexed = False
+            await self.wait_indexed()
+        rows = [(lb, bool(f & 1), bool(f & 2)) for lb, f in zip(reply["lb_db"], reply["flags"])]
+        for k, status, text in reply.get("refused") or ():
+            rows[k] = (status, text)
+        return rows
 
     async def settled_link(self, a_xy, b_xy, tx_h, rx_h):
         """`link` for a reply that rests on the building index: one answered
@@ -586,6 +629,16 @@ def index_state(reply):
     return (reply.get("profile_evidence") or {}).get("buildings_index")
 
 
+def cell_from_row(row, f0_hz, d_m):
+    """(loss, flags) for one pair from its /links.json row, as
+    `cell_from_reply` makes them of /link.json's reply."""
+    if len(row) == 2:
+        return cell_from_reply(row, f0_hz, d_m)
+    loss, near, clear = row
+    return (float(loss), (slt.FLAG_NEAR_FIELD if near else 0)
+            | (slt.FLAG_LOS_CLEAR if clear else 0))
+
+
 def cell_from_reply(reply, f0_hz, d_m):
     """(loss, flags) for one pair from what link.json said about it."""
     if isinstance(reply, tuple):
@@ -639,6 +692,9 @@ async def _fill_pack(table, gd, ns, pairs, base_url, progress=None,
         except aiohttp.ClientError as err:
             raise LossError("no planner sidecar at %s (%s)" % (base_url, err)) from err
         done = 0
+        if car.batch:
+            await _fill_batched(table, ns, pairs, car, xy, f0, radius_m, progress)
+            return
 
         async def one(a, b):
             nonlocal done
@@ -684,6 +740,45 @@ async def _fill_pack(table, gd, ns, pairs, base_url, progress=None,
     finally:
         if own:
             await session.close()
+
+
+async def _fill_batched(table, ns, pairs, car, xy, f0, radius_m, progress):
+    """`_fill_pack`'s pairs through the sidecar's /links.json: each pair the
+    sidecar is asked for once, BATCH_PAIRS a request, its row put both ways."""
+    done = 0
+    asked = []
+    for a, b in pairs:
+        (ax, ay), (bx, by) = xy[a], xy[b]
+        d = math.hypot(bx - ax, by - ay)
+        if not (car.inside(ax, ay) and car.inside(bx, by)):
+            cell = (slt.NEVER, slt.FLAG_OFF_PACK)
+        elif d > radius_m:
+            cell = (slt.NEVER, slt.FLAG_BEYOND_RADIUS)
+        elif d < NEAR_LIMIT_M:
+            cell = (free_space_db(f0, d), slt.FLAG_NEAR_FIELD)
+        else:
+            asked.append((a, b, d))
+            continue
+        table.put(a, b, *cell)
+        table.put(b, a, *cell)
+        done += 1
+        if progress:
+            progress(done, len(pairs))
+    # Each end as the per-pair query gives it: to the millimetre, its height as %g.
+    names = sorted({n for a, b, _ in asked for n in (a, b)})
+    index = {name: i for i, name in enumerate(names)}
+    nodes = [[float("%.3f" % xy[n][0]), float("%.3f" % xy[n][1]),
+              float("%g" % ns.nodes[n]["height_m"])] for n in names]
+    for at in range(0, len(asked), BATCH_PAIRS):
+        chunk = asked[at:at + BATCH_PAIRS]
+        rows = await car.link_rows(nodes, [[index[a], index[b]] for a, b, _ in chunk])
+        for (a, b, d), row in zip(chunk, rows):
+            cell = cell_from_row(row, f0, d)
+            table.put(a, b, *cell)
+            table.put(b, a, *cell)
+        done += len(chunk)
+        if progress:
+            progress(done, len(pairs))
 
 
 def _check_pack(gd, band, base_url):
