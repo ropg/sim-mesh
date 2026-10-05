@@ -30,7 +30,8 @@ use rayon::prelude::*;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -76,6 +77,11 @@ struct Cli {
     /// sidecars, the caller says how many are its to use.
     #[arg(long)]
     sweep_threads: Option<usize>,
+    /// Build the saved index of the pack's buildings, or check the saved one
+    /// is current, and exit without serving: so the first sidecar on a new
+    /// pack starts with its footprints rather than parsing for them.
+    #[arg(long)]
+    index_buildings: bool,
 }
 
 /// One raster layer of the pack, readable by any number of requests at once
@@ -276,6 +282,8 @@ struct AppState {
     /// `profile_evidence.buildings_index` so that difference is visible rather
     /// than being an unexplained change in a saved result.
     buildings: Arc<std::sync::RwLock<BuildingsIndexState>>,
+    /// How far the background index has got, for `/buildings/status`.
+    buildings_progress: Arc<IndexProgress>,
     /// The deployed network's coverage census.
     ///
     /// This is minutes of work, not milliseconds — 269 sweeps over a city — so
@@ -863,6 +871,433 @@ impl BuildingIndex {
         }
         best.map(|(i, _)| i)
     }
+}
+
+/// Where the index of a pack's building file is saved: beside the file.
+///
+/// Parsing `buildings.jsonl` is the one startup cost that grows with the
+/// pack (116 MB, 270 k footprints on the Berlin centre pack), and until it
+/// is done `/buildings.bin` answers 204 and links fall back to the clutter
+/// raster. So the index is saved once built, and a later start loads it,
+/// which is a read and a copy.
+///
+/// A dot file, `.<stem>.idx`: a pack's export leaves dot files out, so the
+/// cache never travels without the file it was built from.
+fn saved_index_path(jsonl: &Path) -> PathBuf {
+    let stem = jsonl.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
+    jsonl.with_file_name(format!(".{stem}.idx"))
+}
+
+/// The saved index's layout, little-endian:
+///
+/// "PBIX" | u32 version | u64 file bytes | u64 file mtime s | u32 file mtime
+/// ns | f64 origin_x | f64 origin_y | u32 buildings | u32 polygons | u32
+/// rings | u32 vertices | per building: f32 x, f32 y, f32 r, f32 br, f32
+/// top_masl, u32 poly_start, u32 poly_end | per building: f32 area_m2, f32
+/// height_m | u32 polys[] | u32 rings[] | per vertex: f32 dx, f32 dy.
+///
+/// The records are the parsed ones, bit for bit, and the cells are rebuilt
+/// from them by `BuildingIndex::insert` in the same order, so a loaded index
+/// answers as the parsed one does. Bump the version with any change to how a
+/// line becomes a `Bldg`: an index saved by another version is parsed again.
+const INDEX_MAGIC: &[u8; 4] = b"PBIX";
+const INDEX_VERSION: u32 = 1;
+const INDEX_HEADER: usize = 60;
+
+/// The building file an index was built from, as its size and mtime. A saved
+/// index is used only while the file still has both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FileStamp {
+    bytes: u64,
+    mtime_s: u64,
+    mtime_ns: u32,
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> std::io::Result<Self> {
+        let t = meta.modified()?.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        Ok(FileStamp { bytes: meta.len(), mtime_s: t.as_secs(), mtime_ns: t.subsec_nanos() })
+    }
+}
+
+impl BuildingIndex {
+    /// The saved form of this index (see `INDEX_MAGIC`) for a building file
+    /// stamped `stamp`.
+    fn to_bytes(&self, stamp: FileStamp) -> Vec<u8> {
+        let n = self.items.len();
+        debug_assert_eq!(self.area_height.len(), n, "one area and height per building");
+        let mut out = Vec::with_capacity(
+            INDEX_HEADER
+                + n * 36
+                + (self.polys.len() + self.rings.len()) * 4
+                + self.verts.len() * 8,
+        );
+        out.extend_from_slice(INDEX_MAGIC);
+        out.extend_from_slice(&INDEX_VERSION.to_le_bytes());
+        out.extend_from_slice(&stamp.bytes.to_le_bytes());
+        out.extend_from_slice(&stamp.mtime_s.to_le_bytes());
+        out.extend_from_slice(&stamp.mtime_ns.to_le_bytes());
+        out.extend_from_slice(&self.origin.0.to_le_bytes());
+        out.extend_from_slice(&self.origin.1.to_le_bytes());
+        for len in [n, self.polys.len(), self.rings.len(), self.verts.len()] {
+            out.extend_from_slice(&(len as u32).to_le_bytes());
+        }
+        for b in &self.items {
+            for v in [b.x, b.y, b.r, b.br, b.top_masl] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&b.poly_start.to_le_bytes());
+            out.extend_from_slice(&b.poly_end.to_le_bytes());
+        }
+        for v in self.area_height.iter().flatten() {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for i in self.polys.iter().chain(&self.rings) {
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        for v in self.verts.iter().flatten() {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// An index from its saved form, with how many of its footprints are too
+    /// wide to trust, if it was saved by this version, for the building file
+    /// as `stamp` has it now, on this pack's frame `origin`. `Err` says why
+    /// not.
+    fn from_bytes(
+        bytes: &[u8],
+        stamp: FileStamp,
+        origin: (f64, f64),
+    ) -> Result<(BuildingIndex, usize), String> {
+        let head = bytes.get(..INDEX_HEADER).ok_or("it is shorter than its header")?;
+        let u32_at = |o: usize| u32::from_le_bytes(head[o..o + 4].try_into().expect("4 bytes"));
+        let u64_at = |o: usize| u64::from_le_bytes(head[o..o + 8].try_into().expect("8 bytes"));
+        let f64_at = |o: usize| f64::from_le_bytes(head[o..o + 8].try_into().expect("8 bytes"));
+        if &head[..4] != INDEX_MAGIC {
+            return Err("it is not a saved building index".into());
+        }
+        if u32_at(4) != INDEX_VERSION {
+            return Err(format!("it was saved as version {}, not {INDEX_VERSION}", u32_at(4)));
+        }
+        if (FileStamp { bytes: u64_at(8), mtime_s: u64_at(16), mtime_ns: u32_at(24) }) != stamp {
+            return Err("the building file has changed since it was saved".into());
+        }
+        let same = |a: f64, b: f64| a.to_bits() == b.to_bits();
+        if !(same(f64_at(28), origin.0) && same(f64_at(36), origin.1)) {
+            return Err("it was saved on another grid".into());
+        }
+        let (n, np, nr, nv) =
+            (u32_at(44) as usize, u32_at(48) as usize, u32_at(52) as usize, u32_at(56) as usize);
+        let want = INDEX_HEADER + n * 36 + (np + nr) * 4 + nv * 8;
+        if bytes.len() != want {
+            return Err(format!("it is {} bytes where its header says {want}", bytes.len()));
+        }
+        let (items, rest) = bytes[INDEX_HEADER..].split_at(n * 28);
+        let (area_height, rest) = rest.split_at(n * 8);
+        let (polys, rest) = rest.split_at(np * 4);
+        let (rings, verts) = rest.split_at(nr * 4);
+        let f = |c: &[u8], o: usize| f32::from_le_bytes(c[o..o + 4].try_into().expect("4 bytes"));
+        let u = |c: &[u8], o: usize| u32::from_le_bytes(c[o..o + 4].try_into().expect("4 bytes"));
+        let pairs = |b: &[u8]| -> Vec<[f32; 2]> {
+            b.as_chunks::<8>().0.iter().map(|c| [f(c, 0), f(c, 4)]).collect()
+        };
+        let words =
+            |b: &[u8]| -> Vec<u32> { b.as_chunks::<4>().0.iter().map(|c| u(c, 0)).collect() };
+        let mut ix = BuildingIndex {
+            origin,
+            area_height: pairs(area_height),
+            polys: words(polys),
+            rings: words(rings),
+            verts: pairs(verts),
+            ..Default::default()
+        };
+        // Every range must lie inside the arrays it indexes: a footprint
+        // query slices by them, and a bad one would panic a request.
+        let ascending = |v: &[u32], end: usize| {
+            v.windows(2).all(|w| w[0] <= w[1]) && v.last().is_none_or(|&l| l as usize <= end)
+        };
+        if !ascending(&ix.polys, nr) || !ascending(&ix.rings, nv) {
+            return Err("its polygon or ring ranges run outside it".into());
+        }
+        ix.items.reserve(n);
+        let mut suspect = 0usize;
+        for c in items.as_chunks::<28>().0 {
+            let b = Bldg {
+                x: f(c, 0),
+                y: f(c, 4),
+                r: f(c, 8),
+                br: f(c, 12),
+                top_masl: f(c, 16),
+                poly_start: u(c, 20),
+                poly_end: u(c, 24),
+            };
+            if b.poly_start > b.poly_end || b.poly_end as usize > np {
+                return Err("a building's polygons run outside it".into());
+            }
+            if b.poly_end > b.poly_start {
+                ix.with_geometry += 1;
+            }
+            suspect += usize::from(ix.insert(b));
+        }
+        Ok((ix, suspect))
+    }
+}
+
+/// Write `ix` to `path` by way of a temporary file and a rename, so a reader,
+/// or a second sidecar on the same pack, sees a whole index or none.
+fn save_index(path: &Path, ix: &BuildingIndex, stamp: FileStamp) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("idx.{}.tmp", std::process::id()));
+    let saved = std::fs::write(&tmp, ix.to_bytes(stamp)).and_then(|()| std::fs::rename(&tmp, path));
+    if saved.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    saved
+}
+
+/// What the background index is doing.
+#[derive(Clone, Copy)]
+enum IndexPhase {
+    Waiting,
+    Reading,
+    Parsing,
+    Saving,
+    Done,
+}
+
+/// How far the building index has got, for `/buildings/status`: what the
+/// thread is doing and, while it parses the building file, how much of it is
+/// read. A page waiting on footprints can then say how long, rather than
+/// only "not yet".
+struct IndexProgress {
+    started: std::time::Instant,
+    phase: AtomicU8,
+    /// Once done: whether the index came from the saved file.
+    from_saved: AtomicBool,
+    bytes_read: AtomicU64,
+    bytes_total: AtomicU64,
+    buildings: AtomicU64,
+    /// Once done: how long it took.
+    took_ms: AtomicU64,
+}
+
+impl IndexProgress {
+    fn new() -> Self {
+        IndexProgress {
+            started: std::time::Instant::now(),
+            phase: AtomicU8::new(IndexPhase::Waiting as u8),
+            from_saved: AtomicBool::new(false),
+            bytes_read: AtomicU64::new(0),
+            bytes_total: AtomicU64::new(0),
+            buildings: AtomicU64::new(0),
+            took_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn phase(&self, p: IndexPhase) {
+        self.phase.store(p as u8, Ordering::Relaxed);
+    }
+
+    fn parsed(&self, bytes_read: u64, buildings: usize) {
+        self.bytes_read.store(bytes_read, Ordering::Relaxed);
+        self.buildings.store(buildings as u64, Ordering::Relaxed);
+    }
+
+    fn done(&self, from_saved: bool, buildings: usize) {
+        self.from_saved.store(from_saved, Ordering::Relaxed);
+        self.buildings.store(buildings as u64, Ordering::Relaxed);
+        self.took_ms.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.phase(IndexPhase::Done);
+    }
+
+    /// `/buildings/status`'s reply, `state` being the index's own.
+    fn json(&self, state: &str) -> serde_json::Value {
+        let phase = self.phase.load(Ordering::Relaxed);
+        let done = phase == IndexPhase::Done as u8;
+        let elapsed_ms = if done {
+            self.took_ms.load(Ordering::Relaxed)
+        } else {
+            self.started.elapsed().as_millis() as u64
+        };
+        serde_json::json!({
+            "state": state,
+            "phase": match phase {
+                p if p == IndexPhase::Reading as u8 => "reading the saved index",
+                p if p == IndexPhase::Parsing as u8 => "parsing the building file",
+                p if p == IndexPhase::Saving as u8 => "saving the index",
+                p if p == IndexPhase::Done as u8 => "done",
+                _ => "waiting",
+            },
+            "source": done.then(|| {
+                if self.from_saved.load(Ordering::Relaxed) { "saved index" } else { "building file" }
+            }),
+            "bytes_read": self.bytes_read.load(Ordering::Relaxed),
+            "bytes_total": self.bytes_total.load(Ordering::Relaxed),
+            "buildings": self.buildings.load(Ordering::Relaxed),
+            "elapsed_s": elapsed_ms as f64 / 1000.0,
+        })
+    }
+}
+
+/// Index a building file line by line, telling `progress` how far it has
+/// read. Returns the index, how many lines could not be read, and how many
+/// footprints are too wide to trust.
+fn parse_buildings(
+    f: File,
+    origin: (f64, f64),
+    progress: &IndexProgress,
+) -> (BuildingIndex, usize, usize) {
+    use std::io::BufRead;
+    let mut idx = BuildingIndex { origin, ..Default::default() };
+    let mut bad = 0usize;
+    // Footprints too wide to be real. Counted rather than dropped: the
+    // record is still a building, it just cannot be trusted to bound itself.
+    let mut suspect = 0usize;
+    let mut read = 0u64;
+    for (k, line) in BufReader::new(f).lines().map_while(Result::ok).enumerate() {
+        read += line.len() as u64 + 1;
+        if k % 4096 == 0 {
+            progress.parsed(read, idx.count);
+        }
+        let Ok(r) = serde_json::from_str::<BuildingRecord>(&line) else {
+            bad += 1;
+            continue;
+        };
+        if !(r.e.is_finite() && r.n.is_finite() && r.area_m2 > 0.0 && r.height_m.is_finite()) {
+            bad += 1;
+            continue;
+        }
+        // Vertices are stored as offsets from this building's own
+        // centroid, so f32 is exact to ~3e-5 m across any footprint;
+        // storing them absolutely would quantize northings to 0.5 m.
+        let poly_start = idx.polys.len() as u32;
+        let mut had_geometry = false;
+        // Farthest vertex from the centroid, i.e. the real bounding
+        // radius. Accumulated here rather than derived from the area,
+        // because an equal-area disc is not a bound.
+        let mut far2: f64 = 0.0;
+        for poly in &r.rings {
+            if poly.exterior.len() < 3 {
+                continue;
+            }
+            for ring in std::iter::once(&poly.exterior).chain(poly.interiors.iter()) {
+                if ring.len() < 3 {
+                    continue;
+                }
+                for &(vx, vy) in ring {
+                    let (ox, oy) = (vx - r.e, vy - r.n);
+                    far2 = far2.max(ox * ox + oy * oy);
+                    idx.verts.push([ox as f32, oy as f32]);
+                }
+                idx.rings.push(idx.verts.len() as u32);
+            }
+            idx.polys.push(idx.rings.len() as u32);
+            had_geometry = true;
+        }
+        if had_geometry {
+            idx.with_geometry += 1;
+        }
+        let poly_end = idx.polys.len() as u32;
+        let r_eq = (r.area_m2 / std::f64::consts::PI).sqrt() as f32;
+        let br = if had_geometry { far2.sqrt() as f32 } else { r_eq };
+        if idx.insert(Bldg {
+            x: (r.e - origin.0) as f32,
+            y: (r.n - origin.1) as f32,
+            r: r_eq,
+            br,
+            top_masl: (r.ground_z + r.height_m) as f32,
+            poly_start,
+            poly_end,
+        }) {
+            suspect += 1;
+        }
+        idx.area_height.push([r.area_m2 as f32, r.height_m as f32]);
+    }
+    progress.parsed(read, idx.count);
+    (idx, bad, suspect)
+}
+
+/// The index of the pack's building file: the saved one where it is
+/// current, else the file parsed and the index saved for the next start.
+/// `Err` only when the file cannot be read at all.
+fn building_index(
+    jsonl: &Path,
+    origin: (f64, f64),
+    progress: &IndexProgress,
+) -> Result<BuildingIndex, String> {
+    let started = std::time::Instant::now();
+    let f = File::open(jsonl).map_err(|e| e.to_string())?;
+    // Stamped from the handle about to be read, so the stamp is the file's
+    // that the index is built from. A file whose mtime cannot be read is
+    // parsed every time, never cached.
+    let stamp = f.metadata().and_then(|m| FileStamp::of(&m)).ok();
+    let saved = saved_index_path(jsonl);
+    let suspect_note = |suspect: usize| {
+        if suspect > 0 {
+            println!("  {suspect} footprint(s) wider than 1 km — geometry ignored for those");
+        }
+    };
+    progress.phase(IndexPhase::Reading);
+    let loaded = match stamp {
+        None => Err("the building file has no modification time".to_string()),
+        Some(stamp) => match std::fs::read(&saved) {
+            Ok(bytes) => BuildingIndex::from_bytes(&bytes, stamp, origin),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("none saved yet".into()),
+            Err(e) => Err(e.to_string()),
+        },
+    };
+    match loaded {
+        Ok((idx, suspect)) => {
+            println!(
+                "buildings: {} LoD2 record(s) loaded from {} in {:.3} s — {} with real \
+                 footprints ({} vertices), {} as equal-area discs",
+                idx.count,
+                saved.display(),
+                started.elapsed().as_secs_f64(),
+                idx.with_geometry,
+                idx.verts.len(),
+                idx.count - idx.with_geometry
+            );
+            suspect_note(suspect);
+            progress.done(true, idx.count);
+            return Ok(idx);
+        }
+        Err(why) => {
+            println!("buildings: no saved index to load ({why}); parsing {}", jsonl.display())
+        }
+    }
+    progress.bytes_total.store(stamp.map_or(0, |s| s.bytes), Ordering::Relaxed);
+    progress.phase(IndexPhase::Parsing);
+    let (idx, bad, suspect) = parse_buildings(f, origin, progress);
+    // Say whether the footprints are REAL or approximated. A pack
+    // built without --lod2-geometry answers every containment test
+    // with an equal-area disc, which is a different and much coarser
+    // claim than a polygon — and the two are indistinguishable from
+    // the record count alone.
+    println!(
+        "buildings: {} LoD2 record(s) indexed in {:.1} s{} — {} with real \
+         footprints ({} vertices), {} as equal-area discs",
+        idx.count,
+        started.elapsed().as_secs_f64(),
+        if bad > 0 { format!(", {bad} unparseable") } else { String::new() },
+        idx.with_geometry,
+        idx.verts.len(),
+        idx.count - idx.with_geometry
+    );
+    suspect_note(suspect);
+    if let Some(stamp) = stamp {
+        progress.phase(IndexPhase::Saving);
+        match save_index(&saved, &idx, stamp) {
+            Ok(()) => println!("buildings: index saved to {} for the next start", saved.display()),
+            Err(e) => eprintln!(
+                "buildings: could not save the index to {} ({e}); the next start parses \
+                 the building file again",
+                saved.display()
+            ),
+        }
+    }
+    progress.done(false, idx.count);
+    Ok(idx)
 }
 
 /// An antenna inside a building: the building, and the entry loss its
@@ -1741,6 +2176,16 @@ async fn buildings_values_bin(
         out,
     )
         .into_response()
+}
+
+/// Where the building index has got, while `/buildings.bin` answers 204 for
+/// it: `state` is `/link.json`'s `buildings_index` (loading, ready, absent);
+/// `phase` what the sidecar is doing; while it parses, `bytes_read` of
+/// `bytes_total` of the building file; `source` once ready, the saved index
+/// or the building file.
+async fn buildings_status(State(st): State<Arc<AppState>>) -> Response {
+    let state = st.buildings.read().expect("buildings lock").label();
+    axum::Json(st.buildings_progress.json(state)).into_response()
 }
 
 /// Compact binary tile: everything the browser needs to render this region
@@ -4197,6 +4642,18 @@ async fn main() {
     let terrain_path = path_of(LayerKind::TerrainDtm)
         .or_else(|| path_of(LayerKind::SurfaceDsm))
         .expect("pack has a terrain layer");
+    if cli.index_buildings {
+        let Some(p) = path_of(LayerKind::Buildings) else {
+            println!("buildings: this pack has no buildings layer, so nothing to index");
+            return;
+        };
+        let m = *CogReader::open(&terrain_path).expect("open terrain").meta();
+        if let Err(e) = building_index(&p, (m.origin.x, m.origin.y), &IndexProgress::new()) {
+            eprintln!("buildings layer {}: {e}", p.display());
+            std::process::exit(1);
+        }
+        return;
+    }
     let clutter_path = path_of(LayerKind::ClutterHeight);
     let population_path = path_of(LayerKind::Population);
     let classes_path = path_of(LayerKind::ClutterClass);
@@ -4307,116 +4764,32 @@ async fn main() {
     proj4rs::transform::transform(&utm, &ll, &mut c).ok();
 
     // Index the buildings behind the bind. A plain OS thread rather than
-    // `spawn_blocking`: this runs once, is CPU-bound for tens of seconds, and
-    // has no business occupying a slot in the pool that serves requests.
+    // `spawn_blocking`: this runs once, is CPU-bound for seconds when the file
+    // must be parsed, and has no business occupying a slot in the pool that
+    // serves requests.
+    let buildings_progress = Arc::new(IndexProgress::new());
     if let Some(p) = buildings_path {
         let slot = Arc::clone(&buildings);
+        let progress = Arc::clone(&buildings_progress);
         // The frame every stored building coordinate is relative to. The pack
         // origin rather than an arbitrary point, so the offsets stay inside
         // the raster's own extent and f32 keeps millimetre resolution.
         let origin = (m.origin.x, m.origin.y);
         std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            let f = match std::fs::File::open(&p) {
-                Ok(f) => f,
+            let state = match building_index(&p, origin, &progress) {
+                Ok(idx) => BuildingsIndexState::Ready(idx),
                 Err(e) => {
                     eprintln!(
                         "buildings layer {}: {e} — links fall back to the clutter raster",
                         p.display()
                     );
-                    *slot.write().expect("buildings lock") = BuildingsIndexState::Absent;
-                    return;
+                    BuildingsIndexState::Absent
                 }
             };
-            use std::io::BufRead;
-            let mut idx = BuildingIndex { origin, ..Default::default() };
-            let mut bad = 0usize;
-            // Footprints too wide to be real. Counted rather than dropped:
-            // the record is still a building, it just cannot be trusted to
-            // bound itself.
-            let mut suspect = 0usize;
-            for line in BufReader::new(f).lines().map_while(Result::ok) {
-                let Ok(r) = serde_json::from_str::<BuildingRecord>(&line) else {
-                    bad += 1;
-                    continue;
-                };
-                if !(r.e.is_finite() && r.n.is_finite() && r.area_m2 > 0.0 && r.height_m.is_finite())
-                {
-                    bad += 1;
-                    continue;
-                }
-                // Vertices are stored as offsets from this building's own
-                // centroid, so f32 is exact to ~3e-5 m across any footprint;
-                // storing them absolutely would quantize northings to 0.5 m.
-                let poly_start = idx.polys.len() as u32;
-                let mut had_geometry = false;
-                // Farthest vertex from the centroid, i.e. the real bounding
-                // radius. Accumulated here rather than derived from the area,
-                // because an equal-area disc is not a bound.
-                let mut far2: f64 = 0.0;
-                for poly in &r.rings {
-                    if poly.exterior.len() < 3 {
-                        continue;
-                    }
-                    for ring in
-                        std::iter::once(&poly.exterior).chain(poly.interiors.iter())
-                    {
-                        if ring.len() < 3 {
-                            continue;
-                        }
-                        for &(vx, vy) in ring {
-                            let (ox, oy) = (vx - r.e, vy - r.n);
-                            far2 = far2.max(ox * ox + oy * oy);
-                            idx.verts.push([ox as f32, oy as f32]);
-                        }
-                        idx.rings.push(idx.verts.len() as u32);
-                    }
-                    idx.polys.push(idx.rings.len() as u32);
-                    had_geometry = true;
-                }
-                if had_geometry {
-                    idx.with_geometry += 1;
-                }
-                let poly_end = idx.polys.len() as u32;
-                let r_eq = (r.area_m2 / std::f64::consts::PI).sqrt() as f32;
-                let br = if had_geometry { far2.sqrt() as f32 } else { r_eq };
-                if idx.insert(Bldg {
-                    x: (r.e - origin.0) as f32,
-                    y: (r.n - origin.1) as f32,
-                    r: r_eq,
-                    br,
-                    top_masl: (r.ground_z + r.height_m) as f32,
-                    poly_start,
-                    poly_end,
-                }) {
-                    suspect += 1;
-                }
-                idx.area_height.push([r.area_m2 as f32, r.height_m as f32]);
-            }
-            // Say whether the footprints are REAL or approximated. A pack
-            // built without --lod2-geometry answers every containment test
-            // with an equal-area disc, which is a different and much coarser
-            // claim than a polygon — and the two are indistinguishable from
-            // the record count alone.
-            println!(
-                "buildings: {} LoD2 record(s) indexed in {:.1} s{} — {} with real \
-                 footprints ({} vertices), {} as equal-area discs",
-                idx.count,
-                started.elapsed().as_secs_f64(),
-                if bad > 0 { format!(", {bad} unparseable") } else { String::new() },
-                idx.with_geometry,
-                idx.verts.len(),
-                idx.count - idx.with_geometry
-            );
-            if suspect > 0 {
-                println!(
-                    "  {suspect} footprint(s) wider than 1 km — geometry ignored for those"
-                );
-            }
             // Published in one write, so a reader sees either the whole index
             // or none of it — never a half-filled one that would answer a link
             // with some buildings missing and no way to tell.
-            *slot.write().expect("buildings lock") = BuildingsIndexState::Ready(idx);
+            *slot.write().expect("buildings lock") = state;
         });
     }
 
@@ -4443,6 +4816,7 @@ async fn main() {
         places,
         nodes,
         buildings,
+        buildings_progress,
         extent,
         utm,
         ll,
@@ -4481,6 +4855,7 @@ async fn main() {
         .route("/roads.bin", get(roads_bin))
         .route("/buildings.bin", get(buildings_bin))
         .route("/buildings/values.bin", get(buildings_values_bin))
+        .route("/buildings/status", get(buildings_status))
         .route("/loss.bin", get(loss_bin))
         .route("/loss/start", get(loss_start))
         .route("/loss/status", get(loss_status))
@@ -4782,6 +5157,126 @@ mod tests {
             serde_json::from_str(r#"{"e":1.0,"n":2.0,"area_m2":10.0,"height_m":8.0}"#)
                 .expect("ground_z is optional");
         assert_eq!(r.ground_z, 0.0);
+    }
+
+    /// Lines of a building file that the parse treats each its own way: a
+    /// block with a courtyard, a record with no geometry, a footprint too wide
+    /// to trust, polygons and rings too short to keep, and two lines that are
+    /// not buildings.
+    fn building_lines() -> String {
+        [
+            r#"{"e":1100.0,"n":2100.0,"area_m2":300.0,"height_m":22.0,"ground_z":34.5,"rings":[{"exterior":[[1090.0,2090.0],[1110.0,2090.0],[1110.0,2110.0],[1090.0,2110.0]],"interiors":[[[1095.0,2095.0],[1105.0,2095.0],[1105.0,2105.0]]]}]}"#,
+            r#"{"e":1300.5,"n":2050.25,"area_m2":80.0,"height_m":9.5}"#,
+            r#"{"e":1500.0,"n":2500.0,"area_m2":50.0,"height_m":12.0,"ground_z":30.0,"rings":[{"exterior":[[1500.0,2500.0],[3200.0,2500.0],[1500.0,2501.0]]}]}"#,
+            r#"{"e":1700.0,"n":2700.0,"area_m2":40.0,"height_m":6.0,"rings":[{"exterior":[[1700.0,2700.0],[1701.0,2700.0]]},{"exterior":[[1695.0,2695.0],[1705.0,2695.0],[1705.0,2705.0],[1695.0,2705.0]],"interiors":[[[1700.0,2700.0],[1701.0,2701.0]]]}]}"#,
+            "not a record",
+            r#"{"e":1.0,"n":2.0,"area_m2":0.0,"height_m":8.0}"#,
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    /// A start that loads the saved index has the index a start that parsed
+    /// the file built, value for value: the records bit for bit, the cells a
+    /// query reads, and so every footprint and every link.
+    #[test]
+    fn a_saved_index_is_the_parsed_one_value_for_value() {
+        let dir = std::env::temp_dir().join(format!("planner_web_saved_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join("buildings.jsonl");
+        std::fs::write(&jsonl, building_lines()).unwrap();
+        let origin = (1000.0, 2000.0);
+
+        let first = IndexProgress::new();
+        let parsed = building_index(&jsonl, origin, &first).unwrap();
+        assert!(!first.from_saved.load(Ordering::Relaxed), "nothing was saved to load");
+        let saved = saved_index_path(&jsonl);
+        assert_eq!(saved, dir.join(".buildings.idx"), "a dot file beside the building file");
+        assert!(saved.exists(), "the first start saves the index");
+        let second = IndexProgress::new();
+        let loaded = building_index(&jsonl, origin, &second).unwrap();
+        assert!(second.from_saved.load(Ordering::Relaxed), "the next start loads it");
+        assert_eq!(second.json("ready")["source"], "saved index");
+
+        assert_eq!((parsed.count, parsed.with_geometry), (4, 3), "two lines are no buildings");
+        let items = |ix: &BuildingIndex| -> Vec<[u32; 7]> {
+            ix.items
+                .iter()
+                .map(|b| {
+                    [b.x, b.y, b.r, b.br, b.top_masl]
+                        .map(f32::to_bits)
+                        .iter()
+                        .copied()
+                        .chain([b.poly_start, b.poly_end])
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap()
+                })
+                .collect()
+        };
+        let flat = |v: &[[f32; 2]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(items(&loaded), items(&parsed));
+        assert_eq!(loaded.cells, parsed.cells);
+        assert_eq!((loaded.count, loaded.with_geometry), (parsed.count, parsed.with_geometry));
+        assert_eq!(loaded.origin, parsed.origin);
+        assert_eq!((&loaded.polys, &loaded.rings), (&parsed.polys, &parsed.rings));
+        assert_eq!(flat(&loaded.verts), flat(&parsed.verts));
+        assert_eq!(flat(&loaded.area_height), flat(&parsed.area_height));
+
+        // A rewritten file is parsed again, and its index saved over the old.
+        std::fs::write(&jsonl, building_lines() + &building_lines()).unwrap();
+        let third = IndexProgress::new();
+        let again = building_index(&jsonl, origin, &third).unwrap();
+        assert!(!third.from_saved.load(Ordering::Relaxed), "the saved index is stale");
+        assert_eq!(again.count, 8);
+        let fourth = IndexProgress::new();
+        assert_eq!(building_index(&jsonl, origin, &fourth).unwrap().count, 8);
+        assert!(fourth.from_saved.load(Ordering::Relaxed));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A saved index is used only for the file, grid and version it was
+    /// saved for, and only whole: anything else is parsed again rather than
+    /// loaded and trusted.
+    #[test]
+    fn a_saved_index_is_refused_for_any_other_file_grid_or_version() {
+        let dir = std::env::temp_dir().join(format!("planner_web_refused_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join("buildings.jsonl");
+        std::fs::write(&jsonl, building_lines()).unwrap();
+        let origin = (1000.0, 2000.0);
+        let (ix, _, _) =
+            parse_buildings(File::open(&jsonl).unwrap(), origin, &IndexProgress::new());
+        std::fs::remove_dir_all(&dir).ok();
+        let stamp = FileStamp { bytes: 1234, mtime_s: 1_790_000_000, mtime_ns: 5 };
+        let bytes = ix.to_bytes(stamp);
+        let load = |b: &[u8], s: FileStamp, o: (f64, f64)| BuildingIndex::from_bytes(b, s, o);
+        let refused = |b: &[u8], s: FileStamp, o: (f64, f64)| {
+            load(b, s, o).err().expect("a saved index that does not fit is refused")
+        };
+        let (back, suspect) = load(&bytes, stamp, origin).unwrap();
+        assert_eq!((back.count, suspect), (4, 1), "the wide footprint is still suspect");
+
+        for other in [
+            FileStamp { bytes: 1235, ..stamp },
+            FileStamp { mtime_s: 1_790_000_001, ..stamp },
+            FileStamp { mtime_ns: 6, ..stamp },
+        ] {
+            let why = refused(&bytes, other, origin);
+            assert!(why.contains("changed"), "{why}");
+        }
+        assert!(refused(&bytes, stamp, (1000.0, 2000.000001)).contains("grid"));
+        let mut newer = bytes.clone();
+        newer[4] = INDEX_VERSION as u8 + 1;
+        assert!(refused(&newer, stamp, origin).contains("version"));
+        refused(&bytes[..bytes.len() - 1], stamp, origin);
+        refused(&[bytes.as_slice(), &[0]].concat(), stamp, origin);
+        refused(&bytes[..INDEX_HEADER - 1], stamp, origin);
+        // A ring ending past the vertices would panic a footprint query later.
+        let last_ring = bytes.len() - ix.verts.len() * 8 - 4;
+        let mut corrupt = bytes.clone();
+        corrupt[last_ring..last_ring + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(refused(&corrupt, stamp, origin).contains("outside"));
     }
 
     /// A building's value is read at its centroid from the FULL raster, and a
