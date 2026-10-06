@@ -19,9 +19,9 @@ import time
 import pytest
 
 from test_model import (ALL_IRQ, CLEAR_IRQ, GET_IRQ, GET_RSSI_INST, HEADER_VALID, PIN_CB,
-                        PREAMBLE, RX_DONE, SET_DIO_IRQ_PARAMS, SET_PACKET_PARAMS, SET_RX,
-                        SET_TX, SYNC, TSYM, TX_DONE, WRITE_BUFFER, load_library, toa_seconds,
-                        PRE)
+                        PREAMBLE, RX_DONE, SET_DIO3_TCXO, SET_DIO_IRQ_PARAMS, SET_PACKET_PARAMS,
+                        SET_RX, SET_STANDBY, SET_TX, SYNC, TSYM, TX_DONE, WRITE_BUFFER,
+                        load_library, toa_seconds, PRE)
 
 NEVER = None
 T_JOIN = 5_000_000
@@ -542,3 +542,39 @@ def test_a_wake_on_a_drifting_clock_fires_once_its_node_time_has_come(tmp_path):
         assert idle(lib, cond)["until"] is NEVER
     finally:
         cond.sock.close()
+
+
+def test_a_standby_within_the_tcxo_start_up_stops_it_and_the_next_one_starts_afresh(virtual):
+    """STDBY_RC while the TCXO starts stops the reference: the state reads
+    STDBY_RC at once, ready then, and the next command that needs the
+    oscillator waits a whole start-up of its own, 5 ms from that command."""
+    lib, cond = virtual
+    join(lib, cond)
+    idle(lib, cond)
+    pin = PIN_CB(lambda ctx, p, level: None)
+    chip = lib.simradio_open(0, pin, None)
+
+    def send(*out):
+        out = bytes(out)
+        lib.simradio_transfer(chip, out, len(out), ctypes.create_string_buffer(len(out)))
+
+    send(SET_DIO3_TCXO, 0x02, 0x00, 0x01, 0x40)     # 1.8 V, 320 steps of 15.625 us: 5 ms
+    t = cond.t
+    send(SET_RX, 0xFF, 0xFF, 0xFF)
+    state = cond.expect("state")
+    assert (state["mode"], state["ready_at"]) == ("FS", t + 5000)
+    assert idle(lib, cond)["until"] == t + 5000
+    cond.run(t + 2000)                              # 2 ms into the start-up
+    idle(lib, cond)
+    send(SET_STANDBY, 0x00)
+    state = cond.expect("state")
+    assert (state["mode"], state["t"], state["ready_at"]) == ("STDBY_RC", t + 2000, t + 2000)
+    assert idle(lib, cond)["until"] is NEVER, "the start-up stopped with the reference"
+    send(SET_RX, 0xFF, 0xFF, 0xFF)
+    state = cond.expect("state")
+    assert (state["mode"], state["ready_at"]) == ("FS", t + 7000), "a whole start-up again"
+    assert idle(lib, cond)["until"] == t + 7000
+    cond.run(t + 7000)
+    assert cond.expect("state")["mode"] == "RX"
+    lib.simradio_close(ctypes.c_void_p(chip))
+    pin  # held for the library's sake

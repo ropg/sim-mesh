@@ -318,7 +318,7 @@ struct ChipState {
      * before anything happens: the carrier, the receiver, the CAD (BUSY high
      * on the part). No TCXO control (a crystal) is no wait, as before. */
     int64_t tcxoUs = 0;
-    int64_t oscReadyUs = 0;    /* when the reference running now is, or was, ready */
+    int64_t oscReadyUs = 0;    /* when the reference running now is, or was, ready; 0 stopped */
 
     uint16_t irqStatus = 0;
     uint16_t irqMask = 0;
@@ -508,7 +508,10 @@ void fillState(const simradio* c, EtherState& s)
 
 void setMode(ChipState& d, const char* mode, uint8_t bits)
 {
-    if (oscillates(mode) && !oscillates(d.mode))
+    /* A mode without the reference stops it, and a start-up under way with it. */
+    if (!oscillates(mode))
+        d.oscReadyUs = 0;
+    else if (!oscillates(d.mode))
         d.oscReadyUs = S()->now_us() + d.tcxoUs;
     d.mode = mode;
     d.modeBits = bits;
