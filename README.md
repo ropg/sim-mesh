@@ -583,7 +583,10 @@ part, and goes back to the list, where the build's row shows its step and
 progress and has **Cancel**; when it ends the row is geodata like any
 other, or says why it failed. One
 build runs at a time, as a child process the front never waits on; the
-compiler's diagnostics go to `testbed/geodata/.cache/logs/<name>.log`.
+compiler's diagnostics go to `testbed/geodata/.cache/logs/<name>.log`. A
+compiler killed for want of memory says so, and which limit to raise: the
+Podman machine's or Docker Desktop's, where the front runs in one (a city
+in a US state's OpenStreetMap extract takes about 2.5 GB).
 
 **The sources** are fetched into `testbed/geodata/.cache/<source>/`, shared by every
 build, so a second region beside the first fetches only what is new; a file
