@@ -587,8 +587,10 @@ other, or says why it failed. One
 build runs at a time, as a child process the front never waits on; the
 compiler's diagnostics go to `testbed/geodata/.cache/logs/<name>.log`. A
 compiler killed for want of memory says so, and which limit to raise: the
-Podman machine's or Docker Desktop's, where the front runs in one (a city
-in a US state's OpenStreetMap extract takes about 2.5 GB).
+Podman machine's or Docker Desktop's, where the front runs in one. What
+the compiler holds grows with the rectangle, not with the OpenStreetMap
+extract it lies in: a city of 15 km takes about half a gigabyte, from
+Massachusetts's 310 MB extract or Austria's 812 MB alike.
 
 **The sources** are fetched into `testbed/geodata/.cache/<source>/`, shared by every
 build, so a second region beside the first fetches only what is new; a file

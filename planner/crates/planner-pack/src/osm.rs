@@ -17,9 +17,15 @@
 //! Only features meeting the build's bounding box are kept: a node inside it,
 //! a way or relation whose extent meets it.
 //!
-//! The reader makes three passes over the file, each decoding blocks in
-//! parallel: relations (to learn which ways they need), ways (to learn which
-//! nodes they need), nodes. Only the tags in [`KEYS`] are kept in memory.
+//! The reader makes four passes over the file, each decoding blocks in
+//! parallel: the ids of the nodes within [`NEAR_DEG`] of the box, relations
+//! (to learn which ways they need), ways (to learn which nodes they need),
+//! nodes. A way is kept only when one of its nodes is near the box, so what
+//! the reader holds grows with the box and not with the extract: a city in
+//! Austria's 812 MB extract would otherwise hold gigabytes of the country's
+//! ways and nodes. A postal area's ways are kept wherever they run, since a
+//! box inside one area has none of its boundary near it. Only the tags in
+//! [`KEYS`] are kept in memory.
 
 use crate::lod2::{footprint, Lod2Building, Polygon};
 use crate::places::{Gazetteer, GazetteerBuilder, Kind};
@@ -55,6 +61,11 @@ pub const KEYS: &[&str] = &[
 
 /// (lat, lon) in degrees.
 pub type LatLon = (f64, f64);
+
+/// How far round the box a node keeps the ways through it, in degrees
+/// (about 3 km of latitude): a way crossing the box passes a node this near
+/// unless its nodes are farther apart than that.
+pub const NEAR_DEG: f64 = 0.03;
 
 /// An element's tags, restricted to [`KEYS`].
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -391,8 +402,8 @@ pub fn height_census(buildings: &[Lod2Building]) -> HashMap<HeightSource, usize>
 /// Read the layers a pack takes from an OpenStreetMap PBF extract.
 ///
 /// `bbox` is `[min_lon, min_lat, max_lon, max_lat]`, `to_xy` projects
-/// `(lat, lon)` to the pack CRS, and `pass(i, 3)` is called as each of the
-/// three passes over the file ends.
+/// `(lat, lon)` to the pack CRS, and `pass(i, 4)` is called as each of the
+/// four passes over the file ends.
 pub fn read_pbf(
     path: &Path,
     bbox: [f64; 4],
@@ -400,6 +411,31 @@ pub fn read_pbf(
     to_xy: &(dyn Fn(f64, f64) -> (f64, f64) + Sync),
     pass: &dyn Fn(u64, u64),
 ) -> Result<OsmLayers, PackError> {
+    // The nodes near the box: what a way must touch to be kept.
+    let near = [bbox[0] - NEAR_DEG, bbox[1] - NEAR_DEG, bbox[2] + NEAR_DEG, bbox[3] + NEAR_DEG];
+    let mut close: Vec<i64> = blocks(path, |b| {
+        let mut out = Vec::new();
+        for g in b.groups() {
+            for n in g.dense_nodes() {
+                if meets(near, [n.lon(), n.lat(), n.lon(), n.lat()]) {
+                    out.push(n.id());
+                }
+            }
+            for n in g.nodes() {
+                if meets(near, [n.lon(), n.lat(), n.lon(), n.lat()]) {
+                    out.push(n.id());
+                }
+            }
+        }
+        out
+    })?
+    .into_iter()
+    .flatten()
+    .collect();
+    close.sort_unstable();
+    let touches = |refs: &[i64]| refs.iter().any(|r| close.binary_search(r).is_ok());
+    pass(1, 4);
+
     // Relations, and the ways they need.
     let mut rels: Vec<RelRec> = blocks(path, |b| {
         let mut out = Vec::new();
@@ -423,6 +459,14 @@ pub fn read_pbf(
     .flatten()
     .collect();
     rels.sort_by_key(|r| r.id);
+    // A postal area's ways are all kept, wherever they run: a box inside one
+    // area has none of its boundary near it, and still lies in it. Any other
+    // relation's ways only near the box, as ways of their own are.
+    let postal_ways: HashSet<i64> = rels
+        .iter()
+        .filter(|r| r.tags.get("boundary") == Some("postal_code"))
+        .flat_map(|r| r.members.iter().map(|m| m.0))
+        .collect();
     let member_ways: HashSet<i64> = rels.iter().flat_map(|r| r.members.iter().map(|m| m.0)).collect();
     // A way that is an outer member of a building multipolygon is that
     // building; its own `building` tag would count it twice.
@@ -431,9 +475,9 @@ pub fn read_pbf(
         .filter(|r| r.tags.get("type") == Some("multipolygon") && is_building(&r.tags))
         .flat_map(|r| r.members.iter().filter(|m| m.1 != "inner").map(|m| m.0))
         .collect();
-    pass(1, 3);
+    pass(2, 4);
 
-    // Ways, and the nodes they need.
+    // Ways near the box, and the nodes they need.
     let mut ways: Vec<WayRec> = blocks(path, |b| {
         let mut out = Vec::new();
         for g in b.groups() {
@@ -443,11 +487,11 @@ pub fn read_pbf(
                 if !own && !member_ways.contains(&w.id()) {
                     continue;
                 }
-                out.push(WayRec {
-                    id: w.id(),
-                    tags: if own { tags } else { Tags::default() },
-                    refs: w.refs().collect(),
-                });
+                let refs: Vec<i64> = w.refs().collect();
+                if !postal_ways.contains(&w.id()) && !touches(&refs) {
+                    continue;
+                }
+                out.push(WayRec { id: w.id(), tags: if own { tags } else { Tags::default() }, refs });
             }
         }
         out
@@ -455,11 +499,12 @@ pub fn read_pbf(
     .into_iter()
     .flatten()
     .collect();
+    drop(close);
     ways.sort_by_key(|w| w.id);
     let mut needed: Vec<i64> = ways.iter().flat_map(|w| w.refs.iter().copied()).collect();
     needed.sort_unstable();
     needed.dedup();
-    pass(2, 3);
+    pass(3, 4);
 
     // Nodes: the coordinates the ways need, and the tagged nodes themselves.
     type NodeOut = (Vec<(usize, f64, f64)>, Vec<(i64, Tags, f64, f64)>);
@@ -469,7 +514,7 @@ pub fn read_pbf(
             if let Ok(i) = needed.binary_search(&id) {
                 coords.push((i, lat, lon));
             }
-            if wants_node(&tags) {
+            if meets(bbox, [lon, lat, lon, lat]) && wants_node(&tags) {
                 tagged.push((id, tags, lat, lon));
             }
         };
@@ -492,7 +537,7 @@ pub fn read_pbf(
         tagged.extend(t);
     }
     tagged.sort_by_key(|t| t.0);
-    pass(3, 3);
+    pass(4, 4);
 
     let pts = |refs: &[i64]| -> Vec<LatLon> {
         refs.iter()

@@ -728,6 +728,15 @@ tiles and lidar pairs that meet its grid, and the front hands it a directory of 
 to just the tiles this rectangle needs, since the cache holds every tile any
 build fetched.
 
+**What the compiler holds grows with the rectangle, never with a file.**
+An OpenStreetMap extract is the smallest region holding the rectangle, a
+state or a country, so the reader first finds the nodes within 3 km of the
+rectangle and keeps only the ways through them (`osm.rs`), and their nodes;
+the ways of a postal area the rectangle may lie inside are the one
+exception, kept wherever they run. A city takes about half a gigabyte from
+Austria's 812 MB extract, where holding the country's ways took 4 GB, more
+than a Podman machine has by default.
+
 **A source is parameters, never code.** What a pack is built from changes far
 more often than how a kind of data is read: a new region's lidar comes in a
 feed standard, a tile scheme and a file format sim-mesh reads already. So an
