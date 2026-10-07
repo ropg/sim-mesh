@@ -88,6 +88,11 @@ git clone https://github.com/sim-mesh/sim-mesh.git
 sim-mesh/sim
 ```
 
+On Windows without WSL, `powershell -ExecutionPolicy Bypass -File
+sim-mesh\sim.ps1` does the same with Docker Desktop or Podman: it starts the
+front, and every other verb runs inside it,
+`docker exec -it sim-mesh-front ./sim <verb>`.
+
 It builds whichever of the page, the virtual radios, the ether's conductor
 and the planner (sim-mesh's own, in `planner/`; without cargo the last two
 are left out, sim says so, synthetic ground works, and a virtual-time run is
