@@ -245,12 +245,17 @@ const inputValues = computed<Record<string, string | null>>(() =>
   chosenInputs[current.value ?? ''] ?? {})
 const inputsReady = computed(() => scriptInputs.value.every(i => !!inputValues.value[i.name]))
 
+/** A base that ends in the upstream release it packages, `<family>-1.2.3`. */
+const UPSTREAM_RE = /^(.+)-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/
+
 /** The installed firmware a firmware input offers: the newest of each base
- *  (`<base>_latest`) first, then every one by name; of `category` when the
- *  input names one. */
+ *  (`<base>_latest`), and of each family of bases that name their upstream
+ *  release, first, then every one by name; of `category` when the input
+ *  names one. */
 function firmwareChoices(category?: string) {
   const rows = catalog.firmware.filter(f => !f.error && (!category || f.category === category))
-  const bases = [...new Set(rows.map(f => f.base))].sort()
+  const families = rows.map(f => UPSTREAM_RE.exec(f.base)?.[1]).filter((b): b is string => !!b)
+  const bases = [...new Set([...rows.map(f => f.base), ...families])].sort()
   return [
     ...bases.map(b => ({ label: `${b}_latest — the newest ${b}`, value: `${b}_latest` })),
     ...rows.map(f => ({ label: f.title ? `${f.name} — ${f.title}` : f.name, value: f.name })),

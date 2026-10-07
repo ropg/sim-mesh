@@ -259,7 +259,8 @@ class Runtime:
     in a thread beside the script's; and its lines in the run's scripts.log."""
 
     def __init__(self):
-        self.world = {}             # geodata, nodesets, name, build, port, script, sim, resume
+        self.world = {}             # geodata, nodesets, name, build, build_tag, port, script,
+                                    # sim, resume
         self.script_name = None     # what its lines in scripts.log are under
         self.speed = None
         self.firmware_rules = []
@@ -361,7 +362,7 @@ class Runtime:
         sim = await sim_module.start(
             world["geodata"], world["nodesets"], world.get("script"), self.speed or "real",
             world.get("name"), world.get("build"), None, None, port,
-            inputs=dict(self.inputs) or None)
+            inputs=dict(self.inputs) or None, build_tag=world.get("build_tag"))
         await sim.firmware(self.firmware_rules)
         if self.first_boot_rules:
             await sim.first_boot(self.first_boot_rules)
