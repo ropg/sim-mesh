@@ -67,6 +67,9 @@ script_include("scripts/startup.py")
 nodes().up()
 '''
 GLOBALS = "globals"
+# The scripts sim-mesh ships: never written over, kept changed under a name of
+# one's own (Save as).
+EXAMPLES = ("lxmf-traffic", "meshtastic-check", "realtime", "startup")
 # The names of globals.py read outside a script, and what each must be: the
 # radio every station without the `no-radio` tag is set to, which the page's
 # coverage and links, the loss tables' band and the analysis take as given.
@@ -274,12 +277,14 @@ def describe(path, name=None):
 
 def listing():
     """Every script's `describe`, with `included_by`: the scripts that
-    include or import it. A script some other one includes (startup.py,
-    globals.py) is a part of those, not a thing to run on its own."""
+    include or import it, and `example`: whether it is one of EXAMPLES. A
+    script some other one includes (startup.py, globals.py) is a part of
+    those, not a thing to run on its own."""
     rows = [describe(script_path(each), each) for each in names()]
     by_path = {os.path.relpath(script_path(row["name"]), store.SIM_DIR): row for row in rows}
     for row in rows:
         row["included_by"] = []
+        row["example"] = row["name"] in EXAMPLES
     for row in rows:
         for ref in row["references"]:
             other = by_path.get(ref["path"])
@@ -307,11 +312,34 @@ def read_reference(relpath):
         return handle.read()
 
 
+def shadows_module(name):
+    """Whether a script called `name` would hide a module of the standard
+    library or one installed: a script runs with scripts/ first on its path."""
+    if not name.isidentifier():
+        return False
+    if name in sys.stdlib_module_names or name in sys.builtin_module_names:
+        return True
+    scripts = os.path.abspath(store.SCRIPTS_DIR)
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, ValueError):
+        return False
+    origin = spec and spec.origin
+    return spec is not None and not (origin and os.path.abspath(origin).startswith(scripts + os.sep))
+
+
 def write(name, text, new=False):
-    """Check a script parses, then put it in place."""
+    """Check a script parses, then put it in place. An example is never
+    written over."""
     path = script_path(name)
+    if not new and name in EXAMPLES:
+        raise store.StoreError("%s is an example: Save as to keep the changes under a name of your own"
+                               % name)
     if new and os.path.exists(path):
         raise store.StoreError("there is already a script called %r" % name)
+    if new and shadows_module(name):
+        raise store.StoreError("%r is a Python module's name, which a script of that name would hide"
+                               % name)
     if not new and not os.path.isfile(path):
         raise store.StoreError("no script called %r" % name)
     parse(text, name + ".py")

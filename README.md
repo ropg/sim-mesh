@@ -1289,8 +1289,15 @@ makes flat synthetic ground at an exponent and an extent, **Build** opens
 the build view, and **Import zip** takes a sim-mesh geodata pack or a bare
 planner pack ([Geodata](#geodata)).
 
-**Scripts** lists the scripts with their first docstring line, edits one
-(saved through the front, which checks it parses), and **Run** starts a
+**Scripts** lists the scripts with their first docstring line: first the
+**Examples** sim-mesh ships, which are never saved over (only **Save as**
+keeps changes to one, under a name of your own), then **Local scripts**,
+yours, with **New**, **Save** and **Save as**. Examples and your scripts
+share one set of names, and a new one may not take the name of a Python
+module (`json`, `random`, an installed package), which it would hide from
+every script; a script others include
+(`startup.py`, `globals.py`) carries a *library* badge and is not run on
+its own. It edits one (saved through the front, which checks it parses), and **Run** starts a
 new simulation of its own on the Nodes tab's geodata and its nodeset (the
 one open there, else the ones checked in its list, merged)
 (which the dialog shows, not changes) and goes over to its live map, framed
@@ -2882,7 +2889,7 @@ tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 | `testbed/seq.py`, `compare.py`, `airtime.py`, `links.py`, `delivery.py`, `compliance.py`, `referee.py` | the analysis tools ([Reading a run](#reading-a-run)) |
 | `testbed/sim_mesh/` | the library: `library` (what a script says, synchronously), `select` (`nodes()`), `driver` (what a firmware's driver is, and what sim-mesh hands it), `traffic` (the LXMF traffic driver), `sim` (the async hold on a simulation the library runs on), `runner` (a script run, its simulation started, its report), `view` (a run opened for analysis), `record`; `sim_mesh/reticulum/` holds Reticulum's parts: the category's driver interface, frame reading (Reticulum packets, SUPE), delivery analysis; `sim_mesh/meshcore/` and `sim_mesh/meshtastic/` the `meshcore` and `meshtastic` categories' driver interfaces |
 | `testbed/boards.py` | the one board, an SX1262 with a GC1109 front end above 22 dBm; a node's maximum power; what a station is told of it |
-| `testbed/scripts/` | the scripts: `realtime.py`, `lxmf-traffic.py`, `meshtastic-check.py`; `startup.py`, which every script includes; `globals.py`, the settings they share and the page reads |
+| `testbed/scripts/` | the scripts: the examples (`script.EXAMPLES`) `realtime.py`, `lxmf-traffic.py`, `meshtastic-check.py` and `startup.py`, which every script includes; `globals.py`, the settings they share and the page reads; and your own beside them |
 | `testbed/geodata/`, `testbed/nodesets/` | your geodata and nodesets (not committed) |
 | `testbed/testdata/` | what the tests stand on: the four stations `four.yaml` on the synthetic ground `plain-27.yaml` |
 
