@@ -19,6 +19,8 @@
             <q-tab name="sims" label="Simulations" @mousedown="sim.view === 'sims' && sim.detach()" />
           </template>
         </q-tabs>
+        <span v-if="socket.front && nodes.geodata" class="sim-geodata"
+              title="The geodata open on the Nodes tab">{{ `geodata ${nodes.geodata}` }}</span>
         <span class="sim-link" :class="{ 'sim-link-off': !socket.connected }">
           {{ socket.connected ? 'connected' : 'reconnecting…' }}
         </span>
@@ -63,6 +65,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useSim, type SimSummary, type Tab } from '../stores/sim'
 import { useSocket } from '../stores/socket'
 import { useCatalog } from '../stores/catalog'
+import { chosenBefore, useNodes } from '../stores/nodes'
 import FirmwarePage from '../pages/FirmwarePage.vue'
 import AntennasPage from '../pages/AntennasPage.vue'
 import GeodataPage from '../pages/GeodataPage.vue'
@@ -75,6 +78,7 @@ import { whenSaved } from '../lib/unsaved'
 const sim = useSim()
 const socket = useSocket()
 const catalog = useCatalog()
+const nodes = useNodes()
 const quasar = useQuasar()
 
 const tab = computed<Tab>({
@@ -98,6 +102,16 @@ socket.connect()
 // With the front, the page starts where work starts: choosing a geodata.
 watch(() => socket.front, (front, was) => {
   if (front && !was && sim.view === 'nodes' && !sim.attached) sim.show('geodata')
+}, { immediate: true })
+
+// The geodata chosen last in this browser, chosen again when the page loads,
+// once the front lists what is installed, if it is still there.
+let restoring = true
+watch(() => [socket.front, catalog.geodata.map(g => `${g.name}${g.error ?? ''}`).join()] as const, ([front]) => {
+  if (!restoring || !front || !catalog.geodata.length) return
+  restoring = false
+  const name = chosenBefore()
+  if (name && !nodes.geodata && catalog.geodata.some(g => g.name === name && !g.error)) void nodes.chooseGeodata(name)
 }, { immediate: true })
 
 // `?sim=<name>`, as `sim run` opens the page: that simulation's live map, once
@@ -128,6 +142,7 @@ watch(() => sim.notices.length, () => {
 .sim-header { background: #171b21; box-shadow: none; border-bottom: 1px solid #262c35; }
 .sim-tabs-row { display: flex; align-items: center; }
 .sim-tabs { flex: 1 1 auto; min-width: 0; min-height: 32px; }
+.sim-geodata { font: 11px ui-monospace, monospace; color: #9ca3af; padding-right: 14px; white-space: nowrap; }
 .sim-link { font: 11px ui-monospace, monospace; color: #22c55e; padding-right: 8px; }
 .sim-link-off { color: #f59e0b; }
 .sim-page-container { height: 100vh; }

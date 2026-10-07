@@ -4,7 +4,7 @@ import { useSocket } from './socket'
 import { useCatalog, type GeodataInfo } from './catalog'
 import { threshold } from '../lib/links'
 import { direction, gain, specOf, type Antenna, type AntennaSpec } from '../lib/antennas'
-import { plannerBase, terrainAt, terrainGrid, type Grid } from '../lib/planner'
+import { coverageBands, NO_BAND, plannerBase, type BandsNode } from '../lib/planner'
 import { txDbm } from '../lib/boards'
 import type { Frame } from '../lib/proj'
 import { NO_RADIO, type NodeView } from './nodes'
@@ -14,11 +14,14 @@ import { NO_RADIO, type NodeView } from './nodes'
  *
  * On a pack each node's path loss to the ground around it is a raster the
  * front has the planner sweep (coverage.py), cached by the node's position
- * and height, fetched here once per key and kept for the page's life, with
- * the terrain under it on the same grid. On synthetic ground it is the
- * log-distance formula, worked out here, on flat ground at 0 m. Either way
- * the level at a point is the node's maximum power at its connector
- * (lib/boards.ts) plus its antenna's gain
+ * and height. The page holds none of them: for the view on show the planner
+ * combines the rasters of the nodes asked about into the band of each
+ * square of it (/coverage/bands.bin), with the arithmetic below. A node
+ * being edited is swept band by band, and shown from the band finished
+ * last while its sweep grows (`coverage_band`). On
+ * synthetic ground the loss is the log-distance formula, worked out here,
+ * on flat ground at 0 m. Either way the level at a point is the node's
+ * maximum power at its connector (lib/boards.ts) plus its antenna's gain
  * toward the point less that loss, and the margin is that less the
  * decoding threshold (the SF and bandwidth scripts/globals.py gives every
  * radio, over the noise floor), as the ether rules. A node tagged no-radio
@@ -28,17 +31,17 @@ import { NO_RADIO, type NodeView } from './nodes'
  * earth's curvature taken off. So a high collinear's narrow beam passes over
  * the ground close under it, and an aimed yagi covers what it faces. */
 
-export interface Raster { w: number; h: number; ox: number; oy: number; rx: number; ry: number; loss: Uint16Array }
+/** A view a coverage image is of: its centre in the geodata's metres, and metres per CSS pixel. */
+export interface CoverageView { cx: number; cy: number; mpp: number }
 
-/** What the map asks at each point: the best margin in dB over the nodes, or
- *  null. `prepare` makes it ready a slice at a time, yielding to the page
- *  between slices; it resolves false when `stale` says the work is no longer
- *  wanted (a newer aim, a moved view), and marginAt is asked only after it
- *  resolved true. */
+/** What the map asks of a view `w`×`h` CSS pixels: the band of each
+ *  `px`-pixel square of it, rows from the top, as an index into
+ *  COVERAGE_BANDS or NO_BAND where nothing decodes. It throws an AbortError
+ *  once `signal` says the view is no longer wanted (a newer aim, a moved
+ *  view). */
 export interface CoverageSource {
   version: string
-  prepare(stale: () => boolean): Promise<boolean>
-  marginAt(x: number, y: number): number | null
+  bands(at: CoverageView, w: number, h: number, px: number, signal: AbortSignal): Promise<Uint8Array>
 }
 
 /** How long one slice of coverage work may hold the page before it yields,
@@ -50,7 +53,6 @@ export function yieldToPage(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 0))
 }
 
-const NEVER = 65535
 const RX_GAIN_DBI = 0
 /** The receiver the rasters are swept to (coverage.py RX_HEIGHT_M). */
 const RX_HEIGHT_M = 2
@@ -67,15 +69,11 @@ export const COVERAGE_BANDS = [
   { name: 'edge, maybe', from: 0, rgba: [239, 68, 68, 130] },
 ] as const
 
-function readRaster(buf: ArrayBuffer): Raster | null {
-  const dv = new DataView(buf)
-  if (String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3)) !== 'PLS2') return null
-  const w = dv.getUint32(4, true), h = dv.getUint32(8, true)
-  return {
-    w, h, ox: dv.getFloat64(12, true), oy: dv.getFloat64(20, true),
-    rx: dv.getFloat64(28, true), ry: dv.getFloat64(36, true),
-    loss: new Uint16Array(buf.slice(44, 44 + w * h * 2)),
-  }
+/** The band a margin falls in: the first it reaches, NO_BAND below 0 or with none. */
+function bandOf(m: number | null): number {
+  if (m === null || m < 0) return NO_BAND
+  const i = COVERAGE_BANDS.findIndex(b => m >= b.from)
+  return i < 0 ? COVERAGE_BANDS.length - 1 : i
 }
 
 /** One node's antenna: where it stands, the ground there and its tip, in
@@ -86,96 +84,6 @@ function beamGain(b: Beam, x: number, y: number, rxGround: number): number {
   if (!b.spec) return 0
   const [az, el] = direction(b.x, b.y, b.top, x, y, rxGround + RX_HEIGHT_M)
   return gain(b.spec, b.antenna, az, el)
-}
-
-/* ── composites ──
- * The best margin over a set of nodes, on one grid in the pack's metres at
- * the rasters' own cell size, over the union of their extents. Each node's
- * raster is merged in once, when it and its terrain are there: a set whose
- * rasters land one by one grows, it is not rebuilt. The last COMPOSITES_KEPT
- * sets are kept. A merge goes a row at a time, yielding every SLICE_MS; one
- * given up halfway is merged again whole next time, which leaves the grid as
- * one merge would, since a cell keeps the best margin. */
-const COMPOSITES_KEPT = 6
-
-interface Each { key: string; budget: number; raster: Raster | null; terrain: Grid | null; beam: Beam }
-
-class Composite {
-  res = 0
-  ox = 0
-  oy = 0
-  w = 0
-  h = 0
-  best: Float32Array = new Float32Array(0)
-  merged = new Set<string>()
-
-  /** Merge the rasters not yet in, growing the grid to hold them; false
-   *  when given up because `stale` said so. */
-  async add(each: Each[], stale: () => boolean): Promise<boolean> {
-    const fresh = each.filter(e => e.raster && e.terrain && !this.merged.has(e.key))
-    if (!fresh.length) return true
-    const all = [...fresh.map(e => e.raster!)]
-    const res = this.res || all[0]!.rx
-    let minx = this.w ? this.ox : Infinity, maxy = this.h ? this.oy : -Infinity
-    let maxx = this.w ? this.ox + this.w * res : -Infinity, miny = this.h ? this.oy - this.h * res : Infinity
-    for (const r of all) {
-      minx = Math.min(minx, r.ox); maxy = Math.max(maxy, r.oy)
-      maxx = Math.max(maxx, r.ox + r.w * r.rx); miny = Math.min(miny, r.oy - r.h * r.ry)
-    }
-    const w = Math.ceil((maxx - minx) / res), h = Math.ceil((maxy - miny) / res)
-    if (w !== this.w || h !== this.h || minx !== this.ox || maxy !== this.oy) {
-      const grown = new Float32Array(w * h).fill(-Infinity)
-      // Carry what is merged across into the larger grid.
-      const dc = Math.round((this.ox - minx) / res), dr = Math.round((maxy - this.oy) / res)
-      for (let row = 0; row < this.h; row++) {
-        grown.set(this.best.subarray(row * this.w, (row + 1) * this.w), (row + dr) * w + dc)
-      }
-      Object.assign(this, { res, ox: minx, oy: maxy, w, h, best: grown })
-    }
-    let since = performance.now()
-    for (const e of fresh) {
-      const r = e.raster!, t = e.terrain!
-      const dc = Math.round((r.ox - this.ox) / res), dr = Math.round((this.oy - r.oy) / res)
-      for (let row = 0; row < r.h; row++) {
-        if (performance.now() - since > SLICE_MS) {
-          await yieldToPage()
-          if (stale()) return false
-          since = performance.now()
-        }
-        const to = (row + dr) * this.w + dc
-        const y = r.oy - row * r.ry
-        for (let col = 0; col < r.w; col++) {
-          const v = r.loss[row * r.w + col]!
-          if (v === NEVER) continue
-          const x = r.ox + col * r.rx
-          const m = e.budget + beamGain(e.beam, x, y, terrainAt(t, x, y) ?? e.beam.ground) - v / 100
-          if (m > this.best[to + col]!) this.best[to + col] = m
-        }
-      }
-      this.merged.add(e.key)
-    }
-    return true
-  }
-
-  at(x: number, y: number): number | null {
-    if (!this.w) return null
-    // A raster's origin is its first cell's centre, as the rasters give it.
-    const col = Math.round((x - this.ox) / this.res), row = Math.round((this.oy - y) / this.res)
-    if (col < 0 || row < 0 || col >= this.w || row >= this.h) return null
-    const m = this.best[row * this.w + col]!
-    return m === -Infinity ? null : m
-  }
-}
-
-const composites = new Map<string, Composite>()
-
-function compositeFor(key: string): Composite {
-  let c = composites.get(key)
-  if (c) composites.delete(key)       // to the back: the most recently used
-  else c = new Composite()
-  composites.set(key, c)
-  while (composites.size > COMPOSITES_KEPT) composites.delete(composites.keys().next().value!)
-  return c
 }
 
 /** Where a node stands, as far as its raster goes. */
@@ -190,15 +98,15 @@ function fspl1m(freqHz: number) {
 
 export const useCoverage = defineStore('coverage', {
   state: () => ({
-    /** Rasters by key, as the front names them. */
-    rasters: {} as Record<string, Raster>,
-    /** The terrain on each raster's own grid, by the raster's key. */
-    terrains: {} as Record<string, Grid>,
     /** Each node's raster key on `geodata`, with the position it was asked
      *  for: a key counts only while the node still stands there, so an
      *  answer that lands late, or one from before a move, is never misread.
      *  Answers add to it, node by node, whatever else was asked since. */
     keys: {} as Record<string, { key: string; at: string }>,
+    /** The keys whose raster is in the front's cache, for the planner to combine. */
+    ready: {} as Record<string, true>,
+    /** The keys whose sweep is growing band by band, and how far out it has got, km. */
+    growing: {} as Record<string, number>,
     /** The last ask, whose answer alone says what is still being swept. */
     asked: 0,
     geodata: null as string | null,
@@ -210,12 +118,12 @@ export const useCoverage = defineStore('coverage', {
 
   actions: {
     /** Have the rasters for these nodes on this geodata: cached ones at once,
-     *  the rest as the front's sweeps land. Nothing to fetch on synthetic ground. */
+     *  the rest as the front's sweeps land. Nothing to ask on synthetic ground. */
     async ensure(gd: GeodataInfo | null, all: NodeView[]) {
       const ask = ++this.asked
       const nodes = withRadio(all)
       if (!gd || gd.kind !== 'pack' || !nodes.length || !useSocket().front) { this.pending = []; return }
-      if (this.geodata !== gd.name) { this.keys = {}; this.geodata = gd.name }
+      if (this.geodata !== gd.name) { this.keys = {}; this.ready = {}; this.growing = {}; this.geodata = gd.name }
       const at = Object.fromEntries(nodes.map(n => [n.name, placeKey(n)]))
       const r = await request('coverage', {
         geodata: gd.name,
@@ -225,48 +133,34 @@ export const useCoverage = defineStore('coverage', {
       const latest = ask === this.asked
       if (!r.ok) { if (latest) this.problem = r.error ?? 'no coverage'; return }
       const tiles = r.tiles as { node: string; key: string; cached: boolean }[]
-      for (const t of tiles) this.keys[t.node] = { key: t.key, at: at[t.node] ?? '' }
+      for (const t of tiles) {
+        this.keys[t.node] = { key: t.key, at: at[t.node] ?? '' }
+        if (t.cached) this.ready[t.key] = true
+      }
       if (latest) {
         this.problem = null
-        this.pending = tiles.filter(t => !t.cached && !this.rasters[t.key]).map(t => t.node)
+        this.pending = tiles.filter(t => !this.ready[t.key]).map(t => t.node)
       }
       this.version++
-      await Promise.all(tiles.filter(t => t.cached).map(t => this.fetch(gd.name, t.key)))
-    },
-
-    async fetch(geodata: string, key: string) {
-      if (this.rasters[key]) return
-      try {
-        const r = await fetch(`/api/coverage?geodata=${encodeURIComponent(geodata)}&key=${key}`)
-        const raster = r.ok ? readRaster(await r.arrayBuffer()) : null
-        if (!raster) return
-        // The terrain under it, on its own grid, for each cell's elevation.
-        const box = {
-          minx: raster.ox - raster.rx / 2, maxx: raster.ox + (raster.w - 0.5) * raster.rx,
-          maxy: raster.oy + raster.ry / 2, miny: raster.oy - (raster.h - 0.5) * raster.ry,
-        }
-        try {
-          this.terrains[key] = await terrainGrid(plannerBase(geodata), box, raster.w, raster.h)
-        } catch {
-          // Flat at the node's own ground, rather than no coverage at all.
-          this.terrains[key] = { w: 0, h: 0, ox: 0, oy: 0, rx: 1, ry: 1, terrain: new Float32Array(0) }
-        }
-        this.rasters[key] = raster
-        this.version++
-      } catch { /* the node stays uncovered on the map */ }
     },
 
     receive(msg: Record<string, unknown>) {
       if (msg.type === 'coverage_tile') {
         this.pending = this.pending.filter(n => n !== msg.node)
-        void this.fetch(msg.geodata as string, msg.key as string)
+        delete this.growing[msg.key as string]
+        if (msg.geodata === this.geodata) this.ready[msg.key as string] = true
+        this.version++
+      } else if (msg.type === 'coverage_band') {
+        if (msg.geodata !== this.geodata) return
+        this.growing[msg.key as string] = msg.km as number
+        this.version++
       } else if (msg.type === 'coverage_error') {
         this.pending = this.pending.filter(n => n !== msg.node)
         this.problem = msg.error as string
       }
     },
 
-    /** The margin source for these nodes on this geodata, in its frame. */
+    /** The bands source for these nodes on this geodata, in its frame. */
     source(gd: GeodataInfo, frame: Frame, all: NodeView[], noiseFigureDb = 6): CoverageSource {
       const exponent = gd.exponent ?? 2.7
       const catalog = useCatalog()
@@ -282,41 +176,69 @@ export const useCoverage = defineStore('coverage', {
         const anchor = fspl1m(freq)
         const held = this.geodata === gd.name ? this.keys[n.name] : undefined
         const key = held && held.at === placeKey(n) ? held.key : ''
-        const raster = this.rasters[key] ?? null
-        const terrain = this.terrains[key] ?? null
         const spec = specOf(antennas, n.antenna)
-        const ground = terrain ? terrainAt(terrain, x, y) ?? 0 : 0
-        const beam: Beam = { x, y, ground, top: ground + n.height_m, spec, antenna: n.antenna }
+        // Synthetic ground is flat at 0 m.
+        const beam: Beam = { x, y, ground: 0, top: n.height_m, spec, antenna: n.antenna }
         // Past this the formula's loss exceeds the budget at the antenna's peak: nothing to ask.
         const reach = Math.pow(10, (budget + (spec?.peak_dbi ?? 0) - anchor) / (10 * exponent))
-        return { x, y, budget, anchor, reach, key, raster, terrain, beam }
+        // Asked of the planner once its raster is cached, or while its sweep grows.
+        const growing = key && !this.ready[key] ? this.growing[key] : undefined
+        return { node: n, x, y, budget, anchor, reach, key, ready: !!key && !!this.ready[key], growing, spec, beam }
       })
-      const pack = gd.kind === 'pack'
       const antennaKey = (n: NodeView) => `${JSON.stringify(n.antenna)}${n.max_dbm ?? ''}`
       const version = `${gd.name}|${radioKey}|${Object.keys(antennas).length}|${nodes.map((n, i) =>
         `${n.name}:${n.lat},${n.lon},${n.height_m},${antennaKey(n)}`
-        + `:${each[i]!.key}:${each[i]!.raster && each[i]!.terrain ? 1 : 0}`).join(';')}`
-      if (pack) {
-        // One grid of the best margin over these nodes, kept per set of
-        // nodes: a repaint is a lookup a cell, whatever the count, and
-        // coming back to a set (the whole network after one node) is free.
-        const grid = compositeFor(`${gd.name}|${radioKey}|${noiseFigureDb}|${Object.keys(antennas).length}|${nodes.map((n, i) =>
-          `${n.name}:${each[i]!.key}:${antennaKey(n)}`).join(';')}`)
-        return { version, prepare: stale => grid.add(each, stale), marginAt: (x, y) => grid.at(x, y) }
+        + `:${each[i]!.key}:${each[i]!.ready ? 1 : each[i]!.growing ?? 0}`).join(';')}`
+      if (gd.kind === 'pack') {
+        // The planner combines the rasters; a node whose raster has not come is left out.
+        const asked: BandsNode[] = each.filter(e => e.ready || e.growing).map(e => ({
+          key: e.key, x: e.x, y: e.y, height_m: e.node.height_m, budget_db: e.budget,
+          antenna: e.spec && {
+            directional: e.spec.kind === 'directional', peak_dbi: e.spec.peak_dbi, vbw_deg: e.spec.vbw_deg,
+            tilt_deg: e.spec.tilt_deg, hbw_deg: e.spec.hbw_deg, floor_db: e.spec.floor_db,
+            azimuth_deg: e.node.antenna?.azimuth_deg ?? 0, elevation_deg: e.node.antenna?.elevation_deg ?? 0,
+          },
+        }))
+        return {
+          version,
+          async bands(at, w, h, px, signal) {
+            if (!asked.length) return new Uint8Array(Math.ceil(w / px) * Math.ceil(h / px)).fill(NO_BAND)
+            return coverageBands(plannerBase(gd.name), {
+              geodata: gd.name, at, w, h, px, bands: COVERAGE_BANDS.map(b => b.from), rxH: RX_HEIGHT_M, nodes: asked,
+            }, signal)
+          },
+        }
+      }
+      const marginAt = (x: number, y: number): number | null => {
+        let best: number | null = null
+        for (const e of each) {
+          const d = Math.hypot(x - e.x, y - e.y)
+          if (d > e.reach) continue
+          const loss = e.anchor + 10 * exponent * Math.log10(Math.max(d, 1))
+          const margin = e.budget + beamGain(e.beam, x, y, 0) - loss
+          if (best === null || margin > best) best = margin
+        }
+        return best
       }
       return {
         version,
-        prepare: () => Promise.resolve(true),
-        marginAt(x: number, y: number): number | null {
-          let best: number | null = null
-          for (const e of each) {
-            const d = Math.hypot(x - e.x, y - e.y)
-            if (d > e.reach) continue
-            const loss = e.anchor + 10 * exponent * Math.log10(Math.max(d, 1))
-            const margin = e.budget + beamGain(e.beam, x, y, 0) - loss
-            if (best === null || margin > best) best = margin
+        // A slice at a time, yielding to the page between slices.
+        async bands(at, w, h, px, signal) {
+          const cols = Math.ceil(w / px), rows = Math.ceil(h / px)
+          const out = new Uint8Array(cols * rows)
+          let since = performance.now()
+          for (let row = 0; row < rows; row++) {
+            if (performance.now() - since > SLICE_MS) {
+              await yieldToPage()
+              if (signal.aborted) throw new DOMException('aborted', 'AbortError')
+              since = performance.now()
+            }
+            const y = at.cy - ((row + 0.5) * px - h / 2) * at.mpp
+            for (let col = 0; col < cols; col++) {
+              out[row * cols + col] = bandOf(marginAt(at.cx + ((col + 0.5) * px - w / 2) * at.mpp, y))
+            }
           }
-          return best
+          return out
         },
       }
     },

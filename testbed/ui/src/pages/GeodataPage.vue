@@ -80,6 +80,10 @@
             <td class="mono">{{ g.error ? '' : g.nodesets ?? '…' }}</td>
             <td class="num mono">{{ sizeText(g.bytes) }}</td>
             <td class="gp-act" @click.stop>
+              <q-btn v-if="!g.error" flat dense no-caps size="sm" color="primary" label="Open"
+                     @click="choose(g.name)">
+                <q-tooltip>Open it: its map here, and its nodesets on the Nodes tab</q-tooltip>
+              </q-btn>
               <q-btn flat dense round size="sm" :icon="matEdit" @click="askRename(g.name)">
                 <q-tooltip>Rename</q-tooltip>
               </q-btn>
@@ -91,7 +95,7 @@
         </tbody>
       </table>
 
-      <IndexOffers kind="geodata" />
+      <IndexOffers kind="geodata" @open="choose" />
 
       <div class="gp-head gp-section">
         <div class="gp-heading">Geodata sources</div>
@@ -216,8 +220,9 @@
 <script setup lang="ts">
 /* Three sections. The ground there is, with the three ways of making or
  * bringing more: New synthetic…, Build… (its own view, BuildView, and then a
- * row here while it builds), and Import zip…; a row opens that geodata on its
- * own, with no nodes on it, and from there Export zip takes it elsewhere.
+ * row here while it builds), and Import zip…; a row, or its Open, opens that
+ * geodata on its own, with no nodes on it, and from there Export zip takes
+ * it elsewhere; the checkboxes choose rows for what is done to several.
  * What the listed indexes offer pre-built (IndexOffers). And the build's
  * sources, with what each holds in the cache. */
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
@@ -365,10 +370,11 @@ function choose(n: string) {
   whenSaved(quasar, () => { void show(n) })
 }
 
+/* The nodesets on it and its sidecar are asked for together: neither waits
+ * for the other. */
 async function show(n: string) {
-  await nodes.chooseGeodata(n)
   preview.value = n
-  const error = await ground.open(n)
+  const [, error] = await Promise.all([nodes.chooseGeodata(n), ground.open(n)])
   if (error) quasar.notify({ type: 'negative', message: error, timeout: 6000 })
 }
 

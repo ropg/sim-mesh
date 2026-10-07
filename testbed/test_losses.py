@@ -489,6 +489,71 @@ def test_a_packs_heights_are_asked_of_its_sidecar_once_its_buildings_are_in(stor
     serving(fake_sidecar([]), old)
 
 
+def test_a_sidecar_with_links_json_is_asked_each_pair_once_its_row_serving_both_ways(
+        stores, tmp_path):
+    """Where the sidecar lists /links.json, a table's pairs go there, each
+    once, from its first end, the ends as the per-pair query gives them (to
+    the millimetre, heights as %g), and each row fills both cells: its flags
+    as a reply's verdicts, a refusal as /link.json's own."""
+    pack = tmp_path / "packs" / "sea"
+    pack.mkdir(parents=True)
+    (pack / "manifest.json").write_text(json.dumps(SEA))
+    geodata.write(geodata.geodata_path("sea"), {"pack": str(pack), "loc_pct": 50})
+    gd = geodata.load("sea")
+    ns = nodeset.create("buoys")
+    for i in range(3):
+        ns.add_node("b%d" % i, 0.2, 3.0 + 0.01 * i, height_m=10 + i / 3)
+    asked, batches = [], []
+    app = web.Application()
+
+    async def pack(request):
+        return web.json_response({"extent": {"minx": 300000, "miny": 0,
+                                             "maxx": 700000, "maxy": 100000},
+                                  "link_batch": "/links.json"})
+
+    async def links(request):
+        body = await request.json()
+        batches.append(body)
+        n = len(body["pairs"])
+        # The last pair refused, the first near field and clear.
+        return web.json_response({"buildings_index": "ready", "read": "once", "compute_ms": 1,
+                                  "lb_db": [100.0 + k for k in range(n - 1)] + [None],
+                                  "flags": [3] + [0] * (n - 1),
+                                  "refused": [[n - 1, 400, "path leaves the pack"]]})
+
+    async def link(request):
+        asked.append(dict(request.query))
+        return web.Response(status=400, text="the probe")
+    app.router.add_get("/api/pack", pack)
+    app.router.add_post("/links.json", links)
+    app.router.add_get("/link.json", link)
+
+    async def go(url):
+        path, _ = await losses.compute(gd, ns, "868", url)
+        # /link.json is asked the probe across the pack, for the index, and no pair.
+        assert len(asked) <= 1 and len(batches) == 1
+        body = batches[0]
+        assert body["loc_pct"] == 50.0
+        names = sorted(ns.nodes)
+        for name, (x, y, h) in zip(names, body["nodes"]):
+            nx, ny = gd.to_xy(ns.nodes[name]["lat"], ns.nodes[name]["lon"])
+            assert (x, y, h) == (float("%.3f" % nx), float("%.3f" % ny),
+                                 float("%g" % ns.nodes[name]["height_m"]))
+        pairs = [(names[i], names[j]) for i, j in body["pairs"]]
+        assert sorted(tuple(sorted(p)) for p in pairs) == [("b0", "b1"), ("b0", "b2"), ("b1", "b2")]
+        table = slt.Table.read(path)
+        for k, (a, b) in enumerate(pairs):
+            for x, y in ((a, b), (b, a)):
+                cell = table.cell(x, y)
+                if k == len(pairs) - 1:
+                    assert (table.loss[cell], table.flags[cell]) == (slt.NEVER, slt.FLAG_OFF_PACK)
+                else:
+                    assert table.loss[cell] == 100.0 + k
+                    assert table.flags[cell] == (slt.FLAG_NEAR_FIELD | slt.FLAG_LOS_CLEAR
+                                                 if k == 0 else 0)
+    serving(app, go)
+
+
 def test_shadowing_over_a_pack_that_is_no_median_is_warned_about_not_refused(tmp_path):
     (tmp_path / "manifest.json").write_text(json.dumps(SEA))
 

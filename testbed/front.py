@@ -66,12 +66,15 @@ from its script's `.firmware(…)` declarations.
 
 **The planner sidecar.** One `planner-web` per pack in use, on
 `127.0.0.1:<free>`: started when the first simulation or page socket opens
-geodata on that pack, stopped when the last one lets go. It is sim-mesh's own,
+geodata on that pack, stopped SIDECAR_GRACE_S after the last one lets go
+unless one holds it again by then, as a reloaded page does. It is sim-mesh's own,
 built from `planner/` (by `sim` as it starts) to
 `planner/target/release/planner-web`; not built, a pack is refused with
 NO_PLANNER and synthetic ground works. The page reaches it as `/planner/<geodata>/…`, passed through with
 the prefix stripped; a child is given its URL directly, for recomputing a
-moved node's row.
+moved node's row. It is given the coverage cache (`--coverage-dir`), whose
+rasters it combines into the bands of the view the page shows
+(`/coverage/bands.bin`).
 
 **Script runs.** A script runs as a process of its own (`sim_mesh.runner`),
 its output kept (the last `SCRIPT_LINES` lines) and sent to every page as it
@@ -226,6 +229,7 @@ front → all sockets   index_progress {index, kind, name, state, now, fetched, 
                                                                    name being fetched (a
                                                                    nodeset's geodata first)
 front → asker         coverage_tile {geodata, node, key} · coverage_error {geodata, node, error}
+                      · coverage_band {geodata, node, key, km}: the edited node's sweep, out to km
 anything else         → the child named by `sim`, or the selected one
 child → socket        the child's own message, with `sim` added
 ```
@@ -324,6 +328,8 @@ NET_LOCK_DIR = os.path.join(tempfile.gettempdir(), "sim-mesh-nets")   # one lock
 READY_TIMEOUT_S = 30.0              # how long a child has to open its port
 STOP_TIMEOUT_S = 15.0               # how long a child has to stop before it is killed
 SIDECAR_READY_S = 60.0              # how long a planner-web has to answer /api/pack
+SIDECAR_GRACE_S = 30.0              # how long one nobody holds is kept: a page reloading
+                                    # lets go of it and opens it again a moment later
 SIDECAR_POLL_S = 0.2
 REPORT_S = 1.0                      # how often every socket hears the registry
 PACE_WINDOW_S = 120.0               # the wall the estimate's pace is taken over
@@ -494,6 +500,8 @@ class Sidecar:
         self.url = "http://127.0.0.1:%d" % port
         self.process = None
         self.holders = set()
+        # Its stop, while nobody holds it: called off when somebody does again.
+        self.idle = None
         self.ready = asyncio.get_running_loop().create_future()
         self.log_path = os.path.join(store.RUNS_DIR, "planner-%s.log"
                                      % store.slug(os.path.basename(pack), "pack"))
@@ -529,6 +537,9 @@ class Sidecars:
             return None
         self.release(holder, keep=gd.pack_dir)
         car = self.by_pack.get(gd.pack_dir)
+        if car is not None and car.idle is not None:
+            car.idle.cancel()
+            car.idle = None
         if car is None:
             binary = planner_web()
             if binary is None:
@@ -550,6 +561,7 @@ class Sidecars:
             with open(car.log_path, "ab") as out:
                 car.process = await asyncio.create_subprocess_exec(
                     binary, "--pack", car.pack, "--host", "127.0.0.1", "--port", str(car.port),
+                    "--coverage-dir", store.COVERAGE_DIR,
                     stdin=asyncio.subprocess.DEVNULL, stdout=out, stderr=out,
                     start_new_session=True, preexec_fn=die_with_parent)
         except OSError as err:
@@ -587,14 +599,24 @@ class Sidecars:
             car.ready.exception()           # retrieved: a failure nobody awaited is not news
 
     def release(self, holder, keep=None):
-        """`holder` lets go of every pack but `keep`; a sidecar nobody holds stops."""
+        """`holder` lets go of every pack but `keep`; a sidecar nobody holds
+        stops SIDECAR_GRACE_S later, unless somebody holds it again first: a
+        page reloaded opens its geodata again before then, and finds the
+        sidecar up, its building index loaded."""
         for pack, car in list(self.by_pack.items()):
             if pack == keep or holder not in car.holders:
                 continue
             car.holders.discard(holder)
-            if not car.holders:
-                del self.by_pack[pack]
-                asyncio.ensure_future(self.stop(car))
+            if not car.holders and car.idle is None:
+                car.idle = asyncio.get_running_loop().call_later(SIDECAR_GRACE_S, self.expire, car)
+
+    def expire(self, car):
+        """A sidecar nobody held again in its grace, stopped."""
+        car.idle = None
+        if car.holders or self.by_pack.get(car.pack) is not car:
+            return
+        del self.by_pack[car.pack]
+        asyncio.ensure_future(self.stop(car))
 
     async def stop(self, car):
         if not car.ready.done():
@@ -616,6 +638,9 @@ class Sidecars:
     async def close(self):
         cars = list(self.by_pack.values())
         self.by_pack.clear()
+        for car in cars:
+            if car.idle is not None:
+                car.idle.cancel()
         await asyncio.gather(*(self.stop(car) for car in cars), return_exceptions=True)
 
 
@@ -2016,7 +2041,10 @@ class Front:
     async def coverage(self, conn, msg):
         """Each node's coverage raster: those in the cache said at once, the
         rest computed one at a time through the sidecar and sent to this
-        socket as `coverage_tile` as each lands."""
+        socket as `coverage_tile` as each lands. The one node a request
+        lacks a raster for is the node being edited: it is swept band by
+        band, each band said as `coverage_band` as it lands, so the page
+        shows its coverage growing rather than nothing until it is whole."""
         gd = load_geodata(msg["geodata"])
         if not gd.is_pack:
             raise ValueError("geodata %s is synthetic: its coverage is worked out on the page"
@@ -2031,11 +2059,18 @@ class Front:
         if todo:
             sidecar = await self.sidecars.hold(conn.holder, gd)
 
+            def growing(node, raster_key):
+                async def said(km):
+                    await conn.send({"type": "coverage_band", "geodata": gd.name,
+                                     "node": node["name"], "key": raster_key, "km": km})
+                return said if len(todo) == 1 else None
+
             async def work():
                 for node, raster_key in todo:
                     self.sweeps.busy.add((gd.name, raster_key))
                     try:
-                        await self.sweeps.raster(sidecar, gd, node)
+                        await self.sweeps.raster(sidecar, gd, node,
+                                                 on_band=growing(node, raster_key))
                         await conn.send({"type": "coverage_tile", "geodata": gd.name,
                                          "node": node["name"], "key": raster_key})
                     except store.StoreError as err:
@@ -2442,7 +2477,9 @@ class Front:
                                                "Content-Type": "text/markdown; charset=utf-8"})
 
     async def api_coverage(self, request):
-        """One node's coverage raster, by geodata and key, from the cache."""
+        """One node's coverage raster, by geodata and key, from the cache. A
+        key names what its raster is made of (coverage.key), so the raster
+        at a key never changes and a browser may keep it for good."""
         try:
             path = coverage_module.cached(request.query.get("geodata", ""),
                                           request.query.get("key", ""))
@@ -2450,7 +2487,9 @@ class Front:
             raise web.HTTPNotFound(text=str(err)) from err
         if path is None:
             raise web.HTTPNotFound(text="no such coverage raster")
-        return web.FileResponse(path, headers={"Content-Type": "application/octet-stream"})
+        return web.FileResponse(path, headers={
+            "Content-Type": "application/octet-stream",
+            "Cache-Control": "private, max-age=31536000, immutable"})
 
     async def upload(self, request, suffix=".zip"):
         """A request's body into a temporary file beside the store, streamed:
