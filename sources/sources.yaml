@@ -326,6 +326,909 @@ europe:
         read: whole
         format: { type: citygml, lod: 2, crs: EPSG:25833, members: "*.gml" }
 
+      - id: by-dgm1
+        title: Bayern DGM1, 1 m terrain
+        holds: >-
+          Bavaria's terrain model from lidar at 1 m: the bare ground's height,
+          as GeoTIFF in 1 km tiles of about 3 MB.
+        licence: CC BY 4.0
+        notice: "Bayerische Vermessungsverwaltung – www.geodaten.bayern.de, CC BY 4.0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: template
+          url:
+            - "https://download1.bayernwolke.de/a/dgm/dgm1/{tile}.tif"
+            - "https://download2.bayernwolke.de/a/dgm/dgm1/{tile}.tif"
+          tile: "{x}_{y}"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          missing: no-data
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: by-dom20
+        title: Bayern DOM20, 0.2 m surface
+        holds: >-
+          Bavaria's surface model at 0.2 m, matched from aerial images: the
+          height of whatever is on top, roofs and tree crowns, as tiled
+          GeoTIFF in 1 km tiles of about 40 MB. A build reads only its
+          rectangle of each.
+        licence: CC BY 4.0
+        notice: "Bayerische Vermessungsverwaltung – www.geodaten.bayern.de, CC BY 4.0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 0.2
+        coverage: outline
+        find:
+          method: template
+          url:
+            - "https://download1.bayernwolke.de/a/dom20/DOM/{tile}_20_DOM.tif"
+            - "https://download2.bayernwolke.de/a/dom20/DOM/{tile}_20_DOM.tif"
+          tile: "32{x}_{y}"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          missing: no-data
+        read: window
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: by-lod2
+        title: Bayern LoD2 building models
+        holds: >-
+          Bavaria's 3D buildings at level of detail 2 (CityGML): each
+          building's footprint, roof shape and height, in 2 km tiles.
+        licence: CC BY 4.0
+        notice: "Bayerische Vermessungsverwaltung – www.geodaten.bayern.de, CC BY 4.0"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: template
+          url:
+            - "https://download1.bayernwolke.de/a/lod2/citygml/{tile}.gml"
+            - "https://download2.bayernwolke.de/a/lod2/citygml/{tile}.gml"
+          tile: "{x}_{y}"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25832
+          missing: no-data
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25832, members: "*.gml" }
+
+      - id: bw-dgm1
+        title: Baden-Württemberg DGM1, 1 m terrain
+        holds: >-
+          Baden-Württemberg's terrain model from lidar at 1 m: the bare
+          ground's height, as XYZ text, four 1 km tiles to a zip of about
+          13 MB.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "Datenquelle: LGL, www.lgl-bw.de, dl-de/by-2-0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: template
+          url: "https://opengeodata.lgl-bw.de/data/dgm/{tile}.zip"
+          tile: "dgm1_32_{x}_{y}_2_bw"
+          unit_m: 1000
+          size_m: 2000
+          origin_m: [1000, 0]
+          crs: EPSG:25832
+          missing: no-data
+        read: whole
+        format: { type: xyz, crs: EPSG:25832, spacing_m: 1, members: "*.xyz" }
+
+      - id: bw-dom1
+        title: Baden-Württemberg DOM1, 1 m surface
+        holds: >-
+          Baden-Württemberg's surface model from lidar at 1 m: the height of
+          whatever is on top, roofs and tree crowns, as GeoTIFF, four 1 km
+          tiles to a zip of about 12 MB.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "Datenquelle: LGL, www.lgl-bw.de, dl-de/by-2-0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        pairs_with: bw-dgm1
+        find:
+          method: template
+          url: "https://opengeodata.lgl-bw.de/data/dom1/{tile}.zip"
+          tile: "dom1_32_{x}_{y}_2_bw"
+          unit_m: 1000
+          size_m: 2000
+          origin_m: [1000, 0]
+          crs: EPSG:25832
+          missing: no-data
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999, members: "*.tif" }
+
+      - id: bw-lod2
+        title: Baden-Württemberg LoD2 building models
+        holds: >-
+          Baden-Württemberg's 3D buildings at level of detail 2 (CityGML):
+          each building's footprint, roof shape and height, four 1 km tiles
+          to a zip.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "Datenquelle: LGL, www.lgl-bw.de, dl-de/by-2-0"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: template
+          url: "https://opengeodata.lgl-bw.de/data/lod2/{tile}.zip"
+          tile: "LoD2_32_{x}_{y}_2_bw"
+          unit_m: 1000
+          size_m: 2000
+          origin_m: [1000, 0]
+          crs: EPSG:25832
+          missing: no-data
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25832, members: "*.gml" }
+
+      - id: hb-dgm1
+        title: Bremen DGM1, 1 m terrain
+        holds: >-
+          Bremen's and Bremerhaven's terrain models from lidar at 1 m (2017
+          and 2015): the bare ground's height, as XYZ text in 1 km tiles, each
+          read alone out of its city's zip.
+        licence: CC BY 4.0
+        notice: "Landesamt GeoInformation Bremen, CC BY 4.0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://gdi2.geo.bremen.de/inspire/download/DGM/data/Gitternetz_DGM1_2017_HB_ASCII_XYZ.zip"
+            - "https://gdi2.geo.bremen.de/inspire/download/DGM/data/Gitternetz_DGM1_2015_BHV_ASCII_XYZ.zip"
+          name: "dgm1_32(?P<x>\\d{3})__?(?P<y>\\d{4})_1_hb\\.xyz$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: xyz, crs: EPSG:25832, spacing_m: 1, members: "*.xyz" }
+
+      - id: hb-dom1
+        title: Bremen DOM1, 1 m surface
+        holds: >-
+          Bremen's and Bremerhaven's surface models from lidar at 1 m (2017
+          and 2015): the height of whatever is on top, roofs and tree crowns,
+          as XYZ text in 1 km tiles, each read alone out of its city's zip.
+        licence: CC BY 4.0
+        notice: "Landesamt GeoInformation Bremen, CC BY 4.0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://gdi2.geo.bremen.de/inspire/download/DOM/data/Gitternetz_DOM1_2017_HB_ASCII_XYZ.zip"
+            - "https://gdi2.geo.bremen.de/inspire/download/DOM/data/Gitternetz_DOM1_2015_BHV_ASCII_XYZ.zip"
+          name: "dom1_32(?P<x>\\d{3})__?(?P<y>\\d{4})_1_hb\\.xyz$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: xyz, crs: EPSG:25832, spacing_m: 1, members: "*.xyz" }
+
+      - id: hb-lod2
+        title: Bremen LoD2 building models
+        holds: >-
+          Bremen's and Bremerhaven's 3D buildings at level of detail 2
+          (CityGML, 2026): each building's footprint, roof shape and height,
+          in 2 km tiles, each read alone out of its city's zip.
+        licence: CC BY 4.0
+        notice: "Landesamt GeoInformation Bremen, CC BY 4.0"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://gdi2.geo.bremen.de/inspire/download/LoD/data/LOD2_CITYGML_HB.zip!LOD2_CITYGML_HB_2026_03.zip"
+            - "https://gdi2.geo.bremen.de/inspire/download/LoD/data/LOD2_CITYGML_BHV.zip!LOD2_CITYGML_BHV_2026_03.zip"
+          name: "LoD2_32_(?P<x>\\d{3})_(?P<y>\\d{4})_2_HB\\.gml$"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25832, members: "*.gml" }
+
+      - id: hh-dgm1
+        title: Hamburg DGM1, 1 m terrain
+        holds: >-
+          Hamburg's terrain model from lidar at 1 m (2022): the bare ground's
+          height, as GeoTIFF in 1 km tiles, each read alone out of the city's
+          zip.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "Freie und Hansestadt Hamburg, Landesbetrieb Geoinformation und Vermessung (LGV), dl-de/by-2-0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://www.daten-hamburg.de/opendata/fernerkundung_hoehenmodelle/dgm/dgm1_hh_2022-04-30.zip"
+          name: "dgm1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_hh_\\d{4}\\.tif$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832 }
+
+      - id: hh-bdom
+        title: Hamburg bDOM, 1 m surface
+        holds: >-
+          Hamburg's surface model at 1 m (2022), matched from aerial images:
+          the height of whatever is on top, roofs and tree crowns, as GeoTIFF
+          in 1 km tiles, each read alone out of the city's zip.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "Freie und Hansestadt Hamburg, Landesbetrieb Geoinformation und Vermessung (LGV), dl-de/by-2-0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://www.daten-hamburg.de/opendata/Digitales_Hoehenmodell_bDOM/dom1_hh_2022-11-21.zip"
+          name: "dom1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_hh_\\d{4}\\.tif$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: hh-lod2
+        title: Hamburg LoD2 building models
+        holds: >-
+          Hamburg's 3D buildings at level of detail 2 (CityGML, 2026): each
+          building's footprint, roof shape and height, in 1 km tiles, each
+          read alone out of the city's zip.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "Freie und Hansestadt Hamburg, Landesbetrieb Geoinformation und Vermessung (LGV), dl-de/by-2-0"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://www.daten-hamburg.de/opendata/3d_stadtmodell_lod2/LoD2-DE_HH_2026-04-28.zip"
+          name: "LoD2_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_HH\\.gml$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25832, members: "*.gml" }
+
+      - id: he-dgm1
+        title: Hessen DGM1, 1 m terrain
+        holds: >-
+          Hessen's terrain model from lidar at 1 m: the bare ground's height,
+          asked of its INSPIRE coverage service (WCS) a 1 km square at a
+          time, as GeoTIFF of about 4 MB.
+        licence: Datenlizenz Deutschland – Zero – 2.0
+        notice: "Hessische Verwaltung für Bodenmanagement und Geoinformation (HVBG), dl-de/zero-2-0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: template
+          url: "https://inspire-hessen.de/raster/dgm1/ows?SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage&COVERAGEID=he_dgm1&FORMAT=image/tiff&SUBSET=E({tile})"
+          tile: "{x},{x2})&SUBSET=N({y},{y2}"
+          file: "dgm1_32_{x}_{y}_he.tif"
+          size_m: 1000
+          crs: EPSG:25832
+          missing: no-data
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: he-dom1
+        title: Hessen DOM1, 1 m surface
+        holds: >-
+          Hessen's surface model from lidar at 1 m: the height of whatever is
+          on top, roofs and tree crowns, asked of its INSPIRE coverage service
+          (WCS) a 1 km square at a time, as GeoTIFF of about 4 MB.
+        licence: Datenlizenz Deutschland – Zero – 2.0
+        notice: "Hessische Verwaltung für Bodenmanagement und Geoinformation (HVBG), dl-de/zero-2-0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: template
+          url: "https://inspire-hessen.de/raster/dom1/ows?SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage&COVERAGEID=dom1&FORMAT=image/tiff&SUBSET=E({tile})"
+          tile: "{x},{x2})&SUBSET=N({y},{y2}"
+          file: "dom1_32_{x}_{y}_he.tif"
+          size_m: 1000
+          crs: EPSG:25832
+          missing: no-data
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: ni-dgm1
+        title: Niedersachsen DGM1, 1 m terrain
+        holds: >-
+          Lower Saxony's terrain model from lidar at 1 m: the bare ground's
+          height, as cloud-optimised GeoTIFF in 1 km tiles, the newest survey
+          of each. A build reads only its rectangle, at a quarter of a cell.
+        licence: CC BY 4.0
+        notice: "Quelle: Auszug aus den Geodaten des Landesamtes für Geoinformation und Landesvermessung Niedersachsen, ©2026, CC BY 4.0, Daten geändert"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: index
+          index: "https://services-eu1.arcgis.com/4v3xxN52w88W065F/arcgis/rest/services/lgln_opengeodata_dgm1/FeatureServer/0"
+          index_format: arcgis
+          crs: EPSG:25832
+          url_property: dgm1
+          tile_property: tile_id
+          newest_property: Aktualitaet
+          refresh_days: 30
+        read: window
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: ni-dom1
+        title: Niedersachsen DOM1, 1 m surface
+        holds: >-
+          Lower Saxony's surface model from lidar at 1 m: the height of
+          whatever is on top, roofs and tree crowns, as cloud-optimised
+          GeoTIFF in 1 km tiles, the newest survey of each. A build reads only
+          its rectangle, at a quarter of a cell.
+        licence: CC BY 4.0
+        notice: "Quelle: Auszug aus den Geodaten des Landesamtes für Geoinformation und Landesvermessung Niedersachsen, ©2026, CC BY 4.0, Daten geändert"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: index
+          index: "https://services-eu1.arcgis.com/4v3xxN52w88W065F/arcgis/rest/services/lgln_opengeodata_dom1/FeatureServer/0"
+          index_format: arcgis
+          crs: EPSG:25832
+          url_property: dom1
+          tile_property: tile_id
+          newest_property: Aktualitaet
+          refresh_days: 30
+        read: window
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: ni-lod2
+        title: Niedersachsen LoD2 building models
+        holds: >-
+          Lower Saxony's 3D buildings at level of detail 2 (CityGML): each
+          building's footprint, roof shape and height, in 1 km tiles.
+        licence: CC BY 4.0
+        notice: "Quelle: Auszug aus den Geodaten des Landesamtes für Geoinformation und Landesvermessung Niedersachsen, ©2026, CC BY 4.0, Daten geändert"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: template
+          url: "https://lod2.s3.eu-de.cloud-object-storage.appdomain.cloud/{tile}.gml"
+          tile: "LoD2_32_{x}_{y}_1_ni"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          missing: no-data
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25832, members: "*.gml" }
+
+      - id: nrw-dgm1
+        title: Nordrhein-Westfalen DGM1, 1 m terrain
+        holds: >-
+          North Rhine-Westphalia's terrain model from lidar at 1 m: the bare
+          ground's height, as GeoTIFF in 1 km tiles of 1 to 4 MB.
+        licence: Datenlizenz Deutschland – Zero – 2.0
+        notice: "Geobasis NRW, dl-de/zero-2-0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://www.opengeodata.nrw.de/produkte/geobasis/hm/dgm1_tiff/dgm1_tiff/index.html"
+          name: "dgm1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_nw_\\d{4}\\.tif$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: nrw-dom1
+        title: Nordrhein-Westfalen DOM1, 1 m surface
+        holds: >-
+          North Rhine-Westphalia's surface model from lidar at 1 m: the height
+          of whatever is on top, roofs and tree crowns, as GeoTIFF in 1 km
+          tiles of 1 to 4 MB.
+        licence: Datenlizenz Deutschland – Zero – 2.0
+        notice: "Geobasis NRW, dl-de/zero-2-0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://www.opengeodata.nrw.de/produkte/geobasis/hm/dom1_tiff/dom1_tiff/index.html"
+          name: "dom1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_nw_\\d{4}\\.tif$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: nrw-lod2
+        title: Nordrhein-Westfalen LoD2 building models
+        holds: >-
+          North Rhine-Westphalia's 3D buildings at level of detail 2
+          (CityGML): each building's footprint, roof shape and height, in 1 km
+          tiles.
+        licence: Datenlizenz Deutschland – Zero – 2.0
+        notice: "Geobasis NRW, dl-de/zero-2-0"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://www.opengeodata.nrw.de/produkte/geobasis/3dg/lod2_gml/lod2_gml/index.html"
+          name: "LoD2_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_NW\\.gml$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25832, members: "*.gml" }
+
+      - id: rp-dgm1
+        title: Rheinland-Pfalz DGM1, 1 m terrain
+        holds: >-
+          Rhineland-Palatinate's terrain model from lidar at 1 m: the bare
+          ground's height, as GeoTIFF in 1 km tiles of 1 to 2 MB.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "©GeoBasis-DE / LVermGeoRP (2026), dl-de/by-2-0, www.lvermgeo.rlp.de [Daten bearbeitet]"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://geobasis-rlp.de/data/dgm1/current/tif/"
+          name: "dgm1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_rp_\\d{4}\\.tif$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: rp-dom1
+        title: Rheinland-Pfalz DOM1, 1 m surface
+        holds: >-
+          Rhineland-Palatinate's surface model from lidar at 1 m: the height
+          of whatever is on top, roofs and tree crowns, as GeoTIFF in 1 km
+          tiles of 1 to 3 MB.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "©GeoBasis-DE / LVermGeoRP (2026), dl-de/by-2-0, www.lvermgeo.rlp.de [Daten bearbeitet]"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://geobasis-rlp.de/data/dom1/current/tif/"
+          name: "dom1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_rp_\\d{4}\\.tif$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: rp-lod2
+        title: Rheinland-Pfalz LoD2 building models
+        holds: >-
+          Rhineland-Palatinate's 3D buildings at level of detail 2 (CityGML):
+          each building's footprint, roof shape and height, in 2 km tiles.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "©GeoBasis-DE / LVermGeoRP (2026), dl-de/by-2-0, www.lvermgeo.rlp.de [Daten bearbeitet]"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://geobasis-rlp.de/data/geb3dlo/current/gml/"
+          name: "LoD2_32_(?P<x>\\d{3})_(?P<y>\\d{4})_2_RP\\.gml$"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25832, members: "*.gml" }
+
+      - id: sl-dgm1
+        title: Saarland DGM1, 1 m terrain
+        holds: >-
+          Saarland's terrain model from lidar at 1 m (2025): the bare ground's
+          height, as GeoTIFF in 1 km tiles, each read alone out of its
+          district's zip.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "© GeoBasis DE/LVGL-SL (2026), dl-de/by-2-0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DGM1_2025_tif_LK/DGM1_tif_MZG_EPSG-25832_Entstehung-2025.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DGM1_2025_tif_LK/DGM1_tif_NK_EPSG-25832_Entstehung-2025.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DGM1_2025_tif_LK/DGM1_tif_SB_EPSG-25832_Entstehung-2025.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DGM1_2025_tif_LK/DGM1_tif_SLS_EPSG-25832_Entstehung-2025.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DGM1_2025_tif_LK/DGM1_tif_SPK_EPSG-25832_Entstehung-2025.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DGM1_2025_tif_LK/DGM1_tif_WND_EPSG-25832_Entstehung-2025.zip"
+          name: "dgm1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_SL_\\d{4}\\.tif$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: sl-dom1
+        title: Saarland DOM1, 1 m surface
+        holds: >-
+          Saarland's surface model from lidar at 1 m (2025): the height of
+          whatever is on top, roofs and tree crowns, as GeoTIFF in 1 km tiles,
+          each read alone out of its district's zip.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "© GeoBasis DE/LVGL-SL (2026), dl-de/by-2-0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DOM1_2025_tif_LK/DOM1_tif_MZG_EPSG-25832_Entstehung-2025.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DOM1_2025_tif_LK/DOM1_tif_NK_EPSG-25832_Entstehung-2025.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DOM1_2025_tif_LK/DOM1_tif_SB_EPSG-25832_Entstehung-2025.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DOM1_2025_tif_LK/DOM1_tif_SLS_EPSG-25832_Entstehung-2025.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DOM1_2025_tif_LK/DOM1_tif_SPK_EPSG-25832_Entstehung-2025.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_DOM1_2025_tif_LK/DOM1_tif_WND_EPSG-25832_Entstehung-2025.zip"
+          name: "dom1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_SL_\\d{4}\\.tif$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: sl-lod2
+        title: Saarland LoD2 building models
+        holds: >-
+          Saarland's 3D buildings at level of detail 2 (CityGML, 2026): each
+          building's footprint, roof shape and height, in 1 km tiles, each
+          read alone out of its district's zip.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "© GeoBasis DE/LVGL-SL (2026), dl-de/by-2-0"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_Geb%c3%a4udemodelle_LoD2_gml_LK/MZG_LOD2BWK_gml.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_Geb%c3%a4udemodelle_LoD2_gml_LK/NK_LOD2BWK_gml.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_Geb%c3%a4udemodelle_LoD2_gml_LK/SB_LOD2BWK_gml.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_Geb%c3%a4udemodelle_LoD2_gml_LK/SLS_LOD2BWK_gml.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_Geb%c3%a4udemodelle_LoD2_gml_LK/SPK_LOD2BWK_gml.zip"
+            - "https://www.shop.lvgl.saarland.de/cloud/public.php/dav/files/NK8ndP55qAqGEZD/OD_Geb%c3%a4udemodelle_LoD2_gml_LK/WND_LOD2BWK_gml.zip"
+          name: "LoD2_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_SL\\.gml$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25832, members: "*.gml" }
+
+      - id: sn-dgm1
+        title: Sachsen DGM1, 1 m terrain
+        holds: >-
+          Saxony's terrain model from lidar at 1 m: the bare ground's height,
+          as GeoTIFF in 2 km tiles, zipped, of up to 14 MB.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "Quelle: GeoSN, dl-de/by-2-0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: template
+          url: "https://geocloud.landesvermessung.sachsen.de/public.php/dav/files/JCcXyifaNdLDnxZ/{tile}.zip"
+          tile: "dgm1_33{x}_{y}_2_sn_tiff"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25833
+          missing: no-data
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25833, nodata: -9999, members: "*.tif" }
+
+      - id: sn-dom1
+        title: Sachsen DOM1, 1 m surface
+        holds: >-
+          Saxony's surface model from lidar at 1 m: the height of whatever is
+          on top, roofs and tree crowns, as GeoTIFF in 2 km tiles, zipped, of
+          up to 15 MB.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "Quelle: GeoSN, dl-de/by-2-0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: template
+          url: "https://geocloud.landesvermessung.sachsen.de/public.php/dav/files/S6wwnFwX7882sZm/{tile}.zip"
+          tile: "dom1_33{x}_{y}_2_sn_tiff"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25833
+          missing: no-data
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25833, nodata: -9999, members: "*.tif" }
+
+      - id: sn-lod2
+        title: Sachsen LoD2 building models
+        holds: >-
+          Saxony's 3D buildings at level of detail 2 (CityGML): each
+          building's footprint, roof shape and height, in 2 km tiles.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "Quelle: GeoSN, dl-de/by-2-0"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: template
+          url: "https://geocloud.landesvermessung.sachsen.de/public.php/dav/files/AyJqXpJAZJXomCb/{tile}.zip"
+          tile: "lod2_33{x}_{y}_2_sn_citygml"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25833
+          missing: no-data
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25833, members: "*.gml" }
+
+      - id: st-dgm1
+        title: Sachsen-Anhalt DGM1, 1 m terrain
+        holds: >-
+          Saxony-Anhalt's terrain model from lidar at 1 m: the bare ground's
+          height, as GeoTIFF in 2 km tiles, each read alone out of the state's
+          four zips of about 10 GB.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "© GeoBasis-DE / LVermGeo ST, dl-de/by-2-0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/DGM/DGM1_1.zip"
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/DGM/DGM1_2.zip"
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/DGM/DGM1_3.zip"
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/DGM/DGM1_4.zip"
+          name: "dgm1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_2_st(?:_\\d{4})?\\.tif$"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: st-dom1
+        title: Sachsen-Anhalt DOM1, 1 m surface
+        holds: >-
+          Saxony-Anhalt's surface model from lidar at 1 m (2022 and 2023): the
+          height of whatever is on top, roofs and tree crowns, as GeoTIFF in
+          2 km tiles, each read alone out of the state's four zips of about
+          11 GB.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "© GeoBasis-DE / LVermGeo ST, dl-de/by-2-0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/DOM/DOM1_1.zip"
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/DOM/DOM1_2.zip"
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/DOM/DOM1_3.zip"
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/DOM/DOM1_4.zip"
+          name: "dom1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_2_st_\\d{4}\\.tif$"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999 }
+
+      - id: st-lod2
+        title: Sachsen-Anhalt LoD2 building models
+        holds: >-
+          Saxony-Anhalt's 3D buildings at level of detail 2 (CityGML, 2026):
+          each building's footprint, roof shape and height, in 2 km tiles,
+          each read alone out of the state's four zips.
+        licence: Datenlizenz Deutschland – Namensnennung – 2.0
+        notice: "© GeoBasis-DE / LVermGeo ST, dl-de/by-2-0"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: zip
+          archives:
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/3D/LoD2-1.zip"
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/3D/LoD2-2.zip"
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/3D/LoD2-3.zip"
+            - "https://www.geodatenportal.sachsen-anhalt.de/gfds_webshare/download/LVermGeo/Geodatenportal/Online-Bereitstellung-LVermGeo/3D/LoD2-4.zip"
+          name: "LoD2_32_(?P<x>\\d{3})_(?P<y>\\d{4})_2_ST\\.gml$"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25832, members: "*.gml" }
+
+      - id: sh-dgm1
+        title: Schleswig-Holstein DGM1, 1 m terrain
+        holds: >-
+          Schleswig-Holstein's terrain model from lidar at 1 m: the bare
+          ground's height, as XYZ text in 1 km tiles of about 28 MB.
+        licence: CC BY 4.0
+        notice: "©GeoBasis-DE/LVermGeo SH/CC BY 4.0 (Quelle verändert)"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: index
+          index: "https://geodaten.schleswig-holstein.de/gaialight-sh/_apps/dladownload/single.php?file=DGM1_SH__Massendownload.geojson&id=4"
+          index_format: geojson
+          crs: EPSG:25832
+          url_property: link_data
+          refresh_days: 30
+        read: whole
+        format: { type: xyz, crs: EPSG:25832, spacing_m: 1, members: "*.xyz" }
+
+      - id: sh-bdom
+        title: Schleswig-Holstein bDOM, 0.2 m surface
+        holds: >-
+          Schleswig-Holstein's surface model at 0.2 m (2023 and 2024), matched
+          from aerial images: the height of whatever is on top, roofs and tree
+          crowns, as uncompressed GeoTIFF in 1 km tiles of about 105 MB, read
+          whole: a city costs gigabytes.
+        licence: CC BY 4.0
+        notice: "©GeoBasis-DE/LVermGeo SH/CC BY 4.0 (Quelle verändert)"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 0.2
+        coverage: outline
+        pairs_with: sh-dgm1
+        find:
+          method: index
+          index: "https://geodaten.schleswig-holstein.de/gaialight-sh/_apps/dladownload/single.php?file=bDOM_SH_Massendownload.geojson&id=4"
+          index_format: geojson
+          crs: EPSG:25832
+          url_property: link_data
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832 }
+
+      - id: sh-lod2
+        title: Schleswig-Holstein LoD2 building models
+        holds: >-
+          Schleswig-Holstein's 3D buildings at level of detail 2 (CityGML):
+          each building's footprint, roof shape and height, in 1 km tiles.
+        licence: CC BY 4.0
+        notice: "©GeoBasis-DE/LVermGeo SH/CC BY 4.0 (Quelle verändert)"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: index
+          index: "https://geodaten.schleswig-holstein.de/gaialight-sh/_apps/dladownload/single.php?file=LOD2_SH_Massendownload.geojson&id=4"
+          index_format: geojson
+          crs: EPSG:25832
+          url_property: data_link
+          refresh_days: 30
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25832, members: "*.xml" }
+
+      - id: th-dgm1
+        title: Thüringen DGM1, 1 m terrain
+        holds: >-
+          Thuringia's terrain model from lidar at 1 m (2020 to 2025): the bare
+          ground's height, as GeoTIFF in 1 km tiles, zipped, of 5 to 9 MB.
+        licence: CC BY 4.0
+        notice: "© GDI-Th, CC BY 4.0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://geoportal.geoportal-th.de/dienste/atom_th_hoehendaten_dgm?type=dataset&id=14418d25-fcd7-4a3f-99a9-e3059a2772af"
+          name: "dgm1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_th_2020-2025\\.zip$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999, members: "*.tif" }
+
+      - id: th-dom1
+        title: Thüringen DOM1, 1 m surface
+        holds: >-
+          Thuringia's surface model from lidar at 1 m (2020 to 2025): the
+          height of whatever is on top, roofs and tree crowns, as GeoTIFF in
+          1 km tiles, zipped, of 5 to 9 MB.
+        licence: CC BY 4.0
+        notice: "© GDI-Th, CC BY 4.0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://geoportal.geoportal-th.de/dienste/atom_th_hoehendaten_dom?type=dataset&id=3b5d8d9c-775d-4617-8dfe-71480d6472a6"
+          name: "dom1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_1_th_2020-2025\\.zip$"
+          unit_m: 1000
+          size_m: 1000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: geotiff, band: 1, crs: EPSG:25832, nodata: -9999, members: "*.tif" }
+
+      - id: th-lod2
+        title: Thüringen LoD2 building models
+        holds: >-
+          Thuringia's 3D buildings at level of detail 2 (CityGML): each
+          building's footprint, roof shape and height, in 2 km tiles.
+        licence: CC BY 4.0
+        notice: "© GDI-Th, CC BY 4.0"
+        redistributable: true
+        layers: { buildings: 100 }
+        coverage: outline
+        find:
+          method: atom
+          feed: "https://geoportal.geoportal-th.de/dienste/atom_th_gebaeude?type=dataset&id=97d152b8-9e00-49f3-9ae4-8bbb30873562"
+          name: "LoD2_32_(?P<x>\\d{3})_(?P<y>\\d{4})_2_TH\\.zip$"
+          unit_m: 1000
+          size_m: 2000
+          crs: EPSG:25832
+          refresh_days: 30
+        read: whole
+        format: { type: citygml, lod: 2, crs: EPSG:25832, members: "*.gml" }
+
   NL:
     name: Netherlands
     sources:

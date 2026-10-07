@@ -541,7 +541,7 @@ planner-job ── geodata/.part-<name>/ ─────────────
 tiles, fetched through the front and kept under `testbed/osmtiles/` a week
 at least, as the tile usage policy asks; the packs there are outlined
 with their names, and the outlines of the sources that do not cover the
-world (Berlin's own data, Germany's census grid) are tinted. A drag pans, the
+world (the German states' own data, Germany's census grid) are tinted. A drag pans, the
 wheel zooms, Ctrl or Cmd and a drag draws the rectangle, and the place
 search asks Nominatim, OpenStreetMap's geocoder, once per search (on Enter),
 as its policy allows.
@@ -558,12 +558,13 @@ which one the build is said to use where several meet. With the sources
 sim-mesh ships:
 
 - **terrain and clutter**: the state surveys' 1 m terrain and their surface
-  models where the rectangle touches Berlin, Brandenburg or
-  Mecklenburg-Vorpommern, AHN's (0.5 m) where it touches the Netherlands,
+  models where the rectangle touches Germany (every state), AHN's (0.5 m)
+  where it touches the Netherlands,
   BEV's 1 m terrain and surface where it touches Austria,
   Copernicus GLO-30 everywhere else; in the United States, USGS 3DEP's
   10 m terrain under GLO-30's clutter;
-- **buildings**: the same states' LoD2 models, 3DBAG's in the Netherlands,
+- **buildings**: the same states' LoD2 models (all but Hessen's, whose
+  LoD2 comes only per municipality), 3DBAG's in the Netherlands,
   OpenStreetMap's everywhere else (an OpenStreetMap building on a LoD2 or
   3DBAG tile is left out);
 - **population**: the Zensus 2022 grid where the rectangle touches Germany,
@@ -606,14 +607,27 @@ is fetched once, resumed where it stopped, and one its host does not have
 | DGM1, bDOM, LoD2 | Berlin | `gdi.berlin.de`'s ATOM feeds: only the tiles meeting the rectangle |
 | DGM, bDOM (0.2 m), LoD2 | Brandenburg | `data.geobasis-bb.de`'s directory listings: only the tiles meeting the rectangle |
 | DGM1, DOM1, LoD2 | Mecklenburg-Vorpommern | `geodaten-mv.de`'s ATOM feeds: only the tiles meeting the rectangle; the host does not resume a broken download |
+| DGM1, DOM20 (0.2 m), LoD2 | Bayern | `download1.bayernwolke.de` (and `download2`), tiles named by their corner: only those meeting the rectangle, the DOM20's windows |
+| DGM1 (XYZ), DOM1, LoD2 | Baden-Württemberg | `opengeodata.lgl-bw.de`, 2 km zips named by their corner: only those meeting the rectangle |
+| DGM1, DOM1 (XYZ, 2017 and 2015), LoD2 | Bremen | `gdi2.geo.bremen.de`'s city zips: only the tiles meeting the rectangle, read out of them by range |
+| DGM1, bDOM, LoD2 | Hamburg | `daten-hamburg.de`'s city zips: only the tiles meeting the rectangle, read out of them by range |
+| DGM1, DOM1 | Hessen | `inspire-hessen.de`'s coverage service (WCS), asked for each 1 km square meeting the rectangle |
+| DGM1, DOM1, LoD2 | Niedersachsen | LGLN's ArcGIS tile layers (the newest survey of each tile) and its object store: only the windows of the tiles meeting the rectangle; LoD2 tiles named by their corner |
+| DGM1, DOM1, LoD2 | Nordrhein-Westfalen | `opengeodata.nrw.de`'s directory listings: only the tiles meeting the rectangle |
+| DGM1, DOM1, LoD2 | Rheinland-Pfalz | `geobasis-rlp.de`'s directory listings (slow, about 9 MB each): only the tiles meeting the rectangle |
+| DGM1, DOM1, LoD2 | Saarland | LVGL's district zips: only the tiles meeting the rectangle, read out of them by range |
+| DGM1, DOM1, LoD2 | Sachsen | GeoSN's file shares, 2 km zips named by their corner: only those meeting the rectangle |
+| DGM1, DOM1, LoD2 | Sachsen-Anhalt | LVermGeo's four state zips of each: only the tiles meeting the rectangle, read out of them by range |
+| DGM1 (XYZ), bDOM (0.2 m), LoD2 | Schleswig-Holstein | `geodaten.schleswig-holstein.de`'s tile indexes: only the tiles meeting the rectangle; the host neither resumes nor says a size, and its bDOM is about 105 MB a square kilometre |
+| DGM1, DOM1, LoD2 | Thüringen | `geoportal-th.de`'s ATOM feeds: only the tiles meeting the rectangle |
 | Zensus 2022 100 m grid | Germany | `destatis.de` |
 | AHN DTM and DSM, 0.5 m | the Netherlands | PDOK's sheet index (`service.pdok.nl`): only the windows of the sheets meeting the rectangle |
 | 3DBAG buildings | the Netherlands | `data.3dbag.nl`'s tile index: only the tiles meeting the rectangle |
 | CBS 2023 100 m grid | the Netherlands | `download.cbs.nl` |
-| 3DEP 1/3 arc-second terrain, 1° tiles | the United States | `prd-tnm.s3.amazonaws.com`: only the windows of the tiles meeting the rectangle |
-| Annual NLCD 2025 land cover, 30 m | the conterminous United States | `mrlc.gov`: one 1.5 GB zip |
 | BEV ALS DTM and DSM, 1 m, 50 km squares | Austria | `data.bev.gv.at`: only the windows of the squares meeting the rectangle |
 | Statistik Austria 2026 100 m grid | Austria | `statistik.at`'s INSPIRE download |
+| 3DEP 1/3 arc-second terrain, 1° tiles | the United States | `prd-tnm.s3.amazonaws.com`: only the windows of the tiles meeting the rectangle |
+| Annual NLCD 2025 land cover, 30 m | the conterminous United States | `mrlc.gov`: one 1.5 GB zip |
 | WorldPop 2025 population, 3 arc-seconds | the United States | `data.worldpop.org`: one 1.5 GB GeoTIFF; the host does not resume a broken download |
 
 Geofabrik's index, Berlin's feeds and the MeshCore node list are kept in
@@ -686,17 +700,31 @@ europe:                             # a continent
   `corner: north-west`: `{ns}`, `{lat}`, `{ew}`, `{lon}`, `:0n` padding,
   the letters upper case unless `letters: lower`; or squares of `size_m`
   in a projected `crs`, their corner named by `{x}` and `{y}` in `unit_m`,
-  as BEV names its 50 km squares of EPSG:3035), `atom` (an
+  as BEV names its 50 km squares of EPSG:3035; the squares start at
+  `origin_m: [x, y]` where their grid is offset (Baden-Württemberg's 2 km
+  tiles start on odd kilometres), `{x2}` and `{y2}` name the far corner (a
+  coverage service's box, Hessen's WCS) and `file` the name a tile is kept
+  under when its address's last part is none), `atom` (an
   INSPIRE download feed, each tile's corner read off its file name),
-  `index` (a file of footprints, GeoJSON or FlatGeobuf, in the `crs` it
-  names: each footprint meeting the rectangle is a file, its address the
-  `url_property`, its checksum the `sha256_property` when it has one),
+  `index` (a file of footprints, GeoJSON or FlatGeobuf, or an ArcGIS
+  feature layer with `index_format: arcgis`, read a page at a time, in the
+  `crs` it names: each footprint meeting the rectangle is a file, its
+  address the `url_property`, its checksum the `sha256_property` when it
+  has one; with `tile_property` and `newest_property`, an index listing a
+  tile once per survey gives only the newest of each), `zip` (the
+  `archives` holding a state's or a city's tiles together, each a part of
+  the whole: every archive's central directory is read by range, a tile's
+  corner read off its member's name, and each tile meeting the rectangle
+  fetched alone; `<archive>!<name>` is a zip stored in another),
   `regions` (Geofabrik's index, the smallest region holding the rectangle)
   or `file`. A feed may also be a web server's directory listing, its
   links relative (Brandenburg's); a link whose file name is in its query
   (`…?file=<name>`, M-V's download service) is kept under that name. Any
   address may be a list: mirrors, tried in order. A file no host has is no
-  data there (`missing: error` makes it a failed build).
+  data there (`missing: error` makes it a failed build). A host that
+  refuses HEAD is asked for a file's first two bytes to learn its size,
+  and one that does not send its intermediate certificate is reached
+  through the intermediates in `sources/intermediates.pem`.
 - **Reading** is `whole`, the file, resumed when a fetch breaks off, or
   `window`, for a regional cloud-optimised GeoTIFF an index or a template
   finds: its directories and only
@@ -716,10 +744,16 @@ europe:                             # a continent
     or population as people per pixel. A terrain with a surface in its
     projection is a pair, both halves measured; a terrain alone replaces
     only the ground, each cell keeping its clutter.
-  - `xyz` and `citygml`, in EPSG:25833 as Berlin, Brandenburg and
-    Mecklenburg-Vorpommern deliver them: XYZ terrain and surface tiles are
-    paired by `dgm1_33_E_N` and `dom1_33_E_N` in their names. A pack outside
-    UTM zone 33 takes them projected into its own zone.
+  - `xyz` (1 m) and `citygml`, in an ETRS89 UTM zone (`crs`, EPSG:25832
+    or 25833) as the German state surveys deliver them; a pack in another
+    zone takes them projected into its own. XYZ terrain and surface tiles
+    of one zone are paired by the corner in their names (`dgm1_32_E_N`,
+    `dom1_32_E_N`, or `dgm1_32E_N` with the zone in front), and a GeoTIFF
+    surface whose source `pairs_with` an XYZ terrain is paired with it the
+    same way (Baden-Württemberg's DOM1 with its DGM1). A CityGML tile's
+    extent is read off its name (`LoD2_32_E_N_2_…`, the last number its
+    size in kilometres), else from its buildings; a page a host appends
+    after the document is not read.
   - `cityjson` (`crs`, and the attributes that hold the `ground` and `roof`
     heights): each Building's LoD0 footprint, as tall as roof less ground.
   - `csv-grid` (`delimiter`, the `x`, `y` and `value` columns, `crs`,
@@ -738,15 +772,15 @@ europe:                             # a continent
   heights).
 - **Layers** are `surface`, `terrain`, `landcover`, `buildings`,
   `population`, `roads`, `places` and `radio-climate`, each source with its
-  priority in each. Berlin's, Mecklenburg-Vorpommern's and the Netherlands'
-  terrain, surface and buildings, and Austria's terrain and surface, are 100
-  to GLO-30's and OpenStreetMap's
+  priority in each. The German states' and the Netherlands' terrain,
+  surface and buildings, and Austria's terrain and surface, are 100 to
+  GLO-30's and OpenStreetMap's
   10; Brandenburg's are 90, since its outline holds Berlin, whose own come
   first there. NLCD's land cover is 100 to WorldCover's 10.
 
-Shipped beyond the worldwide set: Germany (Berlin's, Brandenburg's and
-Mecklenburg-Vorpommern's terrain, surface and LoD2, and the Zensus 2022
-grid), the Netherlands (AHN's 0.5 m terrain and surface, the 3DBAG
+Shipped beyond the worldwide set: Germany (every state's 1 m terrain and
+surface, every state's LoD2 but Hessen's, and the Zensus 2022 grid), the
+Netherlands (AHN's 0.5 m terrain and surface, the 3DBAG
 buildings and CBS's 100 m population grid), Austria (BEV's 1 m terrain and
 surface, and Statistik Austria's 100 m population grid) and the United
 States (3DEP's 1/3 arc-second terrain, NLCD land cover and WorldPop's
