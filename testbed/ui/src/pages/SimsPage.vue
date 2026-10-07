@@ -23,7 +23,7 @@
                  :disable="!keys.length" @click="askBulk('delete', keys)" />
         </template>
       </SelectBar>
-      <table class="sims-table">
+      <table class="sims-table tab-flow">
         <thead>
           <tr>
             <th class="sims-check"></th>
@@ -391,7 +391,7 @@ function askStop(s: SimSummary) {
 .sims-page { overflow-y: auto; height: 100%; }
 .sims-body { padding: 16px 20px 32px; max-width: 1200px; }
 .sims-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-.sims-heading { font-size: 14px; font-weight: 500; color: #d1d5db; margin-bottom: 10px; }
+.sims-heading { font-size: 18px; font-weight: 500; color: #e5e7eb; margin-bottom: 12px; }
 .sims-head .sims-heading { margin-bottom: 0; }
 .sims-none { color: #6b7280; font-size: 13px; line-height: 1.5; max-width: 760px; }
 .sims-table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -404,7 +404,7 @@ function askStop(s: SimSummary) {
 .mono { font-family: ui-monospace, monospace; font-size: 12px; }
 .sims-selected td { background: #1a2029; }
 .sims-exited td { color: #9ca3af; }
-.sims-name { color: #7dd3fc; font-weight: 500; }
+.sims-name { color: var(--q-primary); font-weight: 500; }
 .sims-open { cursor: pointer; }
 .sims-open:hover td { background: #1b2028; }
 .sims-state-paused { color: #a78bfa; }

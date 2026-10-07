@@ -343,7 +343,7 @@ function addTag() {
 .ed-height-in { width: 140px; }
 .ed-height-in :deep(.q-field__messages) { white-space: nowrap; }
 .ed-refs { display: flex; flex-direction: column; gap: 2px; padding-top: 4px; flex: 1 1 auto; min-width: 0; }
-.ed-ref { font-size: 11px; color: #7dd3fc; cursor: pointer; white-space: nowrap; }
+.ed-ref { font-size: 11px; color: var(--q-primary); cursor: pointer; white-space: nowrap; }
 .ed-ref:hover { text-decoration: underline; }
 .ed-dim { font-size: 11px; color: #6b7280; }
 .ed-note { font-size: 11px; color: #fbbf24; line-height: 1.4; }
@@ -352,7 +352,7 @@ function addTag() {
 .ed-some { font-size: 10px; opacity: 0.8; }
 .ed-newtag { width: 110px; font-size: 12px; }
 .ed-offset { font-size: 12px; color: #fca5a5; display: flex; align-items: center; gap: 6px; }
-.ed-offset-to { color: #7dd3fc; cursor: pointer; }
+.ed-offset-to { color: var(--q-primary); cursor: pointer; }
 .ed-offset-to:hover { text-decoration: underline; }
 .ed-actions { display: flex; flex-wrap: wrap; gap: 2px; padding: 4px 6px; }
 .ed-live { padding: 8px 12px; font-size: 12px; }

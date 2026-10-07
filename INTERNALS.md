@@ -848,8 +848,8 @@ search goes the same way (`/api/nominatim`), one request per search.
 **Nodes are never ground.** A planner pack could carry a `Nodes` layer, the
 deployed network baked in at build time. sim-mesh's compiler never writes one,
 and export, import and what the page is told all leave one out: nodes are
-nodesets, which stand on any ground that holds them, and which the layers
-on the Nodes tab show, merge and edit. The public node maps come in as
+nodesets, which stand on any ground that holds them, and which the Nodes
+tab lists, shows, merges and edits. The public node maps come in as
 nodesets through `nodes-import`, whose report counts every row into one
 bucket (kept, or dropped and why).
 
@@ -1358,22 +1358,22 @@ Pinia stores hold the page's state, split as the data is: `catalog` (what
 the store holds — firmware, geodata, nodesets, scripts, snapshots — and the
 script runs with their output), `geodata` (which ground is on show, and for
 a pack its manifest and the sidecar's base path), `display` (how the map is
-shown, per tab), `nodes` (the Nodes tab's active layer, its selection, its
-dirty state, and the other layers, as their files stand), `coverage` (the nodes' rasters) and `sim` (the running simulations
+shown, per tab), `nodes` (the Nodes tab's list of nodesets, the ones
+checked and, as their files stand, loaded for its map; the nodeset open,
+its selection and its dirty state), `coverage` (the nodes' rasters) and `sim` (the running simulations
 and the attached one's live state); one socket store owns the websocket
 they all speak through, and `lib/front` matches each editor verb's answer to
 its request. Every component reads the stores; every action is one store
 method that sends one message. A reconnect replays the `snapshot`, so the
 page holds no state simd cannot restate — which is the whole of what makes
-simd restartable under a page that is open. The active layer is the one
-exception, deliberately: it is the page's own until it is saved. That is
-also why Save visible as sends the layers as they stand to the front to be
-merged there (`nodeset.merge`), rather than naming files: the active one's
-unsaved edits are part of what is saved. Save visible as is the only way to
-save a nodeset under a new name and the only way to merge: one layer shown
-is that layer's Save as, several are the merge. A merged node keeps its tags
-and gains its layer's name as a tag, so a script can still tell the layers
-apart after the merge.
+simd restartable under a page that is open. The nodeset open on the Nodes
+tab is the one exception, deliberately: it is the page's own until it is
+saved, and leaving it asks first about unsaved edits. Save selection as
+sends the checked nodesets' nodes on the geodata, as the page loaded them,
+to the front to be merged there (`nodeset.merge`), so what is written is
+what the map showed, nodes off the geodata left out. A merged node keeps
+its tags and gains its nodeset's name as a tag, so a script can still tell
+them apart after the merge.
 
 **A reply the sidecar cut short is never drawn as if it were whole.** The
 sidecar caps a footprint reply's vertices and fills it in the pack's order,
@@ -1387,9 +1387,11 @@ for a node since moved, is never read as the node's; and the map's repaint
 key includes which raster each node was drawn from, so a raster arriving is
 a repaint.
 
-**One map, two places.** The map page (`NodesPage`) is one component in
-two modes. On the Nodes tab it edits the active layer, with the other shown
-layers drawn beside it; opened from a
+**One map, three uses.** The map page (`NodesPage`) is one component, and
+its map one `GroundMap` whatever it is doing, so changing between them never
+fetches the ground again. On the Nodes tab's list it only shows the checked
+nodesets, hollow in their colours, with nothing to select, move or cover;
+with a nodeset open it edits it; opened from a
 running simulation's row it stands on the Simulations tab in place of the
 list and shows that run's stations live, and the same edits (move, set,
 tag, offset, remove) go to the run's own copy as messages to its simd. The

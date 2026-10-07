@@ -14,8 +14,9 @@ export interface Selection {
   keys: Ref<string[]>
 }
 
-export function useSelection(listed: () => string[]): Selection {
-  const chosen = ref(new Set<string>())
+/** `chosen` is where the chosen keys are kept, when something other than the
+ *  list wants them too. */
+export function useSelection(listed: () => string[], chosen: Ref<Set<string>> = ref(new Set<string>())): Selection {
   watch(listed, (now) => {
     const here = new Set(now)
     if ([...chosen.value].some(k => !here.has(k))) {

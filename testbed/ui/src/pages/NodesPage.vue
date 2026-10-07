@@ -2,32 +2,35 @@
   <q-page class="np">
     <q-toolbar class="np-bar">
       <template v-if="nodes.attached">
-        <q-btn v-if="socket.front" flat dense no-caps label="‹ Simulations" @click="sim.detach()">
+        <q-btn v-if="socket.front" flat dense no-caps label="← Simulations" @click="sim.detach()">
           <q-tooltip>Back to the list; the simulation keeps running</q-tooltip>
         </q-btn>
         <span class="np-sim">
           {{ sim.selected || 'simulation' }}
           <span class="np-sub">{{ sim.run?.nodeset ?? 'nodes' }} on {{ sim.geodata?.name ?? '—' }}</span>
         </span>
-        <q-btn flat dense no-caps label="Save nodes as nodeset…" @click="askSaveAs">
+        <q-btn flat dense no-caps label="Save nodes as nodeset" @click="askSaveAs">
           <q-tooltip>Keep this simulation's nodes, as moved and edited in it, as a nodeset of their own</q-tooltip>
         </q-btn>
       </template>
 
       <template v-else-if="nodes.open">
+        <q-btn v-if="socket.front" flat dense no-caps label="← Nodesets" @click="toList">
+          <q-tooltip>Back to the list of nodesets on {{ nodes.geodata }}</q-tooltip>
+        </q-btn>
         <div class="np-title">
           {{ nodes.nodeset?.name ?? 'unnamed' }}<span v-if="nodes.dirty" class="np-dirty"> •</span>
           <span class="np-sub">{{ nodes.names.length }} nodes on {{ nodes.geodata }}</span>
         </div>
         <q-btn flat dense no-caps label="Save" :disable="!nodes.dirty && !!nodes.nodeset?.name"
                :color="nodes.dirty ? 'amber' : undefined" @click="save" />
-        <q-btn v-if="socket.front && nodes.nodeset?.name" flat dense no-caps label="Edit setup"
+        <q-btn v-if="socket.front && nodes.nodeset?.name" flat dense no-caps label="Setup script"
                @click="editSetup(nodes.nodeset.name)">
           <q-tooltip>This nodeset's own setup script, nodesets/{{ nodes.nodeset.name }}.py, which the startup script runs for it</q-tooltip>
         </q-btn>
       </template>
       <div v-else class="np-title">
-        <span class="np-sub">{{ nodes.geodata ? `no layer active on ${nodes.geodata}` : 'no geodata chosen' }}</span>
+        Nodesets<span class="np-sub">{{ nodes.geodata ? `on ${nodes.geodata}` : 'no geodata chosen' }}</span>
       </div>
       <q-space />
       <template v-if="nodes.attached">
@@ -37,7 +40,99 @@
       <DisplayMenu view="nodes" />
     </q-toolbar>
 
-    <div class="np-body" @contextmenu.capture="pendingAt = null; pendingNode = null">
+    <div class="np-body" :class="{ 'np-listing': listing }">
+      <!-- The list of nodesets on the geodata, beside the map that shows the checked ones. -->
+      <div v-if="listing" class="np-list">
+        <template v-if="!nodes.geodata">
+          <div class="tab-head"><div class="tab-heading">No geodata chosen</div></div>
+          <template v-if="installed.length">
+            <div class="np-text">Open one: its nodesets are listed here.</div>
+            <div class="np-choose">
+              <q-btn v-for="g in installed" :key="g.name" flat dense no-caps color="primary" :label="g.name"
+                     @click="nodes.chooseGeodata(g.name)" />
+            </div>
+          </template>
+          <div v-else class="np-text">None is installed: add one on the Geodata tab.</div>
+        </template>
+        <template v-else>
+          <div class="tab-head">
+            <div class="tab-heading">Nodesets on {{ nodes.geodata }}</div>
+            <q-space />
+            <q-btn flat dense no-caps color="primary" label="New" @click="askNew" />
+            <q-btn flat dense no-caps color="primary" label="Import" @click="importing = true" />
+          </div>
+          <div class="np-text">
+            The nodesets with a node on {{ nodes.geodata }}. The checked ones are on
+            the map together, each in its colour, and two or more can be saved as one
+            new nodeset. Click a nodeset to open it and edit its nodes.
+          </div>
+          <SelectBar :sel="sel">
+            <template #default="{ keys }">
+              <template v-if="keys.length >= 2">
+                <q-btn flat dense no-caps size="sm" label="Save selection as" @click="askMerge" />
+                <q-btn flat dense no-caps size="sm" :icon="matDeleteOutline" label="Delete selection"
+                       @click="askDelete(keys)" />
+              </template>
+            </template>
+          </SelectBar>
+          <table class="np-table tab-flow">
+            <thead><tr><th class="np-check"></th><th>Nodeset</th><th class="num">Nodes</th>
+              <th class="col-size">Size</th><th class="col-act"></th></tr></thead>
+            <tbody>
+              <tr v-for="s in nodes.sets" :key="s.name" class="np-row" :class="{ 'np-picked': sel.has(s.name) }"
+                  title="Click to open this nodeset" @click="askOpen(s.name)">
+                <td class="np-check" @click.stop>
+                  <q-checkbox dense size="xs" :model-value="sel.has(s.name)" @update:model-value="sel.toggle(s.name)" />
+                </td>
+                <td>
+                  <span class="np-ring" :style="{ borderColor: nodes.colourOf(s.name) }" />
+                  <span class="np-name">{{ s.name }}</span>
+                  <div v-if="originOf(s.name)" class="np-sub0">from {{ originOf(s.name) }}</div>
+                </td>
+                <td class="num mono" :class="{ 'np-partly': s.inside < s.nodes }"
+                    :title="s.inside < s.nodes ? `${s.nodes - s.inside} of ${s.nodes} nodes are outside ${nodes.geodata}` : ''">
+                  {{ s.inside }}<template v-if="s.inside < s.nodes">/{{ s.nodes }}</template>
+                </td>
+                <td class="col-size mono">{{ sizeText(s.bytes) }}</td>
+                <td class="col-act" @click.stop>
+                  <q-btn flat dense round size="sm" :icon="matDeleteOutline" @click="askDelete([s.name])">
+                    <q-tooltip>Delete, with its own setup script</q-tooltip>
+                  </q-btn>
+                </td>
+              </tr>
+              <tr v-if="!nodes.sets.length">
+                <td colspan="5" class="np-sub0">No nodeset has a node here yet: New, or Import.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <template v-if="elsewhere.length">
+            <div class="tab-head tab-section"><div class="tab-heading">Nodesets on other geodata</div></div>
+            <table class="np-table tab-flow">
+              <tbody>
+                <tr v-for="n in elsewhere" :key="n.name">
+                  <td>
+                    <span class="np-name">{{ n.name }}</span>
+                    <div v-if="n.from_index" class="np-sub0">from {{ n.from_index.index }}</div>
+                    <div v-if="n.error" class="np-bad">{{ n.error }}</div>
+                  </td>
+                  <td class="num mono">{{ n.nodes ?? '' }}</td>
+                  <td class="col-size mono">{{ sizeText(n.bytes) }}</td>
+                  <td class="col-act">
+                    <q-btn flat dense round size="sm" :icon="matDeleteOutline" @click="askDelete([n.name])">
+                      <q-tooltip>Delete, with its own setup script</q-tooltip>
+                    </q-btn>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+
+          <IndexOffers kind="nodesets" @open="askOpen" />
+        </template>
+      </div>
+
+      <div class="np-mapwrap" @contextmenu.capture="pendingAt = null; pendingNode = null">
       <!-- A running simulation's clocks, big enough to read across a room. -->
       <div v-if="nodes.attached" class="np-clock" :title="timeTitle">
         <div v-if="sim.clock.mode === 'virtual'" class="np-clock-cell">
@@ -52,45 +147,32 @@
           {{ [paceLabel, planLabel].filter(Boolean).join(' · ') }}
         </div>
       </div>
-      <GroundMap ref="map" :nodes="mapNodes" :others="nodes.otherNodes" :offsets="nodes.offsets"
+      <!-- One map: listing, it only shows the checked nodesets; else it edits. -->
+      <GroundMap ref="map" :nodes="listing ? [] : mapNodes" :others="listing ? nodes.viewedNodes : []"
+                :offsets="listing ? [] : nodes.offsets"
                 :selected="nodes.selection"
                 :pair="nodes.pair" :links="links" :coverage="coverageSource" :coverage-label="coverageLabel"
                 :display="display.nodes"
-                :live="nodes.attached" editable
+                :live="nodes.attached" :editable="!listing"
                 :view-key="nodes.attached ? 'sim' : 'ground'"
                 @select="onSelect" @pick="onPick" @move="onMove"
                 @link="(a: string, b: string) => (nodes.pair = [a, b])"
-                @other="(layer: string) => askActivate(layer)"
                 @context="onContext" />
 
       <div v-if="nodes.attached && !sim.loaded" class="np-empty">
         <div class="np-empty-title">Nothing loaded</div>
-      </div>
-      <div v-else-if="!nodes.attached && !nodes.geodata" class="np-empty">
-        <div class="np-empty-title">No geodata chosen</div>
-        <template v-if="installed.length">
-          <div class="np-empty-text">Open one: its nodesets are the layers here.</div>
-          <div class="np-empty-list">
-            <q-btn v-for="g in installed" :key="g.name" flat dense no-caps color="primary" :label="g.name"
-                   @click="nodes.chooseGeodata(g.name)" />
-          </div>
-        </template>
-        <div v-else class="np-empty-text">None is installed: add one on the Geodata tab.</div>
       </div>
       <div v-else-if="nodes.open && !nodes.names.length" class="np-empty">
         <div class="np-empty-text">Right-click the map ▸ New node here</div>
       </div>
 
       <div v-if="loss" class="np-progress">
-        loss table {{ loss.band }} MHz: {{ loss.done }}/{{ loss.total || '…' }} pairs
+        loss table {{ loss.band }}&nbsp;MHz: {{ loss.done }}/{{ loss.total || '…' }}&nbsp;pairs
       </div>
       <div v-else-if="linkPending" class="np-progress">links of {{ nodes.selection[0] }}: computing…</div>
       <div v-else-if="linkProblem" class="np-progress np-bad">links: {{ linkProblem }}</div>
 
-      <div class="np-left">
-        <LayersPanel v-if="socket.front && !nodes.attached && nodes.geodata" @new="askNew" @import="importing = true"
-                     @save-visible="askSaveVisible" @activate="askActivate" @delete="askDelete"
-                     @manage="managing = true" />
+      <div v-if="!listing" class="np-left">
         <TagPanel />
         <div class="np-help">
           Click a node; Shift-click toggles it. Ctrl/Cmd-drag a rectangle to
@@ -100,7 +182,7 @@
       </div>
 
       <!-- Out from under the display menu while it is open. -->
-      <div class="np-side" :class="{ 'np-side-aside': display.menuOpen }">
+      <div v-if="!listing" class="np-side" :class="{ 'np-side-aside': display.menuOpen }">
         <NodeEditor @inspect="o => (nodes.pair = [nodes.selection[0]!, o])"
                     @remove="askRemove" @console="openConsole"
                     @web="openWeb" @factory="askFactory" />
@@ -116,7 +198,7 @@
         </div>
       </div>
 
-      <q-menu context-menu touch-position>
+      <q-menu v-if="!listing" context-menu touch-position>
         <q-list v-if="pendingNode" dense style="min-width: 210px">
           <q-item-label header>{{ nodes.selection.length > 1 ? `${nodes.selection.length} nodes` : pendingNode }}</q-item-label>
           <template v-if="nodes.attached && nodes.selection.length === 1">
@@ -162,6 +244,7 @@
           </q-item>
         </q-list>
       </q-menu>
+      </div>
     </div>
 
     <PairInspector v-if="pairEnds" :a="pairEnds[0]" :b="pairEnds[1]" :table-cell="pairCell"
@@ -171,12 +254,10 @@
     <WebWindow v-for="name in webs" :key="`web-${name}`" :name="name" :visible="true"
                @update:visible="v => !v && closeWeb(name)" />
 
-    <NodesetsDialog v-model="managing" />
-
-    <!-- A new layer from a source: the public node maps, a planner CSV, or a file of points. -->
+    <!-- A new nodeset from a source: the public node maps, a planner CSV, or a file of points. -->
     <q-dialog v-model="importing">
-      <q-card style="min-width: 520px; max-width: 600px">
-        <q-card-section class="text-subtitle2">Import a new layer</q-card-section>
+      <q-card style="min-width: min(520px, 92vw); max-width: 600px">
+        <q-card-section class="text-subtitle2">Import a nodeset</q-card-section>
         <q-card-section class="column q-gutter-sm">
           <q-select v-model="importSource" dense outlined emit-value map-options label="from"
                     :options="IMPORT_SOURCES" />
@@ -204,7 +285,7 @@
                         :label="c.label" :options="csvHeader" clearable options-dense class="np-column" />
             </div>
           </template>
-          <q-input v-model="importName" dense outlined label="layer name" />
+          <q-input v-model="importName" dense outlined label="nodeset name" />
           <q-input v-model.number="importHeight" type="number" dense outlined
                    label="height where the source has none (m)" hint="marked assumed" />
           <div class="text-caption text-grey-6">
@@ -224,7 +305,7 @@
 
     <!-- Run command: one line on the stations chosen, all running one firmware base. -->
     <q-dialog v-model="commanding">
-      <q-card style="min-width: 560px">
+      <q-card style="min-width: min(560px, 92vw)">
         <q-card-section class="text-subtitle2">Run command on {{ targetText }}</q-card-section>
         <q-card-section>
           <div class="row q-col-gutter-sm">
@@ -267,23 +348,24 @@
 </template>
 
 <script setup lang="ts">
-/* The Nodes tab: always the map. Standalone, it is empty until a geodata is
- * opened, on the Geodata tab or from the list it shows meanwhile; then the
- * nodesets with a node on it are layers
- * (LayersPanel): the active one is edited here, its nodes off the geodata
- * left out and kept, the other shown ones are drawn hollow, and a click on
- * one of their nodes makes its layer active. Attached to a running
- * simulation it is that run's live map, with no layers, and the same edits
- * go to the run's own copy. Links are the one selected node's, and nothing
- * else's. Coverage is a heatmap, the network's by default, or only the
- * nodes asked about. */
+/* The Nodes tab. Standalone, it is the list of the nodesets on the geodata
+ * opened (on the Geodata tab, or from the list it shows meanwhile) beside a
+ * map that only shows: the nodesets checked (all of them at first) are drawn
+ * there together, each in its colour, and two or more can be saved as one
+ * new nodeset. A click on one opens it: the map that edits it, its nodes off the geodata left out and kept; ← Nodesets, or
+ * a click on the tab, is the list again. Attached to a running simulation it
+ * is that run's live map, and the same edits go to the run's own copy.
+ * Links are the one selected node's, and nothing else's. Coverage is a
+ * heatmap, the network's by default, or only the nodes asked about. */
 import { computed, nextTick, ref, watch } from 'vue'
+import { storeToRefs } from 'pinia'
 import { useQuasar } from 'quasar'
+import { matDeleteOutline } from '@quasar/extras/material-icons'
 import GroundMap from '../components/GroundMap.vue'
 import NodeEditor from '../components/NodeEditor.vue'
 import TagPanel from '../components/TagPanel.vue'
-import LayersPanel from '../components/LayersPanel.vue'
-import NodesetsDialog from '../components/NodesetsDialog.vue'
+import SelectBar from '../components/SelectBar.vue'
+import IndexOffers from '../components/IndexOffers.vue'
 import DisplayMenu from '../components/DisplayMenu.vue'
 import PairInspector, { type PairEnd } from '../components/PairInspector.vue'
 import PlaceSearch from '../components/PlaceSearch.vue'
@@ -306,6 +388,8 @@ import { txDbm } from '../lib/boards'
 import { cell } from '../lib/slt'
 import { estimateAt, roofAt } from '../lib/roof'
 import { etaText, phaseText, realText, tText } from '../components/runtime'
+import { useSelection } from '../lib/selection'
+import { NBSP, sizeText } from '../lib/size'
 import type { GroundPoint, LinkMark, MapNode, Pick } from '../lib/marks'
 
 const nodes = useNodes()
@@ -376,8 +460,86 @@ const fileAccept = computed(() => ({
 } as Record<string, string>)[importSource.value] ?? '')
 const csvHeader = ref<string[]>([])
 const csvColumns = ref<Record<string, string | null>>({})
-const managing = ref(false)
 const importFile = ref<File | null>(null)
+
+/* ── the list ── */
+/** The list of nodesets is on show, not a map that edits. */
+const listing = computed(() => !!socket.front && !nodes.attached && !nodes.open)
+const sel = useSelection(() => nodes.sets.map(s => s.name), storeToRefs(nodes).checked)
+/** The nodesets not on this geodata, which the list keeps apart. */
+const elsewhere = computed(() => {
+  const here = new Set(nodes.sets.map(s => s.name))
+  return catalog.nodesets.filter(n => !here.has(n.name))
+})
+function originOf(name: string) {
+  const from = catalog.nodesets.find(n => n.name === name)?.from_index
+  return from ? `${from.index}${from.changed ? ', changed here' : ''}` : null
+}
+
+/* The checked nodesets, loaded and framed as they change. */
+watch(() => nodes.checkedNames.join(), async () => {
+  await nodes.loadViewed()
+  if (!listing.value || !nodes.viewedNodes.length) return
+  await nextTick()
+  map.value?.fitToNodes()
+})
+
+/* The list asked again when it comes on show, and when the nodesets there
+ * are change: the registry brings their names every second, the same ones
+ * almost always. */
+watch(() => `${socket.connected} ${socket.front} ${nodes.geodata} ${nodes.attached} ${catalog.nodesets.map(n => n.name).join()}`,
+      () => { if (socket.front && !nodes.attached) void nodes.loadSets() }, { immediate: true })
+watch(listing, (on) => { if (on) { void catalog.refreshNodesets(); void nodes.loadSets() } }, { immediate: true })
+
+function askOpen(name: string) {
+  guard(() => {
+    void nodes.openSet(name).then((e) => {
+      tell(e)
+      const row = nodes.sets.find(l => l.name === name)
+      if (!e && row && row.inside < row.nodes) {
+        quasar.notify({ type: 'warning', timeout: 6000,
+          message: `${row.nodes - row.inside} of ${row.nodes} nodes of ${name} are outside ${nodes.geodata} and not loaded; Save keeps them` })
+      }
+    })
+  })
+}
+
+function toList() { guard(() => nodes.close()) }
+watch(() => sim.nodesList, () => { if (nodes.open && !nodes.attached) toList() })
+
+function askMerge() {
+  const names = nodes.checkedNames
+  if (!names.length) return
+  quasar.dialog({
+    title: 'Save selection as',
+    message: names.length > 1
+      ? `One new nodeset of ${names.join(', ')}, as their files stand, earlier in the list first: `
+        + `each node tagged with its nodeset, and of two within 5${NBSP}m the earlier one's kept.`
+      : `${names[0]}'s nodes on ${nodes.geodata}, as a new nodeset.`,
+    prompt: { model: '', type: 'text' }, cancel: true,
+  }).onOk(async (name: string) => { if (name.trim()) tell(await nodes.mergeAs(name.trim()), 'saved') })
+}
+
+/* The nodesets named deleted after one confirmation; each refusal is said,
+ * and the rest go. */
+function askDelete(names: string[]) {
+  if (!names.length) return
+  quasar.dialog({
+    title: names.length === 1 ? `Delete ${names[0]}` : `Delete ${names.length} nodesets`,
+    message: `Delete ${names.join(', ')}, each with its own setup script? This cannot be undone.`,
+    ok: { label: 'Delete', color: 'negative', flat: true, noCaps: true },
+    cancel: { flat: true, noCaps: true }, persistent: true,
+  }).onOk(async () => {
+    const refused: string[] = []
+    for (const n of names) {
+      const error = await nodes.deleteNodeset(n)
+      if (error) refused.push(error)
+    }
+    await catalog.refreshNodesets()
+    void catalog.refreshIndexes()
+    tell(refused.length ? refused.join('; ') : null, 'deleted')
+  })
+}
 
 /* A CSV's header, split as the front will split it: by whichever of comma,
  * semicolon and tab it has most of, a leading `#` dropped; each column then
@@ -531,13 +693,13 @@ const coverageLabel = computed(() => {
   if (coverage.pending.length) {
     // The node being edited grows band by band: how far out it has got.
     const km = Math.max(0, ...Object.values(coverage.growing))
-    parts.push(`computing ${coverage.pending.length}…${km ? `, out to ${km.toFixed(1)} km` : ''}`)
+    parts.push(`computing ${coverage.pending.length}…${km ? `, out to ${km.toFixed(1)}${NBSP}km` : ''}`)
   }
   if (coverage.problem) parts.push(coverage.problem)
   if (!catalog.globals) parts.push(`no radio to cover with: ${catalog.globalsError ?? 'scripts/globals.py gives none'}`)
   return parts.join(' · ')
 })
-const coverageWanted = computed(() => shown.value && display.nodes.coverage && !!ground.current)
+const coverageWanted = computed(() => shown.value && !listing.value && display.nodes.coverage && !!ground.current)
 watch(() => [coverageWanted.value, ground.current?.name,
              coverageNodes.value.map(n => `${n.name}${n.lat},${n.lon},${n.height_m}`).join(';')] as const,
       ([wanted]) => { if (wanted) void coverage.ensure(ground.current, coverageNodes.value) },
@@ -584,7 +746,7 @@ const pairCell = computed(() => {
   else if (row?.node === p[0]) loss = row.cells[p[1]] ? row.cells[p[1]]!.to ?? Infinity : undefined
   else if (row?.node === p[1]) loss = row.cells[p[0]] ? row.cells[p[0]]!.from ?? Infinity : undefined
   if (loss === undefined || loss === null) return null
-  return Number.isFinite(loss) ? `${loss.toFixed(1)} dB` : 'never heard'
+  return Number.isFinite(loss) ? `${loss.toFixed(1)}${NBSP}dB` : 'never heard'
 })
 
 /* ── time, when attached ── */
@@ -620,57 +782,17 @@ function tell(error: string | null, done?: string) {
   else if (done) quasar.notify({ type: 'positive', message: done, timeout: 2500 })
 }
 
-/* Making another layer active, New and Import all leave the active layer's
- * unsaved edits behind, so each asks first, and only when there is
- * something to lose. */
+/* Leaving the nodeset open, for the list, New or Import, leaves its unsaved
+ * edits behind, so each asks first, and only when there is something to lose. */
 function guard(go: () => void) { whenSaved(quasar, go) }
-
-/* The Layers panel, asked again only when something it depends on changes:
- * the registry brings the nodeset names every second, the same ones almost always. */
-watch(() => `${socket.connected} ${socket.front} ${nodes.geodata} ${nodes.attached} ${catalog.nodesets.map(n => n.name).join()}`,
-      () => { if (socket.front && !nodes.attached) void nodes.loadLayers() }, { immediate: true })
-
-function askActivate(name: string) {
-  guard(() => {
-    void nodes.activate(name).then((e) => {
-      tell(e)
-      const row = nodes.layers.find(l => l.name === name)
-      if (!e && row && row.inside < row.nodes) {
-        quasar.notify({ type: 'warning', timeout: 6000,
-          message: `${row.nodes - row.inside} of ${row.nodes} nodes of ${name} are outside ${nodes.geodata} and not loaded; Save keeps them` })
-      }
-    })
-  })
-}
-
-function askDelete(name: string) {
-  quasar.dialog({
-    title: `Delete ${name}`,
-    message: `Delete the nodeset ${name} and its own setup script? This cannot be undone.`,
-    ok: { label: 'Delete', color: 'negative', flat: true, noCaps: true },
-    cancel: { flat: true, noCaps: true }, persistent: true,
-  }).onOk(async () => tell(await nodes.deleteNodeset(name), 'deleted'))
-}
 
 function askNew() {
   guard(() => {
     quasar.dialog({
-      title: 'New layer', message: 'An empty nodeset, active. Lower-case letters, digits and hyphens.',
+      title: 'New nodeset', message: 'An empty nodeset, opened. Lower-case letters, digits and hyphens.',
       prompt: { model: '', type: 'text' }, cancel: true,
-    }).onOk(async (name: string) => { if (name.trim()) tell(await nodes.newLayer(name.trim())) })
+    }).onOk(async (name: string) => { if (name.trim()) tell(await nodes.newNodeset(name.trim())) })
   })
-}
-
-function askSaveVisible() {
-  const shown = nodes.layers.filter(l => l.shown).map(l => l.name)
-  quasar.dialog({
-    title: 'Save visible as',
-    message: shown.length > 1
-      ? `One new nodeset of ${shown.join(', ')}, as they stand, top first: each node tagged with its layer, `
-        + 'and of two within 5 m the upper layer\'s kept.'
-      : 'The shown layer, as it stands, as a new nodeset.',
-    prompt: { model: '', type: 'text' }, cancel: true,
-  }).onOk(async (name: string) => { if (name.trim()) tell(await nodes.saveVisibleAs(name.trim()), 'saved') })
 }
 
 async function save() {
@@ -848,7 +970,7 @@ watch(() => sim.selected, () => {
 
 <style scoped>
 .np { display: flex; flex-direction: column; height: 100%; }
-.np-bar { min-height: 38px; gap: 6px; padding-left: 4px; background: #171b21; border-bottom: 1px solid #262c35; flex: none; }
+.np-bar { min-height: 38px; gap: 16px; padding-left: 4px; background: #171b21; border-bottom: 1px solid #262c35; flex: none; }
 .np-title { font-size: 14px; font-weight: 500; padding: 0 6px; white-space: nowrap; }
 .np-sim { font-size: 14px; font-weight: 500; padding: 0 8px; white-space: nowrap; display: flex; align-items: center; }
 .np-sub { font-size: 12px; font-weight: 400; color: #6b7280; padding-left: 8px; }
@@ -866,7 +988,34 @@ watch(() => sim.selected, () => {
 .np-clock-label { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.08em; }
 .np-clock-foot { width: 100%; text-align: center; font-size: 11px; color: #7dd3fc; }
 .np-count { font: 11px ui-monospace, monospace; color: #6b7280; }
-.np-body { position: relative; flex: 1 1 auto; min-height: 0; }
+.np-body { position: relative; flex: 1 1 auto; min-height: 0; display: flex; }
+.np-mapwrap { position: relative; flex: 1 1 auto; min-width: 0; min-height: 0; }
+/* The list beside its map; on a narrow page the map above the list. */
+.np-list { flex: 0 0 min(600px, 52%); min-width: 0; overflow-y: auto; padding: 16px 20px 32px;
+  border-right: 1px solid #262c35; }
+@media (max-width: 640px) {
+  .np-listing { flex-direction: column-reverse; overflow-y: auto; }
+  .np-listing .np-mapwrap { flex: 0 0 45vh; }
+  .np-listing .np-list { flex: none; overflow-y: visible; border-right: none; padding: 12px 16px 24px; }
+}
+.np-text { font-size: 12px; color: #9ca3af; line-height: 1.5; margin-bottom: 12px; max-width: 760px; }
+.np-choose { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.np-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.np-table th { text-align: left; font-weight: 500; font-size: 11px; color: #6b7280;
+  padding: 4px 10px; border-bottom: 1px solid #262c35; }
+.np-table td { padding: 6px 10px; border-bottom: 1px solid #1f242c; vertical-align: top; }
+.np-table .num { text-align: right; white-space: nowrap; }
+.np-check { width: 28px; padding-left: 2px !important; padding-right: 0 !important; }
+.np-row { cursor: pointer; }
+.np-row:hover td { background: #1b2028; }
+.np-picked td { background: #172030; }
+.np-ring { display: inline-block; width: 10px; height: 10px; border-radius: 50%; border: 2px solid;
+  margin-right: 6px; vertical-align: -1px; }
+.np-name { font-weight: 500; color: #e5e7eb; }
+.np-row .np-name { color: var(--q-primary); }
+.np-sub0 { font-size: 11px; color: #6b7280; }
+.np-partly { color: #f59e0b; }
+.mono { font-family: ui-monospace, monospace; font-size: 12px; }
 .np-side { position: absolute; top: 12px; right: 12px; display: flex; flex-direction: column; gap: 8px;
   transition: right 0.15s ease; }
 .np-side-aside { right: 304px; }
@@ -892,8 +1041,6 @@ watch(() => sim.selected, () => {
 }
 .np-empty-title { font-size: 15px; color: #9ca3af; padding: 6px 0; }
 .np-empty-text { font-size: 12px; color: #6b7280; max-width: 420px; line-height: 1.5; }
-.np-empty-list { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; max-width: 520px;
-  pointer-events: auto; }
 .np-results { max-height: 46vh; overflow-y: auto; border-top: 1px solid #2b313b; }
 .np-result { display: flex; gap: 10px; padding: 3px 0; }
 .np-result-node { flex: none; width: 84px; font: 12px ui-monospace, monospace; color: #7dd3fc; }

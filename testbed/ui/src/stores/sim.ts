@@ -206,6 +206,9 @@ export const useSim = defineStore('sim', {
     fitWanted: false,
     /** Counts clicks on the Geodata tab, each of which goes back to its list. */
     geodataList: 0,
+    /** Counts clicks on the Nodes tab while it is on show, each of which goes
+     *  back to its list of nodesets. */
+    nodesList: 0,
     /** A simulation a script is starting, attached to before it exists. */
     awaiting: null as string | null,
     /** Loss tables being computed for a simulation, by its name: before its
