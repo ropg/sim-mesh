@@ -363,13 +363,13 @@ def layer(*nodes, offsets=()):
             "offsets": [{"between": list(pair), "db": db} for pair, db in offsets]}
 
 
-def test_one_shown_layer_saves_as_itself():
+def test_one_nodeset_merges_as_itself():
     got = nodeset.merge([("town", layer(("a", 3, 52.5, 13.4, ["x"])))])
     assert list(got["nodes"]) == ["a"] and got["nodes"]["a"]["tags"] == ["x"]
     assert got["nodes"]["a"]["id"] == 3
 
 
-def test_shown_layers_merge_top_first():
+def test_nodesets_merge_earliest_first():
     town = layer(("gw", 1, 52.5000, 13.4000, ["lxmf"]), ("hill", 2, 52.5100, 13.4100, []),
                  offsets=[(("gw", "hill"), 12)])
     # 3 m north of gw, another name for the same mast: the town's gw it is.

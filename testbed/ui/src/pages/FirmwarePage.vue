@@ -1,26 +1,27 @@
 <template>
   <q-page class="dp">
     <div class="dp-body">
-      <div class="dp-head">
-        <div class="dp-heading">Installed firmware</div>
+      <div class="tab-head">
+        <div class="tab-heading">Installed firmware</div>
         <q-space />
-        <q-btn flat dense no-caps label="Add from pre-built…" @click="openPrebuilt" />
-        <q-btn unelevated dense no-caps color="primary" label="Add from zip…" @click="adding = true" />
+        <q-btn flat dense no-caps color="primary" label="Import zip" @click="adding = true" />
       </div>
       <div class="dp-text">
-        What a node can run, for this machine ({{ catalog.arch || '…' }}). A script
-        names one by name, or the newest of a base as <code>&lt;base&gt;_latest</code>;
-        most scripts ask for theirs above the script. Firmware a paused run or a
-        snapshot holds cannot be deleted: its state can only be resumed on it.
+        Installed firmware images compiled for sim-mesh for this server
+        architecture ({{ catalog.arch || '…' }}). Firmware can also be referenced
+        (e.g. in scripts) as <code>&lt;base&gt;_latest</code>, e.g.
+        <code>reticulous-dev-sx1262_latest</code>. Firmware images needed to
+        restart paused simulations will warn that any such simulations will be
+        stopped when you delete them.
       </div>
 
       <SelectBar :sel="sel">
         <template #default="{ keys }">
-          <q-btn flat dense no-caps size="sm" :icon="matDeleteOutline" label="Delete"
+          <q-btn flat dense no-caps size="sm" :icon="matDeleteOutline" label="Delete selection"
                  :disable="!keys.some(free)" @click="removeMany(keys)" />
         </template>
       </SelectBar>
-      <table class="dp-table">
+      <table class="dp-table tab-flow">
         <thead>
           <tr><th class="dp-check"></th><th>Firmware</th><th>Category</th><th>Hardware</th><th>Version</th>
             <th class="num">Size</th><th></th></tr>
@@ -33,7 +34,7 @@
             <td>
               <div class="dp-name mono">{{ f.name }}</div>
               <div v-if="f.error" class="dp-bad">{{ f.error }}</div>
-              <div v-else-if="f.title" class="dp-sub">{{ f.title }}</div>
+              <div v-else-if="f.title" class="dp-sub">{{ keepUnits(f.title) }}</div>
               <div v-if="f.users?.length" class="dp-sub">held by {{ f.users.join(', ') }}</div>
             </td>
             <td class="mono">{{ f.category ?? '—' }}</td>
@@ -41,25 +42,53 @@
               <div>{{ f.hardware ? `virtual ${f.hardware}` : '—' }}</div>
               <div v-if="f.radio" class="dp-sub">virtual {{ f.radio.toUpperCase() }}</div>
             </td>
-            <td class="mono">{{ when(f.version) }}</td>
+            <td class="mono dp-nowrap">{{ when(f.version) }}</td>
             <td class="num mono">{{ sizeText(f.bytes) }}</td>
             <td class="dp-act">
               <q-btn flat dense round size="sm" :icon="matDeleteOutline"
-                     :disable="!!f.users?.length" @click="removeMany([f.name])">
-                <q-tooltip>{{ f.users?.length ? 'Held by a paused run or a snapshot' : 'Delete this firmware' }}</q-tooltip>
+                     :disable="!free(f.name)" @click="removeMany([f.name])">
+                <q-tooltip>{{ free(f.name) ? 'Delete this firmware' : 'Held by a snapshot' }}</q-tooltip>
               </q-btn>
             </td>
           </tr>
           <tr v-if="!catalog.firmware.length">
-            <td colspan="7" class="dp-sub">No firmware installed: add a zip, or a pre-built one.</td>
+            <td colspan="7" class="dp-sub">No firmware installed: import a zip, or download a pre-built one.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="tab-head tab-section">
+        <div class="tab-heading">Download pre-built firmware</div>
+        <q-space />
+        <q-btn flat dense no-caps label="Refresh" :loading="loadingPrebuilt" @click="loadPrebuilt" />
+      </div>
+      <div class="dp-text">From {{ index || 'sim-mesh.net' }}, for this server architecture.</div>
+      <div v-if="prebuiltError" class="dp-bad">{{ prebuiltError }}</div>
+      <table v-else class="dp-table tab-flow">
+        <tbody>
+          <tr v-for="p in prebuilt" :key="p.name">
+            <td>
+              <div class="dp-name mono">{{ p.name }}</div>
+              <div v-if="p.title" class="dp-sub">{{ keepUnits(p.title) }}</div>
+            </td>
+            <td class="mono">{{ p.category ?? '—' }}</td>
+            <td class="mono">{{ p.radio ?? '' }}</td>
+            <td class="dp-act">
+              <span v-if="p.installed" class="dp-ok">installed</span>
+              <q-btn v-else flat dense no-caps size="sm" color="primary" label="Add"
+                     :loading="fetching === p.name" @click="addPrebuilt(p)" />
+            </td>
+          </tr>
+          <tr v-if="!prebuilt.length && !loadingPrebuilt">
+            <td class="dp-sub">Nothing pre-built for this machine.</td>
           </tr>
         </tbody>
       </table>
     </div>
 
     <q-dialog v-model="adding">
-      <q-card style="min-width: 420px">
-        <q-card-section class="text-subtitle2">Add firmware from a zip</q-card-section>
+      <q-card style="min-width: min(420px, 92vw)">
+        <q-card-section class="text-subtitle2">Import a firmware zip</q-card-section>
         <q-card-section class="column q-gutter-sm">
           <q-file v-model="file" dense outlined label="firmware zip" accept=".zip,application/zip" />
           <div class="text-caption text-grey-6">
@@ -70,40 +99,7 @@
         </q-card-section>
         <q-card-actions align="right">
           <q-btn flat no-caps label="Cancel" v-close-popup />
-          <q-btn flat no-caps color="primary" label="Add" :loading="busy" :disable="!file" @click="doAdd" />
-        </q-card-actions>
-      </q-card>
-    </q-dialog>
-
-    <q-dialog v-model="prebuiltOpen">
-      <q-card style="min-width: 640px; max-width: 900px">
-        <q-card-section class="text-subtitle2">Add pre-built firmware</q-card-section>
-        <q-card-section>
-          <div class="dp-text">From {{ index || 'sim-mesh.net' }}, for this machine.</div>
-          <div v-if="prebuiltError" class="dp-bad">{{ prebuiltError }}</div>
-          <table v-else class="dp-table">
-            <tbody>
-              <tr v-for="p in prebuilt" :key="p.name">
-                <td>
-                  <div class="dp-name mono">{{ p.name }}</div>
-                  <div v-if="p.title" class="dp-sub">{{ p.title }}</div>
-                </td>
-                <td class="mono">{{ p.category ?? '—' }}</td>
-                <td class="mono">{{ p.radio ?? '' }}</td>
-                <td class="dp-act">
-                  <q-btn flat dense no-caps size="sm" :label="p.installed ? 'Installed' : 'Add'"
-                         :disable="p.installed" :loading="fetching === p.name" @click="addPrebuilt(p)" />
-                </td>
-              </tr>
-              <tr v-if="!prebuilt.length && !loadingPrebuilt">
-                <td class="dp-sub">Nothing pre-built for this machine.</td>
-              </tr>
-            </tbody>
-          </table>
-          <q-inner-loading :showing="loadingPrebuilt" />
-        </q-card-section>
-        <q-card-actions align="right">
-          <q-btn flat no-caps label="Close" v-close-popup />
+          <q-btn flat no-caps color="primary" label="Import" :loading="busy" :disable="!file" @click="doAdd" />
         </q-card-actions>
       </q-card>
     </q-dialog>
@@ -111,15 +107,18 @@
 </template>
 
 <script setup lang="ts">
-/* The firmware a script can run: installed from a zip, or from what
- * sim-mesh.net builds, and deleted unless something holds it. */
-import { onMounted, ref } from 'vue'
+/* The firmware a script can run: installed from a zip, or downloaded from
+ * what sim-mesh.net builds, listed below the installed ones. Deleting one a
+ * paused simulation holds stops that simulation for good, after a warning;
+ * one a snapshot holds is not deleted. */
+import { onMounted, ref, watch } from 'vue'
 import { useQuasar } from 'quasar'
 import { matDeleteOutline } from '@quasar/extras/material-icons'
 import { useCatalog } from '../stores/catalog'
+import { useSim } from '../stores/sim'
 import { request, upload } from '../lib/front'
 import { useSelection } from '../lib/selection'
-import { sizeText } from '../lib/size'
+import { keepUnits, sizeText } from '../lib/size'
 import SelectBar from '../components/SelectBar.vue'
 
 interface PrebuiltRow {
@@ -128,19 +127,23 @@ interface PrebuiltRow {
 }
 
 const catalog = useCatalog()
+const sim = useSim()
 const quasar = useQuasar()
 const sel = useSelection(() => catalog.firmware.map(f => f.name))
 const adding = ref(false)
 const file = ref<File | null>(null)
 const busy = ref(false)
-const prebuiltOpen = ref(false)
 const prebuilt = ref<PrebuiltRow[]>([])
 const prebuiltError = ref<string | null>(null)
 const loadingPrebuilt = ref(false)
 const fetching = ref<string | null>(null)
 const index = ref('')
 
-onMounted(() => { void catalog.refreshFirmware() })
+onMounted(() => { void catalog.refreshFirmware(); void loadPrebuilt() })
+
+/* Coming back to this tab asks again what holds each firmware: a simulation
+ * paused meanwhile does. */
+watch(() => sim.view, (v) => { if (v === 'firmware') void catalog.refreshFirmware() })
 
 /** A version as it reads: a build stamp as its date and time, a semver as it is. */
 function when(version?: string) {
@@ -152,28 +155,35 @@ function fail(error?: string) {
   quasar.notify({ type: 'negative', message: error ?? 'refused', timeout: 8000 })
 }
 
-/** A firmware nothing holds, which can be deleted. */
+/** A firmware no snapshot holds, which can be deleted; a paused simulation's
+ *  hold is ended by stopping it. */
 function free(name: string) {
-  return !catalog.firmware.find(f => f.name === name)?.users?.length
+  return !catalog.firmware.find(f => f.name === name)?.users?.some(u => u.startsWith('snapshot '))
 }
 
-/* Those of the names nothing holds, deleted after one confirmation that
- * says which are kept. */
+/* Those of the names no snapshot holds, deleted after one confirmation that
+ * says which are kept and which paused simulations are stopped. */
 function removeMany(names: string[]) {
   const go = names.filter(free)
   if (!go.length) return
   const kept = names.length - go.length
+  const stopping = [...new Set(catalog.firmware.filter(f => go.includes(f.name)).flatMap(f => f.paused ?? []))]
+  const stopText = stopping.length
+    ? ` The paused simulation${stopping.length === 1 ? '' : 's'} ${stopping.join(', ')} ${stopping.length === 1 ? 'needs' : 'need'} `
+      + `${go.length === 1 ? 'it' : 'them'} to resume, and ${stopping.length === 1 ? 'is' : 'are'} stopped for good.`
+    : ''
   quasar.dialog({
     title: go.length === 1 ? 'Delete firmware' : `Delete ${go.length} firmware`,
-    message: `Delete ${go.join(', ')}?${kept ? ` ${kept} held by a paused run or a snapshot ${kept === 1 ? 'is' : 'are'} kept.` : ''}`,
-    ok: { label: 'Delete', color: 'negative', flat: true, noCaps: true },
+    message: `Delete ${go.join(', ')}?${stopText}${kept ? ` ${kept} held by a snapshot ${kept === 1 ? 'is' : 'are'} kept.` : ''}`,
+    ok: { label: stopping.length ? 'Stop and delete' : 'Delete', color: 'negative', flat: true, noCaps: true },
     cancel: { flat: true, noCaps: true }, persistent: true,
   }).onOk(() => {
     void (async () => {
-      const r = await request('firmware_delete', { names: go })
+      const r = await request('firmware_delete', { names: go, stop_paused: stopping.length > 0 })
       if (!r.ok) fail(r.error)
       sel.none()
       await catalog.refreshFirmware()
+      void loadPrebuilt()
     })()
   })
 }
@@ -188,10 +198,10 @@ async function doAdd() {
   adding.value = false
   file.value = null
   await catalog.refreshFirmware()
+  void loadPrebuilt()
 }
 
-async function openPrebuilt() {
-  prebuiltOpen.value = true
+async function loadPrebuilt() {
   loadingPrebuilt.value = true
   prebuiltError.value = null
   const r = await request('firmware_prebuilt')
@@ -216,8 +226,6 @@ async function addPrebuilt(p: PrebuiltRow) {
 /* Its own height, the page container's, so a long list scrolls within it. */
 .dp { overflow-y: auto; height: 100%; }
 .dp-body { padding: 16px 20px 32px; max-width: 1100px; }
-.dp-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.dp-heading { font-size: 14px; font-weight: 500; color: #d1d5db; }
 .dp-text { font-size: 12px; color: #9ca3af; line-height: 1.5; margin-bottom: 12px; max-width: 760px; }
 .dp-text code { color: #cbd5e1; }
 .dp-table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -227,12 +235,14 @@ async function addPrebuilt(p: PrebuiltRow) {
 }
 .dp-table td { padding: 8px 10px; border-bottom: 1px solid #1f242c; vertical-align: top; }
 .dp-act { text-align: right; width: 1%; white-space: nowrap; }
-.dp-table .num { text-align: right; }
+.dp-table .num { text-align: right; white-space: nowrap; }
+.dp-nowrap { white-space: nowrap; }
 .dp-check { width: 28px; padding-left: 2px !important; padding-right: 0 !important; }
 .dp-chosen td { background: #172030; }
-.dp-name { font-weight: 500; color: #e5e7eb; }
+.dp-name { font-weight: 500; color: #e5e7eb; word-break: break-all; }
 .dp-sub { font-size: 11px; color: #6b7280; }
 .dp-bad { font-size: 11px; color: #fca5a5; }
+.dp-ok { font-size: 11px; color: #22c55e; }
 .dp-off td { color: #6b7280; }
 .mono { font-family: ui-monospace, monospace; font-size: 12px; }
 </style>

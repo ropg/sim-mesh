@@ -1,4 +1,5 @@
-# The antennas a node can carry: generic representatives of each kind at 868 MHz.
+# The antennas a node can carry: generic representatives of each kind for the
+# sub-GHz bands (433, 868 and 915 MHz), each pattern the same on all three.
 #
 # Each is a pattern, gain in dBi by direction, from a handful of figures
 # (antennas.py says how they combine):
@@ -16,7 +17,7 @@
 
 wire_quarter_wave:
   label: Quarter-wave wire
-  description: Bare ~8.2 cm wire soldered to the RF pad, the classic DIY node antenna
+  description: Bare wire a quarter wave long (about 8 cm at 868 MHz) soldered to the RF pad, the classic DIY node antenna
   kind: omni
   peak_dbi: 1.0
   vbw_deg: 80

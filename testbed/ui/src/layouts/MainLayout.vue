@@ -10,7 +10,8 @@
             <!-- A click goes to the list of geodata, from a preview's map too. -->
             <q-tab name="geodata" label="Geodata" @click="sim.geodataList++" />
           </template>
-          <q-tab name="nodes" label="Nodes" />
+          <!-- On it with a nodeset open, the tab goes back to the list of nodesets. -->
+          <q-tab name="nodes" label="Nodes" @mousedown="sim.view === 'nodes' && sim.nodesList++" />
           <template v-if="socket.front">
             <q-tab name="scripts" label="Scripts" />
             <!-- On it with a simulation open, the tab goes back to the list. On
@@ -20,7 +21,8 @@
           </template>
         </q-tabs>
         <span v-if="socket.front && nodes.geodata" class="sim-geodata"
-              title="The geodata open on the Nodes tab">{{ `geodata ${nodes.geodata}` }}</span>
+              title="The geodata chosen, and the nodeset open on the Nodes tab">{{
+                `geo:${nodes.geodata}${nodes.nodeset?.name ? ` nodes:${nodes.nodeset.name}` : ''}` }}</span>
         <span class="sim-link" :class="{ 'sim-link-off': !socket.connected }">
           {{ socket.connected ? 'connected' : 'reconnecting…' }}
         </span>
@@ -151,7 +153,7 @@ watch(() => sim.notices.length, () => {
   background: #171b21; border-top: 1px solid #262c35; font-size: 11px; color: #9ca3af;
 }
 .sim-status-on { color: #22c55e; }
-.sim-status-sim { margin-left: 8px; color: #7dd3fc; cursor: pointer; }
+.sim-status-sim { margin-left: 8px; color: var(--q-primary); cursor: pointer; }
 .sim-status-sim:hover { text-decoration: underline; }
 .sim-status-dim { color: #6b7280; }
 .sim-status-scripts { color: #9ca3af; }

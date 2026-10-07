@@ -28,6 +28,7 @@ import front  # noqa: E402
 import geodata  # noqa: E402
 import nodeset  # noqa: E402
 import proxy  # noqa: E402
+import runs  # noqa: E402
 import sources  # noqa: E402
 import store  # noqa: E402
 import webrtc  # noqa: E402
@@ -456,7 +457,7 @@ def test_the_editors_list_open_and_save(stores):
         reply = await ask(ws, "antenna_list")
         kinds = {a["type"]: a for a in reply["antennas"]}
         assert kinds["yagi_directional"]["kind"] == "directional"
-        assert kinds["wire_quarter_wave"]["description"].startswith("Bare ~8.2 cm wire")
+        assert kinds["wire_quarter_wave"]["description"].startswith("Bare wire a quarter wave long")
         assert all(a["svg"].startswith("<svg") for a in reply["antennas"])
         sims = await ask(ws, "sims")
         assert "script_runs" in sims and sims["nodesets"] == ["copy", "here", "there"]
@@ -550,6 +551,16 @@ def test_firmware_and_a_pack_are_added_over_http(stores):
         reply = await ask(ws, "firmware_delete", names=[name])
         assert reply["ok"] and reply["deleted"] == [name]
         assert [r["name"] for r in (await ask(ws, "firmware_list"))["firmware"]] == [held]
+        # A paused simulation the front lists holds it: refused without
+        # stop_paused, and with it that simulation is stopped for good first.
+        f.paused["lora"] = runs.Run(str(paused))
+        rows = {r["name"]: r for r in (await ask(ws, "firmware_list"))["firmware"]}
+        assert rows[held]["paused"] == ["lora"]
+        reply = await ask(ws, "firmware_delete", names=[held])
+        assert not reply["ok"] and "paused simulation lora holds it" in reply["error"]
+        reply = await ask(ws, "firmware_delete", names=[held], stop_paused=True)
+        assert reply["ok"] and reply["deleted"] == [held] and reply["stopped"] == ["lora"]
+        assert "lora" not in f.paused and not (paused / "paused").exists()
 
         pack = io.BytesIO()
         with zipfile.ZipFile(pack, "w") as zf:
@@ -576,7 +587,7 @@ def test_firmware_and_a_pack_are_added_over_http(stores):
     running_front(check)
 
 
-# ---- layers: a public node map imported, shown layers saved as one ------------
+# ---- nodesets: a public node map imported, several saved as one ---------------
 
 FAKE_NODES_JOB = r'''#!/usr/bin/env python3
 import json, sys
@@ -591,7 +602,7 @@ print(json.dumps({"nodes": [dict(r, position="gps") for r in inside
 '''
 
 
-def test_a_node_map_becomes_a_layer_and_shown_layers_save_as_one(stores, monkeypatch):
+def test_a_node_map_becomes_a_nodeset_and_several_save_as_one(stores, monkeypatch):
     job = stores / "planner-job"
     job.write_text(FAKE_NODES_JOB)
     job.chmod(0o755)

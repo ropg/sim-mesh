@@ -10,7 +10,7 @@ front: size and sha256 checked; a pack expanded as Import zip expands one, a nod
 
     index: sim-mesh-examples              # a usable name
     title: sim-mesh examples
-    description: |                        # what the collection is, printed as it stands
+    description: |                        # what the collection is
       These examples will soon include some varied geographies and nodesets.
       …
     release: sim-mesh/sim-mesh:examples   # where publish puts its files (Publishing)
@@ -35,8 +35,8 @@ front: size and sha256 checked; a pack expanded as Import zip expands one, a nod
 
 `name`, `url` and `sha256` are an entry's own; everything else is what the
 page shows. The index's `description` is text about the whole collection,
-which the page shows under the index's name and `sim index list` prints,
-its line breaks kept. A key this module does not know is passed over.
+which `sim index list` prints with its line breaks kept and the page shows
+under the index's name reflowed, a blank line parting paragraphs. A key this module does not know is passed over.
 
 **An entry is immutable.** Its sha256 is what it is, and two machines that
 installed it stand on the same bytes, which is what makes a test on standard
