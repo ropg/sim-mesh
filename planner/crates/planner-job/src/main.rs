@@ -14,9 +14,12 @@
 use planner_import::meshcore_map::{self, MapBbox, MapFilter, MeshCoreKind};
 use planner_import::potatomesh::{self, NodeFilter};
 use planner_import::PositionQuality;
-use planner_pack::build::{build, BuildParams, CityJsonInput, PopulationInput, Progress};
+use planner_pack::build::{
+    build, BuildParams, CityJsonInput, PopulationGrid, PopulationInput, Progress,
+};
 use planner_pack::cityjson::Heights;
 use planner_pack::elevation::ElevationInput;
+use planner_pack::landcover::{ClutterClass, LandcoverInput};
 use planner_pack::zensus::GridCsv;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -84,8 +87,9 @@ struct PackBuild {
     res_m: f64,
     utm_zone: u8,
     dsm_tiles: Vec<PathBuf>,
+    /// Land cover sources, each over the ones before it.
     #[serde(default)]
-    worldcover_tiles: Vec<PathBuf>,
+    landcover: Vec<LandcoverJob>,
     #[serde(default)]
     itu_maps_dir: Option<PathBuf>,
     #[serde(default)]
@@ -98,7 +102,7 @@ struct PackBuild {
     osm_buildings: bool,
     #[serde(default)]
     berlin_1m_dir: Option<PathBuf>,
-    /// A population grid as CSV, in its own system.
+    /// A population grid as CSV or as a GeoTIFF, in its own system.
     #[serde(default)]
     population: Option<PopulationJob>,
     /// Terrain and surface GeoTIFF pairs, each in its own system.
@@ -111,16 +115,38 @@ struct PackBuild {
     threads: usize,
 }
 
-/// {csv, proj, delimiter, x, y, value, cell_m, source, notice}
+/// {csv, proj, delimiter, x, y, value, cell_m, source, notice}, or
+/// {raster, proj, nodata?, source, notice}
 #[derive(Debug, Deserialize)]
-struct PopulationJob {
-    csv: PathBuf,
+#[serde(untagged)]
+enum PopulationJob {
+    Csv {
+        csv: PathBuf,
+        proj: String,
+        delimiter: String,
+        x: String,
+        y: String,
+        value: String,
+        cell_m: f64,
+        source: String,
+        notice: String,
+    },
+    Raster {
+        raster: PathBuf,
+        proj: String,
+        #[serde(default)]
+        nodata: Option<f32>,
+        source: String,
+        notice: String,
+    },
+}
+
+/// {tiles: [path], proj, classes: [[code, clutter class code]], source, notice}
+#[derive(Debug, Deserialize)]
+struct LandcoverJob {
+    tiles: Vec<PathBuf>,
     proj: String,
-    delimiter: String,
-    x: String,
-    y: String,
-    value: String,
-    cell_m: f64,
+    classes: Vec<(u32, u8)>,
     source: String,
     notice: String,
 }
@@ -183,28 +209,29 @@ fn pack_build(input: &str) -> Result<Value, String> {
         lod2_dir: job.lod2_dir,
         lod2_geometry: true,
         population: match job.population {
-            Some(p) => {
-                let mut chars = p.delimiter.chars();
-                let (Some(delimiter), None) = (chars.next(), chars.next()) else {
+            Some(PopulationJob::Csv { csv, proj, delimiter, x, y, value, cell_m, source, notice }) => {
+                let mut chars = delimiter.chars();
+                let (Some(one), None) = (chars.next(), chars.next()) else {
                     return Err(format!(
-                        "the population grid's delimiter {:?} is not one character",
-                        p.delimiter
+                        "the population grid's delimiter {delimiter:?} is not one character"
                     ));
                 };
                 Some(PopulationInput {
-                    csv: p.csv,
-                    proj: p.proj,
-                    layout: GridCsv {
-                        delimiter,
-                        x: p.x,
-                        y: p.y,
-                        value: p.value,
-                        cell_m: p.cell_m,
+                    grid: PopulationGrid::Csv {
+                        csv,
+                        layout: GridCsv { delimiter: one, x, y, value, cell_m },
                     },
-                    source: p.source,
-                    notice: p.notice,
+                    proj,
+                    source,
+                    notice,
                 })
             }
+            Some(PopulationJob::Raster { raster, proj, nodata, source, notice }) => Some(PopulationInput {
+                grid: PopulationGrid::Raster { path: raster, nodata },
+                proj,
+                source,
+                notice,
+            }),
             None => None,
         },
         elevation: job
@@ -227,7 +254,26 @@ fn pack_build(input: &str) -> Result<Value, String> {
             source: c.source,
             notice: c.notice,
         }),
-        worldcover_tiles: job.worldcover_tiles,
+        landcover: {
+            let mut out = Vec::new();
+            for l in job.landcover {
+                let mut classes = Vec::new();
+                for (code, class) in l.classes {
+                    let Some(class) = ClutterClass::from_code(class) else {
+                        return Err(format!("{}: {class} is no clutter class code", l.source));
+                    };
+                    classes.push((code, class));
+                }
+                out.push(LandcoverInput {
+                    tiles: l.tiles,
+                    proj: l.proj,
+                    classes,
+                    source: l.source,
+                    notice: l.notice,
+                });
+            }
+            out
+        },
         osm_pbf: job.osm_pbf,
         osm_buildings: job.osm_buildings,
         threads: job.threads,

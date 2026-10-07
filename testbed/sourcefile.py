@@ -24,8 +24,9 @@ sources.py plans and fetches from what it reads.
 **The compiler reads what it reads.** Until it takes its readers' parameters
 from a source, a format's parameters must be the ones its reader assumes:
 an `xyz` or `citygml` the German state surveys' layout in EPSG:25833, a
-landcover `geotiff` WorldCover's classes, a worldwide surface EPSG:4326. A source that asks for anything
-else is refused here, rather than read wrongly in a build.
+worldwide surface EPSG:4326. A source that asks for anything else is refused
+here, rather than read wrongly in a build. A land cover GeoTIFF names its
+own classes, and any GeoTIFF its own system.
 
 Run as a script it is `sim source`: `check` reads every file and says what
 is wrong, `outline ID` writes a source's outline from its own feed, or
@@ -47,7 +48,7 @@ sys.path.insert(0, HERE)
 import crs as crs_module  # noqa: E402
 import store  # noqa: E402
 
-KNOWN_CRS = "EPSG:4326, UTM 326zz/327zz/258zz, 3035, 28992, 7415"
+KNOWN_CRS = "EPSG:4326, 4269, UTM 326zz/327zz/258zz/269zz, 3035, 5070, 28992, 7415"
 SIM_MESH_ROOT = os.path.dirname(HERE)
 SHIPPED = os.path.join(SIM_MESH_ROOT, "sources", "sources.yaml")
 OWN = os.path.join(store.SIM_DIR, "sources.yaml")
@@ -59,10 +60,16 @@ CONTINENTS = ("africa", "antarctica", "asia", "europe", "north-america", "oceani
 COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 LAYERS = ("surface", "terrain", "landcover", "buildings", "population", "roads", "places",
           "radio-climate")
+# In the order of their codes in a pack's ClutterClass layer (planner-core's
+# ClutterClass::code).
 CLUTTER_CLASSES = ("open", "water", "low-vegetation", "forest", "suburban", "urban",
                    "dense-urban", "industrial")
 COVERAGES = ("worldwide", "outline")
 READS = ("whole", "window")
+# A template's tile is named by one of its corners, its hemisphere letters
+# in one case.
+CORNERS = ("south-west", "north-west")
+LETTERS = ("upper", "lower")
 METHODS = {
     # method: (parameters it needs, its addresses, which may each be a list of mirrors)
     "template": (("url", "tile", "crs"), ("url",)),
@@ -76,7 +83,7 @@ CRS_RE = re.compile(r"^EPSG:(\d+)$")
 TILE_FIELD_RE = re.compile(r"\{(ns|ew|lat|lon)(?::0(\d))?\}")
 FORMATS = {
     # format: the layers it can feed
-    "geotiff": ("surface", "terrain", "landcover"),
+    "geotiff": ("surface", "terrain", "landcover", "population"),
     "xyz": ("surface", "terrain"),
     "citygml": ("buildings",),
     "cityjson": ("buildings",),
@@ -93,9 +100,6 @@ FORMAT_NEEDS = {
 }
 # What the compiler's readers assume, which a source's parameters must be
 # until it takes them from the source.
-WORLDCOVER_CLASSES = {10: "forest", 20: "low-vegetation", 30: "low-vegetation", 40: "open",
-                      50: "urban", 60: "open", 70: "open", 80: "water", 90: "low-vegetation",
-                      95: "low-vegetation", 100: "open"}
 COMPILER_READS = {
     "xyz": {"crs": "EPSG:25833", "spacing_m": 1},
     "citygml": {"lod": 2, "crs": "EPSG:25833"},
@@ -239,6 +243,8 @@ def _check(source):
     if e["read"] == "window" and (e["format"]["type"] != "geotiff" or e["coverage"] == "worldwide"):
         raise _fault(path, ident, "a window is read of a regional source's cloud-optimised "
                                   "GeoTIFFs")
+    if e["read"] == "window" and e["find"]["method"] not in ("index", "template"):
+        raise _fault(path, ident, "a window is read of the files an index or a template finds")
 
 
 def _check_find(source):
@@ -265,14 +271,18 @@ def _check_find(source):
         if any("{tile}" not in u for u in source.addresses("url")):
             raise _fault(path, ident, "a template's url holds {tile}")
         size = find.get("size_deg")
-        if find["crs"] != "EPSG:4326" or not isinstance(size, int) or isinstance(size, bool) \
-                or size < 1:
+        if not crs_module.geographic(find["crs"]) or not isinstance(size, int) \
+                or isinstance(size, bool) or size < 1:
             raise _fault(path, ident, "a template's tiles are a whole number of degrees "
-                                      "(size_deg) of EPSG:4326")
+                                      "(size_deg) of EPSG:4326 or 4269")
         fields = {m.group(1) for m in TILE_FIELD_RE.finditer(find["tile"])}
         if fields != {"ns", "ew", "lat", "lon"}:
             raise _fault(path, ident, "a template's tile names its corner with {ns}, {lat}, "
                                       "{ew} and {lon}")
+        if find.get("corner", CORNERS[0]) not in CORNERS:
+            raise _fault(path, ident, "a template's corner is %s" % " or ".join(CORNERS))
+        if find.get("letters", LETTERS[0]) not in LETTERS:
+            raise _fault(path, ident, "a template's letters are %s" % " or ".join(LETTERS))
     elif method == "atom":
         try:
             pattern = re.compile(find["name"])
@@ -282,10 +292,9 @@ def _check_find(source):
             raise _fault(path, ident, "find.name has the groups (?P<x>…) and (?P<y>…)")
         if not (_number(find["unit_m"]) and _number(find["size_m"])):
             raise _fault(path, ident, "unit_m and size_m are numbers of metres")
-        epsg = int(CRS_RE.match(find["crs"]).group(1))
-        if not (32601 <= epsg <= 32660 or 32701 <= epsg <= 32760 or 25801 <= epsg <= 25860):
+        if crs_module._utm(int(CRS_RE.match(find["crs"]).group(1))) is None:
             raise _fault(path, ident, "an atom feed's tiles are in a UTM zone (326zz, 327zz, "
-                                      "258zz)")
+                                      "258zz, 269zz)")
     elif method in ("regions", "index"):
         if find["index_format"] not in INDEX_FORMATS[method]:
             raise _fault(path, ident, "a %s source's index_format is one of %s"
@@ -303,6 +312,9 @@ def _check_format(source):
     if not isinstance(fmt, dict) or fmt.get("type") not in FORMATS:
         raise _fault(path, ident, "format.type is one of %s" % ", ".join(FORMATS))
     kind = fmt["type"]
+    if "crs" in fmt and not crs_module.known(fmt["crs"]):
+        raise _fault(path, ident, "format.crs %s is not a system sim-mesh knows (%s)"
+                     % (fmt["crs"], KNOWN_CRS))
     for layer in e["layers"]:
         if layer not in FORMATS[kind]:
             raise _fault(path, ident, "a %s file feeds %s, not %s"
@@ -312,33 +324,29 @@ def _check_format(source):
         if not isinstance(classes, dict) or not classes:
             raise _fault(path, ident, "a landcover geotiff maps its codes: classes {code: class}")
         for code, name in classes.items():
+            if not re.match(r"^\d+$", str(code)) or int(code) > 0xFFFF:
+                raise _fault(path, ident, "a land cover code is a whole number, not %r" % (code,))
             if name not in CLUTTER_CLASSES:
                 raise _fault(path, ident, "%r is no clutter class (%s)"
                              % (name, ", ".join(CLUTTER_CLASSES)))
-        if {int(k): v for k, v in classes.items()} != WORLDCOVER_CLASSES:
-            raise _fault(path, ident, "the compiler reads land cover as WorldCover's classes "
-                                      "only, so far")
     if kind == "geotiff":
+        if len(e["layers"]) > 1:
+            raise _fault(path, ident, "a GeoTIFF feeds one layer")
         heights = {"surface", "terrain"} & set(e["layers"])
-        if heights and len(e["layers"]) > 1:
-            raise _fault(path, ident, "a GeoTIFF of heights feeds surface or terrain, one of them")
-        if "landcover" in e["layers"] or e["coverage"] == "worldwide":
-            # Read through the GLO-30 and WorldCover paths: tiles in degrees.
-            if e["find"].get("crs") not in (None, "EPSG:4326"):
-                raise _fault(path, ident, "the compiler reads land cover, and a worldwide "
-                                          "surface, as GeoTIFF tiles in EPSG:4326, so far")
-            if e["coverage"] == "worldwide" and heights != {"surface"} and heights:
+        if e["coverage"] == "worldwide" and heights:
+            # Read through the GLO-30 path: tiles in degrees, the ground split.
+            if proj_of(source) != crs_module.proj("EPSG:4326"):
+                raise _fault(path, ident, "the compiler reads a worldwide surface as GeoTIFF "
+                                          "tiles in EPSG:4326, so far")
+            if heights != {"surface"}:
                 raise _fault(path, ident, "a worldwide GeoTIFF of heights is a surface, the "
                                           "ground the compiler splits")
     for key in FORMAT_NEEDS.get(kind, ()):
         if fmt.get(key) in (None, ""):
             raise _fault(path, ident, "a %s format needs %s" % (kind, key))
-    if "crs" in fmt and not crs_module.known(fmt["crs"]):
-        raise _fault(path, ident, "format.crs %s is not a system sim-mesh knows (%s)"
-                     % (fmt["crs"], KNOWN_CRS))
     if "nodata" in fmt and (kind != "geotiff" or not _number(fmt["nodata"])):
-        raise _fault(path, ident, "format.nodata is the number a GeoTIFF of heights writes "
-                                  "where it has none")
+        raise _fault(path, ident, "format.nodata is the number a GeoTIFF writes where it has "
+                                  "none")
     if kind == "csv-grid" and len(str(fmt["delimiter"])) != 1:
         raise _fault(path, ident, "a csv-grid's delimiter is one character")
     if kind in ("csv-grid", "gpkg-grid") and not (_number(fmt["cell_m"]) and fmt["cell_m"] > 0):
@@ -358,7 +366,13 @@ def _check_format(source):
 def proj_of(source):
     """The proj string a source's files are read in by the compiler: its
     format's system, else its finding method's."""
-    return crs_module.proj(source.format.get("crs") or source.find.get("crs") or "EPSG:4326")
+    return crs_module.proj(crs_of(source))
+
+
+def crs_of(source):
+    """The system a source's files are in: its format's, else its finding
+    method's, else degrees."""
+    return source.format.get("crs") or source.find.get("crs") or "EPSG:4326"
 
 
 def _load_outline(source):
@@ -501,7 +515,8 @@ def main(argv=None):
     p = sub.add_parser("outline", help="write a source's outline: an atom feed's tiles, or a "
                                        "Geofabrik region's outline")
     p.add_argument("id")
-    p.add_argument("--geofabrik", metavar="REGION", help="the outline of this Geofabrik region")
+    p.add_argument("--geofabrik", metavar="REGION", nargs="+",
+                   help="the outline of this Geofabrik region, or of these together")
     args = ap.parse_args(argv)
     try:
         if args.verb == "check":
@@ -524,11 +539,14 @@ def main(argv=None):
                         index = await cache.regions_index(next(
                             s for s in raw if (s.find or {}).get("method") == "regions"
                             and (s.find or {}).get("index_format") == "geofabrik"))
-                        geometry = sources_module.outline(index, args.geofabrik)
-                        if geometry is None:
-                            raise SourceFault("Geofabrik has no region %s" % args.geofabrik)
-                        return geometry, ("outline © OpenStreetMap contributors, ODbL 1.0, "
-                                          "by Geofabrik")
+                        polygons = []
+                        for region in args.geofabrik:
+                            geometry = sources_module.outline(index, region)
+                            if geometry is None:
+                                raise SourceFault("Geofabrik has no region %s" % region)
+                            polygons += sources_module._rings(geometry)
+                        return {"type": "MultiPolygon", "coordinates": polygons}, (
+                            "outline © OpenStreetMap contributors, ODbL 1.0, by Geofabrik")
                     if source.find.get("method") != "atom":
                         raise SourceFault("%s finds no tiles to outline: give --geofabrik REGION"
                                           % source.id)

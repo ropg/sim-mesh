@@ -2,8 +2,10 @@
 //! into terrain and clutter, with whatever else the build is given merged in
 //! (buildings from CityGML LoD2 or CityJSON where their tiles cover the grid
 //! and from OpenStreetMap everywhere else; measured terrain and surface from
-//! Berlin's 1 m XYZ or from GeoTIFFs in any projection; WorldCover land
-//! cover; a population grid; OpenStreetMap roads and places), and the manifest.
+//! Berlin's 1 m XYZ or from GeoTIFFs in any projection, or a measured
+//! terrain alone in place of the split's; land cover through each source's class
+//! table; a population grid or raster; OpenStreetMap roads and places), and
+//! the manifest.
 //!
 //! Every input is a file already on disk; the compiler never reaches the
 //! network. `planner-job pack-build` is its caller.
@@ -65,14 +67,29 @@ impl Steps<'_> {
     }
 }
 
-/// A population grid: its CSV, the grid's system (a proj string), the CSV's
-/// layout, and the source's name and notice for the manifest.
+/// A population grid: its file, the grid's system (a proj string), and the
+/// source's name and notice for the manifest.
 pub struct PopulationInput {
-    pub csv: PathBuf,
+    pub grid: PopulationGrid,
     pub proj: String,
-    pub layout: crate::zensus::GridCsv,
     pub source: String,
     pub notice: String,
+}
+
+/// A population grid's file: a CSV of cells and its layout, or a GeoTIFF of
+/// people per pixel and the number it writes where it has none.
+pub enum PopulationGrid {
+    Csv { csv: PathBuf, layout: crate::zensus::GridCsv },
+    Raster { path: PathBuf, nodata: Option<f32> },
+}
+
+impl PopulationInput {
+    fn path(&self) -> &PathBuf {
+        match &self.grid {
+            PopulationGrid::Csv { csv, .. } => csv,
+            PopulationGrid::Raster { path, .. } => path,
+        }
+    }
 }
 
 /// CityJSON buildings: a directory of `.json` files, their system, which
@@ -121,18 +138,22 @@ pub struct BuildParams {
     /// the difference between colouring a street and colouring a 5 m cell
     /// that is part street and part Vorderhaus.
     pub lod2_geometry: bool,
-    /// A population grid as CSV (Zensus 2022's, or CBS's as the front
-    /// writes it): Population layer for household-weighted siting.
+    /// A population grid, as CSV (Zensus 2022's, or CBS's as the front
+    /// writes it) or as a GeoTIFF (WorldPop's): Population layer for
+    /// household-weighted siting.
     pub population: Option<PopulationInput>,
     /// Terrain and surface GeoTIFFs in their own system (AHN's DTM and DSM):
     /// where they cover a cell, both halves measured, as Berlin's 1 m pairs.
+    /// A terrain alone (3DEP's) replaces only the split's terrain; each cell
+    /// keeps its clutter.
     pub elevation: Vec<crate::elevation::ElevationInput>,
     /// CityJSON buildings (3DBAG's tiles): the same sidecar and clutter
     /// merge LoD2 fills, OpenStreetMap's left out where they cover.
     pub cityjson: Option<CityJsonInput>,
-    /// ESA WorldCover tiles (EPSG:4326 COGs): ClutterClass layer for
-    /// per-class calibration.
-    pub worldcover_tiles: Vec<PathBuf>,
+    /// Land cover GeoTIFFs, each through its own class table (WorldCover's
+    /// tiles, NLCD's raster): ClutterClass layer for per-class calibration.
+    /// A later source's class stands over an earlier one's where it has one.
+    pub landcover: Vec<crate::landcover::LandcoverInput>,
     /// OpenStreetMap PBF extract holding the region (`osm.rs`): the roads
     /// layer and the gazetteer, and the buildings when `osm_buildings`.
     pub osm_pbf: Option<PathBuf>,
@@ -190,7 +211,7 @@ impl BuildParams {
             population: None,
             elevation: Vec::new(),
             cityjson: None,
-            worldcover_tiles: Vec::new(),
+            landcover: Vec::new(),
             osm_pbf: None,
             osm_buildings: false,
             threads: 0,
@@ -230,6 +251,10 @@ fn to_lonlat(proj: &Proj, ll: &Proj, x: f64, y: f64) -> Result<(f64, f64), PackE
 pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     let utm = utm_proj(params.utm_zone)?;
     let ll = longlat_proj()?;
+    let pack = crate::system::System::new(&format!(
+        "+proj=utm +zone={} +ellps=WGS84 +datum=WGS84 +units=m +no_defs",
+        params.utm_zone
+    ))?;
 
     let n_threads = init_threads(params.threads);
     eprintln!("pack build: {n_threads} worker threads");
@@ -272,7 +297,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         check(params.itu_maps_dir.as_ref(), "itu_maps_dir", true);
         check(params.berlin_1m_dir.as_ref(), "berlin_1m_dir", true);
         check(params.lod2_dir.as_ref(), "lod2_dir", true);
-        check(params.population.as_ref().map(|p| &p.csv), "population csv", false);
+        check(params.population.as_ref().map(|p| p.path()), "population grid", false);
         check(params.cityjson.as_ref().map(|c| &c.dir), "cityjson dir", true);
         for e in &params.elevation {
             for p in e.terrain.iter().chain(&e.surface) {
@@ -280,8 +305,10 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
             }
         }
         check(params.osm_pbf.as_ref(), "osm_pbf", false);
-        for p in &params.worldcover_tiles {
-            check(Some(p), "worldcover_tiles", false);
+        for l in &params.landcover {
+            for p in &l.tiles {
+                check(Some(p), "landcover tile", false);
+            }
         }
         if !missing.is_empty() {
             return Err(PackError::Invalid(format!(
@@ -306,7 +333,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
             (params.lod2_dir.is_some() || params.cityjson.is_some() || params.osm_buildings)
                 .then_some("buildings"),
             (params.berlin_1m_dir.is_some() || !params.elevation.is_empty()).then_some("lidar"),
-            (!params.worldcover_tiles.is_empty()).then_some("landcover"),
+            (!params.landcover.is_empty()).then_some("landcover"),
             Some("clutter"),
             params.population.as_ref().map(|_| "population"),
             Some("manifest"),
@@ -839,18 +866,25 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     // Terrain and surface rasters in their own system (AHN), where they
     // cover a cell with at least a quarter of its samples: both halves
     // measured, as the 1 m pairs, and over any building source's clutter.
+    // A terrain alone (3DEP) replaces only the terrain: the cell keeps the
+    // clutter it had (GLO-30's split, or its measured buildings), since a
+    // surface from one survey less a terrain from another is no height of
+    // anything. Its clutter is unchanged, so its quality stays what it was.
     let mut used_elevation: Vec<&crate::elevation::ElevationInput> = Vec::new();
     for (i, input) in params.elevation.iter().enumerate() {
-        let got = crate::elevation::sample(input, origin, res, nx, ny, &utm)?;
+        let got = crate::elevation::sample(input, origin, res, nx, ny, &pack)?;
+        let alone = input.surface.is_empty();
         let mut overridden = 0usize;
         for c in 0..nx * ny {
             if got.count[c] == 0 || got.count[c] * 4 < got.per_cell {
                 continue;
             }
             dtm.data[c] = got.terrain[c];
-            clutter.data[c] = got.clutter[c].max(0.0);
-            measured_clutter[c] = true;
-            raise(&mut quality[c], DataQuality::LidarRaster);
+            if !alone {
+                clutter.data[c] = got.clutter[c].max(0.0);
+                measured_clutter[c] = true;
+                raise(&mut quality[c], DataQuality::LidarRaster);
+            }
             overridden += 1;
         }
         eprintln!(
@@ -870,38 +904,42 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         steps.end("lidar");
     }
 
-    // WorldCover clutter-class layer (categorical; nearest-neighbor codes).
-    let mut used_worldcover = false;
+    // Clutter-class layer (categorical; nearest-neighbour codes), each land
+    // cover source over the ones before it where it has a class.
+    let mut used_landcover: Vec<&crate::landcover::LandcoverInput> = Vec::new();
     let mut class_codes: Option<Vec<f32>> = None;
-    if !params.worldcover_tiles.is_empty() {
+    if !params.landcover.is_empty() {
         steps.begin("landcover");
-        // Validate once; workers open their own readers (as with the DSM).
-        crate::worldcover::WorldCoverTiles::open(&params.worldcover_tiles)?;
         let mut codes = vec![f32::NAN; nx * ny];
-        codes.par_chunks_mut(nx).with_min_len(64).enumerate().for_each_init(
-            || {
-                crate::worldcover::WorldCoverTiles::open(&params.worldcover_tiles)
-                    .expect("validated above")
-            },
-            |wc, (row, out_row)| {
-                let y = origin.y - row as f64 * res;
-                for (col, out) in out_row.iter_mut().enumerate() {
-                    let x = origin.x + col as f64 * res;
-                    let Ok((lon, lat)) = to_lonlat(&utm, &ll, x, y) else { continue };
-                    if let Ok(Some(class)) = wc.class_at(lon, lat) {
-                        *out = class.code() as f32;
+        for input in &params.landcover {
+            // Validate once; workers open their own readers (as with the DSM).
+            crate::landcover::LandcoverTiles::open(input)?;
+            let hits = std::sync::atomic::AtomicUsize::new(0);
+            codes.par_chunks_mut(nx).with_min_len(64).enumerate().for_each_init(
+                || crate::landcover::LandcoverTiles::open(input).expect("validated above"),
+                |tiles, (row, out_row)| {
+                    let y = origin.y - row as f64 * res;
+                    for (col, out) in out_row.iter_mut().enumerate() {
+                        let x = origin.x + col as f64 * res;
+                        if let Ok(Some(class)) = tiles.class_at(&pack, x, y) {
+                            *out = class.code() as f32;
+                            hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
-                }
-            },
-        );
-        let hits = codes.iter().filter(|v| v.is_finite()).count();
-        if hits > 0 {
+                },
+            );
+            let hits = hits.into_inner();
+            eprintln!("{}: {hits}/{} cells classified", input.source, nx * ny);
+            if hits > 0 {
+                used_landcover.push(input);
+            }
+        }
+        if !used_landcover.is_empty() {
             let grid = Grid::with_axes(origin, res, -res, nx, ny, codes)
                 .map_err(PackError::Terrain)?;
             write_geotiff_f32(&params.out_dir.join("clutter_class.tif"), &grid)?;
             class_codes = Some(grid.data);
-            used_worldcover = true;
-            eprintln!("worldcover: {hits}/{} cells classified → clutter_class.tif", nx * ny);
+            eprintln!("land cover → clutter_class.tif");
         }
         steps.end("landcover");
     }
@@ -1045,28 +1083,44 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     steps.end("clutter");
 
     // Population layer (persons per pack cell), from a grid in its own
-    // system: Zensus's in EPSG:3035, CBS's in RD New.
+    // system: Zensus's in EPSG:3035, CBS's in RD New, WorldPop's raster in
+    // degrees.
     let mut used_population = false;
     if let Some(input) = &params.population {
         steps.begin("population");
-        let grid_proj = Proj::from_proj_string(&input.proj)
-            .map_err(|e| PackError::Proj(format!("{}: {e}", input.proj)))?;
         let mut pop = vec![0f32; nx * ny];
-        let total = crate::zensus::accumulate_population(
-            std::fs::File::open(&input.csv)?,
-            &input.layout,
-            |x, y| {
-                let mut pt = (x, y, 0.0);
-                proj4rs::transform::transform(&grid_proj, &ll, &mut pt)
-                    .map_err(|e| PackError::Proj(format!("grid→ll: {e}")))?;
-                proj4rs::transform::transform(&ll, &utm, &mut pt)
-                    .map_err(|e| PackError::Proj(format!("ll→utm: {e}")))?;
-                Ok((pt.0, pt.1))
-            },
-            cell_of,
-            res,
-            &mut pop,
-        )?;
+        let total = match &input.grid {
+            PopulationGrid::Csv { csv, layout } => {
+                let grid_proj = Proj::from_proj_string(&input.proj)
+                    .map_err(|e| PackError::Proj(format!("{}: {e}", input.proj)))?;
+                crate::zensus::accumulate_population(
+                    std::fs::File::open(csv)?,
+                    layout,
+                    |x, y| {
+                        let mut pt = (x, y, 0.0);
+                        proj4rs::transform::transform(&grid_proj, &ll, &mut pt)
+                            .map_err(|e| PackError::Proj(format!("grid→ll: {e}")))?;
+                        proj4rs::transform::transform(&ll, &utm, &mut pt)
+                            .map_err(|e| PackError::Proj(format!("ll→utm: {e}")))?;
+                        Ok((pt.0, pt.1))
+                    },
+                    cell_of,
+                    res,
+                    &mut pop,
+                )?
+            }
+            PopulationGrid::Raster { path, nodata } => crate::population::accumulate_raster(
+                path,
+                &input.proj,
+                *nodata,
+                &pack,
+                (origin.x, origin.y),
+                res,
+                nx,
+                ny,
+                &mut pop,
+            )?,
+        };
         let grid =
             Grid::with_axes(origin, res, -res, nx, ny, pop).map_err(PackError::Terrain)?;
         write_geotiff_f32(&params.out_dir.join("population.tif"), &grid)?;
@@ -1135,7 +1189,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     res_m: Some(res),
                 });
             }
-            if used_worldcover {
+            if !used_landcover.is_empty() {
                 layers.push(LayerMeta {
                     kind: LayerKind::ClutterClass,
                     path: "clutter_class.tif".into(),
@@ -1193,11 +1247,8 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 let p = params.population.as_ref().expect("used");
                 l.push(LicenseNotice { source: p.source.clone(), notice: p.notice.clone() });
             }
-            if used_worldcover {
-                l.push(LicenseNotice {
-                    source: "ESA WorldCover 10 m (2021, v200)".into(),
-                    notice: crate::worldcover::WORLDCOVER_NOTICE.into(),
-                });
+            for c in &used_landcover {
+                l.push(LicenseNotice { source: c.source.clone(), notice: c.notice.clone() });
             }
             if used_roads {
                 l.push(LicenseNotice {
@@ -1470,9 +1521,11 @@ mod tests {
         let mut p = BuildParams::berlin_test(vec![dir.join("nope-dsm.tif")], dir.join("out"));
         p.osm_pbf = Some(dir.join("nope-berlin.osm.pbf"));
         p.population = Some(PopulationInput {
-            csv: dir.join("nope-zensus.csv"),
+            grid: PopulationGrid::Csv {
+                csv: dir.join("nope-zensus.csv"),
+                layout: crate::zensus::GridCsv::zensus(),
+            },
             proj: "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80 +units=m +no_defs".into(),
-            layout: crate::zensus::GridCsv::zensus(),
             source: "Zensus".into(),
             notice: "Zensus".into(),
         });

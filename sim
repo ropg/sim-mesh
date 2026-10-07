@@ -61,9 +61,9 @@
 #     sim source check                 read every source file (sources/sources.yaml and
 #                                      testbed/sources.yaml) and say what is wrong
 #     sim source list                  every source, where it stands, what it feeds
-#     sim source outline ID [--geofabrik REGION]
-#                                      write a source's outline: its feed's tiles, or a
-#                                      Geofabrik region's outline
+#     sim source outline ID [--geofabrik REGION …]
+#                                      write a source's outline: its feed's tiles, or
+#                                      Geofabrik regions' outlines together
 #     sim install [--dry-run]          on Linux, what SIM_MESH_NATIVE=1 needs, as sim-mesh's
 #                                      image holds it: the system's packages (sudo), Node
 #                                      22 where the system's is older, and Rust; then
@@ -214,11 +214,14 @@ in_container() {
     # container lets any user take a port under 1024, as Docker's do by
     # default and Podman's do not. SIM_MESH_CALLER_DIR is where sim was run
     # from: a relative path given to a verb is read from there.
+    # SIM_MESH_ENGINE and SIM_MESH_HOST_OS say what the container runs in,
+    # so a process killed for want of memory says which limit to raise.
     local args=(run --rm --init
                 --sysctl net.ipv4.ip_unprivileged_port_start=0
                 -v "$outer:$outer" -w "$ROOT"
                 -v sim-mesh-home:/home/sim-mesh -e HOME=/home/sim-mesh
-                -e SIM_MESH_IN_CONTAINER=1 -e "SIM_MESH_CALLER_DIR=$PWD")
+                -e SIM_MESH_IN_CONTAINER=1 -e "SIM_MESH_CALLER_DIR=$PWD"
+                -e "SIM_MESH_ENGINE=$e" -e "SIM_MESH_HOST_OS=$(uname -s)")
     # What it writes in the mounted tree is the host user's: Docker runs as
     # that uid; rootless Podman maps it so, and root's Podman is root already.
     if [ "$e" != podman ]; then args+=(--user "$(id -u):$(id -g)")
