@@ -214,11 +214,14 @@ in_container() {
     # container lets any user take a port under 1024, as Docker's do by
     # default and Podman's do not. SIM_MESH_CALLER_DIR is where sim was run
     # from: a relative path given to a verb is read from there.
+    # SIM_MESH_ENGINE and SIM_MESH_HOST_OS say what the container runs in,
+    # so a process killed for want of memory says which limit to raise.
     local args=(run --rm --init
                 --sysctl net.ipv4.ip_unprivileged_port_start=0
                 -v "$outer:$outer" -w "$ROOT"
                 -v sim-mesh-home:/home/sim-mesh -e HOME=/home/sim-mesh
-                -e SIM_MESH_IN_CONTAINER=1 -e "SIM_MESH_CALLER_DIR=$PWD")
+                -e SIM_MESH_IN_CONTAINER=1 -e "SIM_MESH_CALLER_DIR=$PWD"
+                -e "SIM_MESH_ENGINE=$e" -e "SIM_MESH_HOST_OS=$(uname -s)")
     # What it writes in the mounted tree is the host user's: Docker runs as
     # that uid; rootless Podman maps it so, and root's Podman is root already.
     if [ "$e" != podman ]; then args+=(--user "$(id -u):$(id -g)")

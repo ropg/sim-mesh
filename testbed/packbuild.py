@@ -316,6 +316,9 @@ class Build:
         code = await self.process.wait()
         await errors
         self.process = None
+        if code == -signal.SIGKILL:
+            raise store.StoreError("the compiler was killed during %s, most likely for want of "
+                                   "memory: %s" % (self.row["step"] or "its start", more_memory()))
         if code != 0 or manifest is None:
             raise store.StoreError(error or "the compiler ended with %d: %s"
                                    % (code, " / ".join(self.tail[-3:]) or "nothing said"))
@@ -354,6 +357,25 @@ class Build:
                                    for r in self.planned["sources"])))
         os.rename(self.part, dest)
         geodata.load(self.name)
+
+
+def more_memory():
+    """How to give the compiler more memory, by what the front runs in: a
+    Podman machine or Docker Desktop's VM on macOS and Windows, which sim
+    says in SIM_MESH_ENGINE and SIM_MESH_HOST_OS, else this machine."""
+    if not os.environ.get("SIM_MESH_IN_CONTAINER"):
+        return "this machine has too little free memory for it; close what else holds memory"
+    engine = os.environ.get("SIM_MESH_ENGINE", "")
+    if os.environ.get("SIM_MESH_HOST_OS") == "Linux":
+        return ("the container has no limit of its own under %s on Linux, so the machine has too "
+                "little free memory for it; close what else holds memory" % (engine or "its engine"))
+    if engine == "podman":
+        return ("give the Podman machine more memory, 4 GB or more (podman machine stop; "
+                "podman machine set --memory 4096; podman machine start), then start sim again")
+    if engine == "docker":
+        return ("give Docker more memory, 4 GB or more (Docker Desktop: Settings › Resources › "
+                "Memory), then start sim again")
+    return "give the container's engine more memory, 4 GB or more, then start sim again"
 
 
 def refuse(spec):

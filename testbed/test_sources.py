@@ -450,6 +450,36 @@ def test_a_us_rectangle_hands_the_compiler_3dep_alone_nlcd_over_worldcover_and_w
     assert "worldcover_tiles" not in params
 
 
+@pytest.mark.parametrize("env, says", [
+    ({"SIM_MESH_IN_CONTAINER": "1", "SIM_MESH_ENGINE": "podman", "SIM_MESH_HOST_OS": "Darwin"},
+     "podman machine set --memory 4096"),
+    ({"SIM_MESH_IN_CONTAINER": "1", "SIM_MESH_ENGINE": "docker", "SIM_MESH_HOST_OS": "Darwin"},
+     "Docker Desktop: Settings › Resources › Memory"),
+    ({"SIM_MESH_IN_CONTAINER": "1", "SIM_MESH_ENGINE": "podman", "SIM_MESH_HOST_OS": "Linux"},
+     "no limit of its own under podman on Linux"),
+    ({}, "this machine has too little free memory"),
+])
+def test_a_compiler_killed_for_memory_says_which_limit_to_raise(tmp_path, monkeypatch, env, says):
+    for key in ("SIM_MESH_IN_CONTAINER", "SIM_MESH_ENGINE", "SIM_MESH_HOST_OS"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    job = tmp_path / "planner-job"
+    job.write_text("#!/usr/bin/env python3\nimport json, os, signal, sys\nsys.stdin.read()\n"
+                   "print(json.dumps({'step': 'osm', 'done': 1, 'total': 8}), flush=True)\n"
+                   "os.kill(os.getpid(), signal.SIGKILL)\n")
+    job.chmod(0o755)
+    monkeypatch.setattr(store, "GEODATA_DIR", str(tmp_path / "geodata"))
+    cache = sources.Cache(None, str(tmp_path / "cache"))
+    build = packbuild.Build(cache, {"name": "boston", "bbox": [-71.1, 42.3, -71.0, 42.4],
+                                    "res_m": 10}, str(job), lambda row: None)
+    with pytest.raises(store.StoreError) as err:
+        asyncio.run(build.compile({"name": "boston"}))
+    assert str(err.value).startswith("the compiler was killed during osm, most likely for want "
+                                     "of memory: ")
+    assert says in str(err.value)
+
+
 def test_a_surface_with_no_terrain_beside_it_is_refused(tmp_path):
     cache = sources.Cache(None, str(tmp_path / "cache"))
     f = sources.File("ahn-dsm", "https://example.org/a.tif", "a.tif")
