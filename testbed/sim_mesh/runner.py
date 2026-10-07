@@ -158,7 +158,8 @@ def run(args):
     library.runtime.on_held = lambda sim: say_page(page_url(args.port, sim=sim.name))
     library.runtime.configure(
         script_name=name, geodata=args.geodata, nodesets=args.nodeset or None, name=args.name,
-        build=args.build, port=args.port, sim=args.sim, resume=args.resume,
+        build=args.build, build_tag=args.build_tag, port=args.port, sim=args.sim,
+        resume=args.resume,
         script=name if in_store else None)
     sys.stdout, sys.stderr = Logged(sys.stdout), Logged(sys.stderr)
     try:
@@ -184,7 +185,8 @@ def main(argv=None):
     ap.add_argument("--nodeset", action="append",
                     help="a nodeset, given once or more; several are merged")
     ap.add_argument("--name", help="the new simulation's name")
-    ap.add_argument("--build")
+    ap.add_argument("--build", help="an installed firmware every node given one runs instead")
+    ap.add_argument("--build-tag", help="with --build: only the nodes carrying this tag")
     ap.add_argument("--port", type=int, default=sim_module.DEFAULT_PORT)
     ap.add_argument("--report", metavar="RUN_DIR",
                     help="only write that run's report, with the script's report(run_dir)")
