@@ -429,8 +429,11 @@ class Simd:
             os.makedirs(record_dir, exist_ok=True)
             record = os.path.join(record_dir, "record.tsv")
         bind = ether_module.parse_bind(self.ether_addr)
-        physics = ether_module.Physics(self.args.noise_figure, self.args.crc_margin_db,
-                                       interference=not self.args.no_interference)
+        physics = ether_module.Physics(self.args.noise_figure,
+                                       interference=not self.args.no_interference,
+                                       fading_db=self.args.fading_db,
+                                       coherence_s=self.args.coherence_s,
+                                       rician_k=self.args.rician_k)
         self.ether_transport, self.ether = await ether_module.open_ether(
             bind, record, physics=physics, time_mode=self.args.time,
             pairwise=self.args.pairwise, seed=self.args.seed, epoch=self.args.epoch,
@@ -573,13 +576,14 @@ class Simd:
             self.broadcast({"type": "tx", "name": name, "eid": eid, "freq": freq,
                             "t_start": t_start, "t_end": t_end})
 
-    def ether_rx(self, sid, from_sid, eid, verdict, level):
+    def ether_rx(self, sid, from_sid, eid, verdict, level, cause=None):
         if not self.heard_loud():
             return
         name, sender = self.name_of(sid), self.name_of(from_sid)
         if name is not None and sender is not None:
             self.broadcast({"type": "rx", "name": name, "from": sender,
-                            "eid": eid, "verdict": verdict, "level": round(level, 1)})
+                            "eid": eid, "verdict": verdict, "level": round(level, 1),
+                            "cause": cause})
 
     def ether_station(self, sid, state):
         """A station said what its radio is doing; the map draws only the carrier."""
@@ -2184,11 +2188,17 @@ def parse_args(argv):
     ap.add_argument("--bench-capture", action="store_true",
                     help="rule on two frames of one spreading factor as a bench saw them "
                          "meet, instead of by the same-SF figure")
-    ap.add_argument("--crc-margin-db", type=float,
-                    default=ether_module.DEFAULT_CRC_MARGIN_DB,
-                    help="the CRC band: how far above its threshold a frame may still "
-                         "fail its CRC, the chance falling linearly to nothing "
-                         "(default %g: none)" % ether_module.DEFAULT_CRC_MARGIN_DB)
+    ap.add_argument("--fading-db", type=float, default=ether_module.DEFAULT_FADING_DB,
+                    help="fading: the spread in dB of every link's level over time "
+                         "(default %g: none)" % ether_module.DEFAULT_FADING_DB)
+    ap.add_argument("--coherence-s", type=float,
+                    default=ether_module.DEFAULT_COHERENCE_S,
+                    help="fading: how long, in seconds, a link's level stays alike "
+                         "(default %g)" % ether_module.DEFAULT_COHERENCE_S)
+    ap.add_argument("--rician-k", type=float, default=ether_module.DEFAULT_RICIAN_K,
+                    metavar="K",
+                    help="fast fading: one Rician draw per frame at each receiver, of "
+                         "this K factor, 0 for Rayleigh (default: none)")
     ap.add_argument("--no-interference", action="store_true",
                     help="an oracle: the ether judges every frame against noise alone "
                          "and never takes a receiver off the frame it follows; what "
@@ -2229,8 +2239,11 @@ def parse_args(argv):
         ap.error(str(err))
     if args.bench_capture and args.pairwise:
         ap.error("--bench-capture is a variant of the receiver-centred rule, not --pairwise's")
-    if args.crc_margin_db < 0:
-        ap.error("--crc-margin-db is a width in dB")
+    try:
+        ether_module.Physics(args.noise_figure, fading_db=args.fading_db,
+                             coherence_s=args.coherence_s, rician_k=args.rician_k)
+    except ValueError as err:
+        ap.error(str(err))
     if not 0 <= args.clock_ppm <= 1000:
         ap.error("--clock-ppm is parts per million, 0 to 1000")
     if args.clock_ppm and args.time == "real":
