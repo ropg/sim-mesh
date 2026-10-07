@@ -43,7 +43,8 @@ export default configure(() => {
     },
     framework: {
       iconSet: 'svg-material-icons',
-      config: { dark: true },
+      // Primary is what can be clicked: light enough to read on the dark page.
+      config: { dark: true, brand: { primary: '#60a5fa' } },
       plugins: ['Dialog', 'Notify'],
     },
   };

@@ -3,22 +3,21 @@ import { request } from '../lib/front'
 import { useSim } from './sim'
 import { useCatalog, type NodesetRow } from './catalog'
 import { DEFAULT_ANTENNA, type Antenna } from '../lib/antennas'
+import type { OtherNode } from '../lib/marks'
 
 /* The Nodes tab: the nodeset on its geodata, the selection, and every edit.
  *
  * Standalone, nothing is shown until a geodata is chosen (chooseGeodata);
  * the one chosen last in this browser is chosen again when the page loads.
- * Every nodeset with a node on it is a **layer**, a row of the Layers
- * panel, shown or hidden; a layer's nodes off the geodata are neither loaded
- * nor drawn, and the active one's are put `aside` and written back on
- * Save. One layer is active: `nodeset`, the
- * one being edited, whose nodes are the selection's, the editor's, the
- * links' and the coverage's, and which Save writes. The other shown layers
- * are loaded as their files stand (`others`) and drawn hollow in their
- * colours; making one of them active loads it as its file stands. Save
- * visible as writes one new nodeset of every shown layer, the active one's
- * unsaved edits included, top of the panel first (nodeset_merge), and makes
- * it the active layer, with the layers it came from hidden.
+ * Then the tab is a **list** of the nodesets with a node on it (`sets`),
+ * beside a map that only shows: the nodesets checked in the list (`checked`)
+ * are loaded as their files stand (`viewed`) and drawn there together, each
+ * in its colour, their nodes off the geodata left out. Save selection as
+ * writes one new nodeset of the checked ones, earlier in the list first
+ * (nodeset_merge). **Opening** one leaves the list for the map that edits
+ * it: `nodeset`, whose nodes are the selection's, the editor's, the links'
+ * and the coverage's, and which Save writes; its nodes off the geodata are
+ * put `aside` and written back on Save. Closing it is the list again.
  *
  * Standalone, the nodeset being edited is the page's own until it is saved:
  * every edit is made here, and Save sends the whole file's mapping to the
@@ -101,10 +100,10 @@ export interface NodeFields {
 
 export type SelectMode = 'replace' | 'add' | 'toggle' | 'remove'
 
-/** One row of the Layers panel: a nodeset with a node on the geodata, how
- *  many it has and how many of them stand on it. */
-export interface LayerRow {
-  name: string; nodes: number; inside: number; shown: boolean
+/** One row of the Nodes tab's list: a nodeset with a node on the geodata,
+ *  how many it has and how many of them stand on it. */
+export interface SetRow {
+  name: string; nodes: number; inside: number
   /** The nodeset's size on disk, with its own setup script. */
   bytes: number | null
 }
@@ -126,8 +125,8 @@ export function chosenBefore(): string | null {
   try { return localStorage.getItem(CHOSEN_KEY) } catch { return null }
 }
 
-/** The colours other layers are drawn in, hollow, by their place in the panel. */
-export const LAYER_COLOURS = ['#f472b6', '#34d399', '#60a5fa', '#fbbf24', '#c084fc', '#f87171', '#2dd4bf', '#fb923c']
+/** The colours the list's nodesets are drawn in, by their place in it. */
+export const SET_COLOURS = ['#f472b6', '#34d399', '#60a5fa', '#fbbf24', '#c084fc', '#f87171', '#2dd4bf', '#fb923c']
 
 /** Before a simulation is started from a nodeset by name: when it is the
  *  one the Nodes tab is editing, with changes not saved, save them, since a
@@ -150,10 +149,12 @@ export const useNodes = defineStore('nodes', {
     selection: [] as string[],
     /** The two nodes the pair inspector shows. */
     pair: null as [string, string] | null,
-    /** The Layers panel, top first. */
-    layers: [] as LayerRow[],
-    /** The shown layers other than the active one, as their files stand. */
-    others: {} as Record<string, NodesetData>,
+    /** The list: the nodesets with a node on the geodata. */
+    sets: [] as SetRow[],
+    /** The ones checked in the list, which its map shows. */
+    checked: new Set<string>(),
+    /** The checked nodesets, as their files stand. */
+    viewed: {} as Record<string, NodesetData>,
   }),
 
   getters: {
@@ -205,25 +206,26 @@ export const useNodes = defineStore('nodes', {
       while (taken.has(id)) id++
       return id
     },
-    /** The active layer's name; '' for a nodeset not saved yet, null for none. */
+    /** The open nodeset's name; '' for one not saved yet, null for none. */
     active(): string | null {
       if (!this.nodeset) return null
       return this.nodeset.name ?? ''
     },
-    colourOf(): (layer: string) => string {
-      const order = this.layers.map(l => l.name)
-      return (layer: string) => LAYER_COLOURS[Math.max(0, order.indexOf(layer)) % LAYER_COLOURS.length]!
+    colourOf(): (set: string) => string {
+      const order = this.sets.map(l => l.name)
+      return (set: string) => SET_COLOURS[Math.max(0, order.indexOf(set)) % SET_COLOURS.length]!
     },
-    /** The other shown layers' nodes, for the map; none on a simulation's live map. */
-    otherNodes(): { layer: string; name: string; lat: number; lon: number; colour: string }[] {
-      if (this.attached) return []
-      const out = []
-      for (const row of this.layers) {
-        const data = row.shown && row.name !== this.active ? this.others[row.name] : undefined
+    /** The checked nodesets, in the list's order. */
+    checkedNames(): string[] { return this.sets.map(s => s.name).filter(n => this.checked.has(n)) },
+    /** The checked nodesets' nodes on the geodata, for the list's map. */
+    viewedNodes(): OtherNode[] {
+      const out: OtherNode[] = []
+      for (const set of this.checkedNames) {
+        const data = this.viewed[set]
         if (!data) continue
-        const colour = this.colourOf(row.name)
+        const colour = this.colourOf(set)
         for (const [name, n] of Object.entries(data.nodes)) {
-          if (within(this.bbox, n)) out.push({ layer: row.name, name, lat: n.lat, lon: n.lon, colour })
+          if (within(this.bbox, n)) out.push({ layer: set, name, lat: n.lat, lon: n.lon, colour })
         }
       }
       return out
@@ -393,29 +395,39 @@ export const useNodes = defineStore('nodes', {
       try {
         if (name) localStorage.setItem(CHOSEN_KEY, name); else localStorage.removeItem(CHOSEN_KEY)
       } catch { /* private window */ }
+      this.close()
+      this.viewed = {}
+      this.sets = []
+      this.checked = new Set()
+      await this.loadSets()
+      // The list starts with every nodeset checked, all of them on its map.
+      this.checked = new Set(this.sets.map(s => s.name))
+      await this.loadViewed()
+    },
+
+    /** The nodeset being edited closed, unsaved edits and all: the list again. */
+    close() {
       this.nodeset = null
       this.aside = {}
-      this.others = {}
-      this.layers = []
       this.selection = []
       this.pair = null
-      await this.loadLayers()
     },
 
     /** The edits dropped: a saved nodeset back as its file stands, an unsaved one gone. */
     async discard() {
       const name = this.nodeset?.name
-      if (name) await this.activate(name)
-      else { this.nodeset = null; this.aside = {}; this.selection = []; this.pair = null }
+      if (name) await this.openSet(name)
+      else this.close()
     },
 
     /** A nodeset gone for good; when it is the one being edited, nothing is. */
     async deleteNodeset(name: string): Promise<string | null> {
       const r = await request('nodeset_delete', { name })
       if (!r.ok) return r.error ?? 'could not delete it'
-      if (this.nodeset?.name === name) { this.nodeset = null; this.aside = {}; this.selection = [] }
-      delete this.others[name]
-      this.layers = this.layers.filter(l => l.name !== name)
+      if (this.nodeset?.name === name) this.close()
+      delete this.viewed[name]
+      this.sets = this.sets.filter(l => l.name !== name)
+      if (this.checked.has(name)) this.checked = new Set([...this.checked].filter(n => n !== name))
       void useCatalog().refreshGeodata()
       return null
     },
@@ -434,106 +446,80 @@ export const useNodes = defineStore('nodes', {
         this.nodeset.name = saved.name
         this.nodeset.dirty = false
         this.nodeset.geometry_hash = saved.geometry_hash
-        await this.loadLayers()
+        delete this.viewed[saved.name ?? '']
+        await this.loadSets()
       }
       return null
     },
-    /** A new nodeset from an import source (nodeset_import), the active layer. */
+    /** A new nodeset from an import source (nodeset_import), opened. */
     async importNodes(fields: Record<string, unknown>): Promise<string | null> {
       const r = await request('nodeset_import', { ...fields, geodata: this.geodata })
       if (!r.ok) return r.error ?? 'could not import it'
-      await this.activateData(r.nodeset as NodesetData)
+      await this.openData(r.nodeset as NodesetData)
       return null
     },
 
-    /* ── layers ── */
+    /* ── the list ── */
 
-    /** The Layers panel for the geodata: every nodeset with a node on it,
-     *  the rows it had keeping their place and whether they were shown, new
-     *  ones below them; the active layer is always a row, and shown. */
-    async loadLayers() {
-      if (!this.geodata) { this.layers = []; return }
+    /** The list for the geodata: every nodeset with a node on it, by name,
+     *  and the one open even with none. A nodeset whose file changed size is
+     *  loaded again for the map; the checked ones not loaded yet are loaded. */
+    async loadSets() {
+      if (!this.geodata) { this.sets = []; return }
       const r = await request('nodeset_list', { geodata: this.geodata })
       if (!r.ok) return
       const rows = (r.nodesets as (NodesetRow & { inside?: number })[]).filter(n => !n.error)
-      const count = new Map(rows.map(n => [n.name, [n.nodes ?? 0, n.inside ?? 0, n.bytes ?? null] as const]))
-      const on = new Set(rows.filter(n => n.inside).map(n => n.name))
-      const active = this.active
-      if (active) on.add(active)
-      const row = (name: string, shown: boolean): LayerRow => {
-        const [nodes, inside, bytes] = count.get(name) ?? [0, 0, null]
-        return { name, nodes, inside, shown, bytes }
+      const open = this.active
+      const sets = rows.filter(n => n.inside || n.name === open)
+        .map(n => ({ name: n.name, nodes: n.nodes ?? 0, inside: n.inside ?? 0, bytes: n.bytes ?? null }))
+      const before = new Map(this.sets.map(s => [s.name, s.bytes]))
+      for (const name of Object.keys(this.viewed)) {
+        const now = sets.find(s => s.name === name)
+        if (!now || now.bytes !== before.get(name)) delete this.viewed[name]
       }
-      const kept = this.layers.filter(l => on.has(l.name)).map(l => row(l.name, l.shown))
-      const known = new Set(kept.map(l => l.name))
-      for (const n of rows) {
-        if (on.has(n.name) && !known.has(n.name)) kept.push(row(n.name, n.name === active))
-      }
-      for (const l of kept) if (l.name === active) l.shown = true
-      this.layers = kept
-      for (const name of Object.keys(this.others)) if (!on.has(name) || name === active) delete this.others[name]
-      await Promise.all(this.layers.filter(l => l.shown && l.name !== active && !this.others[l.name])
-        .map(l => this.loadOther(l.name)))
+      this.sets = sets
+      const here = new Set(sets.map(s => s.name))
+      if ([...this.checked].some(n => !here.has(n))) this.checked = new Set([...this.checked].filter(n => here.has(n)))
+      await this.loadViewed()
     },
 
-    async loadOther(name: string) {
-      const r = await request('nodeset_open', { name })
-      if (r.ok) this.others[name] = r.nodeset as NodesetData
+    /** The checked nodesets not loaded yet, loaded for the map. */
+    async loadViewed() {
+      await Promise.all(this.checkedNames.filter(n => !this.viewed[n]).map(async (name) => {
+        const r = await request('nodeset_open', { name })
+        if (r.ok) this.viewed[name] = r.nodeset as NodesetData
+      }))
     },
 
-    /** Show or hide a layer; the active one is always shown. */
-    async toggleLayer(name: string) {
-      const row = this.layers.find(l => l.name === name)
-      if (!row || name === this.active) return
-      row.shown = !row.shown
-      if (row.shown && !this.others[name]) await this.loadOther(name)
-    },
-
-    /** A layer one place higher in the panel, earlier in a merge. */
-    raiseLayer(name: string) {
-      const i = this.layers.findIndex(l => l.name === name)
-      if (i > 0) this.layers.splice(i - 1, 2, this.layers[i]!, this.layers[i - 1]!)
-    },
-
-    /** Another layer active, as its file stands; the one active before stays
-     *  shown, as its file stands too. The page asks first about unsaved edits. */
-    async activate(name: string): Promise<string | null> {
+    /** A nodeset opened to edit, as its file stands. The page asks first
+     *  about unsaved edits. */
+    async openSet(name: string): Promise<string | null> {
       const r = await request('nodeset_open', { name })
       if (!r.ok) return r.error ?? 'could not open it'
-      await this.activateData(r.nodeset as NodesetData)
+      await this.openData(r.nodeset as NodesetData)
       return null
     },
 
-    async activateData(data: NodesetData) {
-      const before = this.nodeset?.name ?? null
+    async openData(data: NodesetData) {
       this.adopt(data)
-      delete this.others[data.name ?? '']
-      await this.loadLayers()
-      const row = this.layers.find(l => l.name === data.name)
-      if (row) row.shown = true
-      if (before && before !== data.name && this.layers.some(l => l.name === before && l.shown)) {
-        await this.loadOther(before)
-      }
+      await this.loadSets()
     },
 
-    /** New: an empty layer by this name, active. */
-    async newLayer(name: string): Promise<string | null> {
+    /** New: an empty nodeset by this name, opened. */
+    async newNodeset(name: string): Promise<string | null> {
       const r = await request('nodeset_new', { name })
       if (!r.ok) return r.error ?? 'could not make it'
-      await this.activateData(r.nodeset as NodesetData)
-      if (!this.layers.some(l => l.name === name)) this.layers.unshift({ name, nodes: 0, inside: 0, shown: true, bytes: null })
+      await this.openData(r.nodeset as NodesetData)
       return null
     },
 
-    /** Save visible as: every shown layer as it stands, top first, as one new
-     *  nodeset, which becomes the active layer; the layers it came from are hidden. */
-    async saveVisibleAs(name: string): Promise<string | null> {
-      const shown = this.layers.filter(l => l.shown)
-      if (this.nodeset && !this.nodeset.name) shown.unshift({ name: 'unnamed', nodes: 0, inside: 0, shown: true, bytes: null })
-      // What is visible: each layer's nodes on the geodata.
-      const layers = shown.map(l => {
-        const own = l.name === this.active || (l.name === 'unnamed' && this.active === '')
-        const data = own ? this.nodeset : this.others[l.name]
+    /** Save selection as: the checked nodesets as their files stand, earlier
+     *  in the list first, as one new nodeset, which is then the one checked. */
+    async mergeAs(name: string): Promise<string | null> {
+      await this.loadViewed()
+      const layers = this.checkedNames.map(l => {
+        const data = this.viewed[l]
+        // What the map shows: each nodeset's nodes on the geodata.
         const nodes = data ? Object.fromEntries(Object.entries(data.nodes).filter(([, n]) => within(this.bbox, n))) : {}
         // An offset or a link comes along where both its nodes do; the merge
         // refuses one naming a node it has not, such as one off the geodata.
@@ -542,17 +528,14 @@ export const useNodes = defineStore('nodes', {
         const offsets = held.filter(o => o.between.every(e => kept.has(e)))
         const stated: Link[] = data?.links ?? []
         const links = stated.filter(k => k.between.every(e => kept.has(e)))
-        return { name: l.name, data: data ? { nodes, offsets, ...(links.length ? { links } : {}) } : null }
+        return { name: l, data: data ? { nodes, offsets, ...(links.length ? { links } : {}) } : null }
       }).filter(l => l.data)
-      if (!layers.length) return 'no layer is shown'
+      if (!layers.length) return 'no nodeset is checked'
       const r = await request('nodeset_merge', { name, layers })
       if (!r.ok) return r.error ?? 'could not save it'
-      for (const l of this.layers) l.shown = false
-      await this.activateData(r.nodeset as NodesetData)
-      const row = this.layers.find(l => l.name === name)
-      if (row) this.layers.splice(this.layers.indexOf(row), 1)
-      const count = Object.keys((r.nodeset as NodesetData).nodes).length
-      this.layers.unshift({ name, nodes: count, inside: count, shown: true, bytes: null })
+      this.viewed[name] = r.nodeset as NodesetData
+      this.checked = new Set([name])
+      await this.loadSets()
       return null
     },
 

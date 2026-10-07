@@ -2,7 +2,7 @@
   <q-page class="gp">
     <template v-if="preview">
       <q-toolbar class="gp-bar">
-        <q-btn flat dense no-caps label="‹ Back" @click="back" />
+        <q-btn flat dense no-caps label="← Geodata" @click="back" />
         <div class="gp-title">
           {{ preview }}
           <span class="gp-sub">{{ describe(ground.current) }}</span>
@@ -21,12 +21,12 @@
     <BuildView v-else-if="building" @back="building = false" @started="building = false" />
 
     <div v-else class="gp-body">
-      <div class="gp-head">
-        <div class="gp-heading">Installed geodata packs</div>
+      <div class="tab-head">
+        <div class="tab-heading">Installed geodata packs</div>
         <q-space />
-        <q-btn flat dense no-caps label="New synthetic…" @click="creating = true" />
-        <q-btn flat dense no-caps label="Build…" @click="building = true" />
-        <q-btn unelevated dense no-caps color="primary" label="Import zip…" @click="importing = true" />
+        <q-btn flat dense no-caps color="primary" label="New synthetic" @click="creating = true" />
+        <q-btn flat dense no-caps color="primary" label="Build" @click="building = true" />
+        <q-btn flat dense no-caps color="primary" label="Import zip" @click="importing = true" />
       </div>
       <div class="gp-text">
         The ground nodes stand on: a pack (terrain, clutter, buildings, roads,
@@ -38,13 +38,13 @@
       </div>
       <SelectBar :sel="sel">
         <template #default="{ keys }">
-          <q-btn flat dense no-caps size="sm" :icon="matDeleteOutline" label="Delete"
-                 :disable="!keys.length" @click="askDelete(keys)" />
+          <q-btn flat dense no-caps size="sm" :icon="matDeleteOutline" label="Delete selection"
+                 @click="askDelete(keys)" />
         </template>
       </SelectBar>
-      <table class="gp-table">
+      <table class="gp-table tab-flow">
         <thead><tr><th class="gp-check"></th><th>Geodata</th><th>What</th><th>Extent</th><th>Nodesets</th>
-          <th class="num">Size</th><th></th></tr></thead>
+          <th class="col-size">Size</th><th class="col-act"></th></tr></thead>
         <tbody>
           <tr v-if="catalog.build" class="gp-building">
             <td></td>
@@ -65,7 +65,7 @@
           </tr>
           <tr v-for="g in catalog.geodata" :key="g.name"
               :class="{ 'gp-row': !g.error, 'gp-chosen': g.name === nodes.geodata, 'gp-picked': sel.has(g.name) }"
-              @click="!g.error && choose(g.name)">
+              :title="g.error ? '' : 'Click to open this geodata'" @click="!g.error && choose(g.name)">
             <td class="gp-check" @click.stop>
               <q-checkbox dense size="xs" :model-value="sel.has(g.name)" @update:model-value="sel.toggle(g.name)" />
             </td>
@@ -78,12 +78,8 @@
             <td>{{ describe(g) }}</td>
             <td class="mono">{{ extent(g) }}</td>
             <td class="mono">{{ g.error ? '' : g.nodesets ?? '…' }}</td>
-            <td class="num mono">{{ sizeText(g.bytes) }}</td>
-            <td class="gp-act" @click.stop>
-              <q-btn v-if="!g.error" flat dense no-caps size="sm" color="primary" label="Open"
-                     @click="choose(g.name)">
-                <q-tooltip>Open it: its map here, and its nodesets on the Nodes tab</q-tooltip>
-              </q-btn>
+            <td class="col-size mono">{{ sizeText(g.bytes) }}</td>
+            <td class="col-act" @click.stop>
               <q-btn flat dense round size="sm" :icon="matEdit" @click="askRename(g.name)">
                 <q-tooltip>Rename</q-tooltip>
               </q-btn>
@@ -97,15 +93,15 @@
 
       <IndexOffers kind="geodata" @open="choose" />
 
-      <div class="gp-head gp-section">
-        <div class="gp-heading">Geodata sources</div>
+      <div class="tab-head tab-section">
+        <div class="tab-heading">Geodata sources</div>
         <q-space />
-        <q-btn flat dense no-caps size="sm" label="Refresh" @click="loadSources" />
+        <q-btn flat dense no-caps label="Refresh" @click="loadSources" />
       </div>
       <div class="gp-text">
-        What Build fetches its ground from, kept here so a second build beside the
-        first fetches only what is new. Emptying a source's cache costs only the
-        fetch again; it is refused while a build runs.
+        Data sources that geodata packs are built from, cached so you don't need
+        to download things twice. Cached data can be freely deleted after a pack
+        is built.
       </div>
       <div class="gp-sources">
         <div class="gp-sources-list">
@@ -118,16 +114,16 @@
           <q-space />
           <q-btn flat dense no-caps size="sm" label="All sources" @click="clearPoint" />
         </div>
-        <table class="gp-table">
+        <table class="gp-table tab-flow">
           <thead><tr><th>Source</th><th>Licence</th><th class="num">Cached</th><th></th></tr></thead>
           <tbody>
             <tr v-for="s in shownSources" :key="s.source"
                 :class="{ 'gp-row': s.map, 'gp-picked': s.source === shownSource }"
                 @click="s.map && showSource(s.source)">
               <td>
-                <span class="gp-what">{{ s.what }}</span>
+                <span class="gp-what">{{ keepUnits(s.what) }}</span>
                 <q-tooltip v-if="s.holds" anchor="center right" self="center left" max-width="340px"
-                           class="gp-holds">{{ s.holds }}</q-tooltip>
+                           class="gp-holds">{{ keepUnits(s.holds) }}</q-tooltip>
                 <div class="gp-sub">
                   <span class="mono">{{ s.source }}</span><template v-if="s.where"> · {{ s.where }}</template><template
                     v-if="s.own"> · yours</template>
@@ -219,8 +215,8 @@
 
 <script setup lang="ts">
 /* Three sections. The ground there is, with the three ways of making or
- * bringing more: New synthetic…, Build… (its own view, BuildView, and then a
- * row here while it builds), and Import zip…; a row, or its Open, opens that
+ * bringing more: New synthetic, Build (its own view, BuildView, and then a
+ * row here while it builds), and Import zip; a click on a row opens that
  * geodata on its own, with no nodes on it, and from there Export zip takes
  * it elsewhere; the checkboxes choose rows for what is done to several.
  * What the listed indexes offer pre-built (IndexOffers). And the build's
@@ -237,7 +233,7 @@ import SlippyMap from '../components/SlippyMap.vue'
 import { boxGeometry, type Geometry, type MapShape } from '../lib/mapshape'
 import SelectBar from '../components/SelectBar.vue'
 import { useSelection } from '../lib/selection'
-import { sizeText } from '../lib/size'
+import { NBSP, keepUnits, sizeText } from '../lib/size'
 import { useCatalog, type BuildRow, type GeodataInfo, type SourceRow } from '../stores/catalog'
 import { zipGeodataName } from '../lib/zip'
 import { useGeodata } from '../stores/geodata'
@@ -358,7 +354,7 @@ function describe(g: GeodataInfo | null) {
 
 function extent(g: GeodataInfo) {
   if (g.error || !g.bbox) return ''
-  if (g.kind !== 'pack') return `${((g.extent_m ?? 0) / 1000).toFixed(0)} km square at 0°, 0°`
+  if (g.kind !== 'pack') return `${((g.extent_m ?? 0) / 1000).toFixed(0)}${NBSP}km square at 0°, 0°`
   const [lon0, lat0, lon1, lat1] = g.bbox
   return `${lat0.toFixed(3)}…${lat1.toFixed(3)} N, ${lon0.toFixed(3)}…${lon1.toFixed(3)} E`
 }
@@ -429,7 +425,7 @@ function askDelete(names: string[]) {
   else go()
 }
 
-function mb(bytes: number) { return `${(bytes / 1e6).toFixed(bytes < 1e7 ? 1 : 0)} MB` }
+function mb(bytes: number) { return `${(bytes / 1e6).toFixed(bytes < 1e7 ? 1 : 0)}${NBSP}MB` }
 
 /* A build's row: its step, and how far into it. Downloading counts bytes
  * where every host said a size, files where one did not; compiling counts
@@ -502,15 +498,13 @@ async function create() {
 
 <style scoped>
 .gp { display: flex; flex-direction: column; height: 100%; }
-.gp-bar { min-height: 38px; gap: 6px; padding-left: 4px; background: #171b21; border-bottom: 1px solid #262c35; flex: none; }
+.gp-bar { min-height: 38px; gap: 16px; padding-left: 4px; background: #171b21; border-bottom: 1px solid #262c35; flex: none; }
 .gp-title { font-size: 14px; font-weight: 500; padding: 0 10px; }
 .gp-sub { font-size: 12px; font-weight: 400; color: #6b7280; padding-left: 8px; }
 .gp-map { position: relative; flex: 1 1 auto; min-height: 0; }
 /* The whole width: the paragraphs keep their own reading width, the tables
  * and the sources' map take the rest, and the scroll bar is the window's edge. */
 .gp-body { padding: 16px 20px 32px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
-.gp-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.gp-heading { font-size: 14px; font-weight: 500; color: #d1d5db; }
 .gp-text { font-size: 12px; color: #9ca3af; line-height: 1.5; margin-bottom: 12px; max-width: 760px; }
 .gp-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .gp-table th {
@@ -520,15 +514,21 @@ async function create() {
 .gp-table td { padding: 8px 10px; border-bottom: 1px solid #1f242c; vertical-align: top; }
 .gp-name { font-weight: 500; }
 .gp-row { cursor: pointer; }
-.gp-row .gp-name { color: #7dd3fc; }
+.gp-row .gp-name, .gp-row .gp-what { color: var(--q-primary); }
 .gp-row:hover td { background: #1b2028; }
 .gp-chosen td { background: #1a2130; }
 .gp-act { white-space: nowrap; text-align: right; width: 1%; }
 .gp-table .num { text-align: right; white-space: nowrap; }
 .gp-check { width: 28px; padding-left: 2px !important; padding-right: 0 !important; }
 .gp-picked td { background: #172030; }
-.gp-section { margin-top: 28px; }
 .gp-sources { display: flex; gap: 16px; align-items: flex-start; }
+/* A narrow page: the sources' map above their list. */
+@media (max-width: 640px) {
+  .gp-body { padding: 12px 16px 24px; }
+  .gp-sources { flex-direction: column-reverse; align-items: stretch; }
+  .gp-source-side { position: static; min-width: 0; }
+  .gp-source-map { height: 50vh; }
+}
 .gp-sources-list { flex: 1 1 55%; min-width: 0; }
 .gp-at { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #d1d5db;
   background: #1a2130; border-radius: 3px; padding: 2px 4px 2px 10px; margin-bottom: 4px; }
@@ -536,7 +536,7 @@ async function create() {
 .gp-source-map { height: min(60vh, 520px); border: 1px solid #262c35; border-radius: 4px; }
 .gp-source-note { margin-top: 6px; line-height: 1.7; }
 .gp-what { border-bottom: 1px dotted #4b5563; cursor: help; }
-.gp-fit { cursor: pointer; border-radius: 3px; padding: 0 4px; margin-left: -4px; width: fit-content; }
+.gp-fit { cursor: pointer; color: var(--q-primary); border-radius: 3px; padding: 0 4px; margin-left: -4px; width: fit-content; }
 .gp-fit:hover { background: #1b2028; color: #d1d5db; }
 .gp-key { display: inline-block; width: 12px; height: 10px; border-radius: 2px; vertical-align: -1px; }
 .gp-key-covers { background: rgba(59, 130, 246, 0.35); border: 1px solid rgba(59, 130, 246, 0.8); }

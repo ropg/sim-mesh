@@ -70,8 +70,9 @@
  *   links      for the one selected node, every other node coloured by the
  *              level it would be heard at: decodable, or only interfering,
  *              solid where the first Fresnel zone is clear
- *   layers     the other shown layers' nodes, hollow in their layer's
- *              colour, named on hover; a click on one is reported
+ *   others     nodes only shown (the Nodes tab's list of nodesets), hollow
+ *              in their nodeset's colour, named on hover; a click on one is
+ *              reported
  *   nodes      a dot each, a second ring round a node that carries others'
  *              traffic, its name and, smaller, its height and tags
  *   live       rings while a station transmits, flashes where a frame lands,
@@ -103,7 +104,7 @@ import {
 
 const props = withDefaults(defineProps<{
   nodes?: MapNode[]
-  /** The other shown layers' nodes, drawn hollow in their layer's colour. */
+  /** Nodes only shown, drawn hollow in their nodeset's colour. */
   others?: OtherNode[]
   offsets?: Offset[]
   selected?: string[]
@@ -147,7 +148,7 @@ const emit = defineEmits<{
   /** A right-click, with the node under it when there is one. */
   context: [at: GroundPoint, name: string | null]
   hover: [name: string | null]
-  /** A click on another layer's node. */
+  /** A click on a node only shown: its nodeset and its name. */
   other: [layer: string, name: string]
 }>()
 
@@ -266,9 +267,10 @@ function restoreView() {
   fitToNodes()
 }
 
-/** Every node on screen with a margin; with none, the pack or the synthetic extent. */
+/** Every node on screen with a margin (the hollow ones when there are no
+ *  filled ones); with none, the pack or the synthetic extent. */
 function fitToNodes() {
-  const points = [...positions.value.values()]
+  const points = positions.value.size ? [...positions.value.values()] : [...otherXY.value.values()]
   if (!points.length) {
     const pack = ground.pack
     const g = ground.current
@@ -1253,8 +1255,8 @@ function drawNodes() {
   ctx.textAlign = 'left'
 }
 
-/* The other shown layers' nodes: hollow, in their layer's colour, named
- * only while the pointer is on one. */
+/* The nodes only shown: hollow, in their nodeset's colour, named only while
+ * the pointer is on one. */
 function drawOthers() {
   if (!ctx || !props.others.length) return
   ctx.lineWidth = 2
@@ -1621,7 +1623,7 @@ watch(() => [props.nodes, props.others, props.offsets, props.selected, props.lin
 }
 .wmap-credits {
   position: absolute; right: 10px; bottom: 26px; max-width: min(560px, 60%);
-  font-size: 10px; line-height: 1.4; color: #9ca3af; text-align: right; cursor: pointer;
+  font-size: 10px; line-height: 1.4; color: var(--q-primary); text-align: right; cursor: pointer;
   background: rgba(18, 20, 23, 0.8); padding: 2px 6px; border-radius: 3px;
 }
 .wmap-credits div { text-align: left; margin: 2px 0; }

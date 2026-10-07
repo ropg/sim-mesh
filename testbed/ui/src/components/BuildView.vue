@@ -1,7 +1,7 @@
 <template>
   <div class="bv">
     <q-toolbar class="bv-bar">
-      <q-btn flat dense no-caps label="‹ Back" @click="emit('back')" />
+      <q-btn flat dense no-caps label="← Geodata" @click="emit('back')" />
       <div class="bv-title">Build from sources</div>
       <q-space />
       <PlaceSearch nominatim @found="goToPlace" />
@@ -31,8 +31,8 @@
                           :options="[{ label: '30 m', value: 30 }, { label: '10 m', value: 10 }]" />
           </div>
           <div v-if="plan" class="bv-text">
-            {{ plan.grid.cells[0] }} × {{ plan.grid.cells[1] }} cells
-            ({{ plan.grid.size_km[0] }} × {{ plan.grid.size_km[1] }} km),
+            {{ plan.grid.cells[0] }} × {{ plan.grid.cells[1] }}&nbsp;cells
+            ({{ plan.grid.size_km[0] }} × {{ plan.grid.size_km[1] }}&nbsp;km),
             UTM zone {{ plan.grid.zone }} (EPSG:{{ plan.grid.epsg }});
             OpenStreetMap from Geofabrik's {{ plan.extract.name ?? plan.extract.id }} extract.
           </div>
@@ -42,7 +42,7 @@
             <thead><tr><th>source</th><th>to fetch</th><th>licence</th></tr></thead>
             <tbody>
               <tr v-for="s in plan.sources" :key="s.source">
-                <td>{{ s.title }}<div class="bv-dim">{{ s.used_for }}</div>
+                <td>{{ keepUnits(s.title) }}<div class="bv-dim">{{ keepUnits(s.used_for) }}</div>
                   <div class="bv-dim">{{ s.files }} file{{ s.files === 1 ? '' : 's' }}</div></td>
                 <td class="bv-mono">{{ fetchText(s) }}</td>
                 <td class="bv-dim">{{ s.licence }}</td>
@@ -54,7 +54,7 @@
             You can build now. The download sizes take a while: each file's host is asked how big it is.
           </div>
 
-          <q-btn unelevated no-caps color="primary" label="Build" :loading="starting"
+          <q-btn flat dense no-caps color="primary" label="Build" class="self-start" :loading="starting"
                  :disable="!plan || !!refused || !name.trim() || !!catalog.build && catalog.build.state !== 'failed'"
                  @click="build" />
           <div v-if="catalog.build && catalog.build.state !== 'failed'" class="bv-dim">
@@ -91,6 +91,7 @@ import PlaceSearch, { type FoundPlace } from './PlaceSearch.vue'
 import SlippyMap from './SlippyMap.vue'
 import { useCatalog } from '../stores/catalog'
 import { slug } from '../lib/zip'
+import { keepUnits } from '../lib/size'
 import { boxGeometry, type Geometry, type MapShape } from '../lib/mapshape'
 
 interface SourceRow {
@@ -123,7 +124,7 @@ let askTimer: ReturnType<typeof setTimeout> | null = null
 let askCtrl: AbortController | null = null
 
 function mb(bytes: number) {
-  return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.max(0.1, bytes / 1e6).toFixed(1)} MB`
+  return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.max(0.1, bytes / 1e6).toFixed(1)} MB`
 }
 
 function fetchText(s: SourceRow) {
@@ -266,7 +267,7 @@ onUnmounted(() => {
 
 <style scoped>
 .bv { display: flex; flex-direction: column; height: 100%; }
-.bv-bar { min-height: 38px; gap: 6px; padding-left: 4px; background: #171b21; border-bottom: 1px solid #262c35; flex: none; }
+.bv-bar { min-height: 38px; gap: 16px; padding-left: 4px; background: #171b21; border-bottom: 1px solid #262c35; flex: none; }
 .bv-title { font-size: 14px; font-weight: 500; padding: 0 10px; }
 .bv-main { flex: 1 1 auto; min-height: 0; display: flex; }
 .bv-map { flex: 1 1 auto; min-width: 0; }
@@ -279,6 +280,12 @@ onUnmounted(() => {
   flex-direction: column; gap: 8px; border-left: 1px solid #262c35; background: #15181d;
 }
 .bv-text { font-size: 12px; color: #9ca3af; line-height: 1.5; }
+/* A narrow page: the map above the panel, each half the height. */
+@media (max-width: 640px) {
+  .bv-main { flex-direction: column; }
+  .bv-map { flex: 1 1 50%; min-height: 0; }
+  .bv-side { width: auto; flex: 1 1 50%; border-left: none; border-top: 1px solid #262c35; }
+}
 .bv-label { font-size: 11px; color: #6b7280; margin-top: 4px; }
 .bv-row { display: flex; align-items: center; gap: 10px; }
 .bv-bad { font-size: 12px; color: #fca5a5; }
