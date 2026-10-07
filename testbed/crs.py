@@ -14,18 +14,20 @@ the compiler need of each.
 
 `proj(crs)` is the proj string the compiler projects with, exactly.
 `plane(crs)` is what planning projects with here, both ways between
-degrees and the system's metres: Krüger's series for UTM (geodata.py), and
-for RD New the published polynomial between RD and WGS84 coordinates
-(Schreutelkamp and Strang van Hees, 2001), good to about a metre across the
-Netherlands, which is all that choosing tiles and drawing a map asks for.
-Conus Albers has no plane here: a source in it is one file, found without
-projecting.
+degrees and the system's metres: Krüger's series for UTM (geodata.py),
+Snyder's ellipsoidal formulas for LAEA Europe (Map Projections: A Working
+Manual, 1987, pp. 187–190; ETRS89 taken as WGS84), and for RD New the
+published polynomial between RD and WGS84 coordinates (Schreutelkamp and
+Strang van Hees, 2001), good to about a metre across the Netherlands, which
+is all that choosing tiles and drawing a map asks for. Conus Albers has no
+plane here: a source in it is one file, found without projecting.
 
 `per_metre(crs)` is a system's units in a metre, for a distance in metres
 said in them: one for the projected systems, a degree of latitude's share
 for the geographic ones.
 """
 
+import math
 import re
 
 import geodata
@@ -126,12 +128,64 @@ class RdNew:
         return self.LAT0 + lat / 3600.0, self.LON0 + lon / 3600.0
 
 
+class LaeaEurope:
+    """ETRS89 / LAEA Europe both ways, on GRS80: the oblique ellipsoidal
+    aspect, centre 52° N 10° E, false origin 4 321 000 E, 3 210 000 N."""
+
+    A, F = 6378137.0, 1 / 298.257222101
+    LAT0, LON0 = math.radians(52.0), math.radians(10.0)
+    FE, FN = 4321000.0, 3210000.0
+
+    def __init__(self):
+        self.e2 = self.F * (2 - self.F)
+        self.e = math.sqrt(self.e2)
+        self.qp = self._q(math.pi / 2)
+        self.rq = self.A * math.sqrt(self.qp / 2)
+        self.beta0 = math.asin(self._q(self.LAT0) / self.qp)
+        m0 = math.cos(self.LAT0) / math.sqrt(1 - self.e2 * math.sin(self.LAT0) ** 2)
+        self.d = self.A * m0 / (self.rq * math.cos(self.beta0))
+
+    def _q(self, phi):
+        s, e = math.sin(phi), self.e
+        return (1 - self.e2) * (s / (1 - self.e2 * s * s)
+                                - math.log((1 - e * s) / (1 + e * s)) / (2 * e))
+
+    def forward(self, lat, lon):
+        beta = math.asin(self._q(math.radians(lat)) / self.qp)
+        dl = math.radians(lon) - self.LON0
+        b = self.rq * math.sqrt(2 / (1 + math.sin(self.beta0) * math.sin(beta)
+                                     + math.cos(self.beta0) * math.cos(beta) * math.cos(dl)))
+        x = b * self.d * math.cos(beta) * math.sin(dl)
+        y = (b / self.d) * (math.cos(self.beta0) * math.sin(beta)
+                            - math.sin(self.beta0) * math.cos(beta) * math.cos(dl))
+        return self.FE + x, self.FN + y
+
+    def inverse(self, x, y):
+        x, y = x - self.FE, y - self.FN
+        rho = math.hypot(x / self.d, self.d * y)
+        if rho == 0:
+            return math.degrees(self.LAT0), math.degrees(self.LON0)
+        c = 2 * math.asin(rho / (2 * self.rq))
+        beta = math.asin(math.cos(c) * math.sin(self.beta0)
+                         + self.d * y * math.sin(c) * math.cos(self.beta0) / rho)
+        lon = self.LON0 + math.atan2(
+            x * math.sin(c), self.d * rho * math.cos(self.beta0) * math.cos(c)
+            - self.d ** 2 * y * math.sin(self.beta0) * math.sin(c))
+        e2 = self.e2
+        lat = (beta + (e2 / 3 + 31 * e2 ** 2 / 180 + 517 * e2 ** 3 / 5040) * math.sin(2 * beta)
+               + (23 * e2 ** 2 / 360 + 251 * e2 ** 3 / 3780) * math.sin(4 * beta)
+               + (761 * e2 ** 3 / 45360) * math.sin(6 * beta))
+        return math.degrees(lat), math.degrees(lon)
+
+
 def plane(crs):
     """forward(lat, lon) → (x, y) and inverse(x, y) → (lat, lon) for a known
     system."""
     code = epsg(crs)
     if code in GEOGRAPHIC:
         return Degrees()
+    if code == 3035:
+        return LaeaEurope()
     if code in (28992, 7415):
         return RdNew()
     if code is not None and _utm(code) is not None:

@@ -742,8 +742,9 @@ method or reader in sim-mesh, which every source can then use.
 the rectangle (with the shipped ones: the state surveys' terrain, surface
 and LoD2 where it touches Berlin, Brandenburg or Mecklenburg-Vorpommern,
 the Zensus grid where it touches Germany, AHN, 3DBAG and CBS where it
-touches the Netherlands, 3DEP, NLCD and WorldPop where it touches the
-United States, GLO-30 and OpenStreetMap everywhere) and says what
+touches the Netherlands, BEV's terrain and surface and Statistik
+Austria's grid where it touches Austria, 3DEP, NLCD and WorldPop where it
+touches the United States, GLO-30 and OpenStreetMap everywhere) and says what
 each is used for, so the page offers no choice and the dialog after
 **Build** reads the same list. `packbuild` hands each chosen source's files
 to the compiler input its format and layer go to (`packbuild.INPUTS`), never
@@ -763,8 +764,19 @@ worldwide surface as EPSG:4326 (`sourcefile.COMPILER_READS` and the
 GeoTIFF rules), and `sourcefile.py` refuses a source that asks otherwise
 when the file is read: an entry the compiler would misread fails in
 `sim source check` and in the tests, not halfway through a build. A
-GeoPackage grid reaches the compiler as the CSV the front writes from it
-beside the download (x, y of each cell's centre, value).
+GeoPackage grid and an INSPIRE population grid reach the compiler as the
+CSV the front writes from them beside the download (x, y of each cell's
+centre, value); the INSPIRE one's projection and cell come from its cells'
+EU grid codes, said in a `.json` beside the CSV, and a file that mixes
+grids is refused.
+
+**A tile scheme is computed, not listed, wherever it can be.** A template
+names each tile from its corner, so finding a rectangle's tiles asks no
+host anything; a tile no host has is no data. Tiles in metres are found in
+the source's own system: the rectangle's reach projected there
+(`crs.plane`, LAEA Europe by Snyder's ellipsoidal formulas for BEV's 50 km
+squares), the squares meeting it, and a cached square drawn back in
+degrees along its edges, which a projection bends.
 
 **Measured ground from GeoTIFF is sampled, not resampled.** Each cell takes
 up to 8 × 8 samples, about a pixel apart, each transformed from the pack's

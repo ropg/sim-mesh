@@ -60,6 +60,7 @@ INPUTS = {
     ("xyz", "surface", False): "berlin_1m_dir",
     ("csv-grid", "population", False): "population",
     ("gpkg-grid", "population", False): "population",
+    ("inspire-pd-grid", "population", False): "population",
 }
 # The inputs that take several sources; every other takes one. LoD2 is one
 # directory of CityGML the compiler reads whole, so a rectangle across two
@@ -243,6 +244,14 @@ class Build:
                         "raster": raster[0], "proj": sourcefile.proj_of(s),
                         "nodata": None if fmt.get("nodata") is None else float(fmt["nodata"]),
                         "source": s.title, "notice": s.notice or ""}
+            elif fmt["type"] == "inspire-pd-grid":
+                grids = [self.cache.inspire_grid_csv(f) for f in files[s.id] if self.cache.have(f)]
+                if grids:
+                    path, system, cell = grids[0]
+                    params["population"] = {
+                        "csv": path, "proj": crs.proj(system), "delimiter": ",", "x": "x",
+                        "y": "y", "value": "value", "cell_m": cell, "source": s.title,
+                        "notice": s.notice or ""}
             elif fmt["type"] == "gpkg-grid":
                 csv = [self.cache.grid_csv(f, fmt["value"]) for f in files[s.id] if self.cache.have(f)]
                 layout = {"delimiter": ",", "x": "x", "y": "y", "value": "value"}
