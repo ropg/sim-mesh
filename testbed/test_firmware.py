@@ -66,6 +66,23 @@ def test_latest_is_the_newest_of_exactly_that_base(where):
         firmware.resolve("relay_%s_20990101000000" % ARCH)
 
 
+def test_latest_of_a_family_is_its_highest_upstream_release_then_newest_build(where):
+    fw = where / "firmware"
+    stub_firmware.install(fw, "mt", "20270101000000")
+    stub_firmware.install(fw, "mt-2.7.26", "20261005000000")
+    stub_firmware.install(fw, "mt-2.7.26", "20261007000000")
+    stub_firmware.install(fw, "mt-2.10.0-rc.1", "20261001000000")
+    stub_firmware.install(fw, "mt-2.9.1", "20261002000000")
+    stub_firmware.install(fw, "mt-extra", "20281002000000")
+    assert firmware.resolve("mt_latest")["name"] == "mt-2.10.0-rc.1_%s_20261001000000" % ARCH
+    assert firmware.resolve("mt-2.7.26_latest")["name"] == "mt-2.7.26_%s_20261007000000" % ARCH
+    assert firmware.resolve("mt-extra_latest")["version"] == "20281002000000"
+    assert firmware.upstream_of("mt-extra", "mt") is None
+    assert firmware.upstream_of("mtx-1.0.0", "mt") is None
+    stub_firmware.install(fw, "mt-2.10.0", "20261003000000")
+    assert firmware.resolve("mt_latest")["name"] == "mt-2.10.0_%s_20261003000000" % ARCH
+
+
 def test_a_zip_is_installed_under_its_name_whatever_the_file_is_called(where):
     got = add(zip_file(where, "relay-sx1262", "1.0.0", filename="download.zip",
                        title="Relay", radio="sx1262"))

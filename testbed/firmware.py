@@ -23,9 +23,17 @@ part). The name is split at its first and last `_`. Two firmwares that differ
 in anything sim-mesh does not parse, the radio they drive included, are two
 bases.
 
-**`<base>_latest`** is shorthand for the newest installed firmware whose
-base is exactly `<base>`, for this machine's architecture: by stamp, or by
-semantic version, never both, since a base holds builds of one scheme only.
+A base may end in the upstream release it packages, `<base>-<semver>`
+(`meshtastic-sx1262-2.7.26_aarch64_20261007201200`: our build of 20261007
+of Meshtastic 2.7.26), the version after it then being our own build's.
+
+**`<base>_latest`** is shorthand for the newest installed firmware of that
+base, for this machine's architecture: of `<base>` itself and every
+`<base>-<semver>`, the highest upstream release (none ranks below any), then
+within it the newest build — by stamp, or by semantic version, never both,
+since a base holds builds of one scheme only. So
+`meshtastic-sx1262-2.7.26_latest` is our newest build of 2.7.26, and
+`meshtastic-sx1262_latest` our newest build of the newest release installed.
 
 **Adding** checks a zip before it lands: its `node.yaml` must say the name's
 three parts, its category and its executable and driver must be in it, its
@@ -236,15 +244,33 @@ def installed(firmware_dir=None):
             if parse_name(n) and os.path.isfile(os.path.join(base, n, NODE_YAML))}
 
 
+def upstream_of(base, family):
+    """The upstream version a base of `family` names, as its sort key: `()`
+    for the family's own base, the key of `1.2.3` for `<family>-1.2.3`, None
+    for a base that is neither."""
+    if base == family:
+        return ()
+    if not base.startswith(family + "-"):
+        return None
+    version = base[len(family) + 1:]
+    return version_key(version) if scheme(version) == "semver" else None
+
+
 def newest(base, firmware_dir=None, arch=None):
-    """The name of the newest installed firmware of `base` for `arch`, or None."""
+    """The name of the newest installed firmware of `base` for `arch`, or None:
+    of the base itself and every `<base>-<semver>` beside it, the highest
+    upstream version (a base without one below every one with one), then our
+    newest build of it."""
     arch = arch or machine_arch()
-    mine = [parse_name(n) for n in installed(firmware_dir)]
-    mine = [p for p in mine if p and p[0] == base and p[1] == arch]
+    mine = []
+    for parsed in map(parse_name, installed(firmware_dir)):
+        if parsed and parsed[1] == arch:
+            upstream = upstream_of(parsed[0], base)
+            if upstream is not None:
+                mine.append((upstream, version_key(parsed[2]), parsed))
     if not mine:
         return None
-    best = max(mine, key=lambda p: version_key(p[2]))
-    return "%s_%s_%s" % best
+    return "%s_%s_%s" % max(mine)[2]
 
 
 def resolve(ref, firmware_dir=None, arch=None):

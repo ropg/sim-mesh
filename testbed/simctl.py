@@ -4,7 +4,7 @@ front. The `sim` launcher's `new`, `stop`, `pause`, `resume`, `list` and
 `plan` verbs.
 
     sim new [NAME] (--geodata G --nodeset N | --snapshot S)
-                   [--time max|<k>x|real] [--stagger N] [--build B]
+                   [--time max|<k>x|real] [--stagger N] [--build B [--build-tag T]]
                    [--pairwise]
     sim stop NAME                     a paused one's state deleted, it ended
     sim pause NAME                    stopped, its state kept in its run
@@ -22,7 +22,8 @@ snapshot brings its firmware back with it; from geodata and a nodeset no node
 runs anything until a script says what (`sim run <script> --sim <name>`), so
 a simulation of those is usually a script's own, `sim run <script> --geodata
 G --nodeset N`. `--build` names an installed firmware (`<name>` or
-`<base>_latest`) that every node whose firmware has its base runs instead. `--pairwise` puts
+`<base>_latest`) that every node the script gives a firmware runs instead,
+or, with `--build-tag T`, every such node carrying the tag T. `--pairwise` puts
 that simulation's ether on the pairwise rule. `--port` (default 8800) is the
 front's. With `SIM_MESH_FRONT=host:port` the front is one already running
 there, and none is started here.
@@ -170,6 +171,7 @@ async def main():
     new.add_argument("--time", default="real")
     new.add_argument("--stagger", type=float)
     new.add_argument("--build")
+    new.add_argument("--build-tag")
     new.add_argument("--pairwise", action="store_true")
     stop = verb("stop", "stop a simulation")
     stop.add_argument("name")
@@ -210,6 +212,7 @@ async def main():
             msg = {"type": "sim_new", "name": args.name, "geodata": args.geodata,
                    "nodeset": args.nodeset, "snapshot": args.snapshot,
                    "time": args.time, "stagger": args.stagger, "build": args.build,
+                   "build_tag": args.build_tag,
                    "pairwise": args.pairwise or None}
             await ws.send_str(json.dumps({k: v for k, v in msg.items() if v is not None}))
             answer = await reply(ws, "sim_new", progress=True)

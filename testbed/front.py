@@ -94,9 +94,9 @@ them) and these of its own, each answered to the asking socket as
 
 ```
 sims                                                      the registry, now
-sim_new {name?, geodata, nodeset | nodesets, script?, time?, stagger?, build?, pairwise?,
-         firmware_rules?, first_boot_rules?, inputs?}
-sim_new {name?, snapshot, time?, stagger?, build?, pairwise?}
+sim_new {name?, geodata, nodeset | nodesets, script?, time?, stagger?, build?, build_tag?,
+         pairwise?, firmware_rules?, first_boot_rules?, inputs?}
+sim_new {name?, snapshot, time?, stagger?, build?, build_tag?, pairwise?}
       → {ok, name, control, ether, net, run, time, geodata, nodeset, script, snapshot}
 sim_stop {name}                   for good; a paused one's state deleted, ended → {ok, name}
 sim_pause {name, by?}             stopped, its state kept in its run; `by: script` is its
@@ -184,7 +184,8 @@ module_open {path}                → {path, text}   a file a script imports (th
 script_open {name}                → {script, text}
 script_new {name, text?} · script_save {name, text} · script_save_as {name, text}
                                   → {script, text}
-script_run {name, sim | resume | geodata, nodeset | nodesets, build?, inputs?}  → {run, simulation}
+script_run {name, sim | resume | geodata, nodeset | nodesets, build?, build_tag?, inputs?}
+                                  → {run, simulation}
                                   a new simulation is the script's own, started by
                                   it; several nodesets are merged as nodeset_merge
                                   merges them; `inputs` {name: value} for the
@@ -920,6 +921,8 @@ class ScriptRun:
                 argv += ["--nodeset", layer]
             if self.world.get("build"):
                 argv += ["--build", self.world["build"]]
+            if self.world.get("build_tag"):
+                argv += ["--build-tag", self.world["build_tag"]]
         for key, value in sorted(self.inputs.items()):
             argv += ["--set", "%s=%s" % (key, value)]
         env = dict(os.environ, SIM_MESH_PORT=str(port),
@@ -1185,7 +1188,7 @@ class Front:
                 run = await asyncio.to_thread(runs_module.resume_run, msg["resume"],
                                               simd_module.free_run_dir(base), time_mode)
             gd = read_geodata(run.geodata_path, run.geodata_name)
-            run.set(build=msg.get("build") or None)
+            run.set(build=msg.get("build") or None, build_tag=msg.get("build_tag") or None)
             sidecar = None
             if gd.is_pack:
                 try:
@@ -1222,7 +1225,7 @@ class Front:
             if merged:
                 with contextlib.suppress(OSError):
                     os.unlink(merged)
-        run.set(build=msg.get("build") or None,
+        run.set(build=msg.get("build") or None, build_tag=msg.get("build_tag") or None,
                 firmware_rules=list(msg.get("firmware_rules") or []),
                 first_boot_rules=list(msg.get("first_boot_rules") or []),
                 inputs=dict(msg.get("inputs") or {}))
@@ -1988,7 +1991,7 @@ class Front:
             if not msg.get("geodata") or not layers:
                 raise ValueError("a script's simulation needs geodata and a nodeset")
             world = {"geodata": str(msg["geodata"]), "nodesets": layers,
-                     "build": msg.get("build")}
+                     "build": msg.get("build"), "build_tag": msg.get("build_tag")}
             sim = store.check_name(msg.get("sim_name") or self.free_name(layers[0]),
                                    "simulation")
         given = {str(k): str(v) for k, v in (msg.get("inputs") or {}).items()

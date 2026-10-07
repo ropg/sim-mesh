@@ -44,8 +44,10 @@ the run (`firmware_rules`), and each node runs what the last rule matching
 it names (`firmware`), resolved once and kept in the run (`builds`). A node
 no rule matches runs nothing and is not started; a node placed later is
 matched as it lands. A node whose firmware a new rule changes is restarted
-on it, its state kept. The firmware's driver (drivers.py) is how simd starts
-and talks to its stations.
+on it, its state kept. A simulation started with a build (`build`, and
+`build_tag` to limit it to the nodes carrying one tag) runs that firmware on
+every node the rules give one, whatever they give. The firmware's driver
+(drivers.py) is how simd starts and talks to its stations.
 
 **First boot.** A station that boots with no state is set up: its name
 (the `name` verb), then what its first-boot rules give it (`{which,
@@ -77,10 +79,11 @@ Messages, page → simd (anything else is ignored, as on the wire). Any of
 them may carry `after`, seconds on the run's clock before it is acted on:
 
 ```
-sim_load {geodata, nodeset, script?, build?, sidecar?, firmware_rules?, first_boot_rules?}
+sim_load {geodata, nodeset, script?, build?, build_tag?, sidecar?, firmware_rules?,
+          first_boot_rules?}
                                                     a new run from these, factory fresh
 sim_load {run, sidecar?}                            adopt a run directory made already
-snapshot_load {name, build?, sidecar?}              a new run from a snapshot, state and all
+snapshot_load {name, build?, build_tag?, sidecar?}  a new run from a snapshot, state and all
 snapshot_save_as {name}                             this moment, flushed, as a snapshot
 nodeset_add {name, lat, lon, id?, height_m?, height_from?, max_dbm?, antenna?, tags?}
 nodeset_move {name, lat, lon, height_m?, settle?}   settle false: a drag still moving
@@ -377,9 +380,12 @@ class Simd:
 
     @property
     def build_override(self):
-        """A firmware the simulation was started with, in place of every
-        firmware of its base: the run's, else this process's --build."""
-        return (self.run.meta.get("build") if self.run else None) or self.args.build
+        """The firmware the simulation was started with, and the tag it is
+        limited to (None: every node): the run's, else this process's
+        --build and --build-tag."""
+        if self.run and self.run.meta.get("build"):
+            return self.run.meta["build"], self.run.meta.get("build_tag") or None
+        return self.args.build or None, self.args.build_tag or None
 
     def ids(self):
         return {name: node["id"] for name, node in self.nodeset.nodes.items()}
@@ -1241,7 +1247,9 @@ class Simd:
                 "firmware": str(rule["firmware"]).strip()}
 
     def assigned(self):
-        """{node: firmware} as the rules give it: the last matching rule's."""
+        """{node: firmware} as the rules give it: the last matching rule's.
+        A build the simulation was started with then replaces the firmware of
+        every node the rules gave one, or of those carrying its tag."""
         rules = [(select_module.Nodes.from_json(r["which"]), r["firmware"]) for r in self.rules]
         out = {}
         for name in self.nodeset.nodes:
@@ -1249,6 +1257,11 @@ class Simd:
             for chosen, ref in rules:
                 if chosen.matches(facts):
                     out[name] = ref
+        build, tag = self.build_override
+        if build:
+            for name in out:
+                if tag is None or tag in self.nodeset.nodes[name]["tags"]:
+                    out[name] = build
         return out
 
     async def settle_firmware(self):
@@ -1262,7 +1275,7 @@ class Simd:
             if drivers_module.build_present(self.builds.get(ref)) and ref in self.drivers:
                 continue
             try:
-                builds = drivers_module.resolve_builds([ref], self.build_override)
+                builds = drivers_module.resolve_builds([ref])
                 self.drivers.update(drivers_module.load_all(builds))
             except drivers_module.CommandError as err:
                 self.error("firmware %s: %s" % (ref, err))
@@ -1908,7 +1921,7 @@ class Simd:
                                                           self.progress(band), notice=log)
         run = runs_module.create_run(free_run_dir(self.run_base), gd, ns, script_name,
                                      self.args.time, tables)
-        run.set(build=msg.get("build") or None,
+        run.set(build=msg.get("build") or None, build_tag=msg.get("build_tag") or None,
                 firmware_rules=list(msg.get("firmware_rules") or []),
                 first_boot_rules=list(msg.get("first_boot_rules") or []))
         await self.adopt(run, sidecar)
@@ -1921,7 +1934,7 @@ class Simd:
         run = runs_module.load_snapshot(msg["name"], free_run_dir(self.run_base),
                                         self.args.time)
         if msg.get("build"):
-            run.set(build=msg["build"])
+            run.set(build=msg["build"], build_tag=msg.get("build_tag") or None)
         await self.adopt(run, msg.get("sidecar") or self.sidecar)
         log("loaded snapshot %s" % msg["name"])
 
@@ -2166,8 +2179,10 @@ def parse_args(argv):
                          "(run.yaml), and where a run loaded later goes, or beside "
                          "it as <dir>-2, -3… (default %s)" % os.path.relpath(DEFAULT_RUN))
     ap.add_argument("--build",
-                    help="an installed firmware (<name> or <base>_latest) every node "
-                         "whose firmware has its base runs instead")
+                    help="an installed firmware (<name> or <base>_latest) that every "
+                         "node the script gives a firmware runs instead")
+    ap.add_argument("--build-tag", metavar="TAG",
+                    help="with --build: only the nodes carrying this tag run it")
     ap.add_argument("--sidecar",
                     help="the planner-web base URL a pack's rows are recomputed "
                          "through after a move")

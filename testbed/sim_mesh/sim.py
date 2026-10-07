@@ -572,11 +572,13 @@ async def resume(name, time="real", port=None, session=None):
 
 async def start(geodata, nodesets, script=None, time="real", name=None, build=None,
                 firmware_rules=None, first_boot_rules=None, port=None, session=None,
-                inputs=None):
+                inputs=None, build_tag=None):
     """A new simulation from geodata and one or more nodesets (several are
     merged), its firmware and first-boot rules given from the start, started
     by the front and held. `script` is the name of the script it keeps a
-    copy of, `inputs` the values its inputs were given, which the run keeps."""
+    copy of, `inputs` the values its inputs were given, which the run keeps.
+    `build` is a firmware every node given one runs instead, or with
+    `build_tag` every such node carrying that tag."""
     port = port or DEFAULT_PORT
     own = session is None
     session = session or aiohttp.ClientSession()
@@ -585,7 +587,7 @@ async def start(geodata, nodesets, script=None, time="real", name=None, build=No
            "firmware_rules": list(firmware_rules or []),
            "first_boot_rules": list(first_boot_rules or [])}
     for key, value in (("script", script), ("name", name), ("build", build),
-                       ("inputs", inputs)):
+                       ("build_tag", build_tag), ("inputs", inputs)):
         if value:
             msg[key] = value
     try:

@@ -43,7 +43,7 @@ CATEGORY_CLASSES = {"reticulum": ReticulumDriver, "meshcore": MeshcoreDriver,
                     "meshtastic": MeshtasticDriver}
 MACRO_RE = re.compile(r"\{([a-z_]+)(?::([A-Za-z0-9_.-]+))?\}")
 BUILD_KEYS = ("firmware", "base", "category", "radio", "title", "hardware", "version", "arch",
-              "dir", "exec", "driver", "fixed", "env", "asked")
+              "dir", "exec", "driver", "fixed", "env")
 
 
 def radio_library(radio):
@@ -118,30 +118,15 @@ def env(station, build):
 
 # ---- resolving and loading ---------------------------------------------------
 
-def resolve_builds(refs, override=None, firmware_dir=None):
+def resolve_builds(refs, firmware_dir=None):
     """Where each firmware name a run uses runs from: {name: build}, which a
-    run keeps in run.yaml as its `builds`.
-
-    `override` is a simulation's own firmware, used in place of every
-    firmware of the same base. A name that resolves to nothing installed
-    raises CommandError naming it."""
+    run keeps in run.yaml as its `builds`. A name that resolves to nothing
+    installed raises CommandError naming it."""
     try:
-        forced = firmware_module.resolve(str(override), firmware_dir) \
-            if override not in (None, "") else None
-        out = {}
-        for ref in sorted(set(refs)):
-            try:
-                got = firmware_module.resolve(ref, firmware_dir)
-            except firmware_module.FirmwareError:
-                if forced is None:
-                    raise
-                got = None
-            if forced is not None and (got is None or got["base"] == forced["base"]):
-                got = dict(forced, asked=str(override))
-            out[ref] = build_of(got)
+        return {ref: build_of(firmware_module.resolve(ref, firmware_dir))
+                for ref in sorted(set(refs))}
     except firmware_module.FirmwareError as err:
         raise CommandError(str(err)) from err
-    return out
 
 
 def build_of(got):
