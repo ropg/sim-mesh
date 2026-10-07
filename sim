@@ -61,9 +61,9 @@
 #     sim source check                 read every source file (sources/sources.yaml and
 #                                      testbed/sources.yaml) and say what is wrong
 #     sim source list                  every source, where it stands, what it feeds
-#     sim source outline ID [--geofabrik REGION]
-#                                      write a source's outline: its feed's tiles, or a
-#                                      Geofabrik region's outline
+#     sim source outline ID [--geofabrik REGION …]
+#                                      write a source's outline: its feed's tiles, or
+#                                      Geofabrik regions' outlines together
 #     sim install [--dry-run]          on Linux, what SIM_MESH_NATIVE=1 needs, as sim-mesh's
 #                                      image holds it: the system's packages (sudo), Node
 #                                      22 where the system's is older, and Rust; then

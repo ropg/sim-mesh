@@ -66,7 +66,7 @@ coverage rasters are the planner's own sweep, at 90 % whatever this says.
 
 Coordinates on a pack are its own CRS, absolute easting and northing in
 metres. Packs are UTM on WGS84 (EPSG 326zz north, 327zz south) or on ETRS89
-(258zz), and the transverse Mercator here is Krüger's series to sixth order
+(258zz), a source's tiles may be on NAD83 (269zz), and the transverse Mercator here is Krüger's series to sixth order
 in n (Karney 2011), good to well under a millimetre inside a zone, so what
 sim-mesh sends the planner is the point the planner itself would compute. No
 projection library is needed.
@@ -142,12 +142,12 @@ UTM_FALSE_NORTHING_SOUTH = 10000000.0
 def utm_zone_of(epsg):
     """(zone, north, ellipsoid) for an EPSG code this module can project to."""
     epsg = int(epsg)
-    for base, north, ellipsoid in ((32600, True, WGS84), (32700, False, WGS84),
-                                   (25800, True, GRS80)):
+    for base, north, ellipsoid, last in ((32600, True, WGS84, 60), (32700, False, WGS84, 60),
+                                         (25800, True, GRS80, 60), (26900, True, GRS80, 23)):
         zone = epsg - base
-        if 1 <= zone <= 60:
+        if 1 <= zone <= last:
             return zone, north, ellipsoid
-    raise store.StoreError("EPSG %d is not a UTM zone (326zz, 327zz or 258zz)" % epsg)
+    raise store.StoreError("EPSG %d is not a UTM zone (326zz, 327zz, 258zz or 269zz)" % epsg)
 
 
 class TransverseMercator:

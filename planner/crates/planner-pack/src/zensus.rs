@@ -99,36 +99,59 @@ pub fn accumulate_population<R: Read>(
         if pop <= 0.0 {
             continue;
         }
-        // Cheap reject before projecting: transform the midpoint, check the
-        // region, then spread over sub-samples.
-        let (tx, ty) = to_target(x, y)?;
-        if target_index(tx, ty).is_none() {
-            continue;
-        }
-        total_in_region += pop as u64;
-        let mut placed = 0usize;
-        let mut hits: Vec<usize> = Vec::with_capacity((steps * steps) as usize);
-        for iy in 0..steps {
-            for ix in 0..steps {
-                let sx = x - cell / 2.0 + (ix as f64 + 0.5) * (cell / steps as f64);
-                let sy = y - cell / 2.0 + (iy as f64 + 0.5) * (cell / steps as f64);
-                let (px, py) = to_target(sx, sy)?;
-                if let Some(idx) = target_index(px, py) {
-                    hits.push(idx);
-                    placed += 1;
-                }
-            }
-        }
-        if placed > 0 {
-            // Uniform split over the sub-samples that landed in the region —
-            // conserves each cell's population exactly.
-            let split = (pop / placed as f64) as f32;
-            for idx in hits {
-                population[idx] += split;
-            }
+        if spread_cell(
+            (x, y),
+            (cell, cell),
+            steps,
+            pop,
+            &mut to_target,
+            &mut target_index,
+            population,
+        )? {
+            total_in_region += pop as u64;
         }
     }
     Ok(total_in_region)
+}
+
+/// One grid cell's people, centred on `centre` and `size` wide and high in
+/// its grid's units, spread uniformly over `steps` × `steps` sub-samples and
+/// added to the pack cells they land in. Cheap reject first: a cell whose
+/// midpoint is outside the region adds nothing and says false.
+pub fn spread_cell(
+    centre: (f64, f64),
+    size: (f64, f64),
+    steps: i32,
+    pop: f64,
+    to_target: &mut impl FnMut(f64, f64) -> Result<(f64, f64), PackError>,
+    target_index: &mut impl FnMut(f64, f64) -> Option<usize>,
+    population: &mut [f32],
+) -> Result<bool, PackError> {
+    let ((x, y), (w, h)) = (centre, size);
+    let (tx, ty) = to_target(x, y)?;
+    if target_index(tx, ty).is_none() {
+        return Ok(false);
+    }
+    let mut hits: Vec<usize> = Vec::with_capacity((steps * steps) as usize);
+    for iy in 0..steps {
+        for ix in 0..steps {
+            let sx = x - w / 2.0 + (ix as f64 + 0.5) * (w / steps as f64);
+            let sy = y - h / 2.0 + (iy as f64 + 0.5) * (h / steps as f64);
+            let (px, py) = to_target(sx, sy)?;
+            if let Some(idx) = target_index(px, py) {
+                hits.push(idx);
+            }
+        }
+    }
+    if !hits.is_empty() {
+        // Uniform split over the sub-samples that landed in the region —
+        // conserves each cell's population exactly.
+        let split = (pop / hits.len() as f64) as f32;
+        for idx in hits {
+            population[idx] += split;
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

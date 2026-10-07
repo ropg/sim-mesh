@@ -399,7 +399,7 @@ priority in each. Beside the list is a map: clicking a source shows where
 it has data, tinted (the world for a worldwide source; for a source with a
 feed, the tiles its feed lists, inside its outline; for any other its
 outline), and what of it is in the cache, filled (read off the cached files'
-names as its method names them: a template's tile its south-west corner, a
+names as its method names them: a template's tile the corner it is named by, a
 feed's tile its corner, a region's file its region). Clicking either line of
 the key under the map fits the map to all of that area. Clicking
 the map pins a point and lists only the sources with data there, each
@@ -560,15 +560,18 @@ sim-mesh ships:
 - **terrain and clutter**: the state surveys' 1 m terrain and their surface
   models where the rectangle touches Berlin, Brandenburg or
   Mecklenburg-Vorpommern, AHN's (0.5 m) where it touches the Netherlands,
-  Copernicus GLO-30 everywhere else;
+  Copernicus GLO-30 everywhere else; in the United States, USGS 3DEP's
+  10 m terrain under GLO-30's clutter;
 - **buildings**: the same states' LoD2 models, 3DBAG's in the Netherlands,
   OpenStreetMap's everywhere else (an OpenStreetMap building on a LoD2 or
   3DBAG tile is left out);
 - **population**: the Zensus 2022 grid where the rectangle touches Germany,
-  CBS's 2023 grid where it touches the Netherlands, none elsewhere;
+  CBS's 2023 grid where it touches the Netherlands, WorldPop's 2025 grid in
+  the United States, none elsewhere;
+- **land cover**: ESA WorldCover, with NLCD's classes over it in the
+  conterminous United States;
 
-and always ESA WorldCover land cover, OpenStreetMap roads and places, and
-the ITU maps. The panel lists the sources chosen, each with what it is used
+and always OpenStreetMap roads and places, and the ITU maps. The panel lists the sources chosen, each with what it is used
 for ("buildings inside its outline", "buildings outside Berlin LoD2 building
 models"), what is still to fetch (what is in the cache costs nothing) and
 its licence. Build is ready as soon as the sources and their files are
@@ -600,6 +603,9 @@ is fetched once, resumed where it stopped, and one its host does not have
 | AHN DTM and DSM, 0.5 m | the Netherlands | PDOK's sheet index (`service.pdok.nl`): only the windows of the sheets meeting the rectangle |
 | 3DBAG buildings | the Netherlands | `data.3dbag.nl`'s tile index: only the tiles meeting the rectangle |
 | CBS 2023 100 m grid | the Netherlands | `download.cbs.nl` |
+| 3DEP 1/3 arc-second terrain, 1° tiles | the United States | `prd-tnm.s3.amazonaws.com`: only the windows of the tiles meeting the rectangle |
+| Annual NLCD 2025 land cover, 30 m | the conterminous United States | `mrlc.gov`: one 1.5 GB zip |
+| WorldPop 2025 population, 3 arc-seconds | the United States | `data.worldpop.org`: one 1.5 GB GeoTIFF; the host does not resume a broken download |
 
 Geofabrik's index, Berlin's feeds and the MeshCore node list are kept in
 `testbed/geodata/.cache/meta/` and asked again when a week old, or after the
@@ -664,10 +670,12 @@ europe:                             # a continent
 
 - **Coverage** is `worldwide`, only under `global`, or `outline`, a GeoJSON
   polygon in `outlines/<id>.geojson` beside the file. `sim source outline ID`
-  writes one from the source's own feed, or `--geofabrik REGION` from a
-  Geofabrik region's.
-- **Finding**: `template` (tiles of whole degrees named by their south-west
-  corner: `{ns}`, `{lat}`, `{ew}`, `{lon}`, `:0n` padding), `atom` (an
+  writes one from the source's own feed, or `--geofabrik REGION …` from one
+  or more Geofabrik regions' together.
+- **Finding**: `template` (tiles of whole degrees, EPSG:4326 or 4269, named
+  by their south-west corner, or by their north-west one with
+  `corner: north-west`: `{ns}`, `{lat}`, `{ew}`, `{lon}`, `:0n` padding,
+  the letters upper case unless `letters: lower`), `atom` (an
   INSPIRE download feed, each tile's corner read off its file name),
   `index` (a file of footprints, GeoJSON or FlatGeobuf, in the `crs` it
   names: each footprint meeting the rectangle is a file, its address the
@@ -679,17 +687,23 @@ europe:                             # a continent
   address may be a list: mirrors, tried in order. A file no host has is no
   data there (`missing: error` makes it a failed build).
 - **Reading** is `whole`, the file, resumed when a fetch breaks off, or
-  `window`, for a regional cloud-optimised GeoTIFF: its directories and only
+  `window`, for a regional cloud-optimised GeoTIFF an index or a template
+  finds: its directories and only
   the chunks the rectangle meets, at the coarsest level whose pixel is no
   larger than a quarter of the pack's cell, fetched by HTTP range into a
   sparse copy of the file (its `.ranges` beside it says what it holds). A
-  Delft-sized pack takes about 10 MB of an AHN sheet's 330 MB.
+  Delft-sized pack takes about 10 MB of an AHN sheet's 330 MB, a
+  Providence-sized one 8 MB of a 3DEP tile's 500 MB.
 - **Formats**, with their parameters:
   - `geotiff` (`band`; `crs` when it is not EPSG:4326; `classes` for land
-    cover, which must be WorldCover's; `nodata` for heights, the value a
-    file writes where it has none; `members` when the tiles come zipped).
-    A worldwide one is a surface in EPSG:4326; a regional one is a terrain
-    or a surface in any projection sim-mesh knows.
+    cover, each code the file writes and the clutter class it is, a code
+    not named being no class there; `nodata`, the value a file writes where
+    it has none; `members` when the tiles come zipped). It feeds one
+    layer. A worldwide surface is in EPSG:4326; anything else is in any
+    projection sim-mesh knows: a regional terrain or surface, land cover,
+    or population as people per pixel. A terrain with a surface in its
+    projection is a pair, both halves measured; a terrain alone replaces
+    only the ground, each cell keeping its clutter.
   - `xyz` and `citygml`, in EPSG:25833 as Berlin, Brandenburg and
     Mecklenburg-Vorpommern deliver them: XYZ terrain and surface tiles are
     paired by `dgm1_33_E_N` and `dom1_33_E_N` in their names. A pack outside
@@ -703,19 +717,22 @@ europe:                             # a continent
 
   A file that does not fit its format is refused when it is read, with the
   sentence saying which.
-- **Projections** a source may name are EPSG:4326, EPSG:3035, UTM (WGS 84
-  and ETRS89 zones) and RD New (EPSG:28992, and EPSG:7415 for its heights).
+- **Projections** a source may name are EPSG:4326, NAD83 (EPSG:4269, taken
+  as WGS 84's degrees), EPSG:3035, Conus Albers (EPSG:5070), UTM (WGS 84,
+  ETRS89 and NAD83 zones) and RD New (EPSG:28992, and EPSG:7415 for its
+  heights).
 - **Layers** are `surface`, `terrain`, `landcover`, `buildings`,
   `population`, `roads`, `places` and `radio-climate`, each source with its
   priority in each. Berlin's, Mecklenburg-Vorpommern's and the Netherlands'
   terrain, surface and buildings are 100 to GLO-30's and OpenStreetMap's
   10; Brandenburg's are 90, since its outline holds Berlin, whose own come
-  first there.
+  first there. NLCD's land cover is 100 to WorldCover's 10.
 
 Shipped beyond the worldwide set: Germany (Berlin's, Brandenburg's and
 Mecklenburg-Vorpommern's terrain, surface and LoD2, and the Zensus 2022
-grid) and the Netherlands (AHN's 0.5 m terrain and surface, the 3DBAG
-buildings and CBS's 100 m population grid).
+grid), the Netherlands (AHN's 0.5 m terrain and surface, the 3DBAG
+buildings and CBS's 100 m population grid) and the United States (3DEP's
+1/3 arc-second terrain, NLCD land cover and WorldPop's population grid).
 
 An id is one source: a person's file may not take one sim-mesh ships (a
 second address for the same data is a mirror, in the shipped entry). Every
@@ -726,6 +743,7 @@ way, so a pull request that breaks it fails.
 sim source check                     # read every source file, say what is wrong
 sim source list                      # every source, where it stands, what it feeds
 sim source outline zensus --geofabrik germany
+sim source outline nlcd --geofabrik us-west us-midwest us-northeast us-south
 ```
 
 **Buildings from OpenStreetMap** are closed `building` ways and building
