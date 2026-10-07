@@ -17,9 +17,9 @@ written under `geodata/.part-<name>/`, its geodata file is written beside it
 when it is whole, and only then is the directory renamed into place, so
 geodata that exists is geodata that was built.
 
-Berlin's tiles are handed over as a directory of links to just the tiles
-this rectangle meets, since the compiler reads every file of the directory
-it is given and the cache holds every tile any build fetched.
+A LoD2 source's tiles are handed over as a directory of links to just the
+tiles this rectangle meets, since the compiler reads every file of the
+directory it is given and the cache holds every tile any build fetched.
 
 `row` is what the page is told: {name, state, step, done, total, fetched,
 of, error, spec}, state one of fetching, compiling, done, failed, cancelled.
@@ -54,19 +54,20 @@ INPUTS = {
     ("geotiff", "population", False): "population",
     ("itu-p1812-maps", "radio-climate", True): "itu_maps_dir",
     ("osm-pbf", "roads", True): "osm_pbf",
-    ("citygml", "buildings", False): "lod2_dir",
+    ("citygml", "buildings", False): "lod2",
     ("cityjson", "buildings", False): "cityjson",
-    ("xyz", "terrain", False): "berlin_1m_dir",
-    ("xyz", "surface", False): "berlin_1m_dir",
+    ("xyz", "terrain", False): "xyz",
+    ("xyz", "surface", False): "xyz",
     ("csv-grid", "population", False): "population",
     ("gpkg-grid", "population", False): "population",
     ("inspire-pd-grid", "population", False): "population",
 }
-# The inputs that take several sources; every other takes one. LoD2 is one
-# directory of CityGML the compiler reads whole, so a rectangle across two
-# states (Berlin and Potsdam) takes both. Land cover is read worldwide source
-# first, a regional one over it where it has a class (NLCD over WorldCover).
-MANY = ("berlin_1m_dir", "lod2_dir", "elevation_terrain", "elevation_surface", "landcover")
+# The inputs that take several sources; every other takes one. LoD2 and XYZ
+# are one input per source, each in its own UTM zone, so a rectangle across
+# two states (Berlin and Potsdam, Hamburg and Schleswig-Holstein) takes both.
+# Land cover is read worldwide source first, a regional one over it where it
+# has a class (NLCD over WorldCover).
+MANY = ("xyz", "lod2", "elevation_terrain", "elevation_surface", "landcover")
 
 
 class Build:
@@ -204,18 +205,18 @@ class Build:
             "itu_maps_dir": os.path.dirname(itu[0]) if itu else None,
             "osm_pbf": pbf[0] if pbf else None,
             "osm_buildings": bool(pbf) and "buildings" in reg[pbf_source].layers,
-            "lod2_dir": None, "berlin_1m_dir": None, "population": None, "elevation": [],
+            "lod2": [], "xyz": [], "population": None, "elevation": [],
             "cityjson": None, "threads": 0,
         }
         shutil.rmtree(self.inputs, ignore_errors=True)
-        if given.get("lod2_dir"):
-            params["lod2_dir"] = self.link_dir(
-                "lod2", [p for s in given["lod2_dir"] for p in extracted(s)])
-        if given.get("berlin_1m_dir"):
-            # Terrain first, as the pairs have always been laid out.
-            ids = sorted(given["berlin_1m_dir"], key=lambda s: "terrain" not in reg[s].layers)
-            params["berlin_1m_dir"] = self.link_dir(
-                "berlin-1m", [p for s in ids for p in extracted(s)])
+        for source_id in given.get("lod2", ()):
+            s = reg[source_id]
+            params["lod2"].append({
+                "dir": self.link_dir("lod2-" + source_id, extracted(source_id)),
+                "zone": zone_number(sourcefile.crs_of(s)), "source": s.title,
+                "notice": s.notice or ""})
+        self.surfaces_to_xyz(given, reg)
+        params["xyz"] = self.xyz(given, reg, have, extracted)
         params["elevation"] = self.elevation(given, reg, have, extracted)
         tiffs = lambda s: (extracted if s.format.get("members") else have)(s.id)  # noqa: E731
         for source_id in sorted(given.get("landcover", ()), key=lambda s: not reg[s].worldwide):
@@ -264,10 +265,46 @@ class Build:
                                             notice=s.notice or "")
         return params
 
+    @staticmethod
+    def surfaces_to_xyz(given, reg):
+        """A GeoTIFF surface that `pairs_with` an XYZ terrain goes with it,
+        tile by tile (Baden-Württemberg's DOM1 with its XYZ DGM1)."""
+        for source_id in list(given.get("elevation_surface", ())):
+            partner = reg[source_id].entry.get("pairs_with")
+            if partner in given.get("xyz", ()):
+                given["elevation_surface"].remove(source_id)
+                given["xyz"].append(source_id)
+
+    def xyz(self, given, reg, have, extracted):
+        """XYZ terrain and surface sources as the compiler's pairs: the
+        terrains and surfaces of one UTM zone together, their tiles paired by
+        the corner in their names, a GeoTIFF surface's that pairs with one
+        of them (`surfaces_to_xyz`) among them. A surface with no terrain in its zone is no pair, and
+        said so."""
+        by_zone = {}
+        for source_id in given.get("xyz", ()):
+            s = reg[source_id]
+            role = "terrain" if "terrain" in s.layers else "surface"
+            by_zone.setdefault(zone_number(sourcefile.crs_of(s)), {"terrain": [], "surface": []})[
+                role].append(s)
+        tiles = lambda s: (extracted if s.format.get("members") else have)(s.id)  # noqa: E731
+        out = []
+        for zone, pair in sorted(by_zone.items()):
+            if not pair["terrain"]:
+                raise store.StoreError("%s has no terrain to pair with in its zone"
+                                       % pair["surface"][0].title)
+            both = pair["terrain"] + pair["surface"]
+            out.append({
+                "terrain": [p for s in pair["terrain"] for p in tiles(s)],
+                "surface": [p for s in pair["surface"] for p in tiles(s)],
+                "zone": zone, "source": " and ".join(s.title for s in both),
+                "notice": " / ".join(dict.fromkeys(s.notice or "" for s in both))})
+        return out
+
     def elevation(self, given, reg, have, extracted):
         """Regional terrain and surface GeoTIFFs as the compiler's pairs: the
-        terrain and the surface sources in one system and with one no-data
-        value together, read at a quarter of a cell (in the system's units).
+        terrain and the surface sources in one system together, with each
+        one's no-data value, read at a quarter of a cell (in the system's units).
         A terrain with no surface in its system stands alone, in place of the
         split's terrain only (3DEP's in GLO-30's); a surface with no terrain
         is no pair, and said so. A source whose tiles come zipped (Brandenburg's)
@@ -276,13 +313,13 @@ class Build:
         for role in ("terrain", "surface"):
             for source_id in given.get("elevation_" + role, ()):
                 s = reg[source_id]
-                key = (sourcefile.proj_of(s), s.format.get("nodata"))
-                pair = by_proj.setdefault(key, {"terrain": [], "surface": [], "units": 1.0})
+                pair = by_proj.setdefault(sourcefile.proj_of(s),
+                                          {"terrain": [], "surface": [], "units": 1.0})
                 pair[role].append(s)
                 pair["units"] = crs.per_metre(sourcefile.crs_of(s))
         tiffs = lambda s: (extracted if s.format.get("members") else have)(s.id)  # noqa: E731
         out = []
-        for (proj, nodata), pair in by_proj.items():
+        for proj, pair in by_proj.items():
             if not pair["terrain"]:
                 raise store.StoreError("%s has no terrain to pair with in its system"
                                        % pair["surface"][0].title)
@@ -291,7 +328,8 @@ class Build:
                 "terrain": [p for s in pair["terrain"] for p in tiffs(s)],
                 "surface": [p for s in pair["surface"] for p in tiffs(s)],
                 "proj": proj, "pixel_m": float(self.spec["res_m"]) / 4.0 * pair["units"],
-                "nodata": None if nodata is None else float(nodata),
+                "nodata": sorted({float(s.format["nodata"]) for s in both
+                                  if s.format.get("nodata") is not None}),
                 "source": " and ".join(s.title for s in both),
                 "notice": " / ".join(dict.fromkeys(s.notice or "" for s in both))})
         return out
@@ -366,6 +404,11 @@ class Build:
                                    for r in self.planned["sources"])))
         os.rename(self.part, dest)
         geodata.load(self.name)
+
+
+def zone_number(system):
+    """The UTM zone of an `EPSG:<code>` UTM system (258zz, 326zz, …)."""
+    return geodata.utm_zone_of(int(str(system).split(":")[1]))[0]
 
 
 def more_memory():

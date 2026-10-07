@@ -140,8 +140,12 @@ fn kinds(m: &Value, key: &str, field: &str) -> Vec<String> {
 /// The LoD2 a build is given: none, the whole cached set, or only the tiles
 /// of one kilometre column (east 390 km), so OpenStreetMap has the rest.
 fn lod2_input(buildings: &str, all: &Path, out: &Path) -> Value {
+    let one = |dir: &Path| {
+        json!([{"dir": dir, "zone": 33, "source": "Berlin LoD2 building models",
+                "notice": "Geoportal Berlin"}])
+    };
     match buildings {
-        "lod2" => json!(all),
+        "lod2" => one(all),
         "both" => {
             let dir = out.with_extension("lod2");
             let _ = std::fs::remove_dir_all(&dir);
@@ -152,9 +156,9 @@ fn lod2_input(buildings: &str, all: &Path, out: &Path) -> Value {
                     std::os::unix::fs::symlink(f.path(), dir.join(&name)).unwrap();
                 }
             }
-            json!(dir)
+            one(&dir)
         }
-        _ => Value::Null,
+        _ => json!([]),
     }
 }
 
@@ -186,8 +190,8 @@ fn small_build(buildings: &str, out: &Path) -> Option<(Vec<Value>, Value)> {
             }],
             "itu_maps_dir": c.join("itu"), "osm_pbf": inputs[3],
             "osm_buildings": buildings != "lod2",
-            "lod2_dir": lod2_input(buildings, &inputs[5], out),
-            "berlin_1m_dir": null, "threads": 0,
+            "lod2": lod2_input(buildings, &inputs[5], out),
+            "xyz": [], "threads": 0,
             "population": {
                 "csv": inputs[4],
                 "proj": "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80 +units=m +no_defs",
@@ -240,7 +244,7 @@ fn small_real_builds_with_osm_lod2_and_both_buildings() {
         assert!(lic.contains(&"OpenStreetMap roads/rail".to_string()), "{lic:?}");
         assert!(lic.contains(&"OpenStreetMap places/streets/postal codes".to_string()), "{lic:?}");
         let osm_b = lic.contains(&"OpenStreetMap buildings".to_string());
-        let lod2 = lic.contains(&"Berlin LoD2 3D building models".to_string());
+        let lod2 = lic.contains(&"Berlin LoD2 building models".to_string());
         assert_eq!((osm_b, lod2), (buildings != "lod2", buildings != "osm"), "{lic:?}");
         assert!(!lic.iter().any(|l| l.contains("nodes")), "no nodes in a pack: {lic:?}");
         // Every sidecar line carries rings and a height source; with both,

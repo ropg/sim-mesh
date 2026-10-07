@@ -7,7 +7,7 @@
 //! third-party source carries its license notice verbatim so the app can
 //! display attributions offline.
 
-pub mod berlin1m;
+pub mod xyz;
 pub mod build;
 pub mod cityjson;
 pub mod elevation;

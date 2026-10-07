@@ -1,6 +1,8 @@
 """The source kinds past the starting set: RD New, an index of footprints
-(GeoJSON and FlatGeobuf), a window of a cloud-optimised GeoTIFF fetched into
-a sparse copy, and a GeoPackage grid as the compiler's CSV."""
+(GeoJSON, FlatGeobuf and an ArcGIS layer), a window of a cloud-optimised
+GeoTIFF fetched into a sparse copy, a GeoPackage grid as the compiler's CSV,
+members of remote zips fetched alone, templates of WCS boxes and offset
+grids, and hosts that refuse HEAD."""
 
 import asyncio
 import json
@@ -265,3 +267,188 @@ def test_a_geopackage_grid_becomes_the_compilers_csv(tmp_path):
     csv = cache.grid_csv(f, "aantal_inwoners")
     assert open(csv).read() == "x,y,value\n84050.000,447050.000,40\n84150.000,447050.000,-99997\n"
     assert cache.grid_csv(f, "aantal_inwoners") == csv          # written once
+
+
+# ---- members of remote zips ---------------------------------------------------------
+
+def zip_source(**find):
+    entry = {"id": "zz", "title": "Zipped tiles", "licence": "x", "notice": "x",
+             "redistributable": True, "layers": {"terrain": 100}, "coverage": "outline",
+             "find": dict({"method": "zip", "unit_m": 1000, "size_m": 1000,
+                           "crs": "EPSG:25832"}, **find),
+             "read": "whole", "format": {"type": "geotiff", "band": 1, "crs": "EPSG:25832"}}
+    return sourcefile.Source(entry, "own.yaml", "europe", "DE", "Germany")
+
+
+def test_members_of_a_remote_zip_and_of_a_zip_stored_in_it_are_fetched_alone(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    tile = bytes(range(256)) * 400
+    inner = tmp_path / "inner.zip"
+    with zipfile.ZipFile(inner, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("Tiles/LoD2_32_466_5894_2_HB.gml", b"<CityModel/>" * 50)
+    with zipfile.ZipFile(served / "state.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("DGM1_1/", b"")
+        zf.writestr("DGM1_1/dgm1_32_606_5760_2_st.tif", tile)
+        zf.writestr("DGM1_1/dgm1_32_606_5760_2_st.meta", b"meta")
+        zf.write(inner, "nested.zip", compress_type=zipfile.ZIP_STORED)
+
+    async def check(base, session, calls):
+        cache = sources.Cache(session, str(tmp_path / "cache"))
+        members = await cache.zip_members(base + "/state.zip")
+        assert [m["name"] for m in members] == [
+            "DGM1_1/dgm1_32_606_5760_2_st.tif", "DGM1_1/dgm1_32_606_5760_2_st.meta", "nested.zip"]
+        source = zip_source(archives=[base + "/state.zip"],
+                            name="dgm1_32_(?P<x>\\d{3})_(?P<y>\\d{4})_2_st\\.tif$", size_m=2000)
+        assert [(x, y) for _m, x, y in sources.zip_tiles(source, members)] == [(606, 5760)]
+        [f] = sources.zip_files(source, members, [10.55, 51.98, 10.56, 51.99])
+        assert f.name == "dgm1_32_606_5760_2_st.tif" and f.url == base + "/state.zip"
+        assert await cache.size(f) == f.member["csize"] < len(tile)
+        path = await cache.fetch(f)
+        assert open(path, "rb").read() == tile and cache.have(f) is True
+        assert not sources.zip_files(source, members, [13.0, 52.0, 13.1, 52.1])
+        # A tile two archives hold is fetched from the first.
+        twice = members + [dict(members[0], archive=base + "/other.zip")]
+        [f] = sources.zip_files(source, twice, [10.55, 51.98, 10.56, 51.99])
+        assert f.url == base + "/state.zip"
+        # A zip stored in the zip is read in place, its members by the outer's offsets.
+        nested = await cache.zip_members(base + "/state.zip!nested.zip")
+        assert [m["name"] for m in nested] == ["Tiles/LoD2_32_466_5894_2_HB.gml"]
+        g = sources.File("zz", nested[0]["archive"], "LoD2_32_466_5894_2_HB.gml",
+                         member=nested[0])
+        assert open(await cache.fetch(g), "rb").read() == b"<CityModel/>" * 50
+        with pytest.raises(sources.SourceError, match="holds no"):
+            await cache.zip_members(base + "/state.zip!other.zip")
+    import test_sources
+    test_sources.running_host(served, check)
+
+
+def test_a_zip_sources_listing_is_kept_and_served_when_an_archive_fails(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    with zipfile.ZipFile(served / "a.zip", "w") as zf:
+        zf.writestr("dgm1_32_606_5760_2_st.tif", b"t")
+
+    async def check(base, session, calls):
+        cache = sources.Cache(session, str(tmp_path / "cache"))
+        source = zip_source(archives=[base + "/a.zip"], name="(?P<x>\\d{3})_(?P<y>\\d{4})",
+                            refresh_days=0)
+        assert len(await cache.zip_listing(source)) == 1
+        os.remove(served / "a.zip")
+        assert len(await cache.zip_listing(source)) == 1
+    import test_sources
+    test_sources.running_host(served, check)
+
+
+# ---- an ArcGIS feature layer as an index ------------------------------------------
+
+def test_an_arcgis_layer_is_read_a_page_at_a_time_keeping_the_newest_of_each_tile(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(sources, "ARCGIS_PAGE", 2)
+    square = lambda x, y: {"type": "Polygon", "coordinates": [  # noqa: E731
+        [[x, y], [x + 1000, y], [x + 1000, y + 1000], [x, y + 1000], [x, y]]]}
+    features = [
+        {"geometry": square(550000, 5800000), "properties": {"dgm1": "https://s/L1603/a_2016.tif",
+                                                              "tile_id": 1, "Aktualitaet": 10}},
+        {"geometry": square(550000, 5800000), "properties": {"dgm1": "https://s/L2502/a_2025.tif",
+                                                              "tile_id": 1, "Aktualitaet": 20}},
+        {"geometry": square(551000, 5800000), "properties": {"dgm1": "https://s/L2502/b_2025.tif",
+                                                              "tile_id": 2, "Aktualitaet": 20}},
+    ]
+    asked = []
+
+    async def query(request):
+        asked.append(dict(request.query))
+        start, n = int(request.query["resultOffset"]), int(request.query["resultRecordCount"])
+        page = [dict(f, type="Feature") for f in features[start:start + n]]
+        return web.json_response({"type": "FeatureCollection", "features": page,
+                                  "properties": {"exceededTransferLimit":
+                                                 start + n < len(features)}})
+
+    async def go():
+        app = web.Application()
+        app.router.add_get("/FeatureServer/0/query", query)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        base = "http://127.0.0.1:%d" % runner.addresses[0][1]
+        source = sourcefile.Source(
+            dict(SHIPPED["ni-dgm1"].entry, find=dict(SHIPPED["ni-dgm1"].find,
+                                                     index=base + "/FeatureServer/0")),
+            "own.yaml", "europe", "DE", "Germany")
+        try:
+            async with aiohttp.ClientSession() as session:
+                cache = sources.Cache(session, str(tmp_path / "cache"))
+                got = await cache.index_features(source)
+        finally:
+            await runner.cleanup()
+        return got
+    got = asyncio.run(go())
+    assert [q["resultOffset"] for q in asked] == ["0", "2"]
+    assert asked[0]["outSR"] == "25832" and asked[0]["f"] == "geojson"
+    assert sorted(p["dgm1"] for p, _r in got) == ["https://s/L2502/a_2025.tif",
+                                                    "https://s/L2502/b_2025.tif"]
+
+
+def test_an_index_keeps_a_file_named_in_its_query_by_that_name():
+    sh = SHIPPED["sh-lod2"]
+    url = ("https://geodaten.schleswig-holstein.de/gaialight-sh/_apps/dladownload/massen.php"
+           "?file=LoD2_32_426_6004_1_SH.xml&id=4&live=2024&km=32420_6000")
+    ring = [[(426000, 6004000), (427000, 6004000), (427000, 6005000), (426000, 6005000),
+             (426000, 6004000)]]
+    [f] = sources.index_files(sh, [({"data_link": url}, ring)], [7.87, 54.18, 7.88, 54.19])
+    assert f.name == "LoD2_32_426_6004_1_SH.xml" and f.url == url
+
+
+# ---- templates in metres: an offset grid, a WCS box --------------------------------
+
+def test_a_template_grid_starts_at_its_origin():
+    bw = SHIPPED["bw-dgm1"]
+    hull = [9.17, 48.77, 9.19, 48.782]                       # Stuttgart, 513 km E
+    names = [f.name for f in sources.template_files(bw, hull)]
+    assert names and all(int(n.split("_")[2]) % 2 == 1 for n in names), names
+    assert all(int(n.split("_")[3]) % 2 == 0 for n in names), names
+    assert "dgm1_32_513_5402_2_bw.zip" in names
+
+
+def test_a_template_names_its_far_corner_and_keeps_its_file_under_its_own_name():
+    he = SHIPPED["he-dgm1"]
+    [f] = sources.template_files(he, [8.6801, 50.1101, 8.6802, 50.1102])
+    x = int(f.name.split("_")[2])
+    assert f.name == "dgm1_32_%d_%d_he.tif" % (x, int(f.name.split("_")[3]))
+    assert x % 1000 == 0
+    assert "SUBSET=E(%d,%d)&SUBSET=N(" % (x, x + 1000) in f.url
+    m = sources.template_pattern(he).match(f.name)
+    assert m and sources.template_corner(he, m)[0] == x
+
+
+# ---- a host that refuses HEAD -------------------------------------------------------
+
+def test_a_host_that_refuses_head_is_asked_for_two_bytes(tmp_path):
+    body = b"z" * 5000
+    asked = []
+
+    async def tile(request):
+        asked.append((request.method, request.headers.get("Range")))
+        if request.method == "HEAD":
+            raise web.HTTPUnauthorized()
+        return web.Response(status=206, body=body[0:2],
+                            headers={"Content-Range": "bytes 0-1/%d" % len(body)})
+
+    async def go():
+        app = web.Application()
+        app.router.add_route("*", "/t.zip", tile)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        base = "http://127.0.0.1:%d" % runner.addresses[0][1]
+        try:
+            async with aiohttp.ClientSession() as session:
+                cache = sources.Cache(session, str(tmp_path / "cache"))
+                return await cache.size(sources.File("sn-dgm1", base + "/t.zip", "t.zip"))
+        finally:
+            await runner.cleanup()
+    assert asyncio.run(go()) == 5000
+    assert asked == [("HEAD", None), ("GET", "bytes=0-1")]

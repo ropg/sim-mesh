@@ -1,12 +1,11 @@
-//! LoD2 CityGML ingestion (Berlin ATOM: 1×1 km tiles, dl-de/zero-2.0;
-//! same CityGML 2.0 shape as the other Länder feeds).
+//! LoD2 CityGML ingestion: the German state surveys' 3D building models, in
+//! the AdV's common CityGML 2.0 shape, in tiles of an ETRS89 UTM zone.
 //!
-//! Verified 2026-08-31 against LoD2_33_392_5820_1_BE.xml: `bldg:Building` and
-//! `bldg:BuildingPart` each carry `bldg:measuredHeight` (meters) and one or
-//! more `bldg:GroundSurface` rings as `gml:posList srsDimension="3"` E N Z
-//! triplets in EPSG:25833. Every Building/BuildingPart with its own ground
-//! surface + height becomes one record; parents that only aggregate parts
-//! contribute nothing themselves.
+//! `bldg:Building` and `bldg:BuildingPart` each carry `bldg:measuredHeight`
+//! (metres) and one or more `bldg:GroundSurface` rings as `gml:posList
+//! srsDimension="3"` E N Z triplets. Every Building/BuildingPart with its
+//! own ground surface + height becomes one record; parents that only
+//! aggregate parts contribute nothing themselves.
 
 use crate::PackError;
 use planner_buildings::HeightSource;
@@ -14,6 +13,18 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
 use std::io::BufRead;
+use std::path::PathBuf;
+
+/// One source's CityGML: a directory of its `.gml` or `.xml` files, the
+/// ETRS89 UTM zone they are in, and the source's name and notice, for the
+/// manifest.
+#[derive(Debug, Clone)]
+pub struct Lod2Input {
+    pub dir: PathBuf,
+    pub zone: u8,
+    pub source: String,
+    pub notice: String,
+}
 
 /// One ground-surface polygon: an outer ring and the courtyards inside it.
 ///
@@ -40,9 +51,9 @@ pub struct Lod2Building {
     /// The LoD2 `gml:id`, or `w<id>` / `r<id>` for an OpenStreetMap way or
     /// multipolygon relation.
     pub id: String,
-    /// Area-weighted footprint centroid in the pack CRS (LoD2's EPSG:25833
-    /// is taken as UTM 33 within a metre, and projected into a pack in any
-    /// other zone).
+    /// Area-weighted footprint centroid in the pack CRS (a LoD2 source's
+    /// ETRS89 UTM zone is taken as the pack's within a metre, and projected
+    /// into a pack in any other zone).
     pub e: f64,
     pub n: f64,
     /// Mean ground elevation (m amsl) of the footprint rings; for an
@@ -184,14 +195,25 @@ fn finish(ctx: Ctx, out: &mut Vec<Lod2Building>) {
     });
 }
 
-/// The 1 km tile a Berlin LoD2 file name holds, `LoD2_33_<E km>_<N km>_…`,
-/// as its extent in metres. `None` for a name in any other form.
+/// The tile a LoD2 file name holds, `LoD2_<zone>_<E km>_<N km>_<size km>_…`
+/// or with the zone before the easting (`LoD2_33_392_5820_1_BE.xml`,
+/// `LoD2_32_280_5652_1_NW.gml`, `lod2_33410_5656_2_sn.gml`), as its extent
+/// in metres, 1 km where the name gives no size. `None` for a name in any
+/// other form: its buildings' extent is the ground it covers.
 pub fn tile_extent(file_name: &str) -> Option<[f64; 4]> {
-    let mut parts = file_name.strip_prefix("LoD2_")?.split('_');
-    let _zone = parts.next()?;
-    let e: f64 = parts.next()?.parse().ok()?;
-    let n: f64 = parts.next()?.parse().ok()?;
-    Some([e * 1000.0, n * 1000.0, (e + 1.0) * 1000.0, (n + 1.0) * 1000.0])
+    let rest = file_name.get(..5).filter(|p| p.eq_ignore_ascii_case("lod2_"))?;
+    let parts: Vec<&str> = file_name[rest.len()..].split(|c| c == '_' || c == '.').collect();
+    let digits = |p: &str, n: usize| p.len() == n && p.bytes().all(|b| b.is_ascii_digit());
+    let at = parts.windows(2).position(|w| (digits(w[0], 3) || digits(w[0], 5)) && digits(w[1], 4))?;
+    let e: f64 = parts[at][parts[at].len() - 3..].parse().ok()?;
+    let n: f64 = parts[at + 1].parse().ok()?;
+    let size: f64 = parts
+        .get(at + 2)
+        .filter(|s| digits(s, 1))
+        .and_then(|s| s.parse().ok())
+        .filter(|s| *s > 0.0)
+        .unwrap_or(1.0);
+    Some([e * 1000.0, n * 1000.0, (e + size) * 1000.0, (n + size) * 1000.0])
 }
 
 /// Streaming parse of one CityGML file.
@@ -208,10 +230,14 @@ pub fn parse_citygml<R: BufRead>(reader: R) -> Result<Vec<Lod2Building>, PackErr
     // Polygon > (exterior|interior) > LinearRing > posList, so this is the
     // only place the courtyard/outline distinction exists in the document.
     let mut in_interior = false;
+    // Elements open. The document ends with its root: a host that appends
+    // a page of its own after it (Schleswig-Holstein's) is not read.
+    let mut depth = 0usize;
 
     loop {
         match xml.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
+                depth += 1;
                 let local = e.local_name();
                 match local.as_ref() {
                     b"Building" | b"BuildingPart" => {
@@ -276,19 +302,25 @@ pub fn parse_citygml<R: BufRead>(reader: R) -> Result<Vec<Lod2Building>, PackErr
                     in_poslist = false;
                 }
             }
-            Ok(Event::End(e)) => match e.local_name().as_ref() {
-                b"Building" | b"BuildingPart" => {
-                    if let Some(ctx) = stack.pop() {
-                        finish(ctx, &mut out);
+            Ok(Event::End(e)) => {
+                match e.local_name().as_ref() {
+                    b"Building" | b"BuildingPart" => {
+                        if let Some(ctx) = stack.pop() {
+                            finish(ctx, &mut out);
+                        }
                     }
-                }
-                b"GroundSurface" => {
-                    if let Some(c) = stack.last_mut() {
-                        c.in_ground = false;
+                    b"GroundSurface" => {
+                        if let Some(c) = stack.last_mut() {
+                            c.in_ground = false;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
-            },
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
             Ok(Event::Eof) => break,
             Err(e) => return Err(PackError::Invalid(format!("citygml: {e}"))),
             _ => {}
@@ -351,9 +383,6 @@ pub fn rasterize_building(b: &Lod2Building, mut sink: impl FnMut(f64, f64, f64))
     }
 }
 
-pub const BERLIN_LOD2_NOTICE: &str =
-    "Geoportal Berlin: 3D-Geb\u{e4}udemodelle LoD2 \u{2014} Datenlizenz Deutschland \u{2013} Zero \u{2013} Version 2.0 (dl-de/zero-2.0)";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +403,23 @@ mod tests {
   </bldg:Building>
  </cityObjectMember>
 </CityModel>"#;
+
+    #[test]
+    fn a_page_after_the_document_is_not_read() {
+        let text = format!("\u{feff}{SNIPPET}\n<!DOCTYPE html>\n<html><body><p>Zur\u{fc}ck</div></html>\n");
+        let b = parse_citygml(text.as_bytes()).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].id, "B1");
+    }
+
+    #[test]
+    fn a_tile_extent_comes_from_its_name_with_its_size() {
+        assert_eq!(tile_extent("LoD2_32_280_5652_1_NW.gml"), Some([280_000.0, 5_652_000.0, 281_000.0, 5_653_000.0]));
+        assert_eq!(tile_extent("LoD2_32_642_5650_2_TH.gml"), Some([642_000.0, 5_650_000.0, 644_000.0, 5_652_000.0]));
+        assert_eq!(tile_extent("lod2_33_250_5886_2_gml.gml").map(|e| e[2]), Some(252_000.0));
+        assert_eq!(tile_extent("lod2_33410_5656_2_sn.gml"), Some([410_000.0, 5_656_000.0, 412_000.0, 5_658_000.0]));
+        assert_eq!(tile_extent("792_5318.gml"), None);
+    }
 
     #[test]
     fn parses_building_with_ground_ring() {
