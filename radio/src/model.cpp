@@ -327,6 +327,7 @@ struct ChipState {
     int      preamble = 8;
     bool     hdrImplicit = false;
     bool     crcOn = true;
+    bool     iqInverted = false;
     uint8_t  payloadLen = 0;
     int      paVal = 14;
     uint8_t  paDutyCycle = 4;
@@ -343,6 +344,7 @@ struct ChipState {
      * -77. Each frame counts once, however often the ether tells of it. */
     AirFrame air[kAirFrames];
     int      lockId = 0;             /* the frame this receiver is following */
+    bool     hdrOk = true;           /* whether that frame's header will decode */
 
     /* When the last frame this antenna has been told of leaves the air. Not
      * the chip's state but the air's, so no mode change clears it: a driver
@@ -471,6 +473,8 @@ void fillState(const simradio* c, EtherState& s)
     s.hdrImplicit = d.hdrImplicit;
     s.crc         = d.crcOn;
     s.preamble    = d.preamble;
+    s.iqInverted  = d.iqInverted;
+    s.nSide       = 0;                /* an SX1262 has no side detectors */
 }
 
 void setMode(ChipState& d, const char* mode, uint8_t bits)
@@ -763,6 +767,7 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
             d.hdrImplicit = out[3] != 0;
             d.payloadLen  = out[4];
             d.crcOn       = out[5] != 0;
+            d.iqInverted  = out[6] != 0;
             publishState = true;
         }
         break;
@@ -978,9 +983,16 @@ void rxSyncCb(void* arg)
     raise((simradio*)arg, IRQ_SYNC_WORD_VALID);
 }
 
+/* The header is in: valid, or an error that lets go of the frame. The chip
+ * stays in RX and hunts for the next preamble, as continuous RX does. */
 void rxHdrCb(void* arg)
 {
-    raise((simradio*)arg, IRQ_HEADER_VALID);
+    auto* c = (simradio*)arg;
+    S()->lock();
+    bool ok = c->st.hdrOk;
+    if (!ok) dropLock(c);
+    S()->unlock();
+    raise(c, ok ? IRQ_HEADER_VALID : IRQ_HEADER_ERR);
 }
 
 void rxEndCb(void* arg)
@@ -998,8 +1010,7 @@ void rxEndCb(void* arg)
         d.sigRssiPkt = d.rssiPkt;
         d.snrPkt     = snrRegister(d.pendingEnd.snrDb);
         bits = IRQ_RX_DONE;
-        if (!d.pendingEnd.crcOk)    bits |= IRQ_CRC_ERR;
-        if (!d.pendingEnd.headerOk) bits |= IRQ_HEADER_ERR;
+        if (!d.pendingEnd.crcOk) bits |= IRQ_CRC_ERR;
         d.pendingValid = false;
     }
     S()->unlock();
@@ -1055,6 +1066,7 @@ void modelRxBegin(simradio* c, const VirtualRxBegin& f)
      * is sent here as energy. An rx_end for any frame but this one is not
      * this receiver's. */
     d.lockId = f.id;
+    d.hdrOk = f.hdrOk;
 
     /* The sender's stamps are its own clock's; only the gaps between them mean
      * anything here, and they are measured from this instant. The preamble is

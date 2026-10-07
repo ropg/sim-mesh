@@ -296,12 +296,20 @@ def test_set_tx_publishes_a_frame_timed_by_the_toa_formula(chip):
     _, tx = chip.ether.expect("tx")
 
     assert tx["sid"] == SID
-    assert (tx["freq"], tx["bw"], tx["sf"], tx["cr"], tx["pre"]) == (
-        pytest.approx(FREQ, abs=40), BW, SF, CR, PRE)
+    assert (tx["freq"], tx["bw"], tx["sf"], tx["cr"], tx["pre"], tx["iq"]) == (
+        pytest.approx(FREQ, abs=40), BW, SF, CR, PRE, "normal")
     assert tx["t_pre"] - tx["t0"] == int((PRE + 4.25) * TSYM * 1e6)
     assert tx["t_hdr"] - tx["t_pre"] == int(8 * TSYM * 1e6)
     assert tx["t_end"] - tx["t0"] == int(toa_seconds(42) * 1e6)
     assert base64.b64decode(tx["payload"]) == payload
+
+
+def test_set_packet_params_invert_iq_is_published(chip):
+    chip.configure()
+    chip.write(SET_PACKET_PARAMS, PRE >> 8, PRE & 0xFF, 0x00, 42, 0x01, 0x01)
+    chip.ether.expect("state", iq="inverted")
+    chip.set_length(42)
+    chip.ether.expect("state", iq="normal")
 
 
 def test_in_real_time_a_chip_is_never_said_to_be_quiet(chip):
@@ -408,6 +416,26 @@ def test_rx_end_with_a_crc_verdict_raises_crc_err(chip):
     chip.ether.rx_end(102, b"spoiled", verdict="crc")
     chip.wait_irq(RX_DONE)
     assert chip.irq() & (RX_DONE | CRC_ERR) == RX_DONE | CRC_ERR
+
+
+def test_a_header_the_ether_fails_raises_header_err_and_the_chip_hunts_on(chip):
+    chip.configure()
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    settle()
+    chip.ether.rx_begin(104, -80, 10_000, 20_000, 50_000, hdr_ok=False)
+    chip.wait_irq(HEADER_ERR)
+    assert chip.irq() & (HEADER_VALID | RX_DONE) == 0
+    assert chip.status() == ST_RX | DATA_AVAIL, "still in RX, hunting"
+    chip.ether.rx_end(104, b"header lost", verdict="hdr")
+    settle(0.1)
+    assert chip.irq() & (RX_DONE | CRC_ERR) == 0, "the frame was let go at its header"
+
+    chip.clear_irq()
+    chip.ether.rx_begin(105, -80, 10_000, 20_000, 50_000)
+    chip.wait_irq(HEADER_VALID)
+    chip.ether.rx_end(105, b"the next one")
+    chip.wait_irq(RX_DONE)
+    assert chip.irq() & (CRC_ERR | HEADER_ERR) == 0
 
 
 def test_snr_reads_no_more_than_a_lora_receiver_reports(chip):
