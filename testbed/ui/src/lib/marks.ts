@@ -26,8 +26,8 @@ export function forwardingRole(n: MapNode): string | null {
   return FORWARDING.find(r => n.tags.includes(r)) ?? null
 }
 
-/** A node of another shown layer: drawn, named on hover, and a click on it
- *  makes its layer the active one. */
+/** A node only shown, of a nodeset checked on the Nodes tab's list: drawn
+ *  in its nodeset's colour, and named on hover. */
 export interface OtherNode {
   layer: string
   name: string

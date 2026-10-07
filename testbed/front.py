@@ -109,11 +109,15 @@ select {sim}                                              which simulation the s
 
 firmware_list                     → {firmware: [row…], arch}      firmware.listing, each row with
                                     the paused runs and snapshots that hold it (`users`) and
-                                    its size on disk (`bytes`)
+                                    its size on disk (`bytes`), and the paused simulations among
+                                    them by simulation name (`paused`)
 firmware_prebuilt                 → {firmware: [row…], index}     what sim-mesh.net offers this
                                     machine, each row saying whether it is installed
 firmware_add {url}                → {firmware: row}               a pre-built zip, installed
-firmware_delete {names}           → {deleted}                     refused for any one held
+firmware_delete {names, stop_paused?}
+                                  → {deleted, stopped}            refused for any one a snapshot
+                                    holds, and for any one a paused simulation holds unless
+                                    `stop_paused`, which stops those simulations for good first
 antenna_list                      → {antennas: [antenna…]}       antennas.catalogue
 geodata_list                      → {geodata: [{name, kind, bbox, licences, bytes, from_index, …}
                                      | {name, error, bytes}], build: the running or failed
@@ -169,8 +173,9 @@ nodeset_heights {name, geodata}   → {nodeset, changed, estimates}   on a pack,
                                     whose height is assumed given planner's estimate
                                     (the sidecar's /height.json): `roof`, `raster`, or
                                     kept where it found nothing
-nodeset_merge {name, layers: [{name, data}]}  → {nodeset}   the shown layers, top first, as
-                                    they stand, merged into a new nodeset (nodeset.merge)
+nodeset_merge {name, layers: [{name, data}]}  → {nodeset}   the nodesets checked on the Nodes
+                                    tab, earlier in its list first, merged into a new nodeset
+                                    (nodeset.merge)
 nodeset_setup_open {name}         → {name, text, exists}   its own setup, nodesets/<name>.py;
                                     one it has not got yet reads as a fresh one's text
 nodeset_setup_save {name, text}   → {name, text, exists}   checked to parse, then written
@@ -1204,7 +1209,7 @@ class Front:
         layers = msg.get("nodesets") or [msg["nodeset"]]
         merged = None
         if len(layers) > 1:
-            # Several layers are run as one, merged as Save visible as merges
+            # Several nodesets are run as one, merged as Save selection as merges
             # them; losses.py reads the merge from a file of its own.
             data = nodeset_module.merge([(n, nodeset_module.load(n).data) for n in layers])
             merged = os.path.join(store.RUNS_DIR, ".merge-%s.yaml" % name)
@@ -1422,6 +1427,15 @@ class Front:
                 "pace": None, "mode": None, "rate": None, "observed": None, "t": paused.get("t"),
                 "plan": None, "phase": None, "eta": None, "report": run.has_report()}
 
+    def paused_holding(self):
+        """{firmware name: [paused simulation…]}: the firmware each paused
+        simulation's state was written by, which it can only resume on."""
+        out = {}
+        for sim, run in sorted(self.paused.items()):
+            for name in firmware_module.firmware_of(run.meta.get("builds")):
+                out.setdefault(name, []).append(sim)
+        return out
+
     async def sim_stop(self, msg):
         name = msg.get("name")
         child = self.children.get(name)
@@ -1556,9 +1570,12 @@ class Front:
         """One editor verb, answered to the asking socket."""
         name = msg.get("name")
         if verb == "firmware_list":
+            held = self.paused_holding()
+
             def listing():
                 dirs = firmware_module.installed()
-                return [dict(r, bytes=store.disk_bytes(dirs[r["name"]]) if r["name"] in dirs else None)
+                return [dict(r, bytes=store.disk_bytes(dirs[r["name"]]) if r["name"] in dirs else None,
+                             paused=held.get(r["name"], []))
                         for r in firmware_module.listing()]
             rows = await asyncio.to_thread(listing)
             return {"firmware": rows, "arch": firmware_module.machine_arch()}
@@ -1572,10 +1589,25 @@ class Front:
             return {"firmware": firmware_module.row(got["name"], got["dir"])}
         if verb == "firmware_delete":
             names = [str(n) for n in msg.get("names") or ()]
+            held = self.paused_holding()
+            stopping = sorted({s for n in names for s in held.get(n, ())})
+            if stopping and not msg.get("stop_paused"):
+                raise ValueError("paused simulation%s %s hold%s it: deleting stops %s"
+                                 % ("s" if len(stopping) > 1 else "", ", ".join(stopping),
+                                    "" if len(stopping) > 1 else "s",
+                                    "them" if len(stopping) > 1 else "it"))
+            # A snapshot's hold refuses before any simulation is stopped.
+            snapshots = await asyncio.to_thread(firmware_module.holders)
+            kept = {n: [u for u in snapshots.get(n, ()) if u.startswith("snapshot ")] for n in names}
+            if any(kept.values()):
+                raise ValueError("; ".join("%s is held by %s" % (n, ", ".join(u))
+                                           for n, u in sorted(kept.items()) if u))
+            for sim in stopping:
+                await self.sim_stop({"name": sim})
             deleted = await asyncio.to_thread(firmware_module.delete, names)
             log("deleted firmware %s" % ", ".join(deleted))
             self.broadcast({"type": "firmware_changed"})
-            return {"deleted": deleted}
+            return {"deleted": deleted, "stopped": stopping}
         if verb == "antenna_list":
             return {"antennas": await asyncio.to_thread(antennas_module.listing)}
         if verb == "geodata_list":
@@ -1701,7 +1733,7 @@ class Front:
             layers = [(store.check_name(str(layer.get("name")), "layer"), layer.get("data") or {})
                       for layer in msg.get("layers") or ()]
             if not layers:
-                raise store.StoreError("nothing is shown to save")
+                raise store.StoreError("no nodeset is chosen to save")
             nodeset_module.write(path, nodeset_module.merge(layers),
                                  "from %s" % ", ".join(layer for layer, _ in layers))
             return {"nodeset": nodeset_module.load(name).as_dict()}

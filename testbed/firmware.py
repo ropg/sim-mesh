@@ -41,7 +41,9 @@ architecture must be this machine's, and a base keeps one versioning scheme.
 A firmware already installed under that name is refused, not replaced.
 
 **Deleting** is refused for a firmware a paused run or a snapshot uses: their
-state can only be resumed on the firmware that wrote it.
+state can only be resumed on the firmware that wrote it. The page's delete
+(the front's `firmware_delete` with `stop_paused`) stops such paused runs for
+good first, after warning; a snapshot's hold is always refused.
 
 Every directory is whole or absent: a zip is unpacked under a `.part-` name,
 checked, and renamed into place. Downloads are aiohttp in the caller's loop and
@@ -341,7 +343,8 @@ def _yaml(path):
     return doc if isinstance(doc, dict) else {}
 
 
-def _named(builds):
+def firmware_of(builds):
+    """The firmware names a run.yaml's or a snapshot.yaml's `builds` holds."""
     return {str(b.get("firmware")) for b in (builds or {}).values()
             if isinstance(b, dict) and b.get("firmware")}
 
@@ -365,7 +368,7 @@ def holders(runs_dir=None, snapshots_dir=None):
                 if not isinstance(paused, dict) or doc.get("resumed") or \
                         not os.path.isfile(os.path.join(base, entry, "paused", "snapshot.yaml")):
                     continue
-            for name in _named(doc.get("builds")):
+            for name in firmware_of(doc.get("builds")):
                 out.setdefault(name, []).append("%s %s" % (what, entry))
     return out
 
@@ -628,7 +631,7 @@ td:first-child a { font-family: ui-monospace, monospace; font-size: 13px; }
 <h1>Pre-built firmware</h1>
 <p>Firmware zips for <a href="../">sim-mesh</a>: add one with
 <code>sim firmware add &lt;its URL&gt;</code>, or from the Firmware tab's
-<b>Add from pre-built…</b>. What a zip is: <a href="../contract/">the firmware contract</a>.</p>
+<b>Download pre-built firmware</b>. What a zip is: <a href="../contract/">the firmware contract</a>.</p>
 <table>
 <thead><tr><th>Firmware</th><th>What it is</th><th>Category</th><th>Radio</th><th>Arch</th><th>Size</th></tr></thead>
 <tbody>

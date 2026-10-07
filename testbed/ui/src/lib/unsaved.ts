@@ -1,8 +1,8 @@
 import type { QVueGlobals } from 'quasar'
 import { useNodes } from '../stores/nodes'
 
-/* Leaving the nodeset being edited, by another geodata, another layer, New,
- * Import or another tab: with changes not saved, the user saves them,
+/* Leaving the nodeset being edited, for the list of nodesets, another
+ * geodata, New, Import or another tab: with changes not saved, the user saves them,
  * discards them, or stays where they are. `go` runs once nothing is left
  * unsaved. */
 export function whenSaved(quasar: QVueGlobals, go: () => void) {

@@ -11,7 +11,8 @@ import { useSocket } from './socket'
 
 /** An installed firmware, as the Firmware tab lists it, named
  *  `<base>_<arch>_<version>`. `users` are the paused runs and snapshots that
- *  hold it. */
+ *  hold it; `paused` the paused simulations among them, by name, which a
+ *  delete stops. */
 export interface FirmwareRow {
   name: string
   base: string
@@ -22,6 +23,7 @@ export interface FirmwareRow {
   title?: string
   hardware?: string | null
   users?: string[]
+  paused?: string[]
   /** Its directory's size on disk. */
   bytes?: number | null
   error?: string

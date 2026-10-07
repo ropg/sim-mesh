@@ -1,11 +1,11 @@
 <template>
   <div class="io">
-    <div class="io-head">
-      <div class="io-heading">Download pre-built {{ kind === 'geodata' ? 'geodata packs' : 'nodesets' }}</div>
+    <div class="tab-head">
+      <div class="tab-heading">Download pre-built {{ kind === 'geodata' ? 'geodata packs' : 'nodesets' }}</div>
       <q-space />
-      <q-btn flat dense no-caps size="sm" label="Refresh" :loading="catalog.indexesLoading"
+      <q-btn flat dense no-caps label="Refresh" :loading="catalog.indexesLoading"
              @click="catalog.refreshIndexes()" />
-      <q-btn flat dense no-caps label="Add index…" @click="adding = true" />
+      <q-btn flat dense no-caps label="Add index" @click="adding = true" />
     </div>
     <div v-if="catalog.indexes === null" class="io-sub">Asking the indexes…</div>
     <div v-for="ix in catalog.indexes ?? []" :key="ix.name" class="io-index">
@@ -20,33 +20,30 @@
         </q-btn>
         <span v-else class="io-icon-gap" />
       </div>
-      <div v-if="ix.description" class="io-about">{{ ix.description }}</div>
+      <div v-if="ix.description" class="io-about">
+        <p v-for="(para, i) in paragraphs(ix.description)" :key="i">{{ para }}</p>
+      </div>
       <div v-if="ix.error" class="io-bad">{{ ix.error }}</div>
-      <table v-else-if="ix[kind].length" class="io-table">
+      <table v-else-if="ix[kind].length" class="io-table tab-flow">
         <tbody>
-          <tr v-for="e in ix[kind]" :key="e.name">
+          <tr v-for="e in ix[kind]" :key="e.name" :class="{ 'io-row': !e.taken && !fetchingOf(ix.name, e.name) }"
+              :title="rowTitle(ix.name, e)" @click="clicked(ix.name, e)">
             <td class="io-name-cell">
               <span class="io-name">{{ e.name }}</span>
-              <div v-if="e.title" class="io-sub">{{ e.title }}</div>
+              <div v-if="e.title" class="io-sub">{{ keepUnits(e.title) }}</div>
             </td>
             <td>
-              <div v-if="e.description" class="io-text">{{ e.description }}</div>
+              <div v-if="e.description" class="io-text">{{ keepUnits(e.description) }}</div>
               <div class="io-sub">{{ facts(e) }}</div>
             </td>
-            <td class="num mono">{{ sizeText(e.bytes) }}</td>
-            <td class="io-act">
+            <td class="col-size mono">{{ sizeText(e.bytes) }}</td>
+            <td class="col-act" @click.stop>
               <template v-if="fetchingOf(ix.name, e.name)">
-                <span class="io-sub">{{ progressText(fetchingOf(ix.name, e.name)!) }}</span>
+                <div class="io-sub">{{ progressText(fetchingOf(ix.name, e.name)!) }}</div>
                 <q-btn flat dense no-caps size="sm" label="Cancel" @click="cancel(ix.name, e.name)" />
               </template>
-              <q-btn v-else-if="e.installed && kind === 'geodata'" flat dense no-caps size="sm" color="primary"
-                     label="Open" @click="emit('open', e.name)">
-                <q-tooltip>Installed here: open it</q-tooltip>
-              </q-btn>
               <span v-else-if="e.installed" class="io-ok">installed{{ e.changed ? ', changed here' : '' }}</span>
-              <span v-else-if="e.taken" class="io-warn"
-                    title="Something else here has this name: rename or delete it to add this one">name taken here</span>
-              <q-btn v-else flat dense no-caps size="sm" color="primary" label="Add" @click="install(ix.name, e)" />
+              <span v-else-if="e.taken" class="io-warn">name taken here</span>
             </td>
           </tr>
         </tbody>
@@ -78,8 +75,9 @@
 
 <script setup lang="ts">
 /* What the listed indexes offer of one kind, geodata or nodesets: each
- * index with its entries, each entry installed here (geodata to Open), its
- * name taken by something else, being fetched (with Cancel), or to Add.
+ * index with its entries, each entry installed here (a click opens it), its
+ * name taken by something else, being fetched (with Cancel), or not here (a
+ * click installs it).
  * sim-mesh's own index is always listed; one a person added has a trash can
  * that forgets it. The indexes are one list for both kinds. */
 import { onMounted, ref } from 'vue'
@@ -87,10 +85,10 @@ import { useQuasar } from 'quasar'
 import { matDeleteOutline } from '@quasar/extras/material-icons'
 import { fetchKey, useCatalog, type Fetching, type IndexEntry, type IndexKind } from '../stores/catalog'
 import { request } from '../lib/front'
-import { sizeText } from '../lib/size'
+import { keepUnits, sizeText } from '../lib/size'
 
 const props = defineProps<{ kind: IndexKind }>()
-/** An installed geodata entry's Open: its name, for the page to open. */
+/** A click on an installed entry: its name, for the page to open. */
 const emit = defineEmits<{ open: [name: string] }>()
 const catalog = useCatalog()
 const quasar = useQuasar()
@@ -103,6 +101,12 @@ onMounted(() => { if (catalog.indexes === null) void catalog.refreshIndexes() })
 function tell(error: string | null | undefined, done?: string) {
   if (error) quasar.notify({ type: 'negative', message: error, timeout: 8000 })
   else if (done) quasar.notify({ type: 'positive', message: done, timeout: 4000 })
+}
+
+/** An index's description as paragraphs, each reflowed to the page's width:
+ *  a blank line parts two, a single line break is a space. */
+function paragraphs(text: string) {
+  return text.split(/\n\s*\n/).map(p => keepUnits(p.replace(/\s*\n\s*/g, ' ').trim())).filter(Boolean)
 }
 
 function facts(e: IndexEntry) {
@@ -126,6 +130,20 @@ function progressText(f: Fetching) {
   const first = f.now && (f.now.kind !== f.kind || f.now.name !== f.name) ? `${f.now.name} first: ` : ''
   if (!f.fetched) return `${first}fetching…`
   return `${first}${sizeText(f.fetched)}${f.of ? ` of ${sizeText(f.of)}` : ''}`
+}
+
+function rowTitle(index: string, e: IndexEntry) {
+  if (fetchingOf(index, e.name)) return ''
+  if (e.installed) return 'Already installed, click to open'
+  if (e.taken) return 'Something else here has this name: rename or delete it to install this one'
+  return 'Click to install'
+}
+
+/** A click on a row: what is installed opened, what is not installed. */
+function clicked(index: string, e: IndexEntry) {
+  if (fetchingOf(index, e.name) || e.taken) return
+  if (e.installed) emit('open', e.name)
+  else void install(index, e)
 }
 
 async function install(index: string, e: IndexEntry) {
@@ -168,9 +186,7 @@ function askForget(name: string) {
 </script>
 
 <style scoped>
-.io { margin-top: 28px; }
-.io-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.io-heading { font-size: 14px; font-weight: 500; color: #d1d5db; }
+.io { margin-top: 36px; }
 .io-index { margin: 8px 0 14px; }
 .io-index-head { display: flex; align-items: center; gap: 10px; padding: 4px 10px;
   border-bottom: 1px solid #262c35; }
@@ -183,10 +199,18 @@ function askForget(name: string) {
 .io-table td + td { padding-left: 10px; }
 .io-name-cell { width: 28%; }
 .io-name { font-weight: 500; }
+.io-row { cursor: pointer; }
+.col-act .io-sub { white-space: normal; }
+.io-row:hover td { background: #1b2028; }
+.io-row .io-name { color: var(--q-primary); }
 .io-text { font-size: 12px; color: #9ca3af; }
-.io-about { font-size: 12px; color: #9ca3af; line-height: 1.5; padding: 6px 24px 2px;
-  white-space: pre-line; max-width: 760px; }
-.io-act { text-align: right; white-space: nowrap; width: 1%; }
+/* The width of the page's own paragraphs, from the same left edge. */
+.io-about { font-size: 12px; color: #9ca3af; line-height: 1.5; padding: 8px 0 4px; max-width: 760px; }
+.io-about p { margin: 0 0 6px; }
+@media (max-width: 640px) {
+  .io-index-head { flex-wrap: wrap; }
+  .io-address { max-width: 100%; }
+}
 .io-sub { font-size: 11px; color: #6b7280; }
 .io-none { padding: 6px 24px; }
 .io-bad { font-size: 11px; color: #fca5a5; padding: 6px 24px; }

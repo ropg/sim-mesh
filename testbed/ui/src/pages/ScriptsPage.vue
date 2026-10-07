@@ -4,7 +4,7 @@
       <div class="sp-head">
         <span class="sp-heading">Scripts</span>
         <q-space />
-        <q-btn flat dense no-caps size="sm" label="New…" @click="askNew" />
+        <q-btn flat dense no-caps color="primary" label="New" @click="askNew" />
       </div>
       <q-list dense>
         <q-item v-for="s in runnable" :key="s.name" clickable :active="s.name === current"
@@ -36,10 +36,10 @@
           <span class="sp-title">{{ current ?? `${setup} setup` }}<span v-if="anyDirty" class="sp-dirty"> •</span></span>
           <q-btn flat dense no-caps label="Save" :disable="!tab || tab.readonly || (!tabDirty(tab) && !tab.fresh)"
                  @click="save" />
-          <q-btn v-if="!setup" flat dense no-caps label="Save as…" :disable="!tab || tab.readonly || !!tab.nodeset"
+          <q-btn v-if="!setup" flat dense no-caps label="Save as" :disable="!tab || tab.readonly || !!tab.nodeset"
                  @click="askSaveAs" />
           <q-space />
-          <q-btn v-if="!setup" unelevated dense no-caps color="primary" label="Run…"
+          <q-btn v-if="!setup" flat dense no-caps color="primary" label="Run"
                  :disable="!info || !!info.error || !!includedBy.length" @click="running = true">
             <q-tooltip>{{ includedBy.length
               ? `Part of ${includedBy.join(', ')}, which include it: run one of those`
@@ -147,8 +147,8 @@
           <div v-else class="sp-world">
             <div><span>geodata</span><b>{{ nodes.geodata ?? 'none: choose it on the Geodata tab' }}</b></div>
             <div><span>{{ runLayers.length > 1 ? 'nodesets, merged' : 'nodeset' }}</span>
-              <b>{{ runLayers.length ? runLayers.join(', ') : 'none: show a layer on the Nodes tab' }}</b></div>
-            <div class="sp-world-note">What the Nodes tab shows; change it there. Real or virtual time is the script's own <code>time(…)</code> line.</div>
+              <b>{{ runLayers.length ? runLayers.join(', ') : 'none: open or check one on the Nodes tab' }}</b></div>
+            <div class="sp-world-note">The nodeset open on the Nodes tab, else the ones checked in its list; change it there. Real or virtual time is the script's own <code>time(…)</code> line.</div>
           </div>
         </q-card-section>
         <q-card-actions align="right">
@@ -165,7 +165,7 @@
  * and saved through the front, which checks a script parses; Run starts it
  * as a process of the front's, and its output comes back here as it is
  * written. With `?setup=<nodeset>` the page is that nodeset's setup file
- * alone, which the Nodes tab's Edit setup opens. */
+ * alone, which the Nodes tab's Setup script opens. */
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { useQuasar } from 'quasar'
 import { useRoute, useRouter } from 'vue-router'
@@ -211,12 +211,11 @@ const included = computed(() => catalog.scripts.filter(s => !!s.included_by?.len
 const includedBy = computed(() => catalog.scripts.find(s => s.name === current.value)?.included_by ?? [])
 function tabDirty(t: Tab) { return !t.readonly && t.text !== t.saved }
 const anyDirty = computed(() => tabs.value.some(tabDirty))
-/** What a new simulation runs on: the Nodes tab's shown layers, the active
- *  one first, merged when there are several. */
+/** What a new simulation runs on: the nodeset open on the Nodes tab, else
+ *  the ones checked in its list, merged when there are several. */
 const runLayers = computed<string[]>(() => {
-  const active = nodes.nodeset?.name
-  const shown = nodes.layers.filter(l => l.shown && l.name !== active).map(l => l.name)
-  return [...(active ? [active] : []), ...shown]
+  const open = nodes.nodeset?.name
+  return open ? [open] : nodes.checkedNames
 })
 const runningNames = computed(() => sim.sims.filter(s => s.state === 'running').map(s => s.name))
 const pausedNames = computed(() => sim.sims.filter(s => s.state === 'paused').map(s => s.name))
@@ -352,7 +351,7 @@ function openScript(name: string) {
 
 // `?script=<name>&geodata=<g>&nodeset=<n>…&set.<input>=<value>…`, as `sim run`
 // opens the page when a script lacks an input: the script open on its world,
-// the inputs given filled in, and Run… asked, for the rest to be chosen.
+// the inputs given filled in, and Run asked, for the rest to be chosen.
 watch(() => route.query.script, (name) => {
   if (typeof name !== 'string' || !name) return
   const q = { ...route.query }
@@ -363,12 +362,14 @@ watch(() => route.query.script, (name) => {
       const layers = ([] as unknown[]).concat(q.nodeset ?? []).filter((l): l is string =>
         typeof l === 'string' && !!l)
       if (typeof q.geodata === 'string' && q.geodata) await nodes.chooseGeodata(q.geodata)
-      if (layers.length) {
-        const error = await nodes.activate(layers[0]!)
+      // One nodeset is opened; several are checked in the list, to be merged.
+      if (layers.length === 1) {
+        const error = await nodes.openSet(layers[0]!)
         if (error) tell(error)
-        for (const layer of layers.slice(1)) {
-          if (!nodes.layers.find(l => l.name === layer)?.shown) await nodes.toggleLayer(layer)
-        }
+      } else if (layers.length) {
+        nodes.close()
+        nodes.checked = new Set(layers)
+        await nodes.loadSets()
       }
       const r = await request('script_open', { name })
       if (!r.ok) { tell(r.error); return }
@@ -494,12 +495,12 @@ function indent(event: KeyboardEvent) {
 .sp-input-field { min-width: 380px; }
 .sp-subhead { padding-top: 12px; }
 .sp-list { width: 280px; flex: none; border-right: 1px solid #262c35; overflow-y: auto; padding: 10px 0; }
-.sp-head { display: flex; align-items: center; padding: 0 12px 4px; }
-.sp-heading { font-size: 14px; font-weight: 500; color: #d1d5db; }
+.sp-head { display: flex; align-items: center; gap: 18px; padding: 0 12px 10px; }
+.sp-heading { font-size: 18px; font-weight: 500; color: #e5e7eb; }
 .sp-doc { font-size: 11px; color: #6b7280 !important; }
 .sp-active { background: #1a2029; color: #fff; }
 .sp-main-pane { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
-.sp-bar { min-height: 38px; gap: 6px; background: #171b21; border-bottom: 1px solid #262c35; flex: none; }
+.sp-bar { min-height: 38px; gap: 16px; background: #171b21; border-bottom: 1px solid #262c35; flex: none; }
 .sp-tabs { background: #13171d; border-bottom: 1px solid #262c35; flex: none; font-size: 12px; }
 .sp-ro { margin-left: 6px; font-size: 10px; color: #6b7280; border: 1px solid #374151; border-radius: 3px; padding: 0 4px; }
 .sp-title { font-size: 14px; font-weight: 500; padding: 0 8px; }

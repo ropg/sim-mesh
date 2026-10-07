@@ -684,10 +684,10 @@ def distance_m(a, b):
 
 
 def merge(layers):
-    """Nodesets shown together as one, as Save visible as writes it.
+    """Several nodesets as one, as the Nodes tab's Save selection as writes it.
 
-    `layers` is [(layer name, file mapping)], the top of the Layers panel
-    first. One layer is its own mapping unchanged. Of several, every node
+    `layers` is [(nodeset name, file mapping)], the earliest in the Nodes
+    tab's list first. One layer is its own mapping unchanged. Of several, every node
     keeps its tags and gains its layer's name as one; a node within
     MERGE_WITHIN_M of a node of an earlier layer is that node, the earlier
     layer's, and is left out; a name an earlier layer took gets the layer's

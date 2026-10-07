@@ -104,24 +104,24 @@ starts the front and opens
 testbed's: Ctrl-C there stops every simulation and everything they started.
 
 **3. Firmware.** A station runs an installed firmware. On the **Firmware**
-tab, **Add from pre-built…** lists what sim-mesh.net offers for this
-machine's architecture (`aarch64` or `x86_64`) and installs one with a
-click; **Add from zip…** installs a zip of your own. From a shell,
+tab, **Download pre-built firmware** lists what sim-mesh.net offers for this
+machine's architecture (`aarch64` or `x86_64`) and **Add** installs one;
+**Import zip** installs a zip of your own. From a shell,
 `sim firmware add <zip or URL>` does the same.
 
 **4. A first simulation.** Geodata and nodesets are kept in
 `testbed/geodata/` and `testbed/nodesets/` and never committed: they are
 fetched from an index, or made here. On the **Geodata** tab, **Download
 pre-built geodata packs** lists what sim-mesh's own index, `sim-mesh-examples`, and
-any index you add offer, and **Add** installs one; or make ground,
-**Build…** over a rectangle of the map or **New synthetic…**. Click it to
-choose it. On the **Nodes** tab place nodes on it, **Import…** them in the
-Layers panel from a public node map or a file, or fetch a nodeset from an
-index under **Nodesets…**, and **Save nodes as nodeset…**; a nodeset is
-offered on any geodata that holds one of its nodes, and is chosen in the
-Layers panel. On the **Scripts** tab open
+any index you add offer, and a click on one installs it; or make ground,
+**Build** over a rectangle of the map or **New synthetic**. Click it to
+choose it. The **Nodes** tab lists the nodesets with a node on it, beside a
+map of the ones checked: **New** one and place nodes on it, **Import** them
+from a public node map or a file, or fetch a nodeset from an index under
+**Download pre-built nodesets**; a click on a nodeset opens it to edit. On
+the **Scripts** tab open
 `lxmf-traffic`, choose the firmware its nodes run in **Firmware for nodes
-not otherwise configured** above the script, and **Run…** it: a new
+not otherwise configured** above the script, and **Run** it: a new
 simulation of that nodeset on that ground. The page goes over to the
 simulation's live map, framed on its nodes, and its stations come up over
 the next minute; rings on the map are frames on the air. For a simulation
@@ -185,8 +185,8 @@ driver interface its driver implements: `reticulum`, `meshcore`
 verbs are its category's (below), and the traffic and delivery analyses are
 the `reticulum` category's own.
 
-**Adding** one: **Add from zip…** or **Add from pre-built…** on the Firmware
-tab, or
+**Adding** one: **Import zip**, or **Add** in **Download pre-built
+firmware**, on the Firmware tab, or
 
 ```sh
 sim firmware add relay-sx1262_aarch64_20260930163128.zip
@@ -200,11 +200,14 @@ sim firmware resolve relay-sx1262_latest
 A zip is refused when it is built for another architecture, when its base
 already holds firmware versioned the other way, when a firmware of its name
 is installed already, and when its `node.yaml` or anything it names is
-missing. **Deleting** is refused for a firmware a paused run or a snapshot
-holds: their state can only be resumed on the firmware that wrote it, so the
-run or snapshot goes first. On the Firmware tab each row says its size on
-disk and has a checkbox; **Delete** above the list deletes the chosen ones
-nothing holds, after one confirmation naming those it keeps.
+missing. A paused run or a snapshot **holds** the firmware that wrote its
+state, since it can only be resumed on it. `sim firmware delete` refuses a
+held firmware, so the run or snapshot goes first. On the Firmware tab each
+row says its size on disk and has a checkbox; **Delete selection** above the
+list (shown while any are chosen) and each row's bin delete after one
+confirmation. A firmware a paused simulation holds is deleted too: the
+confirmation names the simulations, and they are stopped for good first. A
+firmware a snapshot holds is kept, and the confirmation says so.
 
 **Pre-built firmware** is listed on [sim-mesh.net/firmware](https://sim-mesh.net/firmware/)
 (`SIM_MESH_FIRMWARE_INDEX` names another list),
@@ -278,8 +281,9 @@ that firmware was deleted resolves the name again.
 ## Antennas
 
 A node carries one antenna, a type from the catalogue in
-`testbed/antennas/catalogue.yaml`: generic representatives of what an
-868 MHz node carries, from a bare quarter-wave wire and a spring helical to a
+`testbed/antennas/catalogue.yaml`: generic representatives of what a
+sub-GHz node (433, 868 or 915 MHz) carries, each pattern the same on all
+three bands, from a bare quarter-wave wire and a spring helical to a
 fibreglass collinear, a panel and a yagi, each with its description and a
 picture (`testbed/antennas/<type>.svg`). The **Antennas** tab shows them and
 draws each one's radiation pattern in the horizontal and the vertical plane.
@@ -329,7 +333,7 @@ longitude, the map shows either, and a nodeset made on one synthetic ground
 stands on any other. A pair's loss on flat terrain is log-distance,
 `FSPL(1 m, f) + 10·n·log10(d)` (FSPL: free-space path loss); `n` is 2 for free
 space, 2.7 suburban, and higher numbers bring the neighbourhoods in closer.
-**New synthetic…** on the Geodata tab makes one.
+**New synthetic** on the Geodata tab makes one.
 
 **A pack** is ground data compiled from public sources: terrain, clutter,
 buildings, roads and places in a UTM (Universal Transverse Mercator) zone.
@@ -373,19 +377,22 @@ it is sent with every request and kept in the table's header, and a table
 at one percentage is cached apart from, and never used for, another. The
 coverage rasters stay the planner's own sweep at 90 %.
 
-There are four ways of getting ground, each on the Geodata tab: **Add** on
+There are four ways of getting ground, each on the Geodata tab: a click on
 an entry under **Download pre-built geodata packs** ([Indexes](#indexes)), **New
-synthetic…**, **Build…** ([Build from sources](#build-from-sources)) and
-**Import zip…**. Nothing else makes or moves geodata.
+synthetic**, **Build** ([Build from sources](#build-from-sources)) and
+**Import zip**. Nothing else makes or moves geodata.
 
 The tab has three sections. **Installed geodata packs** is every geodata here,
 each row with its kind, extent, the nodesets standing on it, its size on
 disk, the index it came from when it did, rename and a trash can; a
-checkbox begins each row, and **All**, **None**, **Invert** and **Delete**
-above the list act on the chosen ones. **Download pre-built geodata packs** is
-what the listed indexes offer. **Geodata sources** is the build's cache, one
-row per source with its licence and what it holds here, and a trash can
-that empties it (refused while a build runs; the cost is fetching it again).
+checkbox begins each row, and **All**, **None**, **Invert** and **Delete
+selection** above the list act on the chosen ones; a click on a row opens
+it. **Download pre-built geodata packs** is what the listed indexes offer,
+its sizes and icons lined up with the installed ones'. **Geodata sources**
+is the build's cache, one row per source with its licence and what it holds
+here, and a trash can that empties it (refused while a build runs; cached
+data can be deleted freely once a pack is built, and costs only the fetch
+again).
 Hovering a source's name says what kind of data its files hold; under it,
 where it stands in the source files and the layers it feeds with its
 priority in each. Beside the list is a map: clicking a source shows where
@@ -404,7 +411,7 @@ How geodata goes from one machine to another: a zip holding `geodata.yaml`
 at the top, its first line `# geodata <name>`, and for a pack the pack itself
 under `pack/`, which the yaml's `pack:` names. Synthetic ground is the yaml
 alone. **Export zip** on an open geodata's toolbar writes one; **Import
-zip…** takes one, or a bare planner pack (a `manifest.json` at the top or
+zip** takes one, or a bare planner pack (a `manifest.json` at the top or
 inside one directory), which becomes pack geodata, by a name the dialog asks
 (the zip's own by default).
 
@@ -434,7 +441,7 @@ machine as the same bytes, so a test on them means the same thing on each:
 ```yaml
 index: sim-mesh-examples              # a usable name
 title: sim-mesh examples
-description: |                        # what the collection is, printed as it stands
+description: |                        # what the collection is
   These examples will soon include some varied geographies and nodesets.
   …
 geodata:
@@ -459,8 +466,8 @@ nodesets:
 
 `name`, `url` and `sha256` are an entry's own; the rest is what the page
 shows. The index's own `description` is text about the whole collection,
-shown under its name on the page and printed by `sim index list`, its line
-breaks kept. **An entry is immutable**: its sha256 is what it is, and a pack or
+printed by `sim index list` with its line breaks kept, and shown under its
+name on the page reflowed, a blank line parting paragraphs. **An entry is immutable**: its sha256 is what it is, and a pack or
 nodeset that changes is published under a new name. **An address** is an
 http(s) URL, a `file://` URL or a path on this machine; one ending in `/`
 means the `index.yaml` in it, and every entry's `url` is relative to it, so
@@ -471,7 +478,7 @@ sim-mesh's own index, `sim-mesh-examples`, is always listed, from
 `https://sim-mesh.net/examples/index.yaml` (`SIM_MESH_INDEX` names another):
 varied geographies and nodesets that show sim-mesh and serve as reference
 environments for comparing mesh protocols and firmware versions. **Add
-index…** lists another by its address, under the name it gives; its trash
+index** lists another by its address, under the name it gives; its trash
 can forgets it again, and what came from it stays installed. The list is
 kept in `testbed/indexes.yaml`, one list for geodata and nodesets alike.
 
@@ -530,7 +537,7 @@ planner-job ── one JSON line per step ────────────�
 planner-job ── geodata/.part-<name>/ ──────────────► front: geodata/<name>/, with its geodata.yaml
 ```
 
-**Build…** on the Geodata tab opens a view of its own, with **‹ Back**. The map is OpenStreetMap's standard
+**Build** on the Geodata tab opens a view of its own, with **← Geodata**. The map is OpenStreetMap's standard
 tiles, fetched through the front and kept under `testbed/osmtiles/` a week
 at least, as the tile usage policy asks; the packs there are outlined
 with their names, and the outlines of the sources that do not cover the
@@ -803,7 +810,7 @@ is told its board at start (`SIM_MESH_BOARD` in its environment,
 **A nodeset's own setup**, `testbed/nodesets/<name>.py` beside its YAML,
 is a script of declarations for what only its nodes need: mitte7's makes
 `internet` a TCP gateway and connects the `tcp-peer` nodes to it. The
-startup script includes it for every nodeset of the world; **Edit setup**
+startup script includes it for every nodeset of the world; **Setup script**
 on the Nodes tab opens it.
 
 **What a node runs is not the nodeset's**: a script says it
@@ -840,8 +847,8 @@ still go on top, so a pair with both has the offset added to the stated
 figure. It is a layer like the offsets, and a nodeset without links has no
 `links:` key and is written back without one.
 
-A nodeset is offered on every geodata whose extent holds one of its nodes,
-as a layer of the Nodes tab ([The Nodes tab](#the-nodes-tab)).
+A nodeset is listed on the Nodes tab of every geodata whose extent holds one
+of its nodes ([The Nodes tab](#the-nodes-tab)).
 
 **Importing** makes a new nodeset of the nodes inside the geodata's extent,
 from one of these sources:
@@ -1066,9 +1073,10 @@ Anything else in braces is left exactly as written. Its name and the
 first-boot rules are the whole of what a station is told at its first boot:
 nothing is added behind your back.
 
-**Running one.** The Scripts tab's **Run…** starts a new simulation of the
-script's own on the Nodes tab's geodata and shown nodesets (several merged
-as **Save visible as** merges them), and goes over to its live map; or
+**Running one.** The Scripts tab's **Run** starts a new simulation of the
+script's own on the Nodes tab's geodata and the nodeset open there, or else
+the nodesets checked in its list (several merged as **Save selection as**
+merges them), and goes over to its live map; or
 runs it on a simulation already running, which then takes its rules, or on a
 paused one, which it resumes. The script is a process of its own (`python3
 -m sim_mesh.runner`) whose output is shown beside the editor and kept in the
@@ -1208,23 +1216,34 @@ decides, and [INTERNALS.md](INTERNALS.md#reception-at-the-receiver) why.
 Its tabs are **Firmware**, **Antennas**, **Geodata**, **Nodes**, **Scripts**
 and **Simulations**, and a status line under them all says how many
 simulations and scripts are running (a simulation's name there puts the
-Nodes tab on it). Served by a simd on its own, the page is that one
-simulation's Nodes tab. Served by the front, it opens on the Geodata tab,
-and a page that finds the front serving another build of it (the front's
-`hello` names its entry script) reloads itself.
+Nodes tab on it). Right of the tabs, `geo:<geodata>` names the geodata
+chosen, followed by `nodes:<nodeset>` while a nodeset is open on the Nodes
+tab. Served by a simd on its own, the page is that one simulation's Nodes
+tab. Served by the front, it opens on the Geodata tab, and a page that
+finds the front serving another build of it (the front's `hello` names its
+entry script) reloads itself.
+
+**Everything that can be clicked is blue**: buttons are plain text, and a
+row that opens something is clicked anywhere, its name in blue and its
+tooltip saying what the click does. A value and its unit never part at a
+line break. On a narrow page (a phone) a table's columns become one column
+per row, and side-by-side panes stack, a map above its list.
 
 **Firmware** lists the installed firmware ([Firmware](#firmware)), each by
 its name with its title, its category, the hardware and radio it plays and
 its version, the paused runs and snapshots that hold it, its size on disk,
-and a trash can (off for one that is held); a checkbox begins each row, and
-**Delete** above the list deletes the chosen ones nothing holds. **Add from
-zip…** uploads a zip; **Add from pre-built…** lists what sim-mesh.net
-offers this machine, each installed with one click.
+and a trash can (off for one a snapshot holds); a checkbox begins each row,
+and **Delete selection** deletes the chosen ones. Deleting a firmware a
+paused simulation holds warns that it stops that simulation for good, and
+does so. **Import zip** uploads a zip; **Download pre-built firmware**,
+below the list, is what sim-mesh.net offers this machine, each added with
+one click.
 
 **Every list of things on disk works alike**: each row says how much it
 takes, a checkbox begins it, and **All**, **None** and **Invert** above the
-list choose rows for the list's own actions there, each taking only the
-chosen rows it applies to after one confirmation that says what happens.
+list choose rows for the list's own actions there, shown while rows are
+chosen, each taking only the chosen rows it applies to after one
+confirmation that says what happens.
 
 **Antennas** lists the antenna catalogue, each with its picture and what it
 is; clicking one shows its figures and its radiation pattern in the
@@ -1239,19 +1258,20 @@ Nothing is chosen when the page
 starts, and the world is empty. Clicking a row **chooses** that geodata:
 it is shown on its own, with no nodes, scrollable and zoomable, with
 **Export zip** on its toolbar, and it is the ground the Nodes tab works on,
-the view shared between the two; **‹ Back** returns to the list, where the
+the view shared between the two; **← Geodata** returns to the list, where the
 chosen row is marked. Choosing another asks first when the nodeset being
 edited has unsaved changes: save them, discard them, or stay. Each row
 renames its geodata or deletes it, its pack included; neither is allowed
 while a run or a snapshot stands on its pack, whose copy of the geodata
-names the pack's directory, and the page says which. **New synthetic…**
-makes flat synthetic ground at an exponent and an extent, **Build…** opens
-the build view, and **Import zip…** takes a sim-mesh geodata pack or a bare
+names the pack's directory, and the page says which. **New synthetic**
+makes flat synthetic ground at an exponent and an extent, **Build** opens
+the build view, and **Import zip** takes a sim-mesh geodata pack or a bare
 planner pack ([Geodata](#geodata)).
 
 **Scripts** lists the scripts with their first docstring line, edits one
-(saved through the front, which checks it parses), and **Run…** starts a
-new simulation of its own on the Nodes tab's geodata and shown nodesets
+(saved through the front, which checks it parses), and **Run** starts a
+new simulation of its own on the Nodes tab's geodata and its nodeset (the
+one open there, else the ones checked in its list, merged)
 (which the dialog shows, not changes) and goes over to its live map, framed
 on its nodes, or runs on a running simulation, or on a paused or done one,
 which it resumes. Its output is beside the editor as it comes, with
@@ -1264,7 +1284,7 @@ by its name). **Done** is a simulation its script paused (`sim_pause()`,
 which a script says when it is finished), drawn in its own colour with a
 tick; **paused** is one a person paused. Both are kept to be resumed.
 Clicking a running simulation's row opens it: its live map, in place of the
-list, with **‹ Simulations** (or the tab itself) back to the list; it stays
+list, with **← Simulations** (or the tab itself) back to the list; it stays
 open while other tabs are on show, and going to the Nodes tab closes it.
 
 ```
@@ -1294,57 +1314,57 @@ large figures over the top of its map. Both read as a clock,
 
 ### The Nodes tab
 
-It is always the map, on the geodata chosen on the Geodata tab, and empty
-until one is. Every nodeset with a node inside that geodata is a **layer**,
-a row of the Layers panel on the left, above the tags; a nodeset with none
-there is not listed:
+It works on the geodata chosen on the Geodata tab, and lists the installed
+geodata to choose from until one is. Then it is the **list** of every
+nodeset with a node inside that geodata, beside a map that only shows (no
+coverage, nothing to move); a nodeset with no node there is listed apart,
+under **Nodesets on other geodata**:
 
 ```
-Layers                  [New] [Import…] [Save visible as…] [Nodesets…]
- ● 👁 ● town-core          42        6 kB •  ▲ 🗑   active: edited, selected, saved
- ○ 👁 ◯ meshcore-2026-09   318/402  88 kB    ▲ 🗑   shown, drawn hollow in its colour
- ○ ·  ◯ potatomesh         77       21 kB    ▲ 🗑   hidden
+Nodesets on town              New   Import
+All  None  Invert  2 chosen   Save selection as   Delete selection
+☑ ◯ town-core          42        6 kB  🗑
+☑ ◯ meshcore-2026-09   318/402  88 kB  🗑
+☐ ◯ potatomesh         77       21 kB  🗑
 ```
 
-The eye shows or hides a layer; the ring beside it is the colour its nodes
-are drawn in. The size is the nodeset's file and its own setup script on
+The ring is the colour the nodeset's nodes are drawn in on the map, hollow,
+named on hover. **The checked nodesets are on the map together**, and when
+a geodata is chosen every nodeset is checked; the map frames them as the
+checks change. The size is the nodeset's file and its own setup script on
 disk. The count is its nodes inside the geodata, and where some are
-outside, of how many (amber): those are not loaded, nor drawn, and a Save
-writes them back as they were. **One layer is active**: clicking a node,
-the selection, the tags, the editor, the coverage and **Save** are the
-active layer's. Every other shown layer is drawn in its own colour, hollow,
-and names its nodes on hover; clicking one of its nodes, or its name in the
-panel, makes that layer active. ▲ moves a layer up the panel; the bin
-deletes the nodeset, with its own setup script, after a warning that this
-cannot be undone.
+outside, of how many (amber): those are neither drawn nor loaded, and a
+Save writes them back as they were. The bin deletes the nodeset, with its
+own setup script, after a warning that this cannot be undone; with two or
+more checked, **Delete selection** deletes them all.
 
-Whatever leaves the nodeset being edited — another layer, **New**,
-**Import…**, another geodata, another tab — asks first when it has unsaved
-changes: save them (a new one is asked a name), discard them, or stay.
+- **New** asks a name and opens an empty nodeset.
+- **Import** makes a new nodeset from a source ([Nodesets](#nodesets)), and
+  opens it.
+- **Save selection as**, with two or more checked, asks a name and writes
+  one new nodeset of the checked ones as their files stand, earlier in the
+  list first: nodes keep their tags and gain their nodeset's name as a tag;
+  a name an earlier one took gets the nodeset's name appended; an id taken
+  gets the lowest free one; two nodes within 5 m of each other are one
+  node, the earlier one's; offsets and links come along where both ends do.
+  The new nodeset is then the one checked.
+- **Download pre-built nodesets**, below the list, is what the indexes
+  offer ([Indexes](#indexes)), each nodeset with the geodata it is made for,
+  which installing it brings along when it is not here; a click on one
+  installs it, or opens it when it is installed.
 
-- **New** asks a name and adds an empty layer, active.
-- **Import…** makes a new layer from a source ([Nodesets](#nodesets)), active.
-- **Nodesets…** lists every nodeset, on this geodata or not, with its node
-  count, its size and the index it came from (and whether it was changed
-  here since), checkboxes and **Delete** for several at once; below, what
-  the indexes offer ([Indexes](#indexes)), each nodeset with the geodata it
-  is made for, which **Add** brings along when it is not here.
-- **Save visible as…** asks a name and writes one new nodeset from every
-  shown layer as it stands, unsaved edits included, top of the panel first.
-  With one layer shown it is that layer's Save as; with several it is the
-  merge: nodes keep their tags and gain their layer's name as a tag; a name
-  an earlier layer took gets the layer's name appended; an id taken gets the
-  lowest free one; two nodes within 5 m of each other are one node, the
-  earlier layer's; offsets and links come along where both ends do. The new
-  layer is active and the layers it came from are hidden.
-
-**Save** writes the active layer back to its own file (amber while there is
-something to save; it keeps the file's leading comment); nodes placed with no
-layer active make an unnamed one, asked a name at its first Save. The Nodes
-tab edits nodesets and nothing else. The same map, opened from a running
-simulation's row on the Simulations tab, is that run's live map, with no
-layers: the same edits go to the run's own copy of its nodeset (never to
-`nodesets/`), and **Save nodes as nodeset…** keeps them.
+**A click on a nodeset opens it**: the map then edits it, with the
+selection, the tags, the editor, the links and the coverage, and its
+toolbar has **← Nodesets** (or a click on the Nodes tab) back to the list,
+**Save** and **Setup script**. Whatever leaves the nodeset being edited —
+the list, **New**, **Import**, another geodata, another tab — asks first
+when it has unsaved changes: save them (a new one is asked a name), discard
+them, or stay. **Save** writes it back to its own file (amber while there
+is something to save; it keeps the file's leading comment). The Nodes tab
+edits nodesets and nothing else. The same map, opened from a running
+simulation's row on the Simulations tab, is that run's live map: the same
+edits go to the run's own copy of its nodeset (never to `nodesets/`), and
+**Save nodes as nodeset** keeps them.
 
 **The map** is one canvas, drawn in the geodata's own metres. From the
 ground up:
@@ -1383,8 +1403,8 @@ ground up:
   stand, saved or not, keeping each pair both ways by where its ends stand,
   so selecting the next node or moving one asks only for the pairs that are
   new (`links`);
-- **the other shown layers**' nodes, hollow rings in each layer's colour,
-  named on hover;
+- **the checked nodesets**' nodes, on the list's map, hollow rings in each
+  nodeset's colour, named on hover;
 - **the nodes**: a dot each with its name, its antenna's height above the
   ground (`20 m up`) and, smaller, its tags; a second, black ring round a
   node whose role carries others' traffic;
@@ -1494,8 +1514,9 @@ its row of the Simulations tab. Every edit is logged in the run with its T.
 
 ## Running simulations
 
-A simulation is always a script's: **Run…** on the Scripts tab starts the
-Nodes tab's shown nodesets on its geodata, the script's `firmware()` rules
+A simulation is always a script's: **Run** on the Scripts tab starts the
+Nodes tab's open nodeset, or else the ones checked in its list, on its
+geodata, the script's `firmware()` rules
 saying what the nodes run, so even working with the stations by hand starts
 from a script, `realtime`, whose one input is the firmware. A simulation
 runs the nodeset's file, so the nodeset the Nodes tab is editing has its
@@ -1863,9 +1884,9 @@ The front's editor verbs are answered to the asking socket as `{type, ok,
 
 | Verbs | |
 |---|---|
-| `firmware_list` | the installed firmware, each with what holds it and its size |
+| `firmware_list` | the installed firmware, each with what holds it (the paused simulations among them by name) and its size |
 | `firmware_prebuilt`, `firmware_add {url}` | what sim-mesh.net offers this machine, and one of those installed |
-| `firmware_delete {names}` | firmware removed, refused for any a paused run or a snapshot holds |
+| `firmware_delete {names, stop_paused?}` | firmware removed, `{deleted, stopped}`; refused for any a snapshot holds, and for any a paused simulation holds unless `stop_paused`, which stops those simulations for good first |
 | `antenna_list` | the antenna catalogue, each with its picture |
 | `geodata_list`, `geodata_open`, `geodata_close`, `geodata_new`, `geodata_save`, `geodata_save_as` | geodata, each listed with how many nodesets have a node on it, its size (`bytes`) and the index it came from (`from_index`); opening a pack holds its sidecar for the socket |
 | `geodata_rename {name, to}`, `geodata_delete {name}` | another name, or gone, with its own pack; refused while a running simulation stands on it; a delete says what keeps the pack (`kept_by`) |
@@ -1874,7 +1895,7 @@ The front's editor verbs are answered to the asking socket as `{type, ok,
 | `index_install {index, kind, name}`, `index_cancel {index, kind, name}` | an entry installed, answered when it is in, its progress to every page as `index_progress`; a fetch stopped |
 | `nodeset_list {geodata?}`, `nodeset_open`, `nodeset_new`, `nodeset_save`, `nodeset_save_as`, `nodeset_delete` | nodesets, each with its size and the index it came from; with `geodata`, each row says how many of its nodes stand on it (`inside`); a delete takes the nodeset's own setup script too |
 | `nodeset_import {name, source, …}` | a new nodeset from the MeshCore map, a PotatoMesh instance, `sites.csv`, a deployed-network CSV, or a file of points (`csv` with its `columns`, `geojson`, `kml`, `gpx`, `meshtastic`) |
-| `nodeset_merge {name, layers}` | Save visible as: the shown layers, top first, as they stand, as one new nodeset |
+| `nodeset_merge {name, layers}` | Save selection as: the nodesets checked on the Nodes tab, earlier in its list first, as one new nodeset |
 | `script_list`, `script_open`, `script_new`, `script_save`, `script_save_as` | scripts, checked to parse, each with its inputs |
 | `script_run {name, sim \| resume \| geodata, nodeset, inputs?}`, `script_stop {run}`, `script_log {run}` | a script as a process, its inputs given, and its output |
 | `snapshot_list`, `losses_compute` | the snapshots, each with its size, and a nodeset's tables |
@@ -2825,7 +2846,7 @@ tests, in place of `testbed/geodata/.cache/meshcore/nodes.json`.
 | `testbed/fgb.py` | a FlatGeobuf file's features: properties and polygon rings |
 | `testbed/cogwindow.py` | a window of a cloud-optimised GeoTIFF: its directories, the level and chunks a rectangle needs, the sparse copy and its `.ranges` |
 | `testbed/packbuild.py` | one pack built from its sources: fetch, each source's files to the compiler input its format and layer go to, `planner-job pack-build`, the pack into place |
-| `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, links, edits, the geometry hash, the merge of shown layers, the imports (the planner's CSVs, any CSV, GeoJSON, KML, GPX, a Meshtastic node list) |
+| `testbed/nodeset.py` | nodesets: nodes, their maximum powers, antennas and tags (a role tag, `no-radio`), offsets, links, edits, the geometry hash, the merge of several nodesets, the imports (the planner's CSVs, any CSV, GeoJSON, KML, GPX, a Meshtastic node list) |
 | `planner/` | the Rust workspace: `planner-web` (the sidecar), `planner-job` (a pack's build, a node map's import), `planner-pack` (the compiler, OpenStreetMap from a PBF extract), `planner-buildings`, `planner-import`, and the ground, propagation and coverage crates |
 | `testbed/script.py` | scripts: listing, checking, loading, a script's inputs read without running it |
 | `testbed/sim_mesh/library.py`, `testbed/sim_mesh/select.py` | the script library: `script_…`, `sim_…`, and `nodes()`/`node()` selections with what is done to them (`.firmware`, `.on_first_boot`, `.exec`, `.radio`, `.reticulum…`, `.meshcore…`, `.meshtastic…`), `Node` for first-boot rules, and `scripts.log` |

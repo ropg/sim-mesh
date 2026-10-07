@@ -1,18 +1,18 @@
 <template>
   <q-page class="ap">
     <div class="ap-list">
-      <div class="ap-heading">Antennas</div>
+      <div class="tab-head"><div class="tab-heading">Antennas</div></div>
       <div class="ap-text">
-        Generic representatives of the antennas an 868 MHz node carries. A
-        node's antenna is one of these, chosen in the Nodes tab's editor; a
-        directional one is aimed there too.
+        Generic representatives of the antennas a sub-GHz node carries, the
+        same on 433, 868 and 915&nbsp;MHz. A node's antenna is one of these,
+        chosen in the Nodes tab's editor; a directional one is aimed there too.
       </div>
       <div v-for="a in catalog.antennas" :key="a.type" class="ap-row"
            :class="{ 'ap-on': a.type === chosen?.type }" @click="pick = a.type">
         <div class="ap-pic" v-html="a.svg ?? ''" />
         <div class="ap-what">
-          <div class="ap-label">{{ a.label }} <span class="ap-gain">{{ fmt(a.peak_dbi) }} dBi</span></div>
-          <div class="ap-desc">{{ a.description }}</div>
+          <div class="ap-label">{{ a.label }} <span class="ap-gain">{{ fmt(a.peak_dbi) }}&nbsp;dBi</span></div>
+          <div class="ap-desc">{{ keepUnits(a.description) }}</div>
         </div>
       </div>
     </div>
@@ -23,13 +23,13 @@
         <div>
           <div class="ap-title">{{ chosen.label }}</div>
           <div class="ap-type mono">{{ chosen.type }}</div>
-          <div class="ap-desc">{{ chosen.description }}</div>
+          <div class="ap-desc">{{ keepUnits(chosen.description) }}</div>
           <table class="ap-figs"><tbody>
-            <tr><td>peak gain</td><td>{{ fmt(chosen.peak_dbi) }} dBi</td></tr>
+            <tr><td>peak gain</td><td>{{ fmt(chosen.peak_dbi) }}&nbsp;dBi</td></tr>
             <tr><td>vertical beamwidth</td><td>{{ chosen.vbw_deg }}°</td></tr>
             <tr v-if="chosen.hbw_deg"><td>horizontal beamwidth</td><td>{{ chosen.hbw_deg }}°</td></tr>
             <tr><td>main lobe</td><td>{{ chosen.tilt_deg ? `${chosen.tilt_deg}° above the horizon` : 'on the horizon' }}</td></tr>
-            <tr><td>floor</td><td>{{ chosen.floor_db }} dB below the peak</td></tr>
+            <tr><td>floor</td><td>{{ chosen.floor_db }}&nbsp;dB below the peak</td></tr>
             <tr><td>kind</td><td>{{ chosen.kind === 'directional' ? 'directional, aimed by its node' : 'omnidirectional' }}</td></tr>
           </tbody></table>
         </div>
@@ -62,8 +62,8 @@
         </figure>
       </div>
       <div class="ap-text">
-        Gain in dBi, the rings 10 dB apart. The pattern is drawn from the
-        figures above: 3 dB down at half a beamwidth, never lower than the
+        Gain in dBi, the rings 10&nbsp;dB apart. The pattern is drawn from the
+        figures above: 3&nbsp;dB down at half a beamwidth, never lower than the
         floor. Between two nodes each antenna's gain is taken toward the
         other in three dimensions, from their antennas' heights over the
         ground.
@@ -78,6 +78,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useCatalog } from '../stores/catalog'
 import { gain, type AntennaSpec } from '../lib/antennas'
+import { keepUnits } from '../lib/size'
 
 const catalog = useCatalog()
 const pick = ref<string | null>(null)
@@ -157,14 +158,21 @@ const elPath = computed(() => {
 .ap { display: flex; overflow: hidden; height: 100%; }
 .ap-list { width: 400px; flex: none; overflow-y: auto; padding: 16px 12px 32px 20px; border-right: 1px solid #1f242c; }
 .ap-detail { flex: 1; overflow-y: auto; padding: 16px 24px 32px; }
-.ap-heading { font-size: 14px; font-weight: 500; color: #d1d5db; margin-bottom: 6px; }
+/* A narrow page: the list, then the chosen one's patterns under it. */
+@media (max-width: 640px) {
+  .ap { flex-direction: column; overflow-y: auto; }
+  .ap-list { width: auto; overflow-y: visible; border-right: none; padding: 12px 16px; }
+  .ap-detail { overflow-y: visible; padding: 12px 16px 24px; }
+  .ap-top { flex-wrap: wrap; }
+  .ap-polar { width: min(300px, 100%); height: auto; }
+}
 .ap-text { font-size: 12px; color: #9ca3af; line-height: 1.5; margin-bottom: 12px; max-width: 700px; }
 .ap-row { display: flex; gap: 10px; padding: 8px; border-radius: 4px; cursor: pointer; align-items: flex-start; }
 .ap-row:hover { background: #1a1f27; }
 .ap-on { background: #1e293b; }
 .ap-pic { width: 44px; height: 44px; flex: none; color: #cbd5e1; }
 .ap-pic :deep(svg), .ap-big :deep(svg) { width: 100%; height: 100%; }
-.ap-label { font-size: 13px; color: #e5e7eb; font-weight: 500; }
+.ap-label { font-size: 13px; color: var(--q-primary); font-weight: 500; }
 .ap-gain { font-size: 11px; color: #7dd3fc; font-weight: 400; margin-left: 4px; }
 .ap-desc { font-size: 12px; color: #9ca3af; line-height: 1.4; }
 .ap-top { display: flex; gap: 20px; align-items: flex-start; margin-bottom: 12px; }
