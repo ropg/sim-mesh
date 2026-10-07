@@ -488,7 +488,8 @@ says the index and the page can say it is installed. A name taken here by
 other ground or another nodeset is refused, and nothing is replaced: rename
 or delete what is there first. A nodeset edited since it came says so. A
 nodeset whose geodata the same index offers, and which is not here, brings
-that geodata with it. From a shell:
+that geodata with it, and geodata installed brings every nodeset the same
+index makes for it whose name is free here. From a shell:
 
 ```sh
 sim index list                         # every listed index and what it offers
