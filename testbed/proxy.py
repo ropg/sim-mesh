@@ -38,7 +38,13 @@ import sys
 import stations as stations_module
 
 HOST_PATTERN = re.compile(rb"^host:[ \t]*([^\r\n]+)", re.IGNORECASE | re.MULTILINE)
-LABEL_PATTERN = re.compile(r"^([A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})?)\.sim\.localhost$",
+# `<suffix>` is `localhost` on the machine running the demo; away from it,
+# `.sim.localhost` cannot be reached at all (a remote browser's own
+# "localhost", not the server's), so the page instead names a wildcard-DNS
+# name for the server's own address, e.g. `.sim.192.0.2.10.nip.io`. Which
+# suffix is in use is not this proxy's business, only that `.sim.` sits
+# right after the label: a thin translation, same routing underneath.
+LABEL_PATTERN = re.compile(r"^([A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})?)\.sim\.[A-Za-z0-9.-]+$",
                            re.IGNORECASE)
 
 MAX_HEAD = 64 * 1024

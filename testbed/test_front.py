@@ -67,6 +67,17 @@ def test_a_label_is_a_station_or_a_station_of_a_simulation():
     assert proxy.resolve_by_id("3.lora")[1] == proxy.STATION_PORT
 
 
+def test_the_suffix_away_from_localhost_is_not_the_proxys_business():
+    # A remote browser's own "localhost" is not the server's, so the page
+    # names a wildcard-DNS suffix for the server's real address instead
+    # (nip.io, say); the proxy only cares that `.sim.` sits right after the
+    # label, whatever comes after that.
+    assert proxy.label_of(b"alpha.sim.192.0.2.10.nip.io:8812") == "alpha"
+    assert proxy.label_of(b"Alpha.Lora.sim.203.0.113.9.nip.io") == "alpha.lora"
+    assert proxy.label_of(b"a.b.c.sim.192.0.2.10.nip.io") is None
+    assert proxy.label_of(b"192.0.2.10:8812") is None
+
+
 def test_the_second_label_picks_the_simulation():
     async def go():
         f = make_front()
