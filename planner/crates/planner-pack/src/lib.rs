@@ -12,12 +12,14 @@ pub mod build;
 pub mod cityjson;
 pub mod elevation;
 pub mod itu_maps;
+pub mod landcover;
 pub mod lod2;
 pub mod nodes;
 pub mod osm;
 pub mod places;
+pub mod population;
 pub mod roads;
-pub mod worldcover;
+pub mod system;
 pub mod zensus;
 
 use serde::{Deserialize, Serialize};

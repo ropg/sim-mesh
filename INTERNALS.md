@@ -719,10 +719,11 @@ one row.
 
 pack-build's steps, each only when it applies: `terrain`, `osm`,
 `buildings`, `lidar`, `landcover`, `clutter`, `population`, `manifest`. Its
-input names every file (the GLO-30 tiles, the WorldCover tiles, the ITU
-maps' directory, the PBF extract, a directory of LoD2 CityGML, one of
-CityJSON, one of Berlin's 1 m XYZ pairs, terrain and surface GeoTIFFs with
-their projection, a population CSV with its layout); it reads only the LoD2
+input names every file (the GLO-30 tiles, each land cover source's tiles
+with their projection and class table, the ITU maps' directory, the PBF
+extract, a directory of LoD2 CityGML, one of CityJSON, one of Berlin's 1 m
+XYZ pairs, terrain and surface GeoTIFFs with their projection, a population
+CSV with its layout or a population GeoTIFF); it reads only the LoD2
 tiles and lidar pairs that meet its grid, and the front hands it a directory of links
 to just the tiles this rectangle needs, since the cache holds every tile any
 build fetched.
@@ -741,22 +742,23 @@ method or reader in sim-mesh, which every source can then use.
 the rectangle (with the shipped ones: the state surveys' terrain, surface
 and LoD2 where it touches Berlin, Brandenburg or Mecklenburg-Vorpommern,
 the Zensus grid where it touches Germany, AHN, 3DBAG and CBS where it
-touches the Netherlands, GLO-30 and OpenStreetMap everywhere) and says what
+touches the Netherlands, 3DEP, NLCD and WorldPop where it touches the
+United States, GLO-30 and OpenStreetMap everywhere) and says what
 each is used for, so the page offers no choice and the dialog after
 **Build** reads the same list. `packbuild` hands each chosen source's files
 to the compiler input its format and layer go to (`packbuild.INPUTS`), never
 by the source's name, and refuses two sources for an input that takes one.
-The 1 m pairs, LoD2 and the GeoTIFF terrain and surface take several, so a
-rectangle across Berlin and Potsdam, or across a state border, takes both
-states'.
+The 1 m pairs, LoD2, the GeoTIFF terrain and surface and land cover take
+several, so a rectangle across Berlin and Potsdam, or across a state border,
+takes both states'.
 
 **Sources are data; some of the compiler's readers are still fixed.** A
-GeoTIFF terrain or surface comes with its proj string, a population grid
+GeoTIFF terrain, surface, land cover or population raster comes with its
+proj string (land cover with its class table as well), a population grid
 with its delimiter, columns, projection and cell, CityJSON with its
 projection and height attributes, so those are any source's. XYZ and
 CityGML are read as the German state surveys deliver them, in EPSG:25833
-(used as the grid in a zone-33 pack, projected in another), land cover as
-WorldCover's classes, a
+(used as the grid in a zone-33 pack, projected in another), a
 worldwide surface as EPSG:4326 (`sourcefile.COMPILER_READS` and the
 GeoTIFF rules), and `sourcefile.py` refuses a source that asks otherwise
 when the file is read: an entry the compiler would misread fails in
@@ -777,12 +779,29 @@ open, the last one used tried first: a source of 1 km tiles is a hundred
 of them under a 10 km pack, past the 256 open files macOS allows a
 process if every worker opened all.
 
-**Measured terrain and surface come as a pair.** A regional terrain source
-is used only with a surface source in the same projection and with the same
-no-data value, and the build refuses a rectangle where one has no partner
-("… has no surface to pair with in its system"). A cell is measured only
-when both halves are: the terrain and the clutter above it come from the
-same survey, and a 1 m terrain is never set under GLO-30's 30 m surface.
+**Clutter comes from one survey.** A regional terrain source with a surface
+source in the same projection and with the same no-data value is a pair,
+and a cell is measured only when both halves are: the terrain and the
+clutter above it come from the same survey. A terrain with no surface
+beside it (3DEP's) replaces only the ground and leaves each cell the
+clutter it had, GLO-30's split or its buildings', since GLO-30's surface
+less another survey's terrain is no height of anything: the two differ in
+resolution and in vertical datum (EGM2008 against NAVD88, about a metre).
+Such a cell's quality is what its clutter's is. A surface with no terrain
+beside it is refused ("… has no terrain to pair with in its system").
+
+**A raster is read in its own units.** A geographic source (WorldCover,
+3DEP, WorldPop) counts in degrees, which proj4rs takes and gives in
+radians: every point into or out of a source passes `system::transform`,
+which speaks each system's own units. A pixel, a window's margin and the
+level a window and the reader choose are said in the source's units too, a
+degree taken as 111.32 km.
+
+**Land cover is laid source over source.** Each land cover source's codes
+go through its own table to clutter classes; the worldwide source is read
+first and a regional one over it, a cell taking the class of the last
+source with one there. A code a table does not name (NLCD's no-data 250)
+is no class, and leaves the cell to the source before.
 
 **Priority is the plan's; the compiler's order is the cell's.** A source's
 priority in a layer decides what `sources.plan` says it is used for
@@ -792,8 +811,7 @@ GLO-30's split on every cell they cover enough, the 1 m XYZ pairs first and
 then the GeoTIFF pairs in the order given, so where two measured sources
 cover one cell the later stands. LoD2 and CityJSON buildings displace
 OpenStreetMap's on their tiles. An input that takes one source (population,
-the surface tiles, land cover, the PBF) refuses a rectangle that two
-sources meet.
+the surface tiles, the PBF) refuses a rectangle that two sources meet.
 
 **A window is a sparse copy of the whole file.** `read: window` fetches a
 cloud-optimised GeoTIFF's first 256 KB, walks its directories (TIFF and
@@ -807,7 +825,9 @@ reads zeros where it holds nothing.
 **An outline is a source's own.** A regional source ships its coverage as a
 GeoJSON file beside the source file, so no source's coverage depends on
 another source's index being fetched; Berlin's and Germany's are Geofabrik's
-outlines of them, made once with `sim source outline … --geofabrik`.
+outlines of them, made once with `sim source outline … --geofabrik`, the
+United States' sources' Geofabrik's `us` (the conterminous states, for
+NLCD, its four regions together).
 
 **A pack carries only what may be passed on.** `redistributable: true` is a
 claim about the licence, and an entry that makes it gives the `notice` a

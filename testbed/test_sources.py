@@ -80,6 +80,45 @@ def test_tiles_are_named_by_their_south_west_corner_over_the_grids_reach():
     # A cached name is read back as the tile it is.
     m = sources.template_pattern(glo30).match("Copernicus_DSM_COG_10_S35_00_W059_00_DEM.tif")
     assert (m.group("ns"), m.group("lat"), m.group("ew"), m.group("lon")) == ("S", "35", "W", "059")
+    assert sources.template_corner(glo30, m) == (-35, -59)
+
+
+def test_3deps_tiles_are_named_by_their_north_west_corner_in_lower_case_and_read_as_windows():
+    usgs = SHIPPED["usgs-3dep-13"]
+    tm = geodata.TransverseMercator(10, True, geodata.WGS84)
+    # San Francisco: one tile, 37° to 38° N, 123° to 122° W, named n38w123.
+    hull = sources.degree_hull([-122.52, 37.70, -122.35, 37.82], tm)
+    [tile] = sources.template_files(usgs, hull, 10)
+    assert tile.name == "USGS_13_n38w123.tif"
+    assert tile.url == ("https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/13/TIFF/"
+                        "current/n38w123/USGS_13_n38w123.tif")
+    # Its window is the grid's reach in degrees, a margin of 4 cells round
+    # it, read at a quarter of a cell: in degrees, not metres.
+    x0, y0, x1, y1 = tile.window["box"]
+    margin = 40 / 111320.0
+    assert x0 == pytest.approx(hull[0] - margin, abs=1e-6) and y1 == pytest.approx(hull[3] + margin, abs=1e-6)
+    assert tile.window["want"] == pytest.approx(2.5 / 111320.0)
+    # Across the equator and the prime meridian the letters follow the corner.
+    names = sorted(f.name for f in sources.template_files(usgs, [-0.5, -0.5, 0.5, 0.5]))
+    assert names == ["USGS_13_n00e000.tif", "USGS_13_n00w001.tif", "USGS_13_n01e000.tif",
+                     "USGS_13_n01w001.tif"]
+    # A cached name is read back as the tile whose south-west corner it has.
+    m = sources.template_pattern(usgs).match("USGS_13_n38w123.tif")
+    assert sources.template_corner(usgs, m) == (37, -123)
+    assert sources.template_pattern(usgs).match("USGS_13_N38W123.tif") is None
+
+
+def test_nad83_and_conus_albers_are_systems_sim_mesh_knows():
+    import crs
+    assert crs.known("EPSG:4269") and crs.known("EPSG:5070") and crs.known("EPSG:26910")
+    assert not crs.known("EPSG:26924")
+    assert crs.proj("EPSG:26910") == ("+proj=utm +zone=10 +ellps=GRS80 "
+                                      "+towgs84=0,0,0,0,0,0,0 +units=m +no_defs")
+    assert crs.per_metre("EPSG:4269") == pytest.approx(1 / 111320.0)
+    assert crs.per_metre("EPSG:26910") == 1.0
+    lat, lon = crs.plane("EPSG:26910").inverse(*crs.plane("EPSG:26910").forward(37.77, -122.42))
+    assert (lat, lon) == pytest.approx((37.77, -122.42), abs=1e-9)
+    assert crs.plane("EPSG:4269").forward(37.77, -122.42) == (-122.42, 37.77)
 
 
 def test_the_smallest_extract_holding_the_rectangle_is_the_one():
@@ -288,14 +327,28 @@ def test_the_shipped_sources_hold_together():
     assert list(SHIPPED) == ["glo30", "worldcover", "itu", "geofabrik", "berlin-dgm1",
                              "berlin-bdom", "berlin-lod2", "zensus", "brandenburg-dgm1",
                              "brandenburg-bdom", "brandenburg-lod2", "mv-dgm1", "mv-dom1",
-                             "mv-lod2", "ahn-dtm", "ahn-dsm", "3dbag", "cbs-population"]
+                             "mv-lod2", "ahn-dtm", "ahn-dsm", "3dbag", "cbs-population",
+                             "usgs-3dep-13", "nlcd", "worldpop-us"]
     for source in SHIPPED.values():
         assert source.worldwide == (source.continent == sourcefile.GLOBAL)
         assert source.worldwide or source.outline["type"] in ("Polygon", "MultiPolygon")
         assert source.redistributable == (source.id != "itu")
     assert SHIPPED["zensus"].where == "Europe › Germany"
     assert SHIPPED["3dbag"].where == "Europe › Netherlands"
+    assert SHIPPED["nlcd"].where == "North America › United States"
     assert sourcefile.proj_of(SHIPPED["ahn-dtm"]).startswith("+proj=sterea")
+    assert sourcefile.proj_of(SHIPPED["nlcd"]).startswith("+proj=aea +lat_0=23 +lon_0=-96")
+    assert sourcefile.proj_of(SHIPPED["usgs-3dep-13"]).startswith("+proj=longlat +ellps=GRS80")
+    # The US sources cover the US, Alaska's Aleutians past 180° among it, and
+    # NLCD only the conterminous states.
+    for source in ("usgs-3dep-13", "worldpop-us"):
+        outline = SHIPPED[source].outline
+        assert sources.meets(outline, [-122.5, 37.6, -122.3, 37.8])
+        assert sources.meets(outline, [-150.0, 61.1, -149.8, 61.3])
+        assert sources.meets(outline, [178.0, 51.8, 178.2, 52.0])
+        assert not sources.meets(outline, [13.38, 52.51, 13.42, 52.53])
+    assert sources.meets(SHIPPED["nlcd"].outline, [-74.1, 40.6, -73.9, 40.8])
+    assert not sources.meets(SHIPPED["nlcd"].outline, [-150.0, 61.1, -149.8, 61.3])
 
 
 @pytest.mark.parametrize("change, why", [
@@ -323,6 +376,93 @@ def test_a_source_that_does_not_hold_together_is_refused_saying_why(tmp_path, ch
         {"europe": {"DE": {"name": "Germany", "sources": [entry]}}}, allow_unicode=True))
     with pytest.raises(store.StoreError, match=re.escape(why)):
         sourcefile.read_file(str(tmp_path / "sources.yaml"))
+
+
+@pytest.mark.parametrize("source, change, why", [
+    ("nlcd", lambda e: e["format"]["classes"].update({"x": "open"}), "a land cover code is a whole"),
+    ("nlcd", lambda e: e["format"]["classes"].update({11: "sea"}), "'sea' is no clutter class"),
+    ("nlcd", lambda e: e.update(layers={"landcover": 1, "population": 1}), "a GeoTIFF feeds one layer"),
+    ("nlcd", lambda e: e["format"].update(crs="EPSG:2263"), "format.crs EPSG:2263 is not a system"),
+    ("worldpop-us", lambda e: e.update(read="window"), "a window is read of the files an index or a"),
+    ("usgs-3dep-13", lambda e: e["find"].update(crs="EPSG:26910"), "whole number of degrees"),
+    ("usgs-3dep-13", lambda e: e["find"].update(corner="north-east"), "a template's corner is"),
+    ("usgs-3dep-13", lambda e: e["find"].update(letters="title"), "a template's letters are"),
+])
+def test_a_us_source_that_does_not_hold_together_is_refused_saying_why(tmp_path, source, change,
+                                                                        why):
+    import copy
+    import yaml
+    entry = copy.deepcopy(SHIPPED[source].entry)
+    change(entry)
+    (tmp_path / "outlines").mkdir()
+    shutil.copy(os.path.join(os.path.dirname(sourcefile.SHIPPED), "outlines", source + ".geojson"),
+                tmp_path / "outlines" / (source + ".geojson"))
+    (tmp_path / "sources.yaml").write_text(yaml.safe_dump(
+        {"north-america": {"US": {"name": "United States", "sources": [entry]}}},
+        allow_unicode=True))
+    with pytest.raises(store.StoreError, match=re.escape(why)):
+        sourcefile.read_file(str(tmp_path / "sources.yaml"))
+
+
+def test_a_us_rectangle_hands_the_compiler_3dep_alone_nlcd_over_worldcover_and_worldpop(tmp_path):
+    """The compiler's inputs from what the cache holds: 3DEP's terrain with no
+    surface beside it, read in degrees; land cover worldwide source first,
+    each with its own table as clutter class codes; WorldPop's raster."""
+    cache = sources.Cache(None, str(tmp_path / "cache"))
+    files = {}
+
+    def cached(source_id, name, members=None):
+        f = sources.File(source_id, "https://example.org/" + name, name, members)
+        path = f.path(cache.root)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if members:
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr(name[:-4] + ".tif", b"tif")
+                zf.writestr(name[:-4] + ".tif.aux.xml", b"aux")
+        else:
+            open(path, "wb").write(b"tif")
+        files.setdefault(source_id, []).append(f)
+    cached("glo30", "Copernicus_DSM_COG_10_N37_00_W123_00_DEM.tif")
+    cached("usgs-3dep-13", "USGS_13_n38w123.tif")
+    cached("nlcd", "Annual_NLCD_LndCov_2025_CU_C1V2.zip", "*.tif")
+    cached("worldcover", "ESA_WorldCover_10m_2021_v200_N36W123_Map.tif")
+    cached("worldpop-us", "usa_pop_2025_CN_100m_R2025A_v1.tif")
+    build = packbuild.Build(cache, {"name": "sf", "bbox": [-122.52, 37.70, -122.35, 37.82],
+                                    "res_m": 30}, "planner-job", lambda row: None,
+                            sources_=SHIPPED)
+    build.inputs = str(tmp_path / "inputs")
+    params = build.params({"files": files, "grid": {"zone": 10}}, SHIPPED)
+    [terrain] = params["elevation"]
+    assert [os.path.basename(p) for p in terrain["terrain"]] == ["USGS_13_n38w123.tif"]
+    assert terrain["surface"] == [] and terrain["nodata"] == -999999.0
+    assert terrain["proj"].startswith("+proj=longlat +ellps=GRS80")
+    assert terrain["pixel_m"] == pytest.approx(7.5 / 111320.0)
+    assert [c["source"] for c in params["landcover"]] == [
+        "ESA WorldCover 2021 land cover", "Annual NLCD 2025 land cover"]
+    worldcover, nlcd = params["landcover"]
+    assert [10, 3] in worldcover["classes"] and [80, 1] in worldcover["classes"]
+    assert [24, 5] in nlcd["classes"] and [11, 1] in nlcd["classes"]
+    assert [os.path.basename(p) for p in nlcd["tiles"]] == ["Annual_NLCD_LndCov_2025_CU_C1V2.tif"]
+    assert nlcd["proj"].startswith("+proj=aea")
+    population = params["population"]
+    assert os.path.basename(population["raster"]) == "usa_pop_2025_CN_100m_R2025A_v1.tif"
+    assert population["nodata"] == -99999.0 and population["proj"].startswith("+proj=longlat")
+    assert "worldcover_tiles" not in params
+
+
+def test_a_surface_with_no_terrain_beside_it_is_refused(tmp_path):
+    cache = sources.Cache(None, str(tmp_path / "cache"))
+    f = sources.File("ahn-dsm", "https://example.org/a.tif", "a.tif")
+    os.makedirs(os.path.dirname(f.path(cache.root)))
+    open(f.path(cache.root), "wb").write(b"tif")
+    glo = sources.File("glo30", "https://example.org/g.tif", "g.tif")
+    os.makedirs(os.path.dirname(glo.path(cache.root)))
+    open(glo.path(cache.root), "wb").write(b"tif")
+    build = packbuild.Build(cache, {"name": "x", "bbox": [4.8, 52.3, 4.9, 52.4], "res_m": 30},
+                            "planner-job", lambda row: None, sources_=SHIPPED)
+    build.inputs = str(tmp_path / "inputs")
+    with pytest.raises(store.StoreError, match="AHN DSM 0.5 m surface has no terrain to pair"):
+        build.params({"files": {"glo30": [glo], "ahn-dsm": [f]}, "grid": {"zone": 31}}, SHIPPED)
 
 
 def test_a_persons_source_may_not_take_a_shipped_id_nor_lack_its_outline(tmp_path):

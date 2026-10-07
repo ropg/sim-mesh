@@ -33,6 +33,7 @@ import shutil
 import signal
 import time
 
+import crs
 import geodata
 import sourcefile
 import sources
@@ -48,7 +49,9 @@ INPUTS = {
     ("geotiff", "surface", True): "dsm_tiles",
     ("geotiff", "surface", False): "elevation_surface",
     ("geotiff", "terrain", False): "elevation_terrain",
-    ("geotiff", "landcover", True): "worldcover_tiles",
+    ("geotiff", "landcover", True): "landcover",
+    ("geotiff", "landcover", False): "landcover",
+    ("geotiff", "population", False): "population",
     ("itu-p1812-maps", "radio-climate", True): "itu_maps_dir",
     ("osm-pbf", "roads", True): "osm_pbf",
     ("citygml", "buildings", False): "lod2_dir",
@@ -60,8 +63,9 @@ INPUTS = {
 }
 # The inputs that take several sources; every other takes one. LoD2 is one
 # directory of CityGML the compiler reads whole, so a rectangle across two
-# states (Berlin and Potsdam) takes both.
-MANY = ("berlin_1m_dir", "lod2_dir", "elevation_terrain", "elevation_surface")
+# states (Berlin and Potsdam) takes both. Land cover is read worldwide source
+# first, a regional one over it where it has a class (NLCD over WorldCover).
+MANY = ("berlin_1m_dir", "lod2_dir", "elevation_terrain", "elevation_surface", "landcover")
 
 
 class Build:
@@ -162,9 +166,10 @@ class Build:
         gigabytes.
 
         Each chosen source goes to the compiler input its format and layer
-        are read through (INPUTS): a surface GeoTIFF is the DSM tiles, a
-        land cover one WorldCover's, XYZ terrain and surface the 1 m pairs,
-        and so on. An input that takes one source is refused two."""
+        are read through (INPUTS): a worldwide surface GeoTIFF is the DSM
+        tiles, a land cover one is read through its own class table, XYZ
+        terrain and surface the 1 m pairs, and so on. An input that takes one
+        source is refused two."""
         files = planned["files"]
         reg = sources.registry(sources_)
         have = lambda source: [f.path(self.cache.root) for f in files.get(source, ())  # noqa: E731
@@ -194,7 +199,7 @@ class Build:
             "bbox": [float(v) for v in self.spec["bbox"]], "res_m": float(self.spec["res_m"]),
             "utm_zone": planned["grid"]["zone"],
             "dsm_tiles": dsm,
-            "worldcover_tiles": have(one("worldcover_tiles")) if one("worldcover_tiles") else [],
+            "landcover": [],
             "itu_maps_dir": os.path.dirname(itu[0]) if itu else None,
             "osm_pbf": pbf[0] if pbf else None,
             "osm_buildings": bool(pbf) and "buildings" in reg[pbf_source].layers,
@@ -211,6 +216,16 @@ class Build:
             params["berlin_1m_dir"] = self.link_dir(
                 "berlin-1m", [p for s in ids for p in extracted(s)])
         params["elevation"] = self.elevation(given, reg, have, extracted)
+        tiffs = lambda s: (extracted if s.format.get("members") else have)(s.id)  # noqa: E731
+        for source_id in sorted(given.get("landcover", ()), key=lambda s: not reg[s].worldwide):
+            s = reg[source_id]
+            paths = tiffs(s)
+            if paths:
+                params["landcover"].append({
+                    "tiles": paths, "proj": sourcefile.proj_of(s),
+                    "classes": [[int(code), sourcefile.CLUTTER_CLASSES.index(name)]
+                                for code, name in s.format["classes"].items()],
+                    "source": s.title, "notice": s.notice or ""})
         if one("cityjson"):
             s = reg[one("cityjson")]
             params["cityjson"] = {
@@ -220,7 +235,15 @@ class Build:
         if one("population"):
             s = reg[one("population")]
             fmt = s.format
-            if fmt["type"] == "gpkg-grid":
+            csv = []
+            if fmt["type"] == "geotiff":
+                raster = tiffs(s)
+                if raster:
+                    params["population"] = {
+                        "raster": raster[0], "proj": sourcefile.proj_of(s),
+                        "nodata": None if fmt.get("nodata") is None else float(fmt["nodata"]),
+                        "source": s.title, "notice": s.notice or ""}
+            elif fmt["type"] == "gpkg-grid":
                 csv = [self.cache.grid_csv(f, fmt["value"]) for f in files[s.id] if self.cache.have(f)]
                 layout = {"delimiter": ",", "x": "x", "y": "y", "value": "value"}
             else:
@@ -235,28 +258,30 @@ class Build:
     def elevation(self, given, reg, have, extracted):
         """Regional terrain and surface GeoTIFFs as the compiler's pairs: the
         terrain and the surface sources in one system and with one no-data
-        value together, read at a quarter of a cell. A system with only one
-        of the two is no pair, and said so. A source whose tiles come zipped
-        (Brandenburg's) gives the GeoTIFFs in them."""
+        value together, read at a quarter of a cell (in the system's units).
+        A terrain with no surface in its system stands alone, in place of the
+        split's terrain only (3DEP's in GLO-30's); a surface with no terrain
+        is no pair, and said so. A source whose tiles come zipped (Brandenburg's)
+        gives the GeoTIFFs in them."""
         by_proj = {}
         for role in ("terrain", "surface"):
             for source_id in given.get("elevation_" + role, ()):
                 s = reg[source_id]
                 key = (sourcefile.proj_of(s), s.format.get("nodata"))
-                pair = by_proj.setdefault(key, {"terrain": [], "surface": []})
+                pair = by_proj.setdefault(key, {"terrain": [], "surface": [], "units": 1.0})
                 pair[role].append(s)
+                pair["units"] = crs.per_metre(sourcefile.crs_of(s))
         tiffs = lambda s: (extracted if s.format.get("members") else have)(s.id)  # noqa: E731
         out = []
         for (proj, nodata), pair in by_proj.items():
-            if not pair["terrain"] or not pair["surface"]:
-                lone = (pair["terrain"] or pair["surface"])[0]
-                raise store.StoreError("%s has no %s to pair with in its system" % (
-                    lone.title, "surface" if pair["terrain"] else "terrain"))
+            if not pair["terrain"]:
+                raise store.StoreError("%s has no terrain to pair with in its system"
+                                       % pair["surface"][0].title)
             both = pair["terrain"] + pair["surface"]
             out.append({
                 "terrain": [p for s in pair["terrain"] for p in tiffs(s)],
                 "surface": [p for s in pair["surface"] for p in tiffs(s)],
-                "proj": proj, "pixel_m": float(self.spec["res_m"]) / 4.0,
+                "proj": proj, "pixel_m": float(self.spec["res_m"]) / 4.0 * pair["units"],
                 "nodata": None if nodata is None else float(nodata),
                 "source": " and ".join(s.title for s in both),
                 "notice": " / ".join(dict.fromkeys(s.notice or "" for s in both))})
