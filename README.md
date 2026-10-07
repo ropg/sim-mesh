@@ -907,11 +907,10 @@ purpose, and PotatoMesh carries the Meshtastic nodes there are. The two node
 maps are read by `planner-job nodes-import`, `planner-import`'s parsers. Every
 imported node stands at the height the dialog asks
 (marked assumed) where the source gives none, has the default antenna and the default radio (at a
-CSV's transmit power where it states one), and is tagged with its source (the
-format, for a file), its
-kind (`repeater`, `room-server`, `companion`, `router`, `client`, …) and how
-good its position is (`position-gps`, `position-fixed`, `position-truncated`,
-`position-unknown`). Measurements (range tests, neighbour reports) are not
+CSV's transmit power where it states one). A node from a node map is tagged
+with its kind alone (`repeater`, `room-server`, `companion`, `router`,
+`client`, …); one from a planner CSV with its kind, and one from a file of
+points with the format and the point's own tags. Measurements (range tests, neighbour reports) are not
 nodes, and are not imported.
 
 ## Scripts

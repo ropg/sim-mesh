@@ -623,7 +623,7 @@ def test_a_node_map_becomes_a_nodeset_and_several_save_as_one(stores, monkeypatc
         assert reply["ok"], reply
         nodes = reply["nodeset"]["nodes"]
         assert sorted(nodes) == ["alex-repeater", "meshcore-2"]
-        assert nodes["alex-repeater"]["tags"] == ["meshcore", "repeater", "position-gps"]
+        assert nodes["alex-repeater"]["tags"] == ["repeater"]
         assert nodes["alex-repeater"]["height_m"] == 12
         assert nodes["alex-repeater"]["height_from"] == "assumed"
         reply = await ask(ws, "nodeset_import", name="mc", source="meshcore", geodata="flat")
