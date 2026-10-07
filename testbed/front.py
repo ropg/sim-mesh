@@ -180,10 +180,11 @@ nodeset_setup_open {name}         → {name, text, exists}   its own setup, node
                                     one it has not got yet reads as a fresh one's text
 nodeset_setup_save {name, text}   → {name, text, exists}   checked to parse, then written
 script_list                      → {scripts: [{name, doc, report, inputs, references,
-                                    included_by} …]}   inputs: what the script asks for
+                                    included_by, example} …]}   inputs: what the script asks for
                                     ([{name, type, label, category?, default?}]);
                                     included_by: the scripts that include or import it;
-                                    one some script includes is not run on its own
+                                    one some script includes is not run on its own;
+                                    example: one sim-mesh ships, which script_save refuses
 module_open {path}                → {path, text}   a file a script imports (the library's,
                                     or another script), by its path under testbed/
 script_open {name}                → {script, text}

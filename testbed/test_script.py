@@ -63,6 +63,22 @@ def test_a_script_is_written_only_when_it_parses(scripts_dir):
         script.write("absent", "x = 1\n")
 
 
+def test_an_example_is_kept_only_under_another_name(scripts_dir):
+    (scripts_dir / "realtime.py").write_text("x = 1\n")
+    with pytest.raises(store.StoreError, match="example"):
+        script.write("realtime", "x = 2\n")
+    script.write("mine", "x = 2\n", new=True)
+    rows = {row["name"]: row for row in script.listing()}
+    assert rows["realtime"]["example"] and not rows["mine"]["example"]
+
+
+def test_a_new_script_never_hides_a_module(scripts_dir):
+    for name in ("json", "random", "pytest"):
+        with pytest.raises(store.StoreError, match="module"):
+            script.write(name, "x = 1\n", new=True)
+    script.write("my-json", "x = 1\n", new=True)
+
+
 def test_a_scripts_definitions_are_read_without_running_it(scripts_dir, runtime):
     (scripts_dir / "one.py").write_text(
         "from sim_mesh import *\nWHO = 'one'\nnodes().firmware('x_y_latest')\nnodes().up()\n"
