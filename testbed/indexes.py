@@ -65,6 +65,8 @@ changed here, and says so.
 
 **A nodeset names the geodata it is made for.** Installing one whose geodata
 the same index offers, and which is not installed, installs that first.
+Geodata installed, asked for or brought that way, brings every nodeset the
+same index makes for it whose name is free here.
 
 **Publishing** adds something installed here to an index checked out here:
 
@@ -483,19 +485,33 @@ async def index_named(name, session):
 async def install(index_name, kind, name, session, progress=None):
     """One entry of a listed index installed under its own name: {kind,
     name, installed: [what was installed, in order]}. A nodeset's geodata
-    from the same index comes first when it is not here and its name is free."""
+    from the same index comes first when it is not here and its name is free.
+    Geodata installed, asked for or brought by a nodeset, brings every
+    nodeset the index makes for it whose name is free here."""
     if kind not in KINDS:
         raise IndexFault("an entry is geodata or nodesets, not %s" % kind)
     index = await index_named(index_name, session)
     entry = find(index, kind, name)
     done = []
+    ground = entry if kind == GEODATA else None
     if kind == NODESETS and entry.get("geodata"):
-        ground = next((g for g in index[GEODATA] if g["name"] == entry["geodata"]), None)
-        if ground is not None and not any(status(GEODATA, ground).values()):
-            await _install_one(index, GEODATA, ground, session, progress)
-            done.append({"kind": GEODATA, "name": ground["name"]})
-    await _install_one(index, kind, entry, session, progress)
-    done.append({"kind": kind, "name": name})
+        offered = next((g for g in index[GEODATA] if g["name"] == entry["geodata"]), None)
+        if offered is not None and not any(status(GEODATA, offered).values()):
+            await _install_one(index, GEODATA, offered, session, progress)
+            done.append({"kind": GEODATA, "name": offered["name"]})
+            ground = offered
+    if kind == GEODATA:
+        await _install_one(index, kind, entry, session, progress)
+        done.append({"kind": kind, "name": name})
+    if ground is not None:
+        for made in index[NODESETS]:
+            if (made.get("geodata") == ground["name"] and made["name"] != name
+                    and not any(status(NODESETS, made).values())):
+                await _install_one(index, NODESETS, made, session, progress)
+                done.append({"kind": NODESETS, "name": made["name"]})
+    if kind == NODESETS:
+        await _install_one(index, kind, entry, session, progress)
+        done.append({"kind": kind, "name": name})
     return {"kind": kind, "name": name, "installed": done}
 
 

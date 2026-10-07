@@ -119,6 +119,37 @@ def test_a_nodeset_brings_its_geodata_and_both_remember_the_index(stores, monkey
     assert not os.path.exists(nodeset.origin_path("pair"))
 
 
+def test_geodata_brings_the_nodesets_made_for_it_whose_names_are_free(stores, monkeypatch):
+    site = stores / "site"
+    monkeypatch.setattr(indexes, "OWN_ADDRESS", publish(site))
+    monkeypatch.setattr(indexes, "OWN_NAME", "demos")
+    (site / "trio.yaml").write_bytes(NODESET_TEXT.encode())
+    (site / "taken.yaml").write_bytes(NODESET_TEXT.encode())
+    sha = hashlib.sha256(NODESET_TEXT.encode()).hexdigest()
+    with open(site / "index.yaml", "a", encoding="utf-8") as handle:
+        handle.write("  - { name: trio, url: trio.yaml, sha256: %s, geodata: flat-5 }\n"
+                     "  - { name: taken, url: taken.yaml, sha256: %s, geodata: flat-5 }\n"
+                     "  - { name: elsewhere, url: trio.yaml, sha256: %s, geodata: hills }\n"
+                     % (sha, sha, sha))
+    os.makedirs(store.NODESETS_DIR)
+    nodeset.write(nodeset.nodeset_path("taken"), nodeset.blank())
+    got = run(indexes.install("demos", "geodata", "flat-5", None))
+    assert got["installed"] == [{"kind": "geodata", "name": "flat-5"},
+                                {"kind": "nodesets", "name": "pair"},
+                                {"kind": "nodesets", "name": "trio"}]
+    assert indexes.nodeset_origin("taken") is None
+    assert sorted(nodeset.names()) == ["pair", "taken", "trio"]
+
+    # A nodeset that brings its geodata brings the other nodesets with it.
+    for name in ("pair", "trio"):
+        nodeset.delete(name)
+    geodata.delete("flat-5")
+    got = run(indexes.install("demos", "nodesets", "trio", None))
+    assert got["installed"] == [{"kind": "geodata", "name": "flat-5"},
+                                {"kind": "nodesets", "name": "pair"},
+                                {"kind": "nodesets", "name": "trio"}]
+
+
 def test_a_name_taken_here_is_refused_and_nothing_replaced(stores, monkeypatch):
     monkeypatch.setattr(indexes, "OWN_ADDRESS", publish(stores / "site"))
     monkeypatch.setattr(indexes, "OWN_NAME", "demos")
