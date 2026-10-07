@@ -111,17 +111,32 @@ def test_a_run_never_lands_on_another(tmp_path):
     assert simd.free_run_dir(str(base)) == str(base) + "-2"
 
 
-def test_an_override_replaces_every_firmware_of_its_base(stores):
-    refs = [STUB, "other_latest"]
-    got = drivers.resolve_builds(refs)
+def test_builds_resolve_each_name_once(stores):
+    got = drivers.resolve_builds([STUB, "other_latest", STUB])
     assert got[STUB]["title"] == "Stub two" and got[STUB]["version"] == "20260102000000"
-    assert got["other_latest"]["base"] == "other"
-    older = "stub_%s_20260101000000" % firmware.machine_arch()
-    got = drivers.resolve_builds(refs, override=older)
-    assert got[STUB]["firmware"] == older and got[STUB]["asked"] == older
     assert got["other_latest"]["base"] == "other"
     with pytest.raises(drivers.CommandError, match="nothere"):
         drivers.resolve_builds(["nothere_latest"])
+
+
+@pytest.mark.parametrize("tag, want", [
+    (None, {"a": "other_latest", "c": "other_latest"}),
+    ("far", {"a": STUB, "c": "other_latest"})])
+def test_a_build_replaces_every_nodes_firmware_or_its_tags(stores, tag, want):
+    """Whatever the rules give: every node given a firmware runs the build, or
+    every one carrying its tag; a node given none still runs nothing."""
+    async def go():
+        daemon = make_simd(stores)
+        await daemon.start_ether()
+        await daemon.do_sim_load({"geodata": "flat", "nodeset": "three", "build": "other_latest",
+                                  "build_tag": tag, "firmware_rules": [
+                                      {"which": {"names": ["a", "c"]}, "firmware": STUB}]})
+        assert daemon.run.meta["build"] == "other_latest"
+        assert daemon.run.meta.get("build_tag") == tag
+        assert await until(lambda: daemon.firmware == want)
+        await daemon.stop_all(flush=False)
+        daemon.ether.close()
+    asyncio.run(go())
 
 
 def test_setup_is_the_name_then_the_first_boot_rules_in_order(stores):

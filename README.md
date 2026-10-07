@@ -169,9 +169,14 @@ letters, digits, `-` and `.`; the architecture it runs on, as `uname -m`
 spells it; and a build stamp (`YYYYMMDDhhmmss`, UTC) or a semantic version
 (`1.2.3`). The zip has the same name, `.zip` after it. Two builds that
 differ in anything sim-mesh does not read — the radio they drive among it —
-are two bases, and by custom the base names the radio. **`<base>_latest`**
-names the newest installed firmware of exactly that base for this machine,
-newest by stamp or by semantic version; a base keeps to one of the two.
+are two bases, and by custom the base names the radio. A build of someone
+else's release ends its base in that release, its version our own build's
+stamp: `meshtastic-sx1262-2.7.26_aarch64_20261007201200`.
+**`<base>_latest`** names the newest installed firmware of that base for
+this machine: of `<base>` and every `<base>-<semver>`, the highest release,
+then the newest build of it, by stamp or by semantic version (a base keeps
+to one of the two). So `meshtastic-sx1262-2.7.26_latest` stays on 2.7.26,
+and `meshtastic-sx1262_latest` follows the newest release installed.
 
 **A category** says what kind of mesh a firmware's stations make, and which
 driver interface its driver implements: `reticulum`, `meshcore`
@@ -263,8 +268,10 @@ protocol changes; the **time shim** in a virtual-time run; and a Python for
 its driver. Anything else a station runs — a Python with Reticulum and LXMF
 for a station that is a Python program — is in its zip.
 
-A firmware given to a simulation (`sim new --build`, `simd --build`)
-runs in place of every firmware of its base. A simulation records the
+A firmware given to a simulation (`sim new --build`, `sim run --build`,
+`simd --build`) runs on every node the script gives a firmware, whatever it
+gives, or with `--build-tag T` on every such node carrying the tag T. A node
+the script gives no firmware still runs nothing. A simulation records the
 firmware each name resolved to, and so does a snapshot; a run resumed after
 that firmware was deleted resolves the name again.
 
@@ -1642,7 +1649,7 @@ holds one; otherwise it waits for a driver to send `sim_load`. It runs in the
 foreground: Ctrl-C stops it, and everything it started. It takes `--bind`
 (default `0.0.0.0:9011`), `--ether` (default `127.0.0.1:7000`), `--run` (the
 run directory, default `testbed/runs/simd/`; a run loaded later that would
-land on one there goes beside it as `-2`, `-3`…), `--build`, `--sidecar` (the
+land on one there goes beside it as `-2`, `-3`…), `--build` and `--build-tag`, `--sidecar` (the
 planner-web a pack's moved rows are recomputed through), `--stagger`,
 `--net`, `--time`, `--noise-figure`, `--pairwise` or `--bench-capture`,
 `--crc-margin-db` (the ether's receivers, its rule and its CRC band), and
