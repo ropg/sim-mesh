@@ -63,9 +63,10 @@ class Run:
         self.first_announce = {}            # sid -> first originated announce
         self.types = collections.defaultdict(collections.Counter)
         self.tx = collections.Counter()
-        self.collided = collections.Counter()   # frames some receiver lost to a CRC failure
+        self.collided = collections.Counter()   # frames some receiver lost to interference
         self.rx_clean = collections.Counter()
-        self.rx_crc = collections.Counter()
+        self.rx_crc = collections.Counter()     # receptions not clean, for whatever cause
+        self.rx_noise = collections.Counter()   # of those, the ones noise failed
         self.owner = {}                     # announced destination -> the station that originated it
         self.heard_at = {}                  # (owner, receiver) -> (fewest hops, when first at that count)
         self.first_path = {}                # hops -> when a path of that length first appeared
@@ -178,10 +179,13 @@ class Run:
         verdict = msg.get("verdict")
         eid = msg.get("id")
         payload = msg.get("payload") or ""
+        cause = msg.get("cause")
         if verdict == "clean":
             self.rx_clean[rsid] += 1
         else:
             self.rx_crc[rsid] += 1
+            if cause == "noise":
+                self.rx_noise[rsid] += 1
         frame = arriving.get(eid)
         if frame is None:
             raw = base64.b64decode(payload)
@@ -189,7 +193,8 @@ class Run:
             arriving[eid] = frame
         sender, raw = frame
         if verdict != "clean":
-            if sender is not None and (eid, "crc") not in arriving:
+            if (cause == "interference" and sender is not None
+                    and (eid, "crc") not in arriving):
                 arriving[(eid, "crc")] = True
                 self.collided[sender] += 1
             return
@@ -332,6 +337,7 @@ def report(runs, labels, cli=None, deliveries=None):
     rows.append(["all"] + [sum(r.tx.values()) for r in runs])
     rows.append(["receptions clean"] + [sum(r.rx_clean.values()) for r in runs])
     rows.append(["receptions crc"] + [sum(r.rx_crc.values()) for r in runs])
+    rows.append(["  of which noise"] + [sum(r.rx_noise.values()) for r in runs])
     out.append(table(rows, ["type"] + labels))
 
     out.append("")

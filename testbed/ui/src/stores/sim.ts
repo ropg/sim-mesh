@@ -75,7 +75,8 @@ export interface Pulse {
 export interface Flash {
   name: string
   from: string
-  verdict: 'clean' | 'crc'
+  verdict: 'clean' | 'crc' | 'hdr'
+  cause: 'noise' | 'interference' | 'talked_over' | 'lost' | null
   level: number
   start: number
 }
@@ -385,7 +386,8 @@ export const useSim = defineStore('sim', {
           this.flashes.push({
             name: msg.name as string,
             from: msg.from as string,
-            verdict: msg.verdict as 'clean' | 'crc',
+            verdict: msg.verdict as Flash['verdict'],
+            cause: (msg.cause ?? null) as Flash['cause'],
             level: msg.level as number,
             start: performance.now(),
           })

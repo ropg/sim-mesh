@@ -88,7 +88,7 @@ def read_record(path, reader=None, level_at=None):
             continue            # recorded since the lines above were read: a run still going
         for begin in tied.begins:
             frame.heard[begin.rsid] = "lost" if begin.lock else "cad"
-        for rsid, _slot, verdict in tied.ends:
+        for rsid, _slot, verdict, _cause in tied.ends:
             frame.heard[rsid] = verdict or "?"
     return list(frames.values())
 

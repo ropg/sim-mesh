@@ -21,12 +21,20 @@ Reception is decided at each receiver, from everything arriving there
 (README.md, "What it models"; INTERNALS.md, "Reception"). Every transmission
 whose carrier overlaps a receiver's bandwidth is interference there, whatever
 its spreading factor or sync word; only a frame whose bandwidth, spreading
-factor and sync word match the receiver's state, on its carrier, can be
-decoded. The receiver locks on to a decodable frame at its preamble unless it
-is already demodulating another that the new one does not lead by the
-same-SF figure, and a frame it is locked on survives when, over every
-stretch of its air, it clears thermal noise by its spreading factor's
-demodulation threshold and each class of interference, summed within the
+factor, sync word and IQ polarity match the receiver's state, on its
+carrier, can be decoded — or, on a radio with side detectors, match one of
+those. Against thermal noise a frame goes through three stages, each a
+seeded draw, keyed on the channel and not on the order of events, against
+odds from one symbol error curve per spreading factor
+anchored at the datasheet's sensitivity: its preamble and sync word found
+(the lock), its header read (a failure ends the reception at `t_hdr`), and
+every block of its payload decoded (a failure is a CRC error), so a longer
+frame is more fragile at the same signal-to-noise ratio. With fading on,
+every link's level wanders over time around the table's, per pair of nodes.
+The receiver locks on to a decodable frame at its preamble unless it is
+already demodulating another that the new one does not lead by the same-SF
+figure, and a frame it is locked on survives interference when, over every
+stretch of its air, it clears each class of interference, summed within the
 class, by that class's rejection figure. A station in `CAD` is told a frame is
 arriving, and nothing more, when that frame is decodable there or the energy
 in its band crosses the sense threshold. A slot that starts listening while a
@@ -35,8 +43,9 @@ on while enough of the preamble is to come, and is told the energy otherwise.
 A receiver that leaves RX for anything but TX mid-frame is not told how the
 frame it was following ended.
 
-With `pairwise` set the pairwise rule decides instead, on the same levels: a
-frame is delivered where it is audible, the receiver takes a later frame only
+With `pairwise` set the pairwise rule decides interference instead, on the
+same levels and through the same three stages: a frame is delivered where it
+locks, the receiver takes a later frame only
 when it leads the one in progress by the capture margin, and a frame survives
 only by leading each audible same-carrier interferer by that margin, one at a
 time and without summing.
@@ -59,7 +68,10 @@ a virtual one), direction, station id, JSON.
 
 import argparse
 import asyncio
+import base64
+import binascii
 import contextlib
+import functools
 import hashlib
 import heapq
 import json
@@ -67,6 +79,7 @@ import math
 import os
 import random
 import socket
+import statistics
 import sys
 import time
 from array import array
@@ -75,7 +88,13 @@ from datetime import datetime, timezone
 import slt
 
 # What a receiver's state must share with a frame for the frame to be decoded.
-MATCH_KEYS = ("mod", "bw", "sf", "sync")
+# `iq` is the chirps' direction, "normal" or "inverted": a demodulator set for
+# one finds no preamble in the other, only its energy.
+MATCH_KEYS = ("mod", "bw", "sf", "sync", "iq")
+# What a side detector (a state's `side` list, an LR2021's beside its main
+# one) states of its own; the carrier, bandwidth and modulation are the main
+# detector's, since they share the receive chain.
+SIDE_KEYS = ("sf", "sync", "iq")
 # The modulations this ether models: a state or a frame saying another is
 # refused, since nothing here knows what it would take to hear it.
 MODULATIONS = ("lora",)
@@ -93,13 +112,57 @@ THERMAL_DBM_PER_HZ = -174.0
 DEFAULT_NOISE_FIGURE_DB = 6
 
 # Demodulation threshold: the SNR over thermal noise a spreading factor needs,
-# from the SX1261/2 datasheet: −7.5 dB at SF7 and 2.5 dB lower per step. A
-# frame under its own modem's threshold is never decoded, and a receiver does
-# not lock on to it. SF12 buys 17.5 dB of reach over SF7 and pays for it in
-# air time; a flat threshold would make the two identical to the medium.
+# from the SX1261/2 datasheet: −7.5 dB at SF7 and 2.5 dB lower per step. It is
+# where the error curve below is anchored, and where `audible` says a link is
+# reachable. SF12 buys 17.5 dB of reach over SF7 and pays for it in air time;
+# a flat threshold would make the two identical to the medium.
 SENSITIVITY_DB = {5: -2.5, 6: -5.0, 7: -7.5, 8: -10.0,
                   9: -12.5, 10: -15.0, 11: -17.5, 12: -20.0}
 SLOWEST_SENSITIVITY_DB = -20.0      # a frame that named no spreading factor
+SLOWEST_SF = 12
+
+# The error curve's anchor. A symbol is demodulated by picking the largest of
+# 2^SF bins, non-coherent detection of orthogonal signals in white noise, whose
+# symbol error rate is exact (`symbol_error`); a frame's chance of arriving
+# follows from it stage by stage (`frame_blocks`, `block_survives`). The real
+# chip sits some way off that ideal curve, by an offset per spreading factor
+# (`implementation_loss`), fixed so that the reference frame below fails
+# ANCHOR_PER of the time at SENSITIVITY_DB. Both come from the conditions the
+# SX1261/2 datasheet (DS.SX1261-2.W.APP, rev. 1.2, June 2019, section 3.5)
+# states its sensitivities under: "LoRa PER = 1%, packet 64 bytes, preamble 8
+# symbols, CR = 4/5, CRC on payload enabled, explicit header mode". The fitted
+# offset runs from −1.3 dB at SF5 to +1.1 dB at SF12, about 0.35 dB a step,
+# negative up to SF8: the datasheet's figures are a 2.5 dB ladder, and the
+# ideal curve's steps are some 2.15 dB, so below SF9 the datasheet is better
+# than the ideal receiver. A bench sweep through the threshold is what would
+# replace the anchor.
+REFERENCE_FRAME = {"payload": 64, "cr": 5, "implicit": False, "crc": True,
+                   "preamble": 8, "bw": 125_000}
+ANCHOR_PER = 0.01
+
+# The resolution the symbol error curve is computed at and kept in, in dB.
+SNR_STEP_DB = 0.05
+
+# Fading: a level varying over time around the table's, per pair of nodes, as
+# a Gaussian in dB of this spread, correlated over the coherence time (`Fading`).
+# Off unless asked for. The coherence time is an hour because runs of Sergey's
+# fork (sergeyculum) with per-link fading gave their most believable verdicts
+# at hour-scale periods, shorter ones letting retries through too easily; it
+# stands until deployed nodes' frame-to-frame RSSI gives one.
+DEFAULT_FADING_DB = 0.0
+DEFAULT_COHERENCE_S = 3600.0
+
+# Fast fading, per frame at each receiver: Rician, of this K factor (the
+# power of the steady path over that of the scattered ones; 0 is Rayleigh).
+# Off (None) unless asked for.
+DEFAULT_RICIAN_K = None
+
+# Side detectors (an LR2021's, beside its main one) miss a preamble of this
+# many symbols this often, at 14–15 dB of SNR where noise has nothing to do
+# with it: Sergey's bench of LR2021 side detectors (sergeyculum). A straight line
+# between the points, the shortest one's figure held below it, nothing from
+# the longest on.
+SIDE_DETECTOR_PREAMBLE_MISS = {12: 0.019, 14: 0.004, 16: 0.0}
 
 # Same-SF rejection: how far a frame must lead the summed power of every
 # same-SF transmission in its band to be demodulated through it. The 6 dB of
@@ -150,18 +213,14 @@ PAIRWISE_CAPTURE_DB = 6.0
 # project's bench; the chip model's kPreambleFoundSymbols is the same figure).
 # So a slot that starts listening while a frame is on the air can still lock
 # on to it if at least this much of the preamble is still to come, and has
-# only its energy otherwise.
+# only its energy otherwise. The same symbols, and the sync word's two, are
+# what must be demodulated right for the receiver to lock at all.
 PREAMBLE_FOUND_SYMBOLS = 4.0
+SYNC_WORD_SYMBOLS = 2
 
-# The CRC band: how far above its demodulation threshold a frame that locked
-# may still fail its cyclic redundancy check. A real receiver's packet error
-# rate falls away over a few dB above the threshold, an S-shaped curve; here
-# the chance falls in a straight line, from certain at the threshold to
-# nothing at the band's top. Off (0) unless the medium is given a band
-# (`--crc-margin-db`); INTERNALS.md plans 3 dB. One draw per frame and
-# receiver, hashed from the run's seed (`seeded_draw`), so it is the same
-# whatever order the receptions end in.
-DEFAULT_CRC_MARGIN_DB = 0.0
+# The first block after the preamble: 8 symbols at coding rate 4/8, whatever
+# the payload's coding rate (AN1200.13). It carries the header when there is one.
+FIRST_BLOCK_SYMBOLS = 8
 
 # Capture as a bench measured it (`--bench-capture`, off unless given): the
 # reticulum project's tools/rncapture of 2026-09-17 (its README, the table of
@@ -358,14 +417,185 @@ def seeded_draw(seed, *parts):
     return int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big") / 2.0 ** 64
 
 
-def crc_margin_fails(seed, eid, rsid, slot, margin_db, band_db):
-    """Whether a frame `margin_db` over its demodulation threshold fails its
-    CRC anyway, in a band `band_db` wide: certain at the threshold, never at
-    the band's top, a straight line between. One draw per frame and
-    receiving slot."""
-    if band_db <= 0 or margin_db >= band_db:
-        return False
-    return seeded_draw(seed, eid, rsid, slot, "crc") < 1.0 - max(margin_db, 0.0) / band_db
+def curve_sf(sf):
+    """The spreading factor the error curve is taken at: a frame that named
+    none, or one outside the datasheet's, at the slowest."""
+    try:
+        sf = int(sf)
+    except (TypeError, ValueError):
+        return SLOWEST_SF
+    return sf if sf in SENSITIVITY_DB else SLOWEST_SF
+
+
+def i0e(z):
+    """The modified Bessel function I0(z) scaled by e^−z, for z ≥ 0."""
+    if z < 15.0:
+        total = term = 1.0
+        quarter = z * z / 4.0
+        k = 1
+        while term > 1e-17 * total:
+            term *= quarter / (k * k)
+            total += term
+            k += 1
+        return total * math.exp(-z)
+    return (1.0 + 1.0 / (8.0 * z) + 9.0 / (128.0 * z * z)) / math.sqrt(2.0 * math.pi * z)
+
+
+@functools.lru_cache(maxsize=None)
+def _symbol_error(sf, steps):
+    m = 1 << sf
+    a = math.sqrt(2.0 * m * 10.0 ** (steps * SNR_STEP_DB / 10.0))
+    lo = max(0.0, a - 10.0)
+    hi = a + math.sqrt(2.0 * math.log(m)) + 15.0
+    n = 600
+    h = (hi - lo) / n
+
+    def correct_at(x):
+        if x <= 0.0:
+            return 0.0
+        miss = math.exp(-x * x / 2.0)
+        if miss >= 1.0:
+            return 0.0
+        return (x * math.exp(-(x - a) ** 2 / 2.0) * i0e(a * x)
+                * math.exp((m - 1) * math.log1p(-miss)))
+
+    total = correct_at(lo) + correct_at(hi)
+    for i in range(1, n):
+        total += (4.0 if i % 2 else 2.0) * correct_at(lo + i * h)
+    return min(1.0, max(0.0, 1.0 - total * h / 3.0))
+
+
+def symbol_error(sf, snr_db):
+    """The chance an ideal receiver demodulates one symbol at spreading factor
+    `sf` wrong, at `snr_db` over the noise in its bandwidth.
+
+    The right bin is Rician and each of the 2^SF − 1 others Rayleigh:
+    Pc = ∫ x·exp(−(x² + a²)/2)·I0(a·x)·(1 − exp(−x²/2))^(M−1) dx with
+    a = √(2·2^SF·SNR), integrated by Simpson's rule. Kept per SNR_STEP_DB.
+    """
+    return _symbol_error(curve_sf(sf), round(snr_db / SNR_STEP_DB))
+
+
+def frame_blocks(sf, bw, cr, payload_len, implicit, crc):
+    """How a frame's symbols after the preamble fall into blocks (AN1200.13,
+    the arithmetic of radio/src/toa.h): (the first block's symbols, the number
+    of payload blocks after it, the symbols in each, whether the payload's
+    coding rate corrects an error). The first block is always at 4/8, which
+    corrects."""
+    sf = curve_sf(sf)
+    bw = float(bw or 125_000)
+    cr = min(8, max(5, int(cr or 5))) - 4
+    de = 1 if (1 << sf) / bw > 0.016 else 0
+    bits = 8 * int(payload_len) - 4 * sf + 28 + (16 if crc else 0) - (20 if implicit else 0)
+    blocks = max(math.ceil(bits / (4 * (sf - 2 * de))), 0)
+    return FIRST_BLOCK_SYMBOLS, blocks, cr + 4, cr >= 3
+
+
+def block_survives(p, n, correcting):
+    """The chance a block of `n` symbols, each wrong with chance `p`, decodes.
+
+    Interleaving gives each codeword one bit of each symbol, so one wrong
+    symbol is at most one bit error per codeword: 4/7 and 4/8 correct it, 4/5
+    and 4/6 only detect it. Two approximations, both pessimistic: the first
+    block's reduced rate, which tolerates a symbol landing in the next bin, is
+    taken as any other; and two wrong symbols are taken to defeat a correcting
+    block, which they do only when both flip one bit position.
+    """
+    clean = (1.0 - p) ** n
+    if correcting:
+        clean += n * p * (1.0 - p) ** (n - 1)
+    return clean
+
+
+def lock_odds(p):
+    """The chance a receiver finds a preamble and its sync word, each symbol
+    wrong with chance `p`."""
+    return (1.0 - p) ** (PREAMBLE_FOUND_SYMBOLS + SYNC_WORD_SYMBOLS)
+
+
+def frame_odds(sf, snr_db, payload, cr, implicit, crc, bw):
+    """The chance a frame arrives whole at a steady SNR, its curve taken as
+    it is (no implementation loss): locked, its header read, every block of
+    its payload decoded."""
+    p = symbol_error(sf, snr_db)
+    first, blocks, per_block, correcting = frame_blocks(sf, bw, cr, payload, implicit, crc)
+    return (lock_odds(p) * block_survives(p, first, True)
+            * block_survives(p, per_block, correcting) ** blocks)
+
+
+@functools.lru_cache(maxsize=None)
+def implementation_loss(sf):
+    """How far the chip sits from the ideal curve at spreading factor `sf`, in
+    dB: what puts the reference frame's packet error rate at ANCHOR_PER at the
+    datasheet's threshold. The curve is read at SNR − this."""
+    sf = curve_sf(sf)
+    ref = REFERENCE_FRAME
+    lo, hi = -10.0, 10.0
+    for _ in range(40):
+        mid = (lo + hi) / 2.0
+        per = 1.0 - frame_odds(sf, SENSITIVITY_DB[sf] - mid, ref["payload"], ref["cr"],
+                               ref["implicit"], ref["crc"], ref["bw"])
+        if per > ANCHOR_PER:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2.0
+
+
+def frame_key(sender, start_us, payload):
+    """What a frame is to its draws: the channel's, not the run's numbering —
+    its sender's node name, its start on the ether's clock and a hash of its
+    bytes. Two runs that put the same frame on the air at the same instant
+    draw the same for it, whatever else differs between them."""
+    digest = hashlib.sha256((payload or "").encode()).hexdigest()[:16]
+    return "%s@%d#%s" % (sender, int(start_us), digest)
+
+
+def side_preamble_miss(preamble_symbols):
+    """How often a side detector misses a preamble this many symbols long
+    (SIDE_DETECTOR_PREAMBLE_MISS)."""
+    points = sorted(SIDE_DETECTOR_PREAMBLE_MISS.items())
+    try:
+        n = float(preamble_symbols)
+    except (TypeError, ValueError):
+        return points[0][1]
+    if n <= points[0][0]:
+        return points[0][1]
+    for (lo, p_lo), (hi, p_hi) in zip(points, points[1:]):
+        if n <= hi:
+            return p_lo + (p_hi - p_lo) * (n - lo) / (hi - lo)
+    return points[-1][1]
+
+
+def rician_db(k, draw):
+    """One Rician power gain in dB of K factor `k`, unit mean, from two
+    uniform draws `draw("i")` and `draw("q")` for the scattered part."""
+    normal = statistics.NormalDist()
+    x = normal.inv_cdf(min(max(draw("i"), 1e-12), 1.0 - 1e-12))
+    y = normal.inv_cdf(min(max(draw("q"), 1e-12), 1.0 - 1e-12))
+    steady = math.sqrt(k / (k + 1.0))
+    scatter = math.sqrt(1.0 / (k + 1.0) / 2.0)
+    gain = (steady + scatter * x) ** 2 + (scatter * y) ** 2
+    return 10.0 * math.log10(max(gain, 1e-12))
+
+
+def fade_knot(seed, name_lo, name_hi, k):
+    """One knot of a pair's fading: a unit Gaussian drawn from the seed, the
+    pair and the knot's number alone."""
+    u = seeded_draw(seed, "fade", name_lo, name_hi, k)
+    return statistics.NormalDist().inv_cdf(min(max(u, 1e-12), 1.0 - 1e-12))
+
+
+def fade_unit(knot, t_s, coherence_s):
+    """A unit-variance Gaussian process at `t_s` seconds from the knots
+    `knot(k)` one coherence time apart: cos(π·u/2)·z_k + sin(π·u/2)·z_{k+1},
+    continuous, the same whatever order it is asked in, uncorrelated from two
+    coherence times apart."""
+    pos = t_s / coherence_s
+    k = math.floor(pos)
+    u = pos - k
+    return (math.cos(math.pi * u / 2.0) * knot(k)
+            + math.sin(math.pi * u / 2.0) * knot(k + 1))
 
 
 def same_class(sf_a, sf_b):
@@ -387,8 +617,9 @@ def bench_stronger_odds(lead):
 def bench_outcome(seed, first, second, rsid, lead, locked):
     """Which of two frames that met survive at one receiver, as the bench saw.
 
-    `first` and `second` are the frames' numbers in the order they started,
-    `lead` the first's level over the second's there in dB, and the answer
+    `first` and `second` are the frames' keys (`frame_key`) in the order they
+    started, `rsid` the receiver's node name, `lead` the first's level over
+    the second's there in dB, and the answer
     (the first survives, the second survives). A receiver `locked` on the
     first — following it when the second started after its preamble — never
     receives the second, however strong, and loses the first too unless the
@@ -425,8 +656,10 @@ def fspl_1m_db(freq_hz):
 
 class Physics:
     """The medium's own settings beyond path loss: the receivers' noise
-    figure, the CRC band above the demodulation threshold (off unless given),
-    and whether frames on the air interfere with one another at all.
+    figure, the slow fading of every link over time (its spread in dB and its
+    coherence time; off unless given), fast fading per frame (a Rician K
+    factor; off unless given), and whether frames on the air interfere with
+    one another at all.
 
     Without interference (`--no-interference`, an oracle, never so unless
     asked) a frame is judged against noise alone, as though nothing else were
@@ -437,18 +670,29 @@ class Physics:
     setting at its default is left out of `as_dict`, so what a run records
     says only what was asked for."""
 
-    def __init__(self, noise_figure_db=DEFAULT_NOISE_FIGURE_DB,
-                 crc_margin_db=DEFAULT_CRC_MARGIN_DB, interference=True):
+    def __init__(self, noise_figure_db=DEFAULT_NOISE_FIGURE_DB, interference=True,
+                 fading_db=DEFAULT_FADING_DB, coherence_s=DEFAULT_COHERENCE_S,
+                 rician_k=DEFAULT_RICIAN_K):
         self.noise_figure_db = float(noise_figure_db)
-        self.crc_margin_db = float(crc_margin_db)
-        if self.crc_margin_db < 0:
-            raise ValueError("the CRC band is a width in dB, not %g" % self.crc_margin_db)
         self.interference = bool(interference)
+        self.fading_db = float(fading_db)
+        self.coherence_s = float(coherence_s)
+        self.rician_k = None if rician_k is None else float(rician_k)
+        if not self.fading_db >= 0:
+            raise ValueError("fading is a spread in dB, not %g" % self.fading_db)
+        if not self.coherence_s > 0:
+            raise ValueError("the coherence time is a time in seconds, not %g"
+                             % self.coherence_s)
+        if self.rician_k is not None and not self.rician_k >= 0:
+            raise ValueError("the Rician K factor is a power ratio, 0 or more, not %g"
+                             % self.rician_k)
 
     def describe(self):
         text = "noise figure %.1f dB" % self.noise_figure_db
-        if self.crc_margin_db:
-            text += ", a %.1f dB CRC band" % self.crc_margin_db
+        if self.fading_db:
+            text += ", fading %.1f dB over %g s" % (self.fading_db, self.coherence_s)
+        if self.rician_k is not None:
+            text += ", Rician K %g per frame" % self.rician_k
         if not self.interference:
             text += ", no interference (an oracle)"
         return text
@@ -457,13 +701,19 @@ class Physics:
     def from_dict(cls, data):
         data = data or {}
         return cls(data.get("noise_figure_db", DEFAULT_NOISE_FIGURE_DB),
-                   data.get("crc_margin_db", DEFAULT_CRC_MARGIN_DB),
-                   data.get("interference", True))
+                   data.get("interference", True),
+                   data.get("fading_db", DEFAULT_FADING_DB),
+                   data.get("coherence_s", DEFAULT_COHERENCE_S),
+                   data.get("rician_k", DEFAULT_RICIAN_K))
 
     def as_dict(self):
         out = {"noise_figure_db": self.noise_figure_db}
-        if self.crc_margin_db != DEFAULT_CRC_MARGIN_DB:
-            out["crc_margin_db"] = self.crc_margin_db
+        if self.fading_db != DEFAULT_FADING_DB:
+            out["fading_db"] = self.fading_db
+        if self.coherence_s != DEFAULT_COHERENCE_S:
+            out["coherence_s"] = self.coherence_s
+        if self.rician_k is not None:
+            out["rician_k"] = self.rician_k
         if not self.interference:
             out["interference"] = False
         return out
@@ -560,6 +810,16 @@ class Frame:
         self.sync = msg.get("sync")
         self.power_dbm = msg.get("power_dbm", DEFAULT_POWER_DBM)
         self.payload = msg.get("payload", "")
+        # What the error curve needs of the frame's shape: the payload is
+        # passed through as it came and never read, only its length taken.
+        self.cr = msg.get("cr", 5)
+        self.implicit = msg.get("hdr") == "implicit"
+        self.crc = msg.get("crc", True)
+        self.pre_symbols = msg.get("pre", 8)
+        try:
+            self.payload_len = len(base64.b64decode(self.payload or ""))
+        except (binascii.Error, TypeError, ValueError):
+            self.payload_len = 0
         # What a receiver's stated radio is matched against, kept for the
         # slots that start listening while this frame is on the air.
         self.radio = {key: msg.get(key) for key in ("freq",) + MATCH_KEYS}
@@ -571,6 +831,8 @@ class Frame:
         self.receivers = []     # (sid, slot, level) for each decoding receiver
         self.receptions = {}    # (sid, slot) -> its Reception there
         self.levels = {}        # rsid -> dBm there, or None: never heard
+        self.rice = {}          # rsid -> its fast fading there, dB (`Ether.rice_db`)
+        self.key = None         # what its draws are keyed on (`Ether.key_of`)
 
     def preamble_left(self, now):
         """True when a receiver that starts listening at `now` still has
@@ -599,15 +861,21 @@ class Reception:
     `abandoned` is set when the receiver left RX, for anything but its own
     transmission, while following this frame: nothing was received, so no
     rx_end goes out and nothing is recorded as received or lost.
+    `hdr_ok` is the header's fate, decided at the lock; `ended` is set when
+    the reception closed at the header for it, and the receiver followed the
+    frame no further.
     """
 
-    def __init__(self, frame, rsid, slot, level, lost=False, taken_at=None):
+    def __init__(self, frame, rsid, slot, level, lost=False, taken_at=None, det=0):
         self.frame = frame
         self.rsid = rsid
         self.slot = slot
         self.level = level
+        self.det = det          # the detector that found it: 0 the main one, k side k
         self.lost = lost
         self.abandoned = False
+        self.hdr_ok = True
+        self.ended = False
         # When the receiver took this frame, and when a later one took it off
         # it: the bench rule asks whether it was following the frame when a
         # second one started.
@@ -617,7 +885,8 @@ class Reception:
     def followed_at(self, t):
         """True when the receiver was following this frame at instant `t`."""
         return (self.taken_at is not None and self.taken_at <= t
-                and (self.lost_at is None or self.lost_at > t))
+                and (self.lost_at is None or self.lost_at > t)
+                and not (self.ended and t >= self.frame.hdr_us))
 
 
 class Ether(asyncio.DatagramProtocol):
@@ -678,10 +947,11 @@ class Ether(asyncio.DatagramProtocol):
         self.names = {}             # sid -> node name, the table's index
         self.gains = {}             # sid -> antenna gain in dBi
         self.frames = []            # frames still in flight or just ended
+        self.knots = {}             # (name, name, k) -> a fading knot (`fade_db`)
         self.next_eid = 0           # the ether's own frame numbering
         self.seed = seed if seed is not None else random.randrange(1 << 31)
         self.on_tx = None           # (sid, eid, freq, t_start, t_end)
-        self.on_rx = None           # (sid, rsid, eid, verdict, level)
+        self.on_rx = None           # (sid, rsid, eid, verdict, level, cause)
         self.on_station = None      # (sid, state)
         self.record = None
         if record_path is not None:
@@ -1246,14 +1516,146 @@ class Ether(asyncio.DatagramProtocol):
                 + self.physics.noise_figure_db)
 
     def sensitivity(self, sf):
-        """The SNR this spreading factor needs to demodulate, in dB."""
+        """The datasheet's SNR for this spreading factor, in dB: where the
+        reference frame arrives all but ANCHOR_PER of the time."""
         return SENSITIVITY_DB.get(sf, SLOWEST_SENSITIVITY_DB)
 
     def audible(self, level, bw_hz, sf=None):
-        """True when a frame at this level clears its modem's threshold over noise."""
+        """True when a frame at this level, unfaded, clears its modem's
+        datasheet threshold over noise: reachable, as the map shows it."""
         if level is None:
             return False
         return level >= self.noise(bw_hz) + self.sensitivity(sf)
+
+    def symbol_error_at(self, frame, level):
+        """The chance one symbol of `frame` is demodulated wrong at `level`:
+        the curve at its SNR less the chip's implementation loss."""
+        return symbol_error(frame.sf, level - self.noise(frame.bw)
+                            - implementation_loss(frame.sf))
+
+    def fade_db(self, a, b, t_us):
+        """How far the link between stations a and b sits from the table's
+        level at `t_us`, in dB: σ times a unit Gaussian process over the
+        ether's clock, one per unordered pair of node names (`fade_unit`).
+        Nothing without fading."""
+        sigma = self.physics.fading_db
+        if not sigma:
+            return 0.0
+        name_a, name_b = self.names.get(a), self.names.get(b)
+        if name_a is None or name_b is None:
+            return 0.0
+        lo, hi = sorted((str(name_a), str(name_b)))
+
+        def knot(k):
+            key = (lo, hi, k)
+            z = self.knots.get(key)
+            if z is None:
+                z = self.knots[key] = fade_knot(self.seed, lo, hi, k)
+            return z
+
+        return sigma * fade_unit(knot, t_us / 1e6, self.physics.coherence_s)
+
+    def node(self, sid):
+        """A station's node name, which outlives its restarts; its id where
+        the nodeset names none."""
+        return self.names.get(sid, sid)
+
+    def key_of(self, frame):
+        """What `frame`'s draws are keyed on (`frame_key`), made on first asking."""
+        if frame.key is None:
+            frame.key = frame_key(self.node(frame.sid), frame.start_us, frame.payload)
+        return frame.key
+
+    def draw(self, frame, rsid, slot, what):
+        """One of a frame's draws at a receiving slot: from the seed and the
+        channel — frame, receiver, slot — alone."""
+        return seeded_draw(self.seed, self.key_of(frame), self.node(rsid), slot, what)
+
+    def rice_db(self, frame, rsid):
+        """The frame's fast fading at `rsid`, in dB: one Rician draw for the
+        whole frame at that antenna. Nothing without a K factor."""
+        k = self.physics.rician_k
+        if k is None:
+            return 0.0
+        if rsid not in frame.rice:
+            key, node = self.key_of(frame), self.node(rsid)
+            frame.rice[rsid] = rician_db(
+                k, lambda part: seeded_draw(self.seed, key, node, "rice", part))
+        return frame.rice[rsid]
+
+    def level_at(self, frame, rsid, t_us):
+        """The level `frame` arrives at `rsid` at instant `t_us`: the table's,
+        faded slowly by the pair's process and fast by the frame's own draw.
+        None stays None."""
+        level = self.level_of(frame, rsid)
+        if level is None:
+            return None
+        return level + self.fade_db(frame.sid, rsid, t_us) + self.rice_db(frame, rsid)
+
+    def knot_cuts(self, lo_us, hi_us):
+        """The fading's knots strictly inside (lo, hi): where a piece of air
+        is cut so it never spans two. None without fading, where the level
+        does not move."""
+        if not self.physics.fading_db:
+            return []
+        step = self.physics.coherence_s * 1e6
+        k = math.floor(lo_us / step) + 1
+        cuts = []
+        while k * step < hi_us:
+            if k * step > lo_us:
+                cuts.append(k * step)
+            k += 1
+        return cuts
+
+    def locks_on(self, frame, rsid, slot, now, det=0):
+        """The first stage: whether a receiver finds the frame's preamble and
+        sync word, at the frame's faded level at `now`; a side detector (`det`
+        1 and up) also misses a short preamble at its own rate
+        (`side_preamble_miss`). One draw per frame and slot, so a lock on
+        time, a late one and a CAD read the same."""
+        level = self.level_at(frame, rsid, now)
+        if level is None:
+            return False
+        odds = lock_odds(self.symbol_error_at(frame, level))
+        if det:
+            odds *= 1.0 - side_preamble_miss(frame.pre_symbols)
+        return self.draw(frame, rsid, slot, "lock") < odds
+
+    def header_ok(self, frame, rsid, slot):
+        """The second stage, decided at the lock: whether the first block,
+        the explicit header, decodes at its faded level. A frame without a
+        header has none to fail; its first block is the payload's."""
+        if frame.implicit:
+            return True
+        level = self.level_at(frame, rsid, (frame.pre_us + frame.hdr_us) / 2.0)
+        p = self.symbol_error_at(frame, level)
+        return (self.draw(frame, rsid, slot, "hdr")
+                < block_survives(p, FIRST_BLOCK_SYMBOLS, True))
+
+    def payload_blocks(self, frame, rsid):
+        """The payload's blocks at one receiver, as (faded level, symbols,
+        correcting): spread evenly from the header's end to the frame's, and
+        the first block before them when there is no header."""
+        first, count, per_block, correcting = frame_blocks(
+            frame.sf, frame.bw, frame.cr, frame.payload_len, frame.implicit, frame.crc)
+        out = []
+        if frame.implicit:
+            out.append((self.level_at(frame, rsid, (frame.pre_us + frame.hdr_us) / 2.0),
+                        first, True))
+        span = (frame.end_us - frame.hdr_us) / count if count else 0.0
+        for i in range(count):
+            out.append((self.level_at(frame, rsid, frame.hdr_us + (i + 0.5) * span),
+                        per_block, correcting))
+        return out
+
+    def payload_survives(self, reception, blocks):
+        """The third stage, at the frame's end: whether every block decodes.
+        One draw per frame and slot."""
+        frame = reception.frame
+        odds = 1.0
+        for level, n, correcting in blocks:
+            odds *= block_survives(self.symbol_error_at(frame, level), n, correcting)
+        return self.draw(frame, reception.rsid, reception.slot, "payload") < odds
 
     def levels(self, sid, freq_hz, bw_hz=125_000, power_dbm=None, sf=None):
         """What every other station in the table would hear from `sid` on this
@@ -1417,7 +1819,8 @@ class Ether(asyncio.DatagramProtocol):
         before = station.state(slot) or {}
         station.states[slot] = msg
         mode = msg.get("mode")
-        retuned = any(before.get(key) != msg.get(key) for key in ("freq",) + MATCH_KEYS)
+        retuned = any(before.get(key) != msg.get(key)
+                      for key in ("freq", "side") + MATCH_KEYS)
         if mode != "RX" or retuned:
             # The chip lets go of what it was demodulating on leaving RX, and
             # cannot follow it onto another channel. Its own transmission is
@@ -1514,23 +1917,39 @@ class Ether(asyncio.DatagramProtocol):
             ["%d@%.1fdBm" % (r[0], r[2]) for r in frame.receivers] or "nobody"))
 
     @staticmethod
-    def matches(state, tx):
-        """True when a receiver's stated radio can decode this transmission."""
-        return (all(state.get(k) == tx.get(k) for k in MATCH_KEYS)
-                and same_carrier(state.get("freq"), tx.get("freq"), state.get("bw")))
+    def detector(state, tx):
+        """Which of a receiver's detectors can decode this transmission: 0 its
+        main one, k the k-th of its `side` list, None none."""
+        if not same_carrier(state.get("freq"), tx.get("freq"), state.get("bw")):
+            return None
+        if all(state.get(k) == tx.get(k) for k in MATCH_KEYS):
+            return 0
+        if state.get("mod") != tx.get("mod") or state.get("bw") != tx.get("bw"):
+            return None
+        for k, side in enumerate(state.get("side") or (), start=1):
+            if isinstance(side, dict) and all(side.get(key) == tx.get(key)
+                                              for key in SIDE_KEYS):
+                return k
+        return None
 
     # ---- arrival: the lock ----------------------------------------------
 
-    def begin_message(self, frame, slot, level, energy=False, t0=None):
+    def begin_message(self, frame, slot, level, energy=False, t0=None, hdr_ok=True, det=0):
         """An rx_begin for one slot. `t0` is the instant the slot is told,
         the frame's own start unless the slot started listening later: the
-        chip measures what is left of the frame from it."""
+        chip measures what is left of the frame from it. `hdr_ok` false says
+        the header will fail at `t_hdr`; `det` names the side detector that
+        found it, left out for the main one."""
         begin = {"type": "rx_begin", "slot": slot,
                  "id": frame.eid, "t0": frame.start_us if t0 is None else t0,
                  "t_pre": frame.pre_us, "t_hdr": frame.hdr_us,
                  "t_end": frame.end_us, "level": round(level)}
         if energy:
             begin["cad"] = True
+        if not hdr_ok:
+            begin["hdr_ok"] = False
+        if det:
+            begin["det"] = det
         return begin
 
     def current_lock(self, rstation, slot, now):
@@ -1559,7 +1978,7 @@ class Ether(asyncio.DatagramProtocol):
                 continue
             if not in_band(other.freq, other.bw, state.get("freq"), state.get("bw")):
                 continue
-            level = self.level_of(other, rsid)
+            level = self.level_at(other, rsid, now)
             if level is not None:
                 total += dbm_to_mw(level)
         return mw_to_dbm(total)
@@ -1567,12 +1986,13 @@ class Ether(asyncio.DatagramProtocol):
     def arrive(self, frame, msg, rstation, slot, level, now=None):
         """A frame reaches one listening slot: the receiver-centred rule.
 
-        Off its band, nothing. Decodable — matching its state and over its
-        modem's threshold — a CAD slot is told it is there, and an RX slot
-        locks on to it unless it is following a frame this one does not lead
-        by the same-SF figure; a frame that takes the lock loses the earlier
-        one. Anything else in band is energy: an rx_begin marked `cad`, and no
-        end, when the summed energy there crosses the sense threshold.
+        Off its band, nothing. Decodable — matching its state, and its
+        preamble and sync word found (`locks_on`) — a CAD slot is told it is
+        there, and an RX slot locks on to it unless it is following a frame
+        this one does not lead by the same-SF figure; a frame that takes the
+        lock loses the earlier one. Anything else in band is energy: an
+        rx_begin marked `cad`, and no end, when the summed energy there
+        crosses the sense threshold.
 
         `now` is when a slot that started listening after the frame began is
         told of it (`tell_late`): it can lock on only while enough of the
@@ -1581,23 +2001,26 @@ class Ether(asyncio.DatagramProtocol):
         state = rstation.state(slot)
         if not in_band(frame.freq, frame.bw, state.get("freq"), state.get("bw")):
             return
-        decodable = (self.matches(state, msg)
-                     and self.audible(level, frame.bw, frame.sf))
         late = now is not None and now > frame.start_us
         now = frame.start_us if now is None else now
+        faded = self.level_at(frame, rstation.sid, now)
+        det = self.detector(state, msg)
+        if det and rstation.sensing(slot):
+            det = None          # a CAD is the main detector's alone
+        decodable = det is not None and self.locks_on(frame, rstation.sid, slot, now, det)
         if not decodable:
             if self.in_band_energy(rstation.sid, state, now) >= \
                     sense_threshold_dbm(state.get("bw")):
-                self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
+                self.send(rstation.sid, self.begin_message(frame, slot, faded, energy=True, t0=now))
             return
         if rstation.sensing(slot) or (late and not frame.preamble_left(now)):
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
+            self.send(rstation.sid, self.begin_message(frame, slot, faded, energy=True, t0=now))
             return
         held = self.current_lock(rstation, slot, now)
-        if held is not None and not self.takes(held, frame, rstation.sid, level, now):
+        if held is not None and not self.takes(held, frame, rstation.sid, now):
             # The demodulator is busy with a frame this one does not take it
             # off: it is energy to this receiver, and lost to it.
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
+            self.send(rstation.sid, self.begin_message(frame, slot, faded, energy=True, t0=now))
             self.open_reception(frame, rstation, slot, level, lost=True)
             return
         if held is not None:
@@ -1605,68 +2028,88 @@ class Ether(asyncio.DatagramProtocol):
             held.lost_at = now
             log("frame %d takes station %d off frame %d" % (
                 frame.eid, rstation.sid, held.frame.eid))
-        rstation.locks[slot] = self.open_reception(frame, rstation, slot, level, now=now)
-        self.send(rstation.sid, self.begin_message(frame, slot, level, t0=now))
+        self.take_lock(frame, rstation, slot, level, faded, now, det)
 
-    def takes(self, held, frame, rsid, level, now):
+    def take_lock(self, frame, rstation, slot, level, faded, now, det=0):
+        """A slot locks on to a frame, by detector `det`: its header's fate is
+        decided now, and a header that will fail closes the reception at
+        `t_hdr`."""
+        reception = self.open_reception(frame, rstation, slot, level, now=now)
+        reception.det = det
+        reception.hdr_ok = self.header_ok(frame, rstation.sid, slot)
+        rstation.locks[slot] = reception
+        if not reception.hdr_ok:
+            self.call_at(frame.hdr_us, self.deliver_header_error, reception, key=rstation.sid)
+        self.send(rstation.sid, self.begin_message(frame, slot, faded, t0=now,
+                                                   hdr_ok=reception.hdr_ok, det=det))
+
+    def takes(self, held, frame, rsid, now):
         """Whether a frame arriving now takes a receiver off the one it is
-        following: by leading it by the same-SF figure, or with bench capture
-        as the bench saw two frames meet — never once the receiver is past
-        the first one's preamble, and otherwise when the pair's outcome says
-        the new one survives, the same outcome its verdict will read. Never
-        without interference (`Physics`)."""
+        following, on the two frames' faded levels there now: by leading it by
+        the same-SF figure, or with bench capture as the bench saw two frames
+        meet — never once the receiver is past the first one's preamble, and
+        otherwise when the pair's outcome says the new one survives, the same
+        outcome its verdict will read. Never without interference (`Physics`)."""
         if not self.physics.interference:
             return False
+        lead = self.level_at(frame, rsid, now) - self.level_at(held.frame, rsid, now)
         if not self.bench_capture:
-            return level - held.level >= SAME_SF_REJECTION_DB
+            return lead >= SAME_SF_REJECTION_DB
         if now >= held.frame.pre_us:
             return False
-        return bench_outcome(self.seed, held.frame.eid, frame.eid, rsid,
-                             held.level - level, locked=False)[1]
+        return bench_outcome(self.seed, self.key_of(held.frame), self.key_of(frame),
+                             self.node(rsid), -lead, locked=False)[1]
 
     def arrive_pairwise(self, frame, msg, rstation, slot, level, now=None):
         """A frame reaches one listening slot: the pairwise rule.
 
-        Delivered where it matches and is audible. A later frame takes the
-        receiver only when it leads, in the whole dB the station is shown, the
-        one in progress by the capture margin; otherwise it is energy and lost
-        to this receiver. A CAD slot is told of every frame it could decode,
-        and so is a slot that started listening too late in the preamble
-        (`arrive`).
+        Delivered where it matches and its preamble is found (`locks_on`). A
+        later frame takes the receiver only when it leads, in the whole dB the
+        station is shown, the one in progress by the capture margin; otherwise
+        it is energy and lost to this receiver. A CAD slot is told of every
+        frame it could decode, and so is a slot that started listening too
+        late in the preamble (`arrive`).
         """
         state = rstation.state(slot)
-        if not self.matches(state, msg) or not self.audible(level, frame.bw, frame.sf):
-            return
         late = now is not None and now > frame.start_us
         now = frame.start_us if now is None else now
+        det = self.detector(state, msg)
+        if det and rstation.sensing(slot):
+            det = None          # a CAD is the main detector's alone
+        if det is None or not self.locks_on(frame, rstation.sid, slot, now, det):
+            return
+        faded = self.level_at(frame, rstation.sid, now)
         if rstation.sensing(slot) or (late and not frame.preamble_left(now)):
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
+            self.send(rstation.sid, self.begin_message(frame, slot, faded, energy=True, t0=now))
             return
         held = self.current_lock(rstation, slot, now)
-        if held is not None and (not self.physics.interference
-                                 or round(level) < round(held.level) + PAIRWISE_CAPTURE_DB):
-            self.send(rstation.sid, self.begin_message(frame, slot, level, energy=True, t0=now))
+        if held is not None and (
+                not self.physics.interference
+                or round(faded) < round(self.level_at(held.frame, rstation.sid, now))
+                + PAIRWISE_CAPTURE_DB):
+            self.send(rstation.sid, self.begin_message(frame, slot, faded, energy=True, t0=now))
             self.open_reception(frame, rstation, slot, level, lost=True)
             return
         if held is not None:
             held.lost = True
             held.lost_at = now
-        rstation.locks[slot] = self.open_reception(frame, rstation, slot, level, now=now)
-        self.send(rstation.sid, self.begin_message(frame, slot, level, t0=now))
+        self.take_lock(frame, rstation, slot, level, faded, now, det)
 
     # ---- delivery: the verdict ------------------------------------------
 
-    def segments(self, frame, others):
+    def segments(self, frame, others, cuts=()):
         """The frame's air cut where the set of overlapping transmissions
-        changes: a list of the lists of transmissions on the air in each piece."""
-        cuts = {frame.start_us, frame.end_us}
+        changes, and at any further instants in `cuts`: a list of (start,
+        end, the transmissions on the air) for each piece."""
+        edges = {frame.start_us, frame.end_us}
+        edges.update(t for t in cuts if frame.start_us < t < frame.end_us)
         for other in others:
-            cuts.update(t for t in (other.start_us, other.end_us)
-                        if frame.start_us < t < frame.end_us)
-        edges = sorted(cuts)
+            edges.update(t for t in (other.start_us, other.end_us)
+                         if frame.start_us < t < frame.end_us)
+        edges = sorted(edges)
         pieces = []
         for lo, hi in zip(edges, edges[1:]):
-            pieces.append([o for o in others if o.start_us < hi and o.end_us > lo])
+            pieces.append((lo, hi, [o for o in others if o.start_us < hi and o.end_us > lo]))
         return pieces
 
     @staticmethod
@@ -1675,48 +2118,59 @@ class Ether(asyncio.DatagramProtocol):
         duplex, so the frame is lost to it whatever else was on the air."""
         return any(other.sid == reception.rsid for other in reception.frame.interferers)
 
+    @classmethod
+    def unfollowed(cls, reception):
+        """Why the receiver did not follow the frame to its end, as an rx_end's
+        cause, or None: it did."""
+        if reception.lost:
+            return "lost"
+        if cls.talked_over(reception):
+            return "talked_over"
+        return None
+
     def verdict_for(self, reception):
-        """How this frame ends at one receiver: the receiver-centred rule.
+        """How interference leaves this frame at one receiver, the
+        receiver-centred rule, as (verdict, cause).
 
         Over every piece of the frame's air, the worst deciding: its level
-        over thermal noise at or above its spreading factor's demodulation
-        threshold, and over each class of interference — the transmissions in
-        its band at one spreading factor, their powers summed — at or above
-        that class's rejection figure.
+        over each class of interference — the transmissions in its band at
+        one spreading factor, their powers summed — at or above that class's
+        rejection figure. With fading the levels are taken at each piece's
+        middle, and a piece never spans a knot of it.
         """
-        frame, rsid, level = reception.frame, reception.rsid, reception.level
-        if reception.lost or self.talked_over(reception):
-            return "crc"
-        if level - self.noise(frame.bw) < self.sensitivity(frame.sf):
-            return "crc"
+        frame, rsid = reception.frame, reception.rsid
+        cause = self.unfollowed(reception)
+        if cause:
+            return "crc", cause
         if not self.physics.interference:
-            return "clean"
-        others = []
-        for other in frame.interferers:
-            against = self.level_of(other, rsid)
-            if against is not None:
-                others.append((other, against))
+            return "clean", None
+        others = [o for o in frame.interferers if self.level_of(o, rsid) is not None]
         if not others:
-            return "clean"
-        by_frame = {id(o): a for o, a in others}
-        worst_same_mw = 0.0
-        for piece in self.segments(frame, [o for o, _ in others]):
+            return "clean", None
+        worst_lead = None
+        for lo, hi, piece in self.segments(frame, others,
+                                           self.knot_cuts(frame.start_us, frame.end_us)):
+            if not piece:
+                continue
+            mid = (lo + hi) / 2.0
+            level = self.level_at(frame, rsid, mid)
             classes = {}
             same_mw = 0.0
             for other in piece:
-                mw = dbm_to_mw(by_frame[id(other)])
+                mw = dbm_to_mw(self.level_at(other, rsid, mid))
                 if self.bench_capture and same_class(frame.sf, other.sf):
                     same_mw += mw
                     continue
                 classes[other.sf] = classes.get(other.sf, 0.0) + mw
-            worst_same_mw = max(worst_same_mw, same_mw)
+            if same_mw > 0.0:
+                lead = level - mw_to_dbm(same_mw)
+                worst_lead = lead if worst_lead is None else min(worst_lead, lead)
             for sf, mw in classes.items():
                 if level - mw_to_dbm(mw) < rejection_db(frame.sf, sf):
-                    return "crc"
-        if worst_same_mw > 0.0 and not self.bench_survives(
-                reception, others, level - mw_to_dbm(worst_same_mw)):
-            return "crc"
-        return "clean"
+                    return "crc", "interference"
+        if worst_lead is not None and not self.bench_survives(reception, others, worst_lead):
+            return "crc", "interference"
+        return "clean", None
 
     def bench_survives(self, reception, others, lead):
         """Bench capture's word on a frame against its own class: the
@@ -1727,42 +2181,77 @@ class Ether(asyncio.DatagramProtocol):
         receiver was locked is read off the first frame's reception: past its
         preamble, and following it, when the second started."""
         frame, rsid, slot = reception.frame, reception.rsid, reception.slot
-        same = [(o, a) for o, a in others if same_class(frame.sf, o.sf)]
-        partner = max(same, key=lambda oa: (oa[1], -oa[0].eid))[0]
-        first, second = sorted((frame, partner), key=lambda f: (f.start_us, f.eid))
+        same = [o for o in others if same_class(frame.sf, o.sf)]
+        partner = max(same, key=lambda o: (self.level_of(o, rsid), self.key_of(o)))
+        first, second = sorted((frame, partner), key=lambda f: (f.start_us, self.key_of(f)))
         was = first.receptions.get((rsid, slot))
         locked = (second.start_us >= first.pre_us
                   and was is not None and was.followed_at(second.start_us))
-        outcome = bench_outcome(self.seed, first.eid, second.eid, rsid,
-                                lead if first is frame else -lead, locked)
+        outcome = bench_outcome(self.seed, self.key_of(first), self.key_of(second),
+                                self.node(rsid), lead if first is frame else -lead, locked)
         return outcome[0] if first is frame else outcome[1]
 
     def verdict_pairwise(self, reception):
-        """How this frame ends at one receiver: the pairwise rule.
+        """How interference leaves this frame at one receiver, the pairwise
+        rule, as (verdict, cause).
 
         Each same-carrier interferer this station could hear is taken on its
         own, and the frame survives only by leading every one of them by the
-        capture margin.
+        capture margin, the two levels taken in the middle of their overlap.
         """
-        frame, rsid, level = reception.frame, reception.rsid, reception.level
-        if reception.lost or self.talked_over(reception):
-            return "crc"
+        frame, rsid = reception.frame, reception.rsid
+        cause = self.unfollowed(reception)
+        if cause:
+            return "crc", cause
         if not self.physics.interference:
-            return "clean"
+            return "clean", None
         for other in frame.interferers:
             if not same_carrier(frame.freq, other.freq, max(frame.bw or 0, other.bw or 0)):
                 continue
-            against = self.level_of(other, rsid)
+            if self.level_of(other, rsid) is None:
+                continue
+            mid = (max(frame.start_us, other.start_us) + min(frame.end_us, other.end_us)) / 2.0
+            against = self.level_at(other, rsid, mid)
             if not self.audible(against, other.bw, other.sf):
                 continue        # this receiver never heard the other frame
-            if level - against < PAIRWISE_CAPTURE_DB:
-                return "crc"
-        return "clean"
+            if self.level_at(frame, rsid, mid) - against < PAIRWISE_CAPTURE_DB:
+                return "crc", "interference"
+        return "clean", None
+
+    def end_message(self, reception, verdict, cause, level):
+        """An rx_end for one slot, at the ether's instant now."""
+        frame = reception.frame
+        end = {"type": "rx_end", "slot": reception.slot, "id": frame.eid,
+               "t": self.now(), "verdict": verdict,
+               "payload": frame.payload, "rssi": round(level),
+               "snr": round(level - self.noise(frame.bw))}
+        if cause:
+            end["cause"] = cause
+        return end
+
+    def deliver_header_error(self, reception):
+        """At `t_hdr`, a reception whose header failed: closed, and the slot
+        free to lock on to another frame. Nothing when the receiver stopped
+        following the frame before then — taken off it, gone out of RX, or
+        transmitting — and the frame's end rules on it as it would any other."""
+        frame, rsid, slot = reception.frame, reception.rsid, reception.slot
+        station = self.stations.get(rsid)
+        if station is None or station.locks.get(slot) is not reception:
+            return
+        station.locks.pop(slot, None)
+        reception.ended = True
+        level = self.level_at(frame, rsid, frame.hdr_us)
+        self.send(rsid, self.end_message(reception, "hdr", "noise", level))
+        log("frame %d from %d -> station %d slot %s: hdr at %.1f dBm" % (
+            frame.eid, frame.sid, rsid, slot, level))
+        self.raise_event(self.on_rx, rsid, frame.sid, frame.eid, "hdr", level, "noise")
 
     def deliver_end(self, reception):
-        """Close out one receiver's reception of a frame, at its stated end."""
-        frame, rsid, slot, level = (reception.frame, reception.rsid,
-                                    reception.slot, reception.level)
+        """Close out one receiver's reception of a frame, at its stated end:
+        interference first, by the rule in force, then noise on the payload."""
+        frame, rsid, slot = reception.frame, reception.rsid, reception.slot
+        if reception.ended:
+            return
         station = self.stations.get(rsid)
         if station is not None and station.locks.get(slot) is reception:
             station.locks.pop(slot, None)
@@ -1770,25 +2259,31 @@ class Ether(asyncio.DatagramProtocol):
             log("frame %d from %d -> station %d slot %s: abandoned, it left RX" % (
                 frame.eid, frame.sid, rsid, slot))
             return
-        verdict = (self.verdict_pairwise(reception) if self.pairwise
-                   else self.verdict_for(reception))
-        if verdict == "clean" and self.physics.crc_margin_db:
-            margin = level - self.noise(frame.bw) - self.sensitivity(frame.sf)
-            if crc_margin_fails(self.seed, frame.eid, rsid, slot, margin,
-                                self.physics.crc_margin_db):
-                verdict = "crc"
-        self.send(rsid, {"type": "rx_end", "slot": slot, "id": frame.eid,
-                         "t": self.now(), "verdict": verdict,
-                         "payload": frame.payload, "rssi": round(level),
-                         "snr": round(level - self.noise(frame.bw))})
-        log("frame %d from %d -> station %d slot %s: %s at %.1f dBm%s" % (
-            frame.eid, frame.sid, rsid, slot, verdict, level,
-            " (lost the lock)" if reception.lost else ""))
-        self.raise_event(self.on_rx, rsid, frame.sid, frame.eid, verdict, level)
+        verdict, cause = (self.verdict_pairwise(reception) if self.pairwise
+                          else self.verdict_for(reception))
+        blocks = self.payload_blocks(frame, rsid)
+        if verdict == "clean" and (not reception.hdr_ok
+                                   or not self.payload_survives(reception, blocks)):
+            verdict, cause = "crc", "noise"
+        if blocks:
+            level = mw_to_dbm(sum(dbm_to_mw(b[0]) for b in blocks) / len(blocks))
+        else:
+            level = self.level_at(frame, rsid, frame.hdr_us)
+        self.send(rsid, self.end_message(reception, verdict, cause, level))
+        log("frame %d from %d -> station %d slot %s: %s%s at %.1f dBm" % (
+            frame.eid, frame.sid, rsid, slot, verdict,
+            " (%s)" % cause if cause else "", level))
+        self.raise_event(self.on_rx, rsid, frame.sid, frame.eid, verdict, level, cause)
 
     def prune(self, now):
-        """Drop frames whose air is long gone; collisions can no longer touch them."""
+        """Drop frames whose air is long gone; collisions can no longer touch
+        them. And the fading's knots before any frame still on the air: they
+        are the same whenever drawn again."""
         self.frames = [f for f in self.frames if f.end_us > now]
+        if self.knots:
+            earliest = min([f.start_us for f in self.frames] + [now])
+            k = math.floor(earliest / (self.physics.coherence_s * 1e6)) - 1
+            self.knots = {key: z for key, z in self.knots.items() if key[2] >= k}
 
     def close(self):
         if self.pace_timer is not None:
@@ -2246,10 +2741,15 @@ def main(argv=None):
     ap.add_argument("--bench-capture", action="store_true",
                     help="rule on two frames of one spreading factor as a bench saw them "
                          "meet, instead of by the same-SF figure")
-    ap.add_argument("--crc-margin-db", type=float, default=DEFAULT_CRC_MARGIN_DB,
-                    help="the CRC band: how far above its threshold a frame may still "
-                         "fail its CRC, the chance falling linearly to nothing "
-                         "(default %g: none)" % DEFAULT_CRC_MARGIN_DB)
+    ap.add_argument("--fading-db", type=float, default=DEFAULT_FADING_DB,
+                    help="fading: the spread in dB of every link's level over time "
+                         "(default %g: none)" % DEFAULT_FADING_DB)
+    ap.add_argument("--coherence-s", type=float, default=DEFAULT_COHERENCE_S,
+                    help="fading: how long, in seconds, a link's level stays alike "
+                         "(default %g)" % DEFAULT_COHERENCE_S)
+    ap.add_argument("--rician-k", type=float, default=DEFAULT_RICIAN_K, metavar="K",
+                    help="fast fading: one Rician draw per frame at each receiver, of "
+                         "this K factor, 0 for Rayleigh (default: none)")
     ap.add_argument("--no-interference", action="store_true",
                     help="an oracle: judge every frame against noise alone and never take "
                          "a receiver off the frame it follows; what overlapping frames "
@@ -2269,6 +2769,11 @@ def main(argv=None):
         ap.error("--nodeset and --losses go together")
     if args.bench_capture and args.pairwise:
         ap.error("--bench-capture is a variant of the receiver-centred rule, not --pairwise's")
+    try:
+        physics = Physics(args.noise_figure, not args.no_interference,
+                          args.fading_db, args.coherence_s, args.rician_k)
+    except ValueError as err:
+        ap.error(str(err))
     sids, gains, tables = {}, {}, {}
     if args.nodeset:
         sids, gains = read_nodeset(args.nodeset)
@@ -2276,9 +2781,7 @@ def main(argv=None):
         if args.geodata:
             log("geodata: %s" % args.geodata)
     try:
-        asyncio.run(serve(parse_bind(args.bind), args.record,
-                          Physics(args.noise_figure, args.crc_margin_db,
-                                  interference=not args.no_interference),
+        asyncio.run(serve(parse_bind(args.bind), args.record, physics,
                           (tables, sids, gains),
                           args.time, args.pairwise, args.seed, args.bench_capture))
     except KeyboardInterrupt:

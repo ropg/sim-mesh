@@ -21,7 +21,8 @@ asked through the ether's `level` and `audible`) and reports:
   mode the sender's slot had last stated when that frame went out;
 - **frames nobody was told of**, by sender and channel: a station on a
   channel nobody listens to shows up here;
-- **collisions**: every reception that ended `crc`, with each other
+- **collisions**: every reception that ended `crc` for anything but noise
+  (the ether's `cause`), with each other
   transmission that shared its air and band and reached the receiver, split
   into senders **hidden** from each other, neither able to decode the
   other, and senders **in earshot**, one or both able to. A receiver that
@@ -125,7 +126,7 @@ class Frame:
         self.batch = 0                  # rx_begins recorded at its instant before it
         self.eid = None
         self.begins = []
-        self.ends = []                  # (receiver, slot, verdict)
+        self.ends = []                  # (receiver, slot, verdict, cause)
 
     def fits(self, said, virtual):
         """Whether an rx_begin can be about this frame: sent after it, to
@@ -208,7 +209,8 @@ class Record:
             if frame is None:
                 self.untied += 1
             else:
-                frame.ends.append((rsid, msg.get("slot", 0), msg.get("verdict")))
+                frame.ends.append((rsid, msg.get("slot", 0), msg.get("verdict"),
+                                   msg.get("cause")))
 
     def tie(self, begins, level_at):
         """Virtual time: the frame each of the ether's numbers is.
@@ -340,9 +342,9 @@ def how_told(event):
 
 
 def collisions(record, air, pairs):
-    """Every reception that ended `crc`, with the transmissions that shared
-    its air and band as the ether counts them (`Frame.shares_air`) and
-    reached its receiver."""
+    """Every reception that ended `crc` for anything but noise, with the
+    transmissions that shared its air and band as the ether counts them
+    (`Frame.shares_air`) and reached its receiver."""
     shared = collections.defaultdict(list)
     for g, f in pairs:
         if ether_module.in_band(g.freq, g.bw, f.freq, f.bw):
@@ -350,8 +352,8 @@ def collisions(record, air, pairs):
             shared[f].append(g)
     receptions = []
     for g in record.frames:
-        for rsid, _slot, verdict in g.ends:
-            if verdict != "crc":
+        for rsid, _slot, verdict, cause in g.ends:
+            if verdict != "crc" or cause == "noise":
                 continue
             sending, over = False, []
             for h in shared[g]:

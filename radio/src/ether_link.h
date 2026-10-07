@@ -19,6 +19,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/** The most side detectors a radio has: an LR2021's three. */
+constexpr int kMaxSideDetectors = 3;
+
 /** What a receiver needs to know about this radio to decide whether a frame
  *  reaches it. */
 struct EtherState {
@@ -33,6 +36,12 @@ struct EtherState {
     bool        hdrImplicit;
     bool        crc;
     int         preamble;
+    bool        iqInverted;  /* SetPacketParams' InvertIQ: the chirps run down */
+    /* Side detectors, listening beside the main one on its carrier and
+     * bandwidth (an LR2021's SetLoraSideDetConfig and SetLoraSideDetSyncword):
+     * each its own spreading factor, sync word and IQ. An SX1262 has none. */
+    int         nSide;
+    struct { int sf; int syncWord; bool iqInverted; } side[kMaxSideDetectors];
 };
 
 /** A frame leaving this radio. */

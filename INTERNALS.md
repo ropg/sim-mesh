@@ -527,8 +527,9 @@ The draw is fixed for the run and depends on nothing that happens in it, so
 two runs that differ only in their traffic or their firmware stand on the
 same ground: the common random numbers a paired comparison needs. Names,
 not station ids, because a node keeps its name from one run to the next. A
-loss drawn afresh per frame would be fading, a different thing that lets
-every retry through in the end; this is not that. A pair never heard stays
+loss that varies over time is fading, a different thing that lets every
+retry through in the end; that is the ether's (`--fading-db`), and this is
+not that. A pair never heard stays
 so, a measured cell already holds its path's own shadowing, and a stated
 link is the figure as stated, so none of them is drawn on. On a pack the
 table it is laid over must be a median: P.1812 at 90 % of locations already
@@ -911,7 +912,8 @@ here, and the planner's clutter correction stops at 3 GHz.
 
 A collision is not a property of a transmission; it is what happened at one
 antenna. So the ether rules per receiver, per frame, from everything arriving
-there, in two questions and two tests. [`ether/INTERNALS.md`](ether/INTERNALS.md#reception-two-tests-the-worst-piece-deciding)
+there: who is affected and who can decode, then noise in stages and
+interference stretch by stretch. [`ether/INTERNALS.md`](ether/INTERNALS.md#reception-interference-the-worst-piece-deciding)
 is the whole of it; this is its shape.
 
 **The received power** of a transmission at a receiver is the transmit power
@@ -926,21 +928,39 @@ demodulator hears every chirp in its band. Only a frame whose bandwidth,
 spreading factor and sync word match the receiver's state, on its carrier,
 can be decoded. An off-band transmission contributes nothing.
 
-**Two tests, over the whole frame, the worst stretch deciding.** The frame's
-air is cut wherever the set of overlapping transmissions changes, and in
-every piece:
+**Against noise, three stages.** One symbol error curve per spreading
+factor, exact for an ideal receiver and offset so the datasheet's test frame
+(64 bytes) is lost 1% of the time at the datasheet's threshold, decides by
+seeded draws whether the receiver finds the preamble (the lock: failing it,
+the frame is energy only), reads the header (failing it, the reception ends
+at `t_hdr` as a header error) and decodes every block of the payload
+(failing it, a CRC failure). Longer frames have more blocks, so fail more
+often at the same level.
 
-1. the signal over thermal noise is at or above the spreading factor's
-   demodulation threshold;
-2. the signal over each **class** of interference is at or above that
-   class's rejection figure, where a class is every overlapping transmission
-   at one spreading factor, summed in milliwatts before the test.
+**Against interference, the worst stretch deciding.** The frame's air is cut
+wherever the set of overlapping transmissions changes, and in every piece the
+signal over each **class** of interference is at or above that class's
+rejection figure, where a class is every overlapping transmission at one
+spreading factor, summed in milliwatts before the test.
 
-They are two tests and not one weighted sum: the demodulation threshold is
-against noise and is negative, the same-SF figure is against a chirp and is
-positive, and adding noise to a chirp's power would make neither mean what
-its source measured. Nor are the classes summed into each other, because
-each figure was measured against one interfering spreading factor.
+Noise is not added to the interference: the stages are against noise, the
+same-SF figure is against a chirp, and adding noise to a chirp's power would
+make neither mean what its source measured. Nor are the classes summed into
+each other, because each figure was measured against one interfering
+spreading factor.
+
+**Fading**, when asked for (`--fading-db`, `--coherence-s`), moves every
+link's level over time around the table's, per pair of nodes, and every
+stage and every stretch reads the level at its own instant; `--rician-k`
+adds a fast fade drawn per frame at each receiver. Every draw — stages,
+fades, bench outcomes — is keyed on the channel (the frame's sender, start
+and bytes; the receiver's name), not on the order of events, so arms of a
+comparison share their channel.
+
+**What can decode** is the receiver's main detector — bandwidth, spreading
+factor, sync word and IQ polarity — or, on a radio that has them, any of its
+side detectors (an LR2021's, each its own spreading factor, sync word and
+IQ polarity), which also miss short preambles at a measured rate.
 
 **The figures**, all in one table at the top of `ether/ether.py` with their
 sources ([`ether/INTERNALS.md`](ether/INTERNALS.md#the-figures)):
@@ -949,6 +969,7 @@ sources ([`ether/INTERNALS.md`](ether/INTERNALS.md#the-figures)):
 |---|---|---|
 | thermal noise | −174 dBm/Hz, plus the noise figure (6 dB) | kTB at 290 K; the SX1262's order of magnitude |
 | demodulation threshold | −7.5 dB at SF7, 2.5 dB lower per step | SX1261/2 datasheet |
+| the error curve's anchor | 1% of a 64-byte frame lost at the threshold | SX1261/2 datasheet, the conditions of its sensitivity table |
 | same-SF rejection | 6 dB | Semtech's specification |
 | inter-SF rejection | −8 … −25 dB | Croce et al., "Impact of LoRa Imperfect Orthogonality", IEEE Communications Letters 22(4), 2018, measured on the SX1272 |
 | sense threshold | 15 dB over the ETSI (European Telecommunications Standards Institute) EN 300 220-1 sensitivity limit, −81 dBm at 125 kHz | EN 300 220-1 V3.1.1, 5.21.2 |
@@ -1726,11 +1747,13 @@ descriptor 0 holds T a second each time it is typed at.
 - Memory: the heap ignores capabilities and wraps libc, so pressure on the
   external PSRAM (pseudo-static RAM), DMA-capable (direct memory access)
   allocation and internal-RAM exhaustion are all invisible.
-- The radio's physics below the path-loss model. There is no fading, no
-  antenna pattern, no band above the sensitivity threshold where a frame
-  fails its CRC (cyclic redundancy check) at a probability, and no noise
-  floor but the thermal one; a pair's loss is the table's and is the same
-  for every frame between them. On real ground that loss is P.1812's
+- The radio's physics below the path-loss model, beyond a few figures. The
+  error curve around the sensitivity threshold is an ideal receiver offset
+  to the datasheet's one point, not a measured waterfall; fading, when asked
+  for, is slow and Gaussian with a spread and a coherence time not yet
+  fitted to anything, and fast fading one Rician draw per frame; there is no
+  multipath within a frame, no antenna pattern and no noise floor but the
+  thermal one. On real ground a pair's loss is P.1812's
   statistical figure at 50 % of time and 90 % of locations (or the
   geodata's `loc_pct`), not a measurement of that path. See
   [`ether/INTERNALS.md`](ether/INTERNALS.md) for what the medium does
@@ -1756,10 +1779,10 @@ A simulator that is subtly wrong is worse than one that leaves a thing out:
 it gives confidence rather than information. So every physical figure the
 ether uses is to be held against a measurement on real boards, kept as a
 regression check, and what gets modelled next goes in this order: capture,
-wrong sync word, deafness while retuning, occupancy, the noise sum, the CRC
-band. Fading, multipath, antenna patterns and clock drift come after all of
-those, if at all; past that point the cost grows and the answers do not
-change.
+wrong sync word, deafness while retuning, occupancy, the noise sum, the
+error curve's waterfall and fading's spread and coherence time measured.
+Multipath, antenna patterns and clock drift come after all of those, if at
+all; past that point the cost grows and the answers do not change.
 
 ## Still to build
 
@@ -1774,10 +1797,12 @@ change.
   sends `ready_at`; the ether treats a frame whose `t0` falls before a
   receiver's `ready_at` as energy with no lock. That makes a wrong retune or
   turnaround constant a frame loss that reproduces.
-- **A loss cause for every frame at every station in range**, in the record:
-  `no_rx`, `tx`, `settling`, `off_channel`, `wrong_rate`, `wrong_sync`,
-  `below_threshold`, lost lock, `crc` from interference, `left_rx`, with a
-  summary per station and per pair. A protocol claim ("`settling` cannot
+- **A loss cause for every frame at every station in range**, in the record.
+  An `rx_end` says why a reception failed (`noise`, `interference`,
+  `talked_over`, `lost`); still to come are the frames that never reached a
+  reception — `no_rx`, `tx`, `settling`, `off_channel`, `wrong_rate`,
+  `wrong_sync`, `no_lock`, `left_rx` — and a summary per station and per
+  pair. A protocol claim ("`settling` cannot
   happen here") and a departure policy are judged by these.
 - **A referee over `record.tsv`**, in part. After a run, `compliance.py`
   holds each node to EN 300 220's duty cycle, polite spectrum access and
@@ -1790,10 +1815,22 @@ change.
   listen-before-talk itself. That a slot was in RX or CAD before a `tx` is
   in the record; whether its firmware read the channel, and what it found
   there, is not: an RSSI read or a CAD's result never reaches the ether.
-- **The CRC band by default**: `--crc-margin-db` gives the band above the
-  demodulation threshold where a locked frame ends as `crc` with a
-  probability falling linearly from 1 to 0 (ether/INTERNALS.md). It is off
-  unless given; whether it should default to the 3 dB planned here is open.
+- **Calibrating the error curve and fading**: three numbers stand on
+  assumptions (ether/INTERNALS.md, "The noise" and "Fading"). The curve's
+  position: the datasheet's 1% at its threshold for a 64-byte frame, to be
+  replaced by a step-attenuator sweep on the tools/rncapture bench through
+  the threshold at SF7/125 kHz, 0.5 dB steps, ~200 frames a step, 20- and
+  200-byte frames, counting clean, CRC error and nothing received; fit the
+  offset to the 20-byte curve and check the 200-byte one lands where the
+  model puts it unfitted (that is the test of the length effect), at SF12
+  too if time allows. σ and the coherence time: from deployed nodes' frame
+  to frame RSSI per link (the firmware's per-frame telemetry carries one for
+  every frame, CRC failures included), the spread around a link's long-run
+  mean and its autocorrelation's decay; the share of CRC errors among
+  receptions is the check, and a sim run of the same nodeset with the fitted
+  figures should give the same order of magnitude. Far more CRC errors in
+  the sim points first at too short a coherence time, then at a lock stage
+  too lenient beside the payload stage.
 - **`next_instant()` from a heap**: the pending `until`s kept in a heap keyed
   by instant and station, updated on idle, retraction and leave, stale
   entries dropped when popped, instead of a scan of every station per
