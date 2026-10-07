@@ -523,11 +523,24 @@ export const useSim = defineStore('sim', {
     saveSnapshotAs(name: string) { this.send({ type: 'snapshot_save_as', name }) },
 
     /** The station's own web UI, through the proxy on this same port; behind
-     *  the front the simulation is the second label. */
+     *  the front the simulation is the second label.
+     *
+     *  On localhost this is unchanged: `.sim.localhost` resolves there, and
+     *  the front's own reported port is right (and, in `sim dev`, the only
+     *  one that is — the page's own `location.port` is the Vite dev port,
+     *  not the front's). Away from localhost `.sim.localhost` cannot be
+     *  reached at all (a remote browser's own loopback, not the server's),
+     *  so a wildcard-DNS name for the page's own host stands in for it; and
+     *  the page's own `location.port` is used instead of the front's
+     *  self-reported one, which a remapped port (this demo's container)
+     *  leaves wrong. */
     stationUrl(name: string) {
       const socket = useSocket()
       const label = socket.front && this.selected ? `${name}.${this.selected}` : name
-      return `${location.protocol}//${label}.sim.localhost:${socket.front ? socket.port : this.port}/`
+      const local = location.hostname === 'localhost'
+      const suffix = local ? 'localhost' : `${location.hostname}.nip.io`
+      const port = local ? (socket.front ? socket.port : this.port) : location.port
+      return `${location.protocol}//${label}.sim.${suffix}:${port}/`
     },
 
     /** The station's console websocket. */
