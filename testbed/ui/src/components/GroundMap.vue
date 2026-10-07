@@ -24,6 +24,12 @@
       <div v-else-if="legend === 'population'" class="wmap-legend">
         population <i class="wmap-ramp" /> dense
       </div>
+      <div v-if="indexing" class="wmap-note wmap-index">
+        building footprints: the planner is {{ indexing.phase }}{{ indexing.buildings
+          ? `, ${indexing.buildings.toLocaleString()} so far` : '' }}
+        <q-linear-progress :value="indexing.fraction ?? 0" :indeterminate="indexing.fraction === null"
+                           color="primary" size="3px" class="q-mt-xs" />
+      </div>
       <div v-if="note" class="wmap-note">{{ note }}</div>
     </div>
     <div v-if="credits.length" class="wmap-credits" :title="creditsOpen ? '' : 'the sources’ notices'"
@@ -43,9 +49,10 @@
  * synthetic ground's nautical-mile metres around 0°, 0°), in layers from the
  * ground up:
  *
- *   base       a pack's ground, planner-wasm composing tile.bin with the
- *              server's bake of terrain or clutter height; synthetic
- *              ground's grid, in metres or degrees
+ *   base       a pack's ground, the server's bake of terrain or clutter
+ *              height over tile.bin's terrain, made into an image off the
+ *              main thread (lib/ground.worker.ts); synthetic ground's
+ *              grid, in metres or degrees
  *   roads      roads.bin's ways as lines, by class, railways dashed
  *   buildings  footprints from buildings.bin: outlines under 9 km across,
  *              filled by height above the ground under 4 km
@@ -85,7 +92,7 @@ import { computed, onMounted, onUnmounted, ref, watch, nextTick } from 'vue'
 import { useGeodata } from '../stores/geodata'
 import { useSim } from '../stores/sim'
 import type { Display } from '../stores/display'
-import { COVERAGE_BANDS, SLICE_MS, yieldToPage, type CoverageSource } from '../stores/coverage'
+import { COVERAGE_BANDS, type CoverageSource } from '../stores/coverage'
 import type { Offset } from '../stores/nodes'
 import { M_PER_DEGREE } from '../lib/proj'
 import { forwardingRole, type GroundPoint, type LinkMark, type MapNode, type OtherNode, type Pick } from '../lib/marks'
@@ -156,8 +163,23 @@ const FLASH_MS = 400
 const BLDG_MAX_VIEW_M = 9000
 const BLDG_FILL_VIEW_M = 4000
 const SETTLE_MS = 160
+/* After the wheel, what the view needs is fetched later than its repaint,
+ * as the planner's map waits: a wheel gesture delivers notches 100-300 ms
+ * apart on many mice, and at less each notch aborted the fetch before it,
+ * whose basemap the sidecar then rendered for nobody (measured there: six
+ * notches put six renders in flight, two refused with 429, the rest 1.6-2.0
+ * s each instead of 0.2 s). The map redraws from what it holds meanwhile.
+ * A drag let go has nothing after it to wait for. */
+const WHEEL_SETTLE_MS = 300
+/* A ground update abandoned after this, so that one request that never
+ * answers cannot hold the map: far above a warm update's ~0.3 s and a cold
+ * tile from disk, a tripwire, not a budget (the planner's). */
+const GROUND_DEADLINE_MS = 20_000
 const DRAG_SEND_HZ = 6
 const COVERAGE_PX = 4
+/** Device pixels per CSS pixel at most, as the planner's map has it: past
+ *  1.5 the canvas costs more to fill than the eye gains from it. */
+const DPR_CAP = 1.5
 
 /* ── the view: centre in ground metres, metres per CSS pixel ── */
 const view = ref({ cx: 0, cy: 0, mpp: 20 })
@@ -319,7 +341,15 @@ let overviewReq: AbortController | null = null
  * FOOT_TILES_KEPT of them). The sidecar caps a reply's vertices and fills
  * it in the pack's order, not the reply box's, so a reply that says it was
  * cut short is thrown away and its square asked for again as four. A
- * building across a square's edge comes in both, and is drawn once. */
+ * building across a square's edge comes in both, and is held and drawn once.
+ *
+ * What the squares hold is one cache of buildings by the sidecar's id, as
+ * the planner's own map keeps them: a building already held keeps its
+ * geometry, and the squares holding it are counted, so it goes when the
+ * last of them does. A coarse index finds the buildings under a box:
+ * buckets FOOT_BUCKET_M on a side, each building in every bucket its box
+ * touches, so drawing a view visits the few dozen buckets under it rather
+ * than every building held. */
 const FOOT_TILE_M = 1000
 const FOOT_TILE_MIN_M = 125
 const FOOT_TILES_KEPT = 600
@@ -332,8 +362,57 @@ let footGeneration = 0
 /** The pack has no footprints (or the sidecar is still indexing them). */
 let footNone = false
 let footPaintTimer: ReturnType<typeof setTimeout> | null = null
+/** Squares landed since the overlay was last painted, in the order they landed. */
+let footLanded: FootTile[] = []
 let footprintTries = 0
 const FOOTPRINT_TRIES = 30
+/** The sidecar indexing the pack's buildings, as /buildings/status says it,
+ *  while the footprints wait for it; null when they do not. */
+const indexing = ref<{ phase: string; fraction: number | null; buildings: number } | null>(null)
+let indexWatch = false
+let indexPoll: ReturnType<typeof setTimeout> | null = null
+const INDEX_POLL_MS = 500
+const FOOT_BUCKET_M = 500
+/** Every building held, by id, with how many held squares have it. */
+const footHeld = new Map<number, { f: Footprint; squares: number }>()
+/** Bucket key to the ids of the buildings in that bucket. */
+const footIndex = new Map<number, Set<number>>()
+const bucketKey = (bx: number, by: number) => bx * 1048576 + by
+
+/** Each bucket a building's box touches. */
+function forBuckets(b: Box, each: (key: number) => void) {
+  const bx1 = Math.floor(b.maxx / FOOT_BUCKET_M), by1 = Math.floor(b.maxy / FOOT_BUCKET_M)
+  for (let bx = Math.floor(b.minx / FOOT_BUCKET_M); bx <= bx1; bx++) {
+    for (let by = Math.floor(b.miny / FOOT_BUCKET_M); by <= by1; by++) each(bucketKey(bx, by))
+  }
+}
+
+/** A square's buildings into the cache; those held already keep their geometry. */
+function holdSquare(t: FootTile) {
+  for (const f of t.list) {
+    const held = footHeld.get(f.id)
+    if (held) { held.squares++; continue }
+    footHeld.set(f.id, { f, squares: 1 })
+    forBuckets(f.box, (k) => {
+      let ids = footIndex.get(k)
+      if (!ids) { ids = new Set(); footIndex.set(k, ids) }
+      ids.add(f.id)
+    })
+  }
+}
+
+/** A square let go: its buildings that no other held square has go with it. */
+function dropSquare(t: FootTile) {
+  for (const f of t.list) {
+    const held = footHeld.get(f.id)
+    if (!held || --held.squares > 0) continue
+    footHeld.delete(f.id)
+    forBuckets(held.f.box, (k) => {
+      const ids = footIndex.get(k)
+      if (ids) { ids.delete(f.id); if (!ids.size) footIndex.delete(k) }
+    })
+  }
+}
 
 function footKey(size: number, ix: number, iy: number) { return `${size}:${ix}:${iy}` }
 function footBox(t: { size: number; ix: number; iy: number }): Box {
@@ -343,17 +422,18 @@ function meets(a: Box, b: Box) {
   return a.minx < b.maxx && a.maxx > b.minx && a.miny < b.maxy && a.maxy > b.miny
 }
 
-/** Every footprint held that meets `box`, each once. */
-function* footprintsIn(box: Box): Generator<Footprint> {
-  const seen = new Set<number>()
-  for (const t of footTiles.values()) {
-    if (t.state !== 'done' || !meets(footBox(t), box)) continue
-    for (const f of t.list) {
-      if (seen.has(f.id)) continue
-      seen.add(f.id)
-      yield f
+/** Every footprint held whose box meets `box`, each once. */
+function footprintsIn(box: Box): Footprint[] {
+  const out: Footprint[] = [], seen = new Set<number>()
+  forBuckets(box, (k) => {
+    for (const id of footIndex.get(k) ?? []) {
+      if (seen.has(id)) continue
+      seen.add(id)
+      const f = footHeld.get(id)!.f
+      if (f.box.maxx >= box.minx && f.box.minx <= box.maxx && f.box.maxy >= box.miny && f.box.miny <= box.maxy) out.push(f)
     }
-  }
+  })
+  return out
 }
 let pin: [number, number] | null = null
 
@@ -369,15 +449,22 @@ function covers(outer: Box, inner: Box) {
 }
 
 let settleTimer: ReturnType<typeof setTimeout> | null = null
-/** The view has moved: redraw now, fetch and paint what it needs once it stops. */
-function settled() {
+let fetchTimer: ReturnType<typeof setTimeout> | null = null
+/** The view has moved: redraw now, paint what it holds once it stops, and
+ *  fetch what it needs then, or, after the wheel, a little later. */
+function settled(wheel = false) {
   redrawWanted = true
   if (settleTimer) clearTimeout(settleTimer)
-  settleTimer = setTimeout(() => {
-    settleTimer = null
-    fetchGround(); fetchFootprints(); fetchRoads(); paintOverlay(); void paintCoverage()
-    void fetchPopulation()
-  }, SETTLE_MS)
+  if (fetchTimer) { clearTimeout(fetchTimer); fetchTimer = null }
+  // Asked for before the overlay is painted, which would hold the requests back.
+  settleTimer = setTimeout(() => { settleTimer = null; if (!wheel) fetchView(); paintOverlay() }, SETTLE_MS)
+  if (wheel) fetchTimer = setTimeout(() => { fetchTimer = null; fetchView() }, WHEEL_SETTLE_MS)
+}
+
+/** What the view needs, asked for. */
+function fetchView() {
+  fetchGround(); fetchFootprints(); fetchRoads(); void paintCoverage()
+  void fetchPopulation()
 }
 
 /** Whether a heatmap is on show: population, or coverage with something painted. */
@@ -403,7 +490,7 @@ async function fetchPopulation() {
     const image = await populationImage(base, box, w, h, ctrl.signal)
     if (ctrl.signal.aborted) return
     if (!image) { note.value = 'this pack has no population layer'; return }
-    population = { image, key, res: (box.maxx - box.minx) / image.canvas.width }
+    population = { image, key, res: (box.maxx - box.minx) / image.bitmap.width }
     redrawWanted = true
   } catch (e) {
     if ((e as Error).name !== 'AbortError') note.value = `population: ${(e as Error).message}`
@@ -412,11 +499,15 @@ async function fetchPopulation() {
   }
 }
 
+/* A map not on show, the other tab's, asks for nothing, as for the detail
+ * tile: both tabs' maps are mounted, and the hidden one's overview, roads
+ * and footprints came to 1.3 MB of every pack opened. It asks when it
+ * comes on show. */
 async function fetchOverview() {
   const base = ground.sidecar, pack = ground.pack
   overviewReq?.abort()
   overview = null
-  if (!base || !pack) return
+  if (!base || !pack || size.w < 40) return
   const ctrl = new AbortController()
   overviewReq = ctrl
   const key = groundKey()
@@ -443,25 +534,28 @@ async function fetchGround() {
   groundReq?.abort()
   const ctrl = new AbortController()
   groundReq = ctrl
+  const deadline = setTimeout(() => ctrl.abort(), GROUND_DEADLINE_MS)
   const box = viewBox(0.6)
   const w = Math.round(size.w * 1.6), h = Math.round(size.h * 1.6)
   busy.value = true
   try {
     const image = await baseImage(base, box, w, h, props.display.base, ctrl.signal)
     if (ctrl.signal.aborted) return
-    detail = { image, grid: image.grid, key, res: (box.maxx - box.minx) / image.canvas.width }
+    detail = { image, grid: image.grid, key, res: (box.maxx - box.minx) / image.bitmap.width }
     redrawWanted = true
-    // Footprints are coloured by height over this tile's terrain.
-    paintOverlay()
+    // Filled footprints are coloured by height over this tile's terrain.
+    if (props.display.buildings && viewWidthM() <= BLDG_FILL_VIEW_M) paintOverlay()
   } catch (e) {
     if ((e as Error).name !== 'AbortError') note.value = `ground: ${(e as Error).message}`
   } finally {
+    clearTimeout(deadline)
     if (groundReq === ctrl) { groundReq = null; busy.value = false }
   }
 }
 
 async function fetchFootprints() {
   const base = ground.sidecar
+  if (size.w < 40) return
   if (!base || !props.display.buildings || viewWidthM() > BLDG_MAX_VIEW_M) {
     note.value = base && props.display.buildings && viewWidthM() > BLDG_MAX_VIEW_M
       ? 'zoom in to see buildings' : ground.problem
@@ -528,17 +622,10 @@ async function loadTile(base: string, tile: FootTile, key: string, generation: n
     if (got === null) {
       footTiles.delete(key)
       // The sidecar answers the same while it is still indexing the
-      // footprints as when the pack has none, so ask again for a while.
-      if (footprintTries++ < FOOTPRINT_TRIES) {
-        note.value = 'building footprints: waiting for the planner to index them'
-        setTimeout(fetchFootprints, 2000)
-      } else {
-        footNone = true
-        note.value = 'this pack has no building footprints (built without --lod2-geometry)'
-      }
+      // footprints as when the pack has none: its status says which.
+      if (!indexWatch) { indexWatch = true; void watchIndex(base, generation) }
       return
     }
-    if (note.value?.startsWith('building footprints: waiting')) note.value = null
     if (got.truncated && tile.size > FOOT_TILE_MIN_M) {
       tile.state = 'split'
       fetchFootprints()
@@ -546,7 +633,8 @@ async function loadTile(base: string, tile: FootTile, key: string, generation: n
     }
     tile.state = 'done'
     tile.list = got.list
-    schedulePaint()
+    holdSquare(tile)
+    schedulePaint(tile)
   } catch (e) {
     if (generation !== footGeneration) return
     footTiles.delete(key)
@@ -556,10 +644,41 @@ async function loadTile(base: string, tile: FootTile, key: string, generation: n
   }
 }
 
-/** Squares land a few at a time: one repaint for each burst. */
-function schedulePaint() {
+/* How far the sidecar has got indexing the buildings, every INDEX_POLL_MS
+ * until it is ready (the squares are asked for again) or says the pack has
+ * none. A sidecar that does not answer the status is asked for the squares
+ * again every two seconds for a while, as before it had one. */
+async function watchIndex(base: string, generation: number) {
+  indexPoll = null
+  let status: { state: string; phase: string; bytes_read: number; bytes_total: number; buildings: number } | null = null
+  try {
+    const r = await fetch(`${base}/buildings/status`)
+    if (r.ok) status = await r.json()
+  } catch { /* asked again below */ }
+  if (generation !== footGeneration) return
+  if (status?.state === 'loading') {
+    indexing.value = { phase: status.phase, buildings: status.buildings,
+                       fraction: status.bytes_total ? Math.min(1, status.bytes_read / status.bytes_total) : null }
+    indexPoll = setTimeout(() => void watchIndex(base, generation), INDEX_POLL_MS)
+    return
+  }
+  indexing.value = null
+  indexWatch = false
+  if (status?.state === 'absent' || (!status && footprintTries++ >= FOOTPRINT_TRIES)) {
+    footNone = true
+    note.value = 'this pack has no building footprints (built without --lod2-geometry)'
+  } else if (status) {
+    fetchFootprints()
+  } else {
+    indexPoll = setTimeout(() => { indexPoll = null; fetchFootprints() }, 2000)
+  }
+}
+
+/** Squares land a few at a time: each burst is painted onto the overlay at once. */
+function schedulePaint(tile: FootTile) {
+  footLanded.push(tile)
   if (footPaintTimer) return
-  footPaintTimer = setTimeout(() => { footPaintTimer = null; paintOverlay() }, 80)
+  footPaintTimer = setTimeout(() => { footPaintTimer = null; paintLanded() }, 80)
 }
 
 /** Keep the FOOT_TILES_KEPT squares nearest the view. */
@@ -568,13 +687,22 @@ function evictFootTiles(cx: number, cy: number) {
   const done = [...footTiles.entries()].filter(([, t]) => t.state === 'done' || t.state === 'split')
   done.sort((a, b) => Math.hypot((b[1].ix + 0.5) * b[1].size - cx, (b[1].iy + 0.5) * b[1].size - cy)
                     - Math.hypot((a[1].ix + 0.5) * a[1].size - cx, (a[1].iy + 0.5) * a[1].size - cy))
-  for (const [key] of done.slice(0, footTiles.size - FOOT_TILES_KEPT)) footTiles.delete(key)
+  for (const [key, t] of done.slice(0, footTiles.size - FOOT_TILES_KEPT)) {
+    if (t.state === 'done') dropSquare(t)
+    footTiles.delete(key)
+  }
 }
 
 /** Forget every square: different ground, or the layer turned off. */
 function resetFootprints() {
   footGeneration++
+  if (indexPoll) { clearTimeout(indexPoll); indexPoll = null }
+  indexWatch = false
+  indexing.value = null
   footTiles.clear()
+  footHeld.clear()
+  footIndex.clear()
+  footLanded = []
   footQueue = []
   footActive = 0
   footNone = false
@@ -583,7 +711,7 @@ function resetFootprints() {
 
 async function fetchRoads() {
   const base = ground.sidecar
-  if (!base || !props.display.roads) return
+  if (!base || !props.display.roads || size.w < 40) return
   const want = viewBox()
   // A held set is kept while it covers the view and was fetched at about
   // this scale: the sidecar's byte budget makes a wide view's set partial.
@@ -626,8 +754,20 @@ function heightColour(m: number): string {
   return `rgba(${r}, ${g}, ${b}, 0.75)`
 }
 
+/* What the overlay holds of the footprints: whether it has them, filled or
+ * as outlines, the box they were kept to, and the buildings on it. A square
+ * that lands after the overlay was painted is painted onto it as it is (at
+ * the view it is of, only the buildings it does not hold), so a burst of
+ * squares costs their own footprints, not every one in view again; once the
+ * last square wanted is in, the overlay is painted whole once more, so what
+ * it shows does not depend on the order the squares landed in. */
+const overlayFoot = { on: false, fill: false, box: { minx: 0, miny: 0, maxx: 0, maxy: 0 } as Box, ids: new Set<number>() }
+
+/** The overlay, whole, at the view as it is now. */
 function paintOverlay() {
   overlay.on = false
+  overlayFoot.on = false
+  footLanded = []
   redrawWanted = true
   const showWays = ground.isPack && props.display.roads && ways
   const showFootprints = ground.isPack && props.display.buildings && footTiles.size > 0
@@ -636,8 +776,25 @@ function paintOverlay() {
   const c = beginSurface(overlay, 1)
   const box = viewBox(0.05)
   if (showWays) paintWays(c, box)
-  if (showFootprints) paintFootprints(c, box)
+  if (showFootprints) {
+    Object.assign(overlayFoot, { on: true, fill: viewWidthM() <= BLDG_FILL_VIEW_M, box, ids: new Set() })
+    paintFootprints(c, footprintsIn(box))
+  }
   overlay.on = true
+}
+
+/** The squares landed since the overlay was painted, onto it; or, once the
+ *  last square wanted is in, the overlay whole. */
+function paintLanded() {
+  const landed = footLanded
+  footLanded = []
+  if (!overlay.on || !overlayFoot.on) return
+  if (!footQueue.length && !footActive) { paintOverlay(); return }
+  const list = landed.filter(t => t.state === 'done' && footTiles.get(footKey(t.size, t.ix, t.iy)) === t)
+    .flatMap(t => t.list)
+  paintFootprints(overlay.canvas.getContext('2d')!, list)
+  overlay.grey = null
+  redrawWanted = true
 }
 
 function beginSurface(s: Surface, scale: number): CanvasRenderingContext2D {
@@ -682,50 +839,64 @@ function paintWays(c: CanvasRenderingContext2D, box: Box) {
   c.globalAlpha = 1
 }
 
-function paintFootprints(c: CanvasRenderingContext2D, box: Box) {
-  const fill = viewWidthM() <= BLDG_FILL_VIEW_M
-  c.lineWidth = 0.8
-  c.strokeStyle = 'rgba(210, 214, 222, 0.55)'
-  for (const f of footprintsIn(box)) {
-    if (f.box.maxx < box.minx || f.box.minx > box.maxx || f.box.maxy < box.miny || f.box.miny > box.maxy) continue
-    c.beginPath()
+/* Footprints as the planner's map draws them: all the outlines one path,
+ * stroked once, and the fills one path a colour, under them. A ring is
+ * closed by a line back to its first point, not by closePath(), which in
+ * Chrome costs as many steps as the path has rings, so that closing n rings
+ * costs n² (measured by the planner on a 3 km view of Berlin, 12 589 rings:
+ * 2 566 ms with closePath(), 5.7 ms without). */
+function paintFootprints(c: CanvasRenderingContext2D, all: Footprint[]) {
+  const { fill, box, ids } = overlayFoot
+  const list = all.filter(f => !ids.has(f.id) && f.box.maxx >= box.minx && f.box.minx <= box.maxx
+    && f.box.maxy >= box.miny && f.box.miny <= box.maxy)
+  for (const f of list) ids.add(f.id)
+  // toScreen's arithmetic at the view the overlay is of, without an array a point.
+  const { cx, cy, mpp } = overlay.view, hw = overlay.w / 2, hh = overlay.h / 2
+  const path = (f: Footprint) => {
     for (const ring of f.rings) {
       const n = ring.length / 2
-      for (let k = 0; k < n; k++) {
-        const [sx, sy] = toScreen(ring[k * 2]!, ring[k * 2 + 1]!)
-        if (k === 0) c.moveTo(sx, sy); else c.lineTo(sx, sy)
-      }
-      c.closePath()
+      if (n < 2) continue
+      const x0 = hw + (ring[0]! - cx) / mpp, y0 = hh - (ring[1]! - cy) / mpp
+      c.moveTo(x0, y0)
+      for (let k = 1; k < n; k++) c.lineTo(hw + (ring[k * 2]! - cx) / mpp, hh - (ring[k * 2 + 1]! - cy) / mpp)
+      c.lineTo(x0, y0)
     }
-    if (fill) {
+  }
+  if (fill) {
+    const byColour = new Map<string, Footprint[]>()
+    for (const f of list) {
       const g = groundAt((f.box.minx + f.box.maxx) / 2, (f.box.miny + f.box.maxy) / 2)
-      c.fillStyle = g === null ? 'rgba(120, 128, 140, 0.55)' : heightColour(f.top - g)
+      const colour = g === null ? 'rgba(120, 128, 140, 0.55)' : heightColour(f.top - g)
+      const same = byColour.get(colour)
+      if (same) same.push(f); else byColour.set(colour, [f])
+    }
+    for (const [colour, fs] of byColour) {
+      c.beginPath()
+      for (const f of fs) path(f)
+      c.fillStyle = colour
       c.fill('evenodd')
     }
-    c.stroke()
   }
+  c.beginPath()
+  for (const f of list) path(f)
+  c.lineWidth = 0.8
+  c.strokeStyle = 'rgba(210, 214, 222, 0.55)'
+  c.stroke()
 }
 
-/* Coverage: the source's margin every COVERAGE_PX pixels, in the band it
- * falls in (COVERAGE_BANDS: green indoors too, yellow outdoors only, red
- * the edge), nothing where it does not decode. */
-function marginColour(m: number): readonly number[] {
-  for (const band of COVERAGE_BANDS) if (m >= band.from) return band.rgba
-  return COVERAGE_BANDS[COVERAGE_BANDS.length - 1]!.rgba
-}
-
-/* A paint is a job: the source made ready and the image painted a slice at
- * a time (SLICE_MS), yielding to the page between slices, into a canvas of
- * its own that replaces the one on show only when it is whole. A newer
- * paint (an aim, a move of the view) makes the older one stale, and it
- * stops at its next slice; meanwhile the last coverage stays drawn and
- * `coverageBusy` puts up "redrawing coverage". */
-let coverageJob = 0
+/* Coverage: the band of every COVERAGE_PX square of the view, as the
+ * source gives it (COVERAGE_BANDS: green indoors too, yellow outdoors only,
+ * red the edge), nothing where it does not decode. A paint is a job: the
+ * bands asked for the view as it is, and drawn into a canvas of its own
+ * that replaces the one on show only when it is whole. A newer paint (an
+ * aim, a move of the view) aborts the older one; meanwhile the last
+ * coverage stays drawn and `coverageBusy` puts up "redrawing coverage". */
+let coverageReq: AbortController | null = null
 const coverageBusy = ref(false)
 
 async function paintCoverage() {
-  const job = ++coverageJob
-  const stale = () => job !== coverageJob
+  coverageReq?.abort()
+  coverageReq = null
   const src = props.coverage
   coverageVersion = src?.version ?? ''
   if (!src || !props.display.coverage || !size.w) {
@@ -734,32 +905,33 @@ async function paintCoverage() {
     redrawWanted = true
     return
   }
+  const ctrl = new AbortController()
+  coverageReq = ctrl
   coverageBusy.value = true
-  if (!await src.prepare(stale)) return
   // The view as it is now: the image is of it, wherever the view goes meanwhile.
   const at = { ...view.value }, w = size.w, h = size.h
+  let bands: Uint8Array
+  try {
+    bands = await src.bands(at, w, h, COVERAGE_PX, ctrl.signal)
+  } catch (e) {
+    if (coverageReq !== ctrl) return
+    coverageReq = null
+    coverageBusy.value = false
+    if ((e as Error).name !== 'AbortError') note.value = `coverage: ${(e as Error).message}`
+    return
+  }
+  if (coverageReq !== ctrl) return
+  coverageReq = null
   const cols = Math.ceil(w / COVERAGE_PX), rows = Math.ceil(h / COVERAGE_PX)
   const canvas = document.createElement('canvas')
   canvas.width = cols
   canvas.height = rows
   const c = canvas.getContext('2d')!
   const img = c.createImageData(cols, rows)
-  let since = performance.now()
-  for (let row = 0; row < rows; row++) {
-    if (performance.now() - since > SLICE_MS) {
-      await yieldToPage()
-      if (stale()) return
-      since = performance.now()
-    }
-    const y = at.cy - ((row + 0.5) * COVERAGE_PX - h / 2) * at.mpp
-    for (let col = 0; col < cols; col++) {
-      const x = at.cx + ((col + 0.5) * COVERAGE_PX - w / 2) * at.mpp
-      const m = src.marginAt(x, y)
-      if (m === null || m < 0) continue
-      img.data.set(marginColour(m), (row * cols + col) * 4)
-    }
+  for (let i = 0; i < cols * rows; i++) {
+    const band = COVERAGE_BANDS[bands[i]!]
+    if (band) img.data.set(band.rgba, i * 4)
   }
-  if (stale()) return
   c.putImageData(img, 0, 0)
   Object.assign(coverageSurface, { canvas, w, h, view: at, on: true, grey: null })
   coverageBusy.value = false
@@ -806,18 +978,18 @@ function draw() {
 /** Whether this frame is drawn grey under a heatmap. */
 let mono = false
 
-function drawImageAt(canvas: HTMLCanvasElement, b: Box) {
+function drawImageAt(image: HTMLCanvasElement | ImageBitmap, b: Box) {
   const [x0, y0] = toScreen(b.minx, b.maxy)
   const [x1, y1] = toScreen(b.maxx, b.miny)
-  ctx!.drawImage(canvas, x0, y0, x1 - x0, y1 - y0)
+  ctx!.drawImage(image, x0, y0, x1 - x0, y1 - y0)
 }
 
 function drawHeld(held: Held) {
-  if (mono && !held.grey) held.grey = greyed(held.image.canvas)
-  drawImageAt(mono ? held.grey! : held.image.canvas, held.image.bounds)
+  if (mono && !held.grey) held.grey = greyed(held.image.bitmap)
+  drawImageAt(mono ? held.grey! : held.image.bitmap, held.image.bounds)
 }
 
-function drawHeatmap(img: Heatmap) { drawImageAt(img.canvas, img.bounds) }
+function drawHeatmap(img: Heatmap) { drawImageAt(img.bitmap, img.bounds) }
 
 function drawGround() {
   if (!ctx) return
@@ -1336,7 +1508,7 @@ function onWheel(event: WheelEvent) {
   view.value.cx = bx - (at.x - size.w / 2) * view.value.mpp
   view.value.cy = by + (at.y - size.h / 2) * view.value.mpp
   saveView()
-  settled()
+  settled(true)
 }
 
 function onContext(event: MouseEvent) {
@@ -1356,11 +1528,12 @@ const scale = computed(() => {
 function resize() {
   const element = wrap.value, surface = canvas.value
   if (!element || !surface) return
-  const dpr = window.devicePixelRatio || 1
+  const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP)
   const shown = size.w === 0 && element.clientWidth > 0
   size = { w: element.clientWidth, h: element.clientHeight, dpr }
-  // Coming on show (its tab chosen): where the other map sharing the view left it.
-  if (shown) adoptShared()
+  // Coming on show (its tab chosen): where the other map sharing the view
+  // left it, and the overview it did not ask for while hidden.
+  if (shown) { adoptShared(); if (!overview) void fetchOverview() }
   surface.width = Math.round(size.w * dpr)
   surface.height = Math.round(size.h * dpr)
   surface.style.width = `${size.w}px`
@@ -1377,7 +1550,6 @@ onMounted(async () => {
   observer = new ResizeObserver(resize)
   if (wrap.value) observer.observe(wrap.value)
   restoreView()
-  void fetchOverview()
   frame = requestAnimationFrame(tick)
 })
 onUnmounted(() => {
@@ -1386,7 +1558,8 @@ onUnmounted(() => {
   groundReq?.abort(); overviewReq?.abort(); wayReq?.abort(); populationReq?.abort()
   resetFootprints()
   if (settleTimer) clearTimeout(settleTimer)
-  coverageJob++
+  if (fetchTimer) clearTimeout(fetchTimer)
+  coverageReq?.abort()
   saveView()
 })
 
@@ -1396,7 +1569,7 @@ watch(() => [ground.current?.name, ground.pack?.name], () => {
   detail = null; overview = null; overlay.on = false; pin = null
   resetFootprints()
   ways = null; wayBox = null; coverageSurface.on = false; population = null
-  coverageJob++; coverageBusy.value = false
+  coverageReq?.abort(); coverageReq = null; coverageBusy.value = false
   note.value = ground.problem
   restoreView()
   void fetchOverview()
@@ -1439,6 +1612,7 @@ watch(() => [props.nodes, props.others, props.offsets, props.selected, props.lin
   background: rgba(18, 20, 23, 0.8); padding: 2px 6px; border-radius: 3px;
 }
 .wmap-legend { display: flex; align-items: center; gap: 10px; color: #d1d5db; }
+.wmap-index { min-width: 260px; }
 .wmap-legend span { display: flex; align-items: center; gap: 4px; }
 .wmap-legend b { font-weight: 500; color: #e5e7eb; }
 .wmap-legend i { display: inline-block; width: 12px; height: 10px; border-radius: 2px; }

@@ -8,7 +8,8 @@ front ── GET /loss/status … until the sweep is whole ───────
 front ── GET /loss.bin?lat&lon&minx&miny&maxx&maxy&w&h ───────────► planner-web
 front: testbed/coverage/<geodata>/<key>.bin
 front ── coverage_tile {geodata, node, key} ─────────────────────► page       as each lands
-page ── GET /api/coverage?geodata=&key= ─────────────────────────► front      the raster
+page ── POST /planner/<geodata>/coverage/bands.bin {view, nodes} ► planner-web  the view's bands
+planner-web: testbed/coverage/<geodata>/<key>.bin, one per node (--coverage-dir)
 ```
 
 A raster is the planner's own point-to-area sweep (`planner-coverage`) from
@@ -22,8 +23,10 @@ the first cell, 65535 where nothing was evaluated. Its cells are the pack's
 own, up to `CELLS` across the square (planner-web answers no finer than the
 sweep, and no more than 2048 a side): 10 m on a 10 m pack, 30 m on a 30 m
 one, about 10 m on anything finer. It is path loss only:
-the page adds the node's transmit power and antenna gain, and draws the best
-level at each point over the nodes on show.
+the node's transmit power and antenna gain are added for a view, by the
+sidecar from the rasters here (`/coverage/bands.bin`), which the page draws
+as the band of the best margin at each point over the nodes on show.
+`/api/coverage` serves a raster itself.
 
 A raster depends on the pack and the node's position and height alone, so
 its key is those (`key`): moving a node or changing its height is a new
@@ -32,6 +35,11 @@ one sweep at a time and a new one cancels the last, so the front asks for
 one node at a time per sidecar, and for the whole radius at once (`whole`,
 where the sidecar lists it) rather than the ladder of growing bands its map
 paints while it waits: the last band is the same raster without the others.
+A node being edited (`ladder`: the one raster a request lacks) is swept
+band by band instead, as the planner's own map sweeps one: a band out to
+half a kilometre is ready in well under a second, and the sweep, named by
+the raster's key, lets the sidecar show the node's coverage from the band
+finished last (`/coverage/bands.bin`) while the rest of it grows.
 A sweep waits for the sidecar's building index, so no raster is computed
 without the buildings around its node. Synthetic ground has no rasters: its
 log-distance loss is a formula the page works out itself.
@@ -50,6 +58,7 @@ RX_HEIGHT_M = 2.0
 RADIUS_KM = 10.0
 CELLS = 2048                        # asked across the square, each way; planner-web's most
 POLL_S = 0.5
+POLL_BAND_S = 0.1                   # while a ladder grows, so each band is shown as it lands
 SWEEP_TIMEOUT_S = 600.0
 
 
@@ -84,9 +93,11 @@ class Sweeps:
         self.busy = set()               # (geodata, key) being computed or queued
         self.options = {}               # sidecar -> what its /loss/start takes
 
-    async def raster(self, sidecar, gd, node, rx_h=RX_HEIGHT_M, radius_km=RADIUS_KM):
+    async def raster(self, sidecar, gd, node, rx_h=RX_HEIGHT_M, radius_km=RADIUS_KM,
+                     on_band=None):
         """The node's raster, computed through the sidecar into the cache
-        unless it is there already: its path."""
+        unless it is there already: its path. With `on_band`, it is swept
+        band by band, and `on_band(km)` is awaited as each band lands."""
         raster_key = key(gd, node, rx_h, radius_km)
         path = cached(gd.name, raster_key)
         if path:
@@ -96,7 +107,8 @@ class Sweeps:
             path = cached(gd.name, raster_key)
             if path:
                 return path
-            data = await self.sweep(sidecar, gd, node, rx_h, radius_km)
+            data = await self.sweep(sidecar, gd, node, rx_h, radius_km,
+                                    raster_key if on_band else None, on_band)
             path = cache_path(gd.name, raster_key)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = "%s.%d.tmp" % (path, os.getpid())
@@ -115,26 +127,40 @@ class Sweeps:
             self.options[sidecar] = frozenset(info.get("loss_options") or ())
         return self.options[sidecar]
 
-    async def sweep(self, sidecar, gd, node, rx_h, radius_km):
+    async def sweep(self, sidecar, gd, node, rx_h, radius_km, ladder=None, on_band=None):
+        """`ladder`, the raster's key, sweeps it band by band under that name;
+        otherwise the whole radius is swept at once."""
         import aiohttp
 
         x, y = gd.to_xy(float(node["lat"]), float(node["lon"]))
         where = {"x": "%.3f" % x, "y": "%.3f" % y, "tx_h": "%g" % float(node["height_m"]),
                  "rx_h": "%g" % rx_h, "radius_km": "%g" % radius_km}
+        span = radius_km * 1000.0
+        view = dict(where, minx="%.3f" % (x - span), maxx="%.3f" % (x + span),
+                    miny="%.3f" % (y - span), maxy="%.3f" % (y + span),
+                    w=str(CELLS), h=str(CELLS))
         timeout = aiohttp.ClientTimeout(total=60)
         try:
-            # Only the whole radius is kept, so only it is swept: the inner
-            # bands a map paints while it waits are sweeps of their own, and
-            # the last band is the same raster without them.
-            if "whole" in await self.loss_options(sidecar, timeout):
-                where["whole"] = "true"
-            async with self.session.get(sidecar + "/loss/start", params=where,
+            options = await self.loss_options(sidecar, timeout)
+            if ladder and "key" in options:
+                # Named, with the raster it will be cut to, so the sidecar
+                # can show each band as that raster.
+                start = dict(view, key=ladder)
+            else:
+                # Only the whole radius is kept, so only it is swept: the
+                # inner bands a map paints while it waits are sweeps of their
+                # own, and the last band is the same raster without them.
+                start, ladder = dict(where), None
+                if "whole" in options:
+                    start["whole"] = "true"
+            async with self.session.get(sidecar + "/loss/start", params=start,
                                         timeout=timeout) as resp:
                 if resp.status != 200:
                     raise store.StoreError("coverage: /loss/start answered %d: %s"
                                            % (resp.status, (await resp.text())[:200]))
             loop = asyncio.get_running_loop()
             deadline = loop.time() + SWEEP_TIMEOUT_S
+            shown = 0.0
             while True:
                 async with self.session.get(sidecar + "/loss/status", timeout=timeout) as resp:
                     status = await resp.json(content_type=None)
@@ -145,14 +171,14 @@ class Sweeps:
                         and math.isclose(float(status.get("band_km") or 0), radius_km,
                                          rel_tol=1e-6):
                     break
+                ready = float(status.get("ready_km") or 0) if state == "running" else 0.0
+                if ladder and on_band and ready > shown:
+                    shown = ready
+                    await on_band(ready)
                 if loop.time() > deadline:
                     raise store.StoreError("coverage: the sweep took over %.0f s"
                                            % SWEEP_TIMEOUT_S)
-                await asyncio.sleep(POLL_S)
-            span = radius_km * 1000.0
-            view = dict(where, minx="%.3f" % (x - span), maxx="%.3f" % (x + span),
-                        miny="%.3f" % (y - span), maxy="%.3f" % (y + span),
-                        w=str(CELLS), h=str(CELLS))
+                await asyncio.sleep(POLL_BAND_S if ladder else POLL_S)
             async with self.session.get(sidecar + "/loss.bin", params=view,
                                         timeout=timeout) as resp:
                 if resp.status != 200:

@@ -12,7 +12,8 @@
 //! - a semaphore caps concurrent renders, so load sheds instead of thrashing
 //! - render size and coverage radius are hard-capped per request
 //! - responses are PNG, decoded by the browser's own image path
-//! - nothing is cached in RAM beyond the open COG readers' bounded caches
+//! - nothing is cached in RAM beyond the open COG readers' bounded caches,
+//!   and the coverage rasters `/coverage/bands.bin` combines (bounded too)
 
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -23,6 +24,7 @@ use clap::Parser;
 use planner_core::geo::Xy;
 use planner_pack::{LayerKind, PackManifest};
 use planner_render::{BaseLayer, RenderOpts, ViewRect};
+use planner_terrain::cog::CogMeta;
 use planner_terrain::cog::CogReader;
 #[cfg(unix)]
 use planner_terrain::cog::SharedRows;
@@ -30,7 +32,8 @@ use rayon::prelude::*;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -65,18 +68,97 @@ struct Cli {
     /// 2 GB VPS.
     #[arg(long, default_value_t = 1)]
     sweep_slots: usize,
+    /// Concurrent point-to-point link requests, a `/link.json` pair or a
+    /// `/links.json` batch each. Default: as the render slots, which is also
+    /// how many pairs a pack's loss table asks at once. Their own, so a
+    /// table's burst of pairs is never what a tile is refused for.
+    #[arg(long)]
+    link_slots: Option<usize>,
     /// Threads a propagation sweep runs on. Default: cores minus two, never
     /// below one. On a host shared with others, or one running several
     /// sidecars, the caller says how many are its to use.
     #[arg(long)]
     sweep_threads: Option<usize>,
+    /// Build the saved index of the pack's buildings, or check the saved one
+    /// is current, and exit without serving: so the first sidecar on a new
+    /// pack starts with its footprints rather than parsing for them.
+    #[arg(long)]
+    index_buildings: bool,
+    /// The coverage rasters sim-mesh's front caches (its testbed/coverage),
+    /// which `/coverage/bands.bin` combines for a view, as
+    /// `<dir>/<geodata>/<key>.bin`. Without it that route answers 404.
+    #[arg(long)]
+    coverage_dir: Option<PathBuf>,
+}
+
+/// One raster layer of the pack, readable by any number of requests at once
+/// where its layout allows.
+///
+/// `CogReader` seeks one shared file handle, so it is `&mut` and sits behind
+/// a lock, and every request that read a window waited for the one before it:
+/// a tile waited out a sweep's 40 km window, and a pack table's pairs were
+/// read one at a time however many render slots there were (at 8 slots, 173
+/// nodes, ~15 k pairs, the reads were 58 s of a 61 s build). A layer whose
+/// rows are directly readable is read by positioned reads instead
+/// (`SharedRows`), which need no lock; the grid is the one `CogReader`
+/// returns. `shared` is `None` where a layer's layout allows no such read,
+/// and that layer is read through its lock as before.
+struct Layer {
+    locked: Mutex<CogReader<BufReader<File>>>,
+    #[cfg(unix)]
+    shared: Option<SharedRows>,
+    /// The layer's grid, as the reader opened it, for working out which
+    /// cells a window holds without asking the reader.
+    meta: CogMeta,
+}
+
+impl Layer {
+    fn new(reader: CogReader<BufReader<File>>) -> Self {
+        Layer {
+            #[cfg(unix)]
+            shared: reader.shared_rows(),
+            meta: *reader.meta(),
+            locked: Mutex::new(reader),
+        }
+    }
+
+    /// `CogReader::window`, read without the lock where the layer allows it.
+    /// Blocking: call it from a blocking thread or under `block_in_place`.
+    fn window(
+        &self,
+        lo: Xy,
+        hi: Xy,
+    ) -> Result<planner_terrain::Grid, planner_terrain::TerrainError> {
+        #[cfg(unix)]
+        if let Some(read) = self.shared.as_ref().and_then(|s| s.window(lo, hi).transpose()) {
+            return read;
+        }
+        self.locked.blocking_lock().window(lo, hi)
+    }
+
+    /// `CogReader::window_max`, likewise.
+    fn window_max(
+        &self,
+        lo: Xy,
+        hi: Xy,
+        max_w: usize,
+        max_h: usize,
+    ) -> Result<planner_terrain::Grid, planner_terrain::TerrainError> {
+        #[cfg(unix)]
+        if let Some(read) =
+            self.shared.as_ref().and_then(|s| s.window_max(lo, hi, max_w, max_h).transpose())
+        {
+            return read;
+        }
+        self.locked.blocking_lock().window_max(lo, hi, max_w, max_h)
+    }
 }
 
 struct Layers {
-    terrain: Mutex<CogReader<BufReader<File>>>,
-    clutter: Option<Mutex<CogReader<BufReader<File>>>>,
-    population: Option<Mutex<CogReader<BufReader<File>>>>,
-    classes: Option<Mutex<CogReader<BufReader<File>>>>,
+    terrain: Layer,
+    clutter: Option<Layer>,
+    population: Option<Layer>,
+    classes: Option<Layer>,
     /// Fraction of each cell covered by a building footprint, 0..1.
     ///
     /// The unblended half of `clutter`. A cell at 0 is street, courtyard,
@@ -87,64 +169,139 @@ struct Layers {
     ///
     /// `None` on any pack built before the layer existed, which is why every
     /// consumer must keep working without it.
-    built_fraction: Option<Mutex<CogReader<BufReader<File>>>>,
+    built_fraction: Option<Layer>,
     /// Representative height of the buildings in a cell, m above ground.
     ///
     /// The obstacle a path crossing the building actually meets, with no
     /// built-fraction scaling applied. `clutter` mixes this with coverage and
     /// is the right input for an area sweep that treats every cell as a
     /// receiver; this is the right input for one specific path.
-    building_top: Option<Mutex<CogReader<BufReader<File>>>>,
-    /// The four layers `/link.json` reads, readable without their locks.
+    building_top: Option<Layer>,
+}
+
+/// `/link.json`'s four windows over a pair's box — terrain, clutter,
+/// building top, built fraction. A side layer the pack lacks, or that could
+/// not read the box, is `None`.
+struct LinkWindows {
+    terrain: planner_terrain::Grid,
+    clutter: Option<planner_terrain::Grid>,
+    building_top: Option<planner_terrain::Grid>,
+    built_fraction: Option<planner_terrain::Grid>,
+}
+
+impl LinkWindows {
+    /// The windows over `(lo, hi)`. Blocking.
     ///
-    /// Every request used to queue on `terrain`'s lock for its windows, so a
-    /// pack table's pairs were read one at a time however many render slots
-    /// there were: at 8 slots, 173 nodes, ~15 k pairs, the reads were 58 s of
-    /// a 61 s build. A layer whose rows are directly readable is read here
-    /// by positioned reads instead (see `SharedRows`); the grid is the one
-    /// `CogReader::window` returns. `None` where a layer's layout allows no
-    /// such read, and that layer is read through its lock as before.
-    #[cfg(unix)]
-    unlocked: Unlocked,
+    /// Read one after another on the link's own thread. Joined in rayon's
+    /// global pool they were faster for one link, but that pool is the
+    /// tiles', and a pack table keeps every link slot busy: measured over a
+    /// 16-way burst of links, tiles took a median 6.5 ms read in the pool and
+    /// 5.2 ms read here, for 3.5% fewer links.
+    fn read(
+        layers: &Layers,
+        (lo, hi): (Xy, Xy),
+    ) -> Result<LinkWindows, planner_terrain::TerrainError> {
+        let read = |l: &Option<Layer>| l.as_ref().and_then(|l| l.window(lo, hi).ok());
+        Ok(LinkWindows {
+            terrain: layers.terrain.window(lo, hi)?,
+            clutter: read(&layers.clutter),
+            building_top: read(&layers.building_top),
+            built_fraction: read(&layers.built_fraction),
+        })
+    }
+
+    fn views(&self) -> LinkViews<'_> {
+        LinkViews {
+            terrain: self.terrain.view(),
+            clutter: self.clutter.as_ref().map(planner_terrain::Grid::view),
+            building_top: self.building_top.as_ref().map(planner_terrain::Grid::view),
+            built_fraction: self.built_fraction.as_ref().map(planner_terrain::Grid::view),
+        }
+    }
 }
 
-#[cfg(unix)]
-struct Unlocked {
-    terrain: Option<SharedRows>,
-    clutter: Option<SharedRows>,
-    building_top: Option<SharedRows>,
-    built_fraction: Option<SharedRows>,
+/// One layer read once for a batch of pairs, over the box that holds all of
+/// theirs.
+struct SharedWindow {
+    grid: planner_terrain::Grid,
+    meta: CogMeta,
+    /// The read's first column and row in the layer.
+    c0: u32,
+    r0: u32,
 }
 
-/// `/link.json`'s four windows — terrain, clutter, building top, built
-/// fraction — read without the locks where the layers allow it, all four at
-/// once. `None` for a layer with no lock-free reader, or whose reader could
-/// not read this box; the caller reads that one through its lock.
-#[cfg(unix)]
-fn link_windows_unlocked(layers: &Layers, lo: Xy, hi: Xy) -> [Option<planner_terrain::Grid>; 4] {
-    let u = &layers.unlocked;
-    let read = |s: &Option<SharedRows>| s.as_ref().and_then(|s| s.window(lo, hi).ok().flatten());
-    let ((t, c), (bt, bf)) = rayon::join(
-        || rayon::join(|| read(&u.terrain), || read(&u.clutter)),
-        || rayon::join(|| read(&u.building_top), || read(&u.built_fraction)),
-    );
-    [t, c, bt, bf]
+impl SharedWindow {
+    /// The layer's window over `(lo, hi)`. Blocking.
+    fn read(layer: &Layer, (lo, hi): (Xy, Xy)) -> Result<Self, planner_terrain::TerrainError> {
+        let (c0, r0, _, _) = layer.meta.window_box(lo, hi)?;
+        Ok(SharedWindow { grid: layer.window(lo, hi)?, meta: layer.meta, c0, r0 })
+    }
+
+    /// What the layer's own window over `(lo, hi)` would have been: the same
+    /// cells, at the origin that window would have had. `None` where this
+    /// read does not hold them.
+    fn view(&self, (lo, hi): (Xy, Xy)) -> Option<planner_terrain::GridView<'_>> {
+        let (c0, r0, w, h) = self.meta.window_box(lo, hi).ok()?;
+        let (dc, dr) = (c0.checked_sub(self.c0)?, r0.checked_sub(self.r0)?);
+        self.grid.sub_view(dc as usize, dr as usize, w, h, self.meta.window_origin(c0, r0))
+    }
 }
 
-#[cfg(not(unix))]
-fn link_windows_unlocked(_: &Layers, _: Xy, _: Xy) -> [Option<planner_terrain::Grid>; 4] {
-    [None, None, None, None]
+/// Cells per layer a batch reads once and shares among its pairs: 16 M, a
+/// 64 MB read a layer, the whole of a 20 km city at 5 m. A batch whose pairs
+/// span more reads each pair's own windows, as `/link.json` does.
+const BATCH_SHARED_CELLS: usize = 16 << 20;
+
+/// `/link.json`'s four layers, each read once for a batch of pairs.
+struct SharedLinkWindows {
+    terrain: SharedWindow,
+    clutter: Option<SharedWindow>,
+    building_top: Option<SharedWindow>,
+    built_fraction: Option<SharedWindow>,
 }
 
-/// One layer's window through its lock: the read every request made before
-/// the lock-free readers, and still the one for a layer without one.
-async fn locked_window(
-    layer: &Mutex<CogReader<BufReader<File>>>,
-    lo: Xy,
-    hi: Xy,
-) -> Result<planner_terrain::Grid, planner_terrain::TerrainError> {
-    let mut guard = layer.lock().await;
-    tokio::task::block_in_place(|| guard.window(lo, hi))
+impl SharedLinkWindows {
+    /// The layers over `(lo, hi)`, when that box is within
+    /// `BATCH_SHARED_CELLS` and every layer the pack has reads it; else
+    /// `None`, and the pairs read their own. Blocking.
+    fn read(layers: &Layers, (lo, hi): (Xy, Xy)) -> Option<Self> {
+        let (_, _, w, h) = layers.terrain.meta.window_box(lo, hi).ok()?;
+        if w * h > BATCH_SHARED_CELLS {
+            return None;
+        }
+        // A side layer that cannot read the whole box may still read a pair's
+        // own, which a shared `None` would hide: then nothing is shared.
+        let side = |l: &Option<Layer>| match l {
+            None => Ok(None),
+            Some(l) => SharedWindow::read(l, (lo, hi)).map(Some),
+        };
+        Some(SharedLinkWindows {
+            terrain: SharedWindow::read(&layers.terrain, (lo, hi)).ok()?,
+            clutter: side(&layers.clutter).ok()?,
+            building_top: side(&layers.building_top).ok()?,
+            built_fraction: side(&layers.built_fraction).ok()?,
+        })
+    }
+
+    /// A pair's views, those of its own windows over `bx`; `None` where any
+    /// is not held here.
+    fn views(&self, bx: (Xy, Xy)) -> Option<LinkViews<'_>> {
+        fn side(
+            s: &Option<SharedWindow>,
+            bx: (Xy, Xy),
+        ) -> Option<Option<planner_terrain::GridView<'_>>> {
+            match s {
+                None => Some(None),
+                Some(s) => s.view(bx).map(Some),
+            }
+        }
+        Some(LinkViews {
+            terrain: self.terrain.view(bx)?,
+            clutter: side(&self.clutter, bx)?,
+            building_top: side(&self.building_top, bx)?,
+            built_fraction: side(&self.built_fraction, bx)?,
+        })
+    }
 }
 
 struct AppState {
@@ -161,6 +318,16 @@ struct AppState {
     /// After the direct row-read fix a full-screen tile is 11–323 ms, so these
     /// must never queue behind a propagation sweep.
     slots: Semaphore,
+    /// Concurrency for point-to-point LINKS, each a profile and four P.1812
+    /// runs, and for batches of them (`/links.json`), whose pairs run in
+    /// `sweep_pool`.
+    ///
+    /// They held render slots, and a pack table asks as many pairs at once as
+    /// there are slots, so while a table filled every tile and basemap the
+    /// page asked was refused with 429. Links refuse each other here; a 429
+    /// from `slots` again means the map itself asks more than the machine
+    /// renders.
+    link_slots: Semaphore,
     /// Concurrency for EXPENSIVE requests — the point-to-area sweeps.
     ///
     /// Separate from `slots` because they are now four orders of magnitude
@@ -223,6 +390,8 @@ struct AppState {
     /// `profile_evidence.buildings_index` so that difference is visible rather
     /// than being an unexplained change in a saved result.
     buildings: Arc<std::sync::RwLock<BuildingsIndexState>>,
+    /// How far the background index has got, for `/buildings/status`.
+    buildings_progress: Arc<IndexProgress>,
     /// The deployed network's coverage census.
     ///
     /// This is minutes of work, not milliseconds — 269 sweeps over a city — so
@@ -238,6 +407,16 @@ struct AppState {
     /// means heavy work happens exactly when the user changes a transmitter
     /// parameter, and never on navigation.
     coverage_cache: Mutex<Option<CachedCoverage>>,
+    /// `--coverage-dir`.
+    coverage_dir: Option<PathBuf>,
+    /// What `tile.bin` and `basemap.bin` replies are made of besides their
+    /// query, for their validators (`ground_etag`).
+    ground_stamp: Option<u64>,
+    /// The coverage rasters `/coverage/bands.bin` has read, each with the
+    /// terrain under it, the most recently used last, up to
+    /// `COVERAGE_KEPT_BYTES`: the front's, by file, and the bands of a sweep
+    /// still growing, by file and band.
+    coverage_rasters: std::sync::Mutex<Vec<(String, Arc<CoverageRaster>)>>,
     /// A sweep growing outward from the transmitter.
     ///
     /// The single-shot `/loss.bin` was fine when a sweep took seconds. At the
@@ -378,6 +557,9 @@ struct BuildingIndex {
     /// height estimator takes of a building (`/height.json`), kept beside the
     /// records a path reads rather than in them.
     area_height: Vec<[f32; 2]>,
+    /// The building file this index was built from, where its mtime could be
+    /// read: what a `/buildings.bin` validator rests on.
+    stamp: Option<FileStamp>,
 }
 
 const BLDG_CELL_M: f32 = 100.0;
@@ -391,7 +573,8 @@ const BLDG_CELL_M: f32 = 100.0;
 enum BuildingsIndexState {
     /// A background thread is parsing. Links use the clutter raster meanwhile.
     Loading,
-    Ready(BuildingIndex),
+    /// Shared, so a request can take the index and let the lock go.
+    Ready(Arc<BuildingIndex>),
     /// No Buildings layer in the manifest, or the file could not be read.
     Absent,
 }
@@ -401,6 +584,14 @@ impl BuildingsIndexState {
     fn get(&self) -> Option<&BuildingIndex> {
         match self {
             BuildingsIndexState::Ready(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// The index to keep past the lock, if it is usable.
+    fn ready(&self) -> Option<Arc<BuildingIndex>> {
+        match self {
+            BuildingsIndexState::Ready(b) => Some(Arc::clone(b)),
             _ => None,
         }
     }
@@ -812,6 +1003,435 @@ impl BuildingIndex {
     }
 }
 
+/// Where the index of a pack's building file is saved: beside the file.
+///
+/// Parsing `buildings.jsonl` is the one startup cost that grows with the
+/// pack (116 MB, 270 k footprints on the Berlin centre pack), and until it
+/// is done `/buildings.bin` answers 204 and links fall back to the clutter
+/// raster. So the index is saved once built, and a later start loads it,
+/// which is a read and a copy.
+///
+/// A dot file, `.<stem>.idx`: a pack's export leaves dot files out, so the
+/// cache never travels without the file it was built from.
+fn saved_index_path(jsonl: &Path) -> PathBuf {
+    let stem = jsonl.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
+    jsonl.with_file_name(format!(".{stem}.idx"))
+}
+
+/// The saved index's layout, little-endian:
+///
+/// "PBIX" | u32 version | u64 file bytes | u64 file mtime s | u32 file mtime
+/// ns | f64 origin_x | f64 origin_y | u32 buildings | u32 polygons | u32
+/// rings | u32 vertices | per building: f32 x, f32 y, f32 r, f32 br, f32
+/// top_masl, u32 poly_start, u32 poly_end | per building: f32 area_m2, f32
+/// height_m | u32 polys[] | u32 rings[] | per vertex: f32 dx, f32 dy.
+///
+/// The records are the parsed ones, bit for bit, and the cells are rebuilt
+/// from them by `BuildingIndex::insert` in the same order, so a loaded index
+/// answers as the parsed one does. Bump the version with any change to how a
+/// line becomes a `Bldg`: an index saved by another version is parsed again.
+const INDEX_MAGIC: &[u8; 4] = b"PBIX";
+const INDEX_VERSION: u32 = 1;
+const INDEX_HEADER: usize = 60;
+
+/// The building file an index was built from, as its size and mtime. A saved
+/// index is used only while the file still has both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FileStamp {
+    bytes: u64,
+    mtime_s: u64,
+    mtime_ns: u32,
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> std::io::Result<Self> {
+        let t = meta.modified()?.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        Ok(FileStamp { bytes: meta.len(), mtime_s: t.as_secs(), mtime_ns: t.subsec_nanos() })
+    }
+}
+
+impl BuildingIndex {
+    /// The saved form of this index (see `INDEX_MAGIC`) for a building file
+    /// stamped `stamp`.
+    fn to_bytes(&self, stamp: FileStamp) -> Vec<u8> {
+        let n = self.items.len();
+        debug_assert_eq!(self.area_height.len(), n, "one area and height per building");
+        let mut out = Vec::with_capacity(
+            INDEX_HEADER
+                + n * 36
+                + (self.polys.len() + self.rings.len()) * 4
+                + self.verts.len() * 8,
+        );
+        out.extend_from_slice(INDEX_MAGIC);
+        out.extend_from_slice(&INDEX_VERSION.to_le_bytes());
+        out.extend_from_slice(&stamp.bytes.to_le_bytes());
+        out.extend_from_slice(&stamp.mtime_s.to_le_bytes());
+        out.extend_from_slice(&stamp.mtime_ns.to_le_bytes());
+        out.extend_from_slice(&self.origin.0.to_le_bytes());
+        out.extend_from_slice(&self.origin.1.to_le_bytes());
+        for len in [n, self.polys.len(), self.rings.len(), self.verts.len()] {
+            out.extend_from_slice(&(len as u32).to_le_bytes());
+        }
+        for b in &self.items {
+            for v in [b.x, b.y, b.r, b.br, b.top_masl] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&b.poly_start.to_le_bytes());
+            out.extend_from_slice(&b.poly_end.to_le_bytes());
+        }
+        for v in self.area_height.iter().flatten() {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for i in self.polys.iter().chain(&self.rings) {
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        for v in self.verts.iter().flatten() {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// An index from its saved form, with how many of its footprints are too
+    /// wide to trust, if it was saved by this version, for the building file
+    /// as `stamp` has it now, on this pack's frame `origin`. `Err` says why
+    /// not.
+    fn from_bytes(
+        bytes: &[u8],
+        stamp: FileStamp,
+        origin: (f64, f64),
+    ) -> Result<(BuildingIndex, usize), String> {
+        let head = bytes.get(..INDEX_HEADER).ok_or("it is shorter than its header")?;
+        let u32_at = |o: usize| u32::from_le_bytes(head[o..o + 4].try_into().expect("4 bytes"));
+        let u64_at = |o: usize| u64::from_le_bytes(head[o..o + 8].try_into().expect("8 bytes"));
+        let f64_at = |o: usize| f64::from_le_bytes(head[o..o + 8].try_into().expect("8 bytes"));
+        if &head[..4] != INDEX_MAGIC {
+            return Err("it is not a saved building index".into());
+        }
+        if u32_at(4) != INDEX_VERSION {
+            return Err(format!("it was saved as version {}, not {INDEX_VERSION}", u32_at(4)));
+        }
+        if (FileStamp { bytes: u64_at(8), mtime_s: u64_at(16), mtime_ns: u32_at(24) }) != stamp {
+            return Err("the building file has changed since it was saved".into());
+        }
+        let same = |a: f64, b: f64| a.to_bits() == b.to_bits();
+        if !(same(f64_at(28), origin.0) && same(f64_at(36), origin.1)) {
+            return Err("it was saved on another grid".into());
+        }
+        let (n, np, nr, nv) =
+            (u32_at(44) as usize, u32_at(48) as usize, u32_at(52) as usize, u32_at(56) as usize);
+        let want = INDEX_HEADER + n * 36 + (np + nr) * 4 + nv * 8;
+        if bytes.len() != want {
+            return Err(format!("it is {} bytes where its header says {want}", bytes.len()));
+        }
+        let (items, rest) = bytes[INDEX_HEADER..].split_at(n * 28);
+        let (area_height, rest) = rest.split_at(n * 8);
+        let (polys, rest) = rest.split_at(np * 4);
+        let (rings, verts) = rest.split_at(nr * 4);
+        let f = |c: &[u8], o: usize| f32::from_le_bytes(c[o..o + 4].try_into().expect("4 bytes"));
+        let u = |c: &[u8], o: usize| u32::from_le_bytes(c[o..o + 4].try_into().expect("4 bytes"));
+        let pairs = |b: &[u8]| -> Vec<[f32; 2]> {
+            b.as_chunks::<8>().0.iter().map(|c| [f(c, 0), f(c, 4)]).collect()
+        };
+        let words =
+            |b: &[u8]| -> Vec<u32> { b.as_chunks::<4>().0.iter().map(|c| u(c, 0)).collect() };
+        let mut ix = BuildingIndex {
+            origin,
+            area_height: pairs(area_height),
+            polys: words(polys),
+            rings: words(rings),
+            verts: pairs(verts),
+            ..Default::default()
+        };
+        // Every range must lie inside the arrays it indexes: a footprint
+        // query slices by them, and a bad one would panic a request.
+        let ascending = |v: &[u32], end: usize| {
+            v.windows(2).all(|w| w[0] <= w[1]) && v.last().is_none_or(|&l| l as usize <= end)
+        };
+        if !ascending(&ix.polys, nr) || !ascending(&ix.rings, nv) {
+            return Err("its polygon or ring ranges run outside it".into());
+        }
+        ix.items.reserve(n);
+        let mut suspect = 0usize;
+        for c in items.as_chunks::<28>().0 {
+            let b = Bldg {
+                x: f(c, 0),
+                y: f(c, 4),
+                r: f(c, 8),
+                br: f(c, 12),
+                top_masl: f(c, 16),
+                poly_start: u(c, 20),
+                poly_end: u(c, 24),
+            };
+            if b.poly_start > b.poly_end || b.poly_end as usize > np {
+                return Err("a building's polygons run outside it".into());
+            }
+            if b.poly_end > b.poly_start {
+                ix.with_geometry += 1;
+            }
+            suspect += usize::from(ix.insert(b));
+        }
+        Ok((ix, suspect))
+    }
+}
+
+/// Write `ix` to `path` by way of a temporary file and a rename, so a reader,
+/// or a second sidecar on the same pack, sees a whole index or none.
+fn save_index(path: &Path, ix: &BuildingIndex, stamp: FileStamp) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("idx.{}.tmp", std::process::id()));
+    let saved = std::fs::write(&tmp, ix.to_bytes(stamp)).and_then(|()| std::fs::rename(&tmp, path));
+    if saved.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    saved
+}
+
+/// What the background index is doing.
+#[derive(Clone, Copy)]
+enum IndexPhase {
+    Waiting,
+    Reading,
+    Parsing,
+    Saving,
+    Done,
+}
+
+/// How far the building index has got, for `/buildings/status`: what the
+/// thread is doing and, while it parses the building file, how much of it is
+/// read. A page waiting on footprints can then say how long, rather than
+/// only "not yet".
+struct IndexProgress {
+    started: std::time::Instant,
+    phase: AtomicU8,
+    /// Once done: whether the index came from the saved file.
+    from_saved: AtomicBool,
+    bytes_read: AtomicU64,
+    bytes_total: AtomicU64,
+    buildings: AtomicU64,
+    /// Once done: how long it took.
+    took_ms: AtomicU64,
+}
+
+impl IndexProgress {
+    fn new() -> Self {
+        IndexProgress {
+            started: std::time::Instant::now(),
+            phase: AtomicU8::new(IndexPhase::Waiting as u8),
+            from_saved: AtomicBool::new(false),
+            bytes_read: AtomicU64::new(0),
+            bytes_total: AtomicU64::new(0),
+            buildings: AtomicU64::new(0),
+            took_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn phase(&self, p: IndexPhase) {
+        self.phase.store(p as u8, Ordering::Relaxed);
+    }
+
+    fn parsed(&self, bytes_read: u64, buildings: usize) {
+        self.bytes_read.store(bytes_read, Ordering::Relaxed);
+        self.buildings.store(buildings as u64, Ordering::Relaxed);
+    }
+
+    fn done(&self, from_saved: bool, buildings: usize) {
+        self.from_saved.store(from_saved, Ordering::Relaxed);
+        self.buildings.store(buildings as u64, Ordering::Relaxed);
+        self.took_ms.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.phase(IndexPhase::Done);
+    }
+
+    /// `/buildings/status`'s reply, `state` being the index's own.
+    fn json(&self, state: &str) -> serde_json::Value {
+        let phase = self.phase.load(Ordering::Relaxed);
+        let done = phase == IndexPhase::Done as u8;
+        let elapsed_ms = if done {
+            self.took_ms.load(Ordering::Relaxed)
+        } else {
+            self.started.elapsed().as_millis() as u64
+        };
+        serde_json::json!({
+            "state": state,
+            "phase": match phase {
+                p if p == IndexPhase::Reading as u8 => "reading the saved index",
+                p if p == IndexPhase::Parsing as u8 => "parsing the building file",
+                p if p == IndexPhase::Saving as u8 => "saving the index",
+                p if p == IndexPhase::Done as u8 => "done",
+                _ => "waiting",
+            },
+            "source": done.then(|| {
+                if self.from_saved.load(Ordering::Relaxed) { "saved index" } else { "building file" }
+            }),
+            "bytes_read": self.bytes_read.load(Ordering::Relaxed),
+            "bytes_total": self.bytes_total.load(Ordering::Relaxed),
+            "buildings": self.buildings.load(Ordering::Relaxed),
+            "elapsed_s": elapsed_ms as f64 / 1000.0,
+        })
+    }
+}
+
+/// Index a building file line by line, telling `progress` how far it has
+/// read. Returns the index, how many lines could not be read, and how many
+/// footprints are too wide to trust.
+fn parse_buildings(
+    f: File,
+    origin: (f64, f64),
+    progress: &IndexProgress,
+) -> (BuildingIndex, usize, usize) {
+    use std::io::BufRead;
+    let mut idx = BuildingIndex { origin, ..Default::default() };
+    let mut bad = 0usize;
+    // Footprints too wide to be real. Counted rather than dropped: the
+    // record is still a building, it just cannot be trusted to bound itself.
+    let mut suspect = 0usize;
+    let mut read = 0u64;
+    for (k, line) in BufReader::new(f).lines().map_while(Result::ok).enumerate() {
+        read += line.len() as u64 + 1;
+        if k % 4096 == 0 {
+            progress.parsed(read, idx.count);
+        }
+        let Ok(r) = serde_json::from_str::<BuildingRecord>(&line) else {
+            bad += 1;
+            continue;
+        };
+        if !(r.e.is_finite() && r.n.is_finite() && r.area_m2 > 0.0 && r.height_m.is_finite()) {
+            bad += 1;
+            continue;
+        }
+        // Vertices are stored as offsets from this building's own
+        // centroid, so f32 is exact to ~3e-5 m across any footprint;
+        // storing them absolutely would quantize northings to 0.5 m.
+        let poly_start = idx.polys.len() as u32;
+        let mut had_geometry = false;
+        // Farthest vertex from the centroid, i.e. the real bounding
+        // radius. Accumulated here rather than derived from the area,
+        // because an equal-area disc is not a bound.
+        let mut far2: f64 = 0.0;
+        for poly in &r.rings {
+            if poly.exterior.len() < 3 {
+                continue;
+            }
+            for ring in std::iter::once(&poly.exterior).chain(poly.interiors.iter()) {
+                if ring.len() < 3 {
+                    continue;
+                }
+                for &(vx, vy) in ring {
+                    let (ox, oy) = (vx - r.e, vy - r.n);
+                    far2 = far2.max(ox * ox + oy * oy);
+                    idx.verts.push([ox as f32, oy as f32]);
+                }
+                idx.rings.push(idx.verts.len() as u32);
+            }
+            idx.polys.push(idx.rings.len() as u32);
+            had_geometry = true;
+        }
+        if had_geometry {
+            idx.with_geometry += 1;
+        }
+        let poly_end = idx.polys.len() as u32;
+        let r_eq = (r.area_m2 / std::f64::consts::PI).sqrt() as f32;
+        let br = if had_geometry { far2.sqrt() as f32 } else { r_eq };
+        if idx.insert(Bldg {
+            x: (r.e - origin.0) as f32,
+            y: (r.n - origin.1) as f32,
+            r: r_eq,
+            br,
+            top_masl: (r.ground_z + r.height_m) as f32,
+            poly_start,
+            poly_end,
+        }) {
+            suspect += 1;
+        }
+        idx.area_height.push([r.area_m2 as f32, r.height_m as f32]);
+    }
+    progress.parsed(read, idx.count);
+    (idx, bad, suspect)
+}
+
+/// The index of the pack's building file: the saved one where it is
+/// current, else the file parsed and the index saved for the next start.
+/// `Err` only when the file cannot be read at all.
+fn building_index(
+    jsonl: &Path,
+    origin: (f64, f64),
+    progress: &IndexProgress,
+) -> Result<BuildingIndex, String> {
+    let started = std::time::Instant::now();
+    let f = File::open(jsonl).map_err(|e| e.to_string())?;
+    // Stamped from the handle about to be read, so the stamp is the file's
+    // that the index is built from. A file whose mtime cannot be read is
+    // parsed every time, never cached.
+    let stamp = f.metadata().and_then(|m| FileStamp::of(&m)).ok();
+    let saved = saved_index_path(jsonl);
+    let suspect_note = |suspect: usize| {
+        if suspect > 0 {
+            println!("  {suspect} footprint(s) wider than 1 km — geometry ignored for those");
+        }
+    };
+    progress.phase(IndexPhase::Reading);
+    let loaded = match stamp {
+        None => Err("the building file has no modification time".to_string()),
+        Some(stamp) => match std::fs::read(&saved) {
+            Ok(bytes) => BuildingIndex::from_bytes(&bytes, stamp, origin),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("none saved yet".into()),
+            Err(e) => Err(e.to_string()),
+        },
+    };
+    match loaded {
+        Ok((mut idx, suspect)) => {
+            idx.stamp = stamp;
+            println!(
+                "buildings: {} LoD2 record(s) loaded from {} in {:.3} s — {} with real \
+                 footprints ({} vertices), {} as equal-area discs",
+                idx.count,
+                saved.display(),
+                started.elapsed().as_secs_f64(),
+                idx.with_geometry,
+                idx.verts.len(),
+                idx.count - idx.with_geometry
+            );
+            suspect_note(suspect);
+            progress.done(true, idx.count);
+            return Ok(idx);
+        }
+        Err(why) => {
+            println!("buildings: no saved index to load ({why}); parsing {}", jsonl.display())
+        }
+    }
+    progress.bytes_total.store(stamp.map_or(0, |s| s.bytes), Ordering::Relaxed);
+    progress.phase(IndexPhase::Parsing);
+    let (mut idx, bad, suspect) = parse_buildings(f, origin, progress);
+    idx.stamp = stamp;
+    // Say whether the footprints are REAL or approximated. A pack
+    // built without --lod2-geometry answers every containment test
+    // with an equal-area disc, which is a different and much coarser
+    // claim than a polygon — and the two are indistinguishable from
+    // the record count alone.
+    println!(
+        "buildings: {} LoD2 record(s) indexed in {:.1} s{} — {} with real \
+         footprints ({} vertices), {} as equal-area discs",
+        idx.count,
+        started.elapsed().as_secs_f64(),
+        if bad > 0 { format!(", {bad} unparseable") } else { String::new() },
+        idx.with_geometry,
+        idx.verts.len(),
+        idx.count - idx.with_geometry
+    );
+    suspect_note(suspect);
+    if let Some(stamp) = stamp {
+        progress.phase(IndexPhase::Saving);
+        match save_index(&saved, &idx, stamp) {
+            Ok(()) => println!("buildings: index saved to {} for the next start", saved.display()),
+            Err(e) => eprintln!(
+                "buildings: could not save the index to {} ({e}); the next start parses \
+                 the building file again",
+                saved.display()
+            ),
+        }
+    }
+    progress.done(false, idx.count);
+    Ok(idx)
+}
+
 /// An antenna inside a building: the building, and the entry loss its
 /// signal pays to leave (or reach) it.
 ///
@@ -859,7 +1479,10 @@ struct NetworkResult {
     /// cells — 392 MB as the f32 `Grid` it used to be, 98 MB as counts. The
     /// wire format `/network.bin` already spoke was u8; only the server's own
     /// copy was four times wider than the numbers in it.
-    served: planner_coverage::gaps::CountGrid,
+    ///
+    /// Shared, so the footprint routes read values from it without holding
+    /// the census lock while they build a reply.
+    served: Arc<planner_coverage::gaps::CountGrid>,
     k_target: u8,
     sites: usize,
     skipped: usize,
@@ -879,8 +1502,23 @@ struct NetworkResult {
 
 struct CachedCoverage {
     key: CoverageKey,
-    loss: planner_terrain::Grid,
+    /// Shared, as the census raster is, for the footprint routes.
+    loss: Arc<planner_terrain::Grid>,
     compute_ms: u128,
+    /// The caller's name for the sweep this band is of, when it gave one.
+    tag: Option<Arc<SweepTag>>,
+}
+
+/// A sweep a caller named, and the raster it will ask `/loss.bin` for once
+/// the sweep is whole: sim-mesh's front caches a node's coverage by its key,
+/// and while the ladder grows, `/coverage/bands.bin` reads the node's
+/// coverage out of the band finished last, cut and sampled as that raster
+/// will be.
+struct SweepTag {
+    key: String,
+    view: ViewRect,
+    w: u32,
+    h: u32,
 }
 
 /// Inverse-project one pack-CRS point to `(lon, lat)` in degrees.
@@ -986,7 +1624,7 @@ async fn view_png(State(st): State<Arc<AppState>>, Query(q): Query<ViewQuery>) -
     };
 
     let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
-    let (base, tint_lock) = match q.layer.as_str() {
+    let (base, tint_layer) = match q.layer.as_str() {
         "clutter" => (BaseLayer::HillshadeClutter, st.layers.clutter.as_ref()),
         "population" => (BaseLayer::HillshadePopulation, st.layers.population.as_ref()),
         _ => (BaseLayer::Hillshade, None),
@@ -996,27 +1634,16 @@ async fn view_png(State(st): State<Arc<AppState>>, Query(q): Query<ViewQuery>) -
     // Read one window per layer, sized to the request.
     let lo = st.clamp(Xy { x: view.min_x, y: view.min_y });
     let hi = st.clamp(Xy { x: view.max_x, y: view.max_y });
-    let terrain = {
-        let mut r = st.layers.terrain.lock().await;
-        match r.window(lo, hi) {
-            Ok(g) => g,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
-    };
-    let tint = match tint_lock {
-        Some(m) => {
-            let mut r = m.lock().await;
-            r.window(lo, hi).ok()
-        }
-        None => None,
-    };
-
-    let classes = match st.layers.classes.as_ref() {
-        Some(m) => {
-            let mut r = m.lock().await;
-            r.window(lo, hi).ok()
-        }
-        None => None,
+    let (terrain, tint, classes) = tokio::task::block_in_place(|| {
+        (
+            st.layers.terrain.window(lo, hi),
+            tint_layer.and_then(|l| l.window(lo, hi).ok()),
+            st.layers.classes.as_ref().and_then(|l| l.window(lo, hi).ok()),
+        )
+    });
+    let terrain = match terrain {
+        Ok(g) => g,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let mut rgba = planner_render::render_base_with_classes(
         &terrain,
@@ -1109,7 +1736,7 @@ async fn coverage_png(State(st): State<Arc<AppState>>, Query(q): Query<CoverageQ
 
     let tx = st.to_xy(q.lat, q.lon);
     let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
-    let (base, tint_lock) = match q.layer.as_str() {
+    let (base, tint_layer) = match q.layer.as_str() {
         "clutter" => (BaseLayer::HillshadeClutter, st.layers.clutter.as_ref()),
         "population" => (BaseLayer::HillshadePopulation, st.layers.population.as_ref()),
         _ => (BaseLayer::Hillshade, None),
@@ -1125,26 +1752,16 @@ async fn coverage_png(State(st): State<Arc<AppState>>, Query(q): Query<CoverageQ
         x: view.max_x.max(tx.x + radius_m),
         y: view.max_y.max(tx.y + radius_m),
     });
-    let terrain = {
-        let mut r = st.layers.terrain.lock().await;
-        match r.window(lo, hi) {
-            Ok(g) => g,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
-    };
-    let clutter = match st.layers.clutter.as_ref() {
-        Some(m) => {
-            let mut r = m.lock().await;
-            r.window(lo, hi).ok()
-        }
-        None => None,
-    };
-    let tint = match tint_lock {
-        Some(m) => {
-            let mut r = m.lock().await;
-            r.window(lo, hi).ok()
-        }
-        None => None,
+    let (terrain, clutter, tint) = tokio::task::block_in_place(|| {
+        (
+            st.layers.terrain.window(lo, hi),
+            st.layers.clutter.as_ref().and_then(|l| l.window(lo, hi).ok()),
+            tint_layer.and_then(|l| l.window(lo, hi).ok()),
+        )
+    });
+    let terrain = match terrain {
+        Ok(g) => g,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
     let mut link = planner_core::model::LinkParams::eu868_defaults();
@@ -1210,8 +1827,9 @@ async fn coverage_png(State(st): State<Arc<AppState>>, Query(q): Query<CoverageQ
             Ok(c) => {
                 *st.coverage_cache.lock().await = Some(CachedCoverage {
                     key,
-                    loss: c.loss,
+                    loss: Arc::new(c.loss),
                     compute_ms: t0.elapsed().as_millis(),
+                    tag: None,
                 })
             }
             // A transmitter outside the pack (or any other sweep refusal) is
@@ -1244,13 +1862,9 @@ async fn coverage_png(State(st): State<Arc<AppState>>, Query(q): Query<CoverageQ
     let ms = if hit { 0 } else { cached.compute_ms };
     let loss = &cached.loss;
 
-    let classes = match st.layers.classes.as_ref() {
-        Some(m) => {
-            let mut r = m.lock().await;
-            r.window(lo, hi).ok()
-        }
-        None => None,
-    };
+    let classes = tokio::task::block_in_place(|| {
+        st.layers.classes.as_ref().and_then(|l| l.window(lo, hi).ok())
+    });
     let mut rgba = planner_render::render_base_with_classes(
         &terrain,
         tint.as_ref(),
@@ -1465,6 +2079,19 @@ fn window_raster<S: ViewSource + Sync + ?Sized>(
     how: Resample,
 ) -> (u32, u32, f64, f64, Xy, Vec<f32>) {
     let (w, h) = tile_dims(view, want_w, want_h, src.dx_m().abs(), src.dy_m().abs());
+    window_cells(src, view, w, h, how)
+}
+
+/// `window_raster` on exactly `w`×`h` cells over `view`, however much finer
+/// than the source's own they are: for a caller whose picture is drawn a
+/// cell of its own at a time, the coverage bands.
+fn window_cells<S: ViewSource + Sync + ?Sized>(
+    src: &S,
+    view: &ViewRect,
+    w: u32,
+    h: u32,
+    how: Resample,
+) -> (u32, u32, f64, f64, Xy, Vec<f32>) {
     let res_x = view.width_m() / w as f64;
     let res_y = view.height_m() / h as f64;
 
@@ -1582,42 +2209,163 @@ fn building_values(
     )
 }
 
-async fn buildings_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -> Response {
-    // A hard vertex budget rather than a zoom rule. Berlin has 8.4 M
-    // vertices; a whole-city request would be hundreds of megabytes and the
-    // outlines would be invisible anyway. The reply says when it truncated so
-    // the page can show that it is not drawing everything, instead of quietly
-    // drawing half a city.
-    const MAX_VERTS: usize = 900_000;
-    let lo = Xy { x: q.minx.min(q.maxx), y: q.miny.min(q.maxy) };
-    let hi = Xy { x: q.minx.max(q.maxx), y: q.miny.max(q.maxy) };
-    // The coverage cache and the census are behind ASYNC mutexes and the
-    // building index behind a std RwLock. Taking them in this order matters: a
-    // std guard held across an `.await` makes the whole handler non-Send, and
-    // axum rejects it at compile time with an error that names the route
-    // rather than the lock. Await first, then take the sync guard and never
-    // yield.
-    let cache = st.coverage_cache.lock().await;
-    let net = st.network.lock().await;
-    let guard = st.buildings.read().expect("buildings lock");
-    let Some(ix) = guard.get() else {
-        return (StatusCode::NO_CONTENT, "no building geometry in this pack").into_response();
-    };
-    let loss_g = cache.as_ref().map(|c| &c.loss);
-    let census_g = match &*net {
-        NetworkCensus::Ready(r) => Some(&r.served),
+/// `/buildings.bin`'s query: the box, and whether to fill in each building's
+/// values.
+#[derive(Deserialize)]
+struct BuildingsQuery {
+    minx: f64,
+    miny: f64,
+    maxx: f64,
+    maxy: f64,
+    /// Non-zero: each ring carries its building's loss and census values,
+    /// from the latest sweep band and the census. Otherwise both are NaN,
+    /// "not evaluated". Off by default: sim-mesh's map draws footprints by
+    /// height and never reads them, and computing them tied every reply to
+    /// the sweep and census locks and to state no cache could validate.
+    #[serde(default)]
+    values: u8,
+}
+
+/// A hard vertex budget for one `/buildings.bin` reply rather than a zoom
+/// rule. Berlin has 8.4 M vertices; a whole-city request would be hundreds of
+/// megabytes and the outlines would be invisible anyway. The reply says when
+/// it truncated so the page can show that it is not drawing everything,
+/// instead of quietly drawing half a city.
+const MAX_FOOTPRINT_VERTS: usize = 900_000;
+
+/// The rasters per-building values are read from, as they are now: the
+/// latest sweep band and the census. Each is taken from under its lock and
+/// the lock let go at once, so a reply is built while sweeps and the census
+/// publish beside it, and replies are built side by side.
+async fn value_rasters(
+    st: &AppState,
+) -> (Option<Arc<planner_terrain::Grid>>, Option<Arc<planner_coverage::gaps::CountGrid>>) {
+    let loss = st.coverage_cache.lock().await.as_ref().map(|c| Arc::clone(&c.loss));
+    let census = match &*st.network.lock().await {
+        NetworkCensus::Ready(r) => Some(Arc::clone(&r.served)),
         _ => None,
     };
-    let (verts, lens, tops, ids, truncated) = ix.outlines_in(lo, hi, MAX_VERTS);
+    (loss, census)
+}
 
-    // Layout: "PBO3" | u32 ring_count | u8 truncated | f64 origin_x |
-    // f64 origin_y | per ring: u32 building_id, u32 vertex_count, f32 top_masl,
-    // f32 loss_db, f32 census_count, then vertex_count x (f32 dx, f32 dy).
-    //
-    // Vertices are OFFSETS from the origin in the header. Sending absolute UTM
-    // as f32 would quantise northings to 0.5 m -- the roads layer accepts that
-    // because it only needs to look like a street, but this layer exists to
-    // tell two adjacent buildings apart at a metre.
+/// The validator of a `/buildings.bin` reply without values: a hash of all
+/// it is made from, which is the building file the index was built from (its
+/// size and mtime), the grid the coordinates are relative to, the box and
+/// the vertex budget. `None` for an index whose file had no mtime.
+fn footprints_etag(ix: &BuildingIndex, lo: Xy, hi: Xy) -> Option<String> {
+    let stamp = ix.stamp?;
+    let words = [
+        u64::from(INDEX_VERSION),
+        stamp.bytes,
+        stamp.mtime_s,
+        u64::from(stamp.mtime_ns),
+        ix.origin.0.to_bits(),
+        ix.origin.1.to_bits(),
+        lo.x.to_bits(),
+        lo.y.to_bits(),
+        hi.x.to_bits(),
+        hi.y.to_bits(),
+        MAX_FOOTPRINT_VERTS as u64,
+    ];
+    // FNV-1a: the same on every build and machine, so a page keeps its
+    // validators across sidecar restarts, which std's hasher does not
+    // promise.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in b"PBO3".iter().copied().chain(words.iter().flat_map(|w| w.to_le_bytes())) {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    Some(format!("\"pbo3-{h:016x}\""))
+}
+
+/// Whether a request's `If-None-Match` names `etag`, or is `*`.
+fn etag_matches(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == etag)
+}
+
+/// `resp` with its validator: an ETag and `no-cache`, so a browser keeps the
+/// reply and asks whether it changed; `no-store` where there is none.
+fn with_validator(mut resp: Response, etag: Option<&str>) -> Response {
+    use axum::http::HeaderValue;
+    let h = resp.headers_mut();
+    match etag.and_then(|e| HeaderValue::from_str(e).ok()) {
+        Some(v) => {
+            h.insert(header::ETAG, v);
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        }
+        None => {
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
+    }
+    resp
+}
+
+/// Footprint outlines in a box, for the page to draw and to place nodes on.
+///
+/// Built under no lock: the index is taken from under its own and the lock
+/// let go, and values are read from rasters taken the same way. These
+/// replies once held the sweep and census locks while they were built, so
+/// the squares of a map were built one at a time, and a sweep band waited
+/// for them to publish.
+async fn buildings_bin(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<BuildingsQuery>,
+) -> Response {
+    let lo = Xy { x: q.minx.min(q.maxx), y: q.miny.min(q.maxy) };
+    let hi = Xy { x: q.minx.max(q.maxx), y: q.miny.max(q.maxy) };
+    let Some(ix) = st.buildings.read().expect("buildings lock").ready() else {
+        return (StatusCode::NO_CONTENT, "no building geometry in this pack").into_response();
+    };
+    if q.values == 0 {
+        // Geometry alone is a function of the index and the box, so a page
+        // that has drawn this box asks whether it changed instead of
+        // fetching it again.
+        let etag = footprints_etag(&ix, lo, hi);
+        if etag.as_deref().is_some_and(|e| etag_matches(&headers, e)) {
+            return with_validator(StatusCode::NOT_MODIFIED.into_response(), etag.as_deref());
+        }
+        let out = tokio::task::block_in_place(|| footprints_reply(&ix, lo, hi, None, None));
+        let resp = ([(header::CONTENT_TYPE, "application/octet-stream")], out).into_response();
+        return with_validator(resp, etag.as_deref());
+    }
+    let (loss, census) = value_rasters(&st).await;
+    let out = tokio::task::block_in_place(|| {
+        footprints_reply(&ix, lo, hi, loss.as_deref(), census.as_deref())
+    });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream"), (header::CACHE_CONTROL, "no-store")],
+        out,
+    )
+        .into_response()
+}
+
+/// `/buildings.bin`'s reply for a box: each footprint ring in it, carrying
+/// its building's values read from `loss` and `census`, NaN where there is
+/// no raster. Blocking.
+///
+/// Layout: "PBO3" | u32 ring_count | u8 truncated | f64 origin_x |
+/// f64 origin_y | per ring: u32 building_id, u32 vertex_count, f32 top_masl,
+/// f32 loss_db, f32 census_count, then vertex_count x (f32 dx, f32 dy).
+///
+/// Vertices are OFFSETS from the origin in the header. Sending absolute UTM
+/// as f32 would quantise northings to 0.5 m -- the roads layer accepts that
+/// because it only needs to look like a street, but this layer exists to
+/// tell two adjacent buildings apart at a metre.
+fn footprints_reply(
+    ix: &BuildingIndex,
+    lo: Xy,
+    hi: Xy,
+    loss: Option<&planner_terrain::Grid>,
+    census: Option<&planner_coverage::gaps::CountGrid>,
+) -> Vec<u8> {
+    let (verts, lens, tops, ids, truncated) = ix.outlines_in(lo, hi, MAX_FOOTPRINT_VERTS);
     let mut out = Vec::with_capacity(25 + verts.len() * 8 + lens.len() * 20);
     out.extend_from_slice(b"PBO3");
     out.extend_from_slice(&(lens.len() as u32).to_le_bytes());
@@ -1633,7 +2381,7 @@ async fn buildings_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuer
             Some((lid, l, c)) if lid == id => (l, c),
             _ => {
                 let (x, y) = ix.centroid(id);
-                let lc = building_values(loss_g, census_g, x, y);
+                let lc = building_values(loss, census, x, y);
                 last = Some((id, lc.0, lc.1));
                 lc
             }
@@ -1649,18 +2397,7 @@ async fn buildings_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuer
         }
         v += n as usize;
     }
-    drop(guard);
-    drop(net);
-    drop(cache);
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        out,
-    )
-        .into_response()
+    out
 }
 
 /// Values only -- no geometry -- for every building in a box.
@@ -1671,6 +2408,8 @@ async fn buildings_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuer
 /// 5.2 MB at 6 km of outlines it already held, decoded again, for 12 bytes
 /// per building of actual news. This route is those 12 bytes.
 ///
+/// Built under no lock, as `/buildings.bin` is.
+///
 /// Layout: "PBV1" | u32 count | per building: u32 id, f32 loss_db,
 /// f32 census_count.
 async fn buildings_values_bin(
@@ -1679,31 +2418,24 @@ async fn buildings_values_bin(
 ) -> Response {
     let lo = Xy { x: q.minx.min(q.maxx), y: q.miny.min(q.maxy) };
     let hi = Xy { x: q.minx.max(q.maxx), y: q.miny.max(q.maxy) };
-    let cache = st.coverage_cache.lock().await;
-    let net = st.network.lock().await;
-    let guard = st.buildings.read().expect("buildings lock");
-    let Some(ix) = guard.get() else {
+    let Some(ix) = st.buildings.read().expect("buildings lock").ready() else {
         return (StatusCode::NO_CONTENT, "no building geometry in this pack").into_response();
     };
-    let loss_g = cache.as_ref().map(|c| &c.loss);
-    let census_g = match &*net {
-        NetworkCensus::Ready(r) => Some(&r.served),
-        _ => None,
-    };
-    let ids = ix.ids_in(lo, hi);
-    let mut out = Vec::with_capacity(8 + ids.len() * 12);
-    out.extend_from_slice(b"PBV1");
-    out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
-    for id in ids {
-        let (x, y) = ix.centroid(id);
-        let (loss, census) = building_values(loss_g, census_g, x, y);
-        out.extend_from_slice(&id.to_le_bytes());
-        out.extend_from_slice(&loss.to_le_bytes());
-        out.extend_from_slice(&census.to_le_bytes());
-    }
-    drop(guard);
-    drop(net);
-    drop(cache);
+    let (loss, census) = value_rasters(&st).await;
+    let out = tokio::task::block_in_place(|| {
+        let ids = ix.ids_in(lo, hi);
+        let mut out = Vec::with_capacity(8 + ids.len() * 12);
+        out.extend_from_slice(b"PBV1");
+        out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in ids {
+            let (x, y) = ix.centroid(id);
+            let (loss, census) = building_values(loss.as_deref(), census.as_deref(), x, y);
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&loss.to_le_bytes());
+            out.extend_from_slice(&census.to_le_bytes());
+        }
+        out
+    });
     (
         StatusCode::OK,
         [
@@ -1715,6 +2447,50 @@ async fn buildings_values_bin(
         .into_response()
 }
 
+/// Where the building index has got, while `/buildings.bin` answers 204 for
+/// it: `state` is `/link.json`'s `buildings_index` (loading, ready, absent);
+/// `phase` what the sidecar is doing; while it parses, `bytes_read` of
+/// `bytes_total` of the building file; `source` once ready, the saved index
+/// or the building file.
+async fn buildings_status(State(st): State<Arc<AppState>>) -> Response {
+    let state = st.buildings.read().expect("buildings lock").label();
+    axum::Json(st.buildings_progress.json(state)).into_response()
+}
+
+/// One layer resampled onto a tile's `tw`×`th` cells: each cell's bilinear
+/// sample at its centre, encoded by `enc` into `bpc` bytes.
+///
+/// Rows run in parallel. A screen-sized tile is ~1.8 M cells per layer and
+/// four layers of serial bilinear sampling was the whole cost of a tile fetch
+/// (~1.8 s), which in turn is what made refetching at a finer zoom level feel
+/// expensive. The buffer is allocated once and each row writes only its own
+/// slice, so no locking and no per-row allocation.
+fn tile_block(
+    g: &planner_terrain::Grid,
+    view: &ViewRect,
+    tw: u32,
+    th: u32,
+    bpc: usize,
+    enc: &(dyn Fn(f32, &mut [u8]) + Sync),
+) -> Vec<u8> {
+    let mut buf = vec![0u8; (tw * th) as usize * bpc];
+    buf.par_chunks_mut(tw as usize * bpc).enumerate().for_each(|(row, line)| {
+        for col in 0..tw as usize {
+            let p = view.px_to_world(col as u32, row as u32, tw, th);
+            let v = g.sample_bilinear(p).unwrap_or(f32::NAN);
+            enc(v, &mut line[col * bpc..col * bpc + bpc]);
+        }
+    });
+    buf
+}
+
+/// Terrain as a tile carries it: decimetres, ±3200 m at 0.1 m, plenty for
+/// any terrain, and `i16::MIN` where there is none.
+fn terrain_decimetres(v: f32, dst: &mut [u8]) {
+    let dm = if v.is_finite() { (v * 10.0).clamp(-32000.0, 32000.0) as i16 } else { i16::MIN };
+    dst.copy_from_slice(&dm.to_le_bytes());
+}
+
 /// Compact binary tile: everything the browser needs to render this region
 /// itself, fetched once and reused for every subsequent frame.
 ///
@@ -1722,13 +2498,70 @@ async fn buildings_values_bin(
 /// | f64 res_m | u8 flags(bit0 classes, bit1 population, bit2 clutter)
 /// | i16 terrain[w*h] (decimetres) | u8 classes[w*h]? | u16 pop[w*h]? (×10 clamped)
 /// | u16 clutter[w*h]? (decimetres)
-async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -> Response {
-    let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
-    let res_hint = terrain_res_hint(&st);
-    let (tw, th) = tile_dims(&view, q.w, q.h, res_hint, res_hint);
+async fn tile_bin(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<TileQuery>,
+) -> Response {
+    let etag = ground_etag(
+        st.ground_stamp,
+        b"PTL2",
+        &[q.minx.to_bits(), q.miny.to_bits(), q.maxx.to_bits(), q.maxy.to_bits(),
+          u64::from(q.w), u64::from(q.h), u64::from(q.terrain_only)],
+    );
+    if etag.as_deref().is_some_and(|e| etag_matches(&headers, e)) {
+        return with_validator(StatusCode::NOT_MODIFIED.into_response(), etag.as_deref());
+    }
     let Ok(_permit) = st.slots.try_acquire() else {
         return (StatusCode::TOO_MANY_REQUESTS, "renderer busy").into_response();
     };
+    match tokio::task::block_in_place(|| tile_reply(&st, &q)) {
+        Ok(out) => with_validator(
+            ([(header::CONTENT_TYPE, "application/octet-stream")], out).into_response(),
+            etag.as_deref(),
+        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// What `tile.bin` and `basemap.bin` replies are made of besides their
+/// query: the pack's layer files and this program, each as its size and
+/// mtime, hashed once at start; `None` where one of them has no mtime.
+fn ground_stamp(layers: &[PathBuf]) -> Option<u64> {
+    let mut words = Vec::new();
+    for p in layers.iter().cloned().chain(std::env::current_exe().ok()) {
+        let s = FileStamp::of(&std::fs::metadata(&p).ok()?).ok()?;
+        words.extend([s.bytes, s.mtime_s, u64::from(s.mtime_ns)]);
+    }
+    Some(fnv1a(&words))
+}
+
+/// The validator of a `tile.bin` or `basemap.bin` reply: a hash of the
+/// ground stamp, the route's magic and everything in its query. A page
+/// that has drawn a box asks whether it changed, and a revisit or the other
+/// tab's map on the same view costs a 304 rather than the tile again.
+fn ground_etag(stamp: Option<u64>, magic: &[u8; 4], query: &[u64]) -> Option<String> {
+    let stamp = stamp?;
+    let words: Vec<u64> =
+        std::iter::once(u64::from(u32::from_le_bytes(*magic))).chain([stamp]).chain(query.iter().copied()).collect();
+    Some(format!("\"{}-{:016x}\"", String::from_utf8_lossy(magic).to_lowercase(), fnv1a(&words)))
+}
+
+/// FNV-1a over words' little-endian bytes: the same on every build and
+/// machine, so a page keeps its validators across sidecar restarts.
+fn fnv1a(words: &[u64]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in words.iter().flat_map(|w| w.to_le_bytes()) {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// `tile.bin`'s reply for `q`. Blocking.
+fn tile_reply(st: &AppState, q: &TileQuery) -> Result<Vec<u8>, String> {
+    let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
+    let res_hint = terrain_res_hint(st);
+    let (tw, th) = tile_dims(&view, q.w, q.h, res_hint, res_hint);
     // Both axes, independently. Deriving one square `res` from the width and
     // applying it vertically as well silently stretches the raster whenever the
     // view aspect and the pixel aspect disagree (e.g. after a window resize) —
@@ -1738,43 +2571,17 @@ async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -
     let lo = st.clamp(Xy { x: view.min_x, y: view.min_y });
     let hi = st.clamp(Xy { x: view.max_x, y: view.max_y });
 
-    // Decompress the four layer windows CONCURRENTLY. They live in separate
-    // files behind separate locks, so serialising them just added up four
-    // independent decode costs — the dominant part of a tile fetch, since a
-    // full-screen view can span half the pack.
-    let mut t_guard = st.layers.terrain.lock().await;
-    // Only take the side-layer locks when their blocks will be sent. With
-    // `terrain_only` the page never reads them, and each acquisition here is
-    // a wait on a lock the basemap request running beside this one holds
-    // while it renders.
+    // Read the four layer windows CONCURRENTLY. They live in separate files,
+    // so serialising them just added up four independent read costs — the
+    // dominant part of a tile fetch, since a full-screen view can span half
+    // the pack.
+    //
+    // The side layers only when their blocks will be sent: with
+    // `terrain_only` the page never reads them. In and out the order is
+    // classes, population, clutter, `None` for one this pack lacks.
     let want_side = q.terrain_only == 0;
-    let mut c_guard = match st.layers.classes.as_ref() {
-        Some(m) if want_side => Some(m.lock().await),
-        _ => None,
-    };
-    let mut p_guard = match st.layers.population.as_ref() {
-        Some(m) if want_side => Some(m.lock().await),
-        _ => None,
-    };
-    let mut h_guard = match st.layers.clutter.as_ref() {
-        Some(m) if want_side => Some(m.lock().await),
-        _ => None,
-    };
-    // The optional layers go through one par_iter so their `&mut` borrows are
-    // disjoint by construction; terrain rides alongside on the other half of a
-    // join. Order in/out is classes, population, clutter — filtered by which
-    // layers this pack actually has.
-    let mut side: Vec<&mut CogReader<BufReader<File>>> = Vec::new();
-    let have = [c_guard.is_some(), p_guard.is_some(), h_guard.is_some()];
-    if let Some(g) = c_guard.as_mut() {
-        side.push(g);
-    }
-    if let Some(g) = p_guard.as_mut() {
-        side.push(g);
-    }
-    if let Some(g) = h_guard.as_mut() {
-        side.push(g);
-    }
+    let side = [&st.layers.classes, &st.layers.population, &st.layers.clutter]
+        .map(|l| l.as_ref().filter(|_| want_side));
     // Read at the STRIDE the reply needs, not at full resolution.
     //
     // `window` materialises the whole box: on this pack a zoomed-out request
@@ -1784,24 +2591,17 @@ async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -
     // output) because the resample below is bilinear and wants a neighbour on
     // each side; beyond that the extra cells were being read to be skipped.
     let (rw, rh) = ((tw as usize) * 2, (th as usize) * 2);
-    let (terrain, mut side_out) = tokio::task::block_in_place(|| {
-        rayon::join(
-            || t_guard.window_max(lo, hi, rw, rh),
-            || {
-                side.par_iter_mut()
-                    .map(|r| r.window_max(lo, hi, rw, rh).ok())
-                    .collect::<Vec<_>>()
-            },
-        )
-    });
-    let terrain = match terrain {
-        Ok(g) => g,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let mut take = side_out.drain(..);
-    let classes = if have[0] { take.next().flatten() } else { None };
-    let population = if have[1] { take.next().flatten() } else { None };
-    let clutter = if have[2] { take.next().flatten() } else { None };
+    let (terrain, side_out) = rayon::join(
+        || st.layers.terrain.window_max(lo, hi, rw, rh),
+        || {
+            side.par_iter()
+                .map(|l| l.and_then(|l| l.window_max(lo, hi, rw, rh).ok()))
+                .collect::<Vec<_>>()
+        },
+    );
+    let terrain = terrain.map_err(|e| e.to_string())?;
+    let [classes, population, clutter]: [Option<planner_terrain::Grid>; 3] =
+        side_out.try_into().expect("one window per side layer");
 
     let n = (tw * th) as usize;
     let mut out: Vec<u8> = Vec::with_capacity(16 + n * 6);
@@ -1826,29 +2626,10 @@ async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -
     let flags = (classes.is_some() as u8) | ((population.is_some() as u8) << 1)
         | ((clutter.is_some() as u8) << 2);
     out.push(flags);
-    // Resample every layer in parallel over rows. A screen-sized tile is
-    // ~1.8 M cells per layer and four layers of serial bilinear sampling was
-    // the whole cost of a tile fetch (~1.8 s), which in turn is what made
-    // refetching at a finer zoom level feel expensive.
-    //
-    // block(bytes_per_cell, encode) fills a preallocated buffer; each row
-    // writes only its own slice, so no locking and no per-row allocation.
     let block = |g: &planner_terrain::Grid, bpc: usize, enc: &(dyn Fn(f32, &mut [u8]) + Sync)| {
-        let mut buf = vec![0u8; n * bpc];
-        buf.par_chunks_mut(tw as usize * bpc).enumerate().for_each(|(row, line)| {
-            for col in 0..tw as usize {
-                let p = view.px_to_world(col as u32, row as u32, tw, th);
-                let v = g.sample_bilinear(p).unwrap_or(f32::NAN);
-                enc(v, &mut line[col * bpc..col * bpc + bpc]);
-            }
-        });
-        buf
+        tile_block(g, &view, tw, th, bpc, enc)
     };
-    // Terrain as decimetres: ±3200 m at 0.1 m, plenty for any terrain.
-    let terrain_block = block(&terrain, 2, &|v, dst| {
-        let dm = if v.is_finite() { (v * 10.0).clamp(-32000.0, 32000.0) as i16 } else { i16::MIN };
-        dst.copy_from_slice(&dm.to_le_bytes());
-    });
+    let terrain_block = block(&terrain, 2, &terrain_decimetres);
     let class_block = classes.as_ref().map(|g| {
         block(g, 1, &|v, dst| {
             dst[0] = if v.is_finite() { v.round().clamp(0.0, 255.0) as u8 } else { 255 };
@@ -1865,15 +2646,97 @@ async fn tile_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>) -
     for b in [class_block, pop_block, clut_block].into_iter().flatten() {
         out.extend_from_slice(&b);
     }
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        out,
-    )
-        .into_response()
+    Ok(out)
+}
+
+/// `POST /tiles.bin`'s body: `tile.bin` queries, each box's numbers a string
+/// read exactly (`exact`), as a query string's are.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TilesRequest {
+    tiles: Vec<TilesQuery>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TilesQuery {
+    #[serde(deserialize_with = "exact")]
+    minx: f64,
+    #[serde(deserialize_with = "exact")]
+    miny: f64,
+    #[serde(deserialize_with = "exact")]
+    maxx: f64,
+    #[serde(deserialize_with = "exact")]
+    maxy: f64,
+    w: u32,
+    h: u32,
+    #[serde(default)]
+    terrain_only: u8,
+}
+
+/// Many `tile.bin` replies at once, each what that route answers its query,
+/// after its length as a u32: "PTLS" | u32 count | (u32 len, tile)…
+///
+/// For the ground under each of a set of nodes, which the page asked as one
+/// tile a node, four at a time: 41 requests for the 40 nodes of a
+/// berlin-centre plan. One render slot for them all, the tiles built side by
+/// side, and at most `MAX_PIXELS` cells among them.
+async fn tiles_bin(
+    State(st): State<Arc<AppState>>,
+    axum::Json(req): axum::Json<TilesRequest>,
+) -> Response {
+    let queries: Vec<TileQuery> = req
+        .tiles
+        .iter()
+        .map(|t| TileQuery {
+            minx: t.minx,
+            miny: t.miny,
+            maxx: t.maxx,
+            maxy: t.maxy,
+            w: t.w,
+            h: t.h,
+            terrain_only: t.terrain_only,
+        })
+        .collect();
+    let res_hint = terrain_res_hint(&st);
+    let cells: u64 = queries
+        .iter()
+        .map(|q| {
+            let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
+            let (w, h) = tile_dims(&view, q.w, q.h, res_hint, res_hint);
+            u64::from(w) * u64::from(h)
+        })
+        .sum();
+    if cells > u64::from(MAX_PIXELS) {
+        return (StatusCode::BAD_REQUEST, "more cells than one reply holds").into_response();
+    }
+    let Ok(_permit) = st.slots.try_acquire() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "renderer busy").into_response();
+    };
+    let replies = tokio::task::block_in_place(|| {
+        queries.par_iter().map(|q| tile_reply(&st, q)).collect::<Result<Vec<_>, _>>()
+    });
+    match replies {
+        Ok(replies) => {
+            let mut out = Vec::with_capacity(8 + replies.iter().map(|r| 4 + r.len()).sum::<usize>());
+            out.extend_from_slice(b"PTLS");
+            out.extend_from_slice(&(replies.len() as u32).to_le_bytes());
+            for r in &replies {
+                out.extend_from_slice(&(r.len() as u32).to_le_bytes());
+                out.extend_from_slice(r);
+            }
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                out,
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1915,18 +2778,28 @@ struct BasemapQuery {
 /// f64 max_y | w*h*4 RGBA.
 async fn basemap_bin(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<BasemapQuery>,
 ) -> Response {
     let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
     if !(view.width_m() > 0.0 && view.height_m() > 0.0) {
         return (StatusCode::BAD_REQUEST, "degenerate box").into_response();
     }
+    let etag = ground_etag(
+        st.ground_stamp,
+        b"PBM1",
+        &[q.minx.to_bits(), q.miny.to_bits(), q.maxx.to_bits(), q.maxy.to_bits(),
+          u64::from(q.w), u64::from(q.h), u64::from(q.layer), u64::from(q.roads)],
+    );
+    if etag.as_deref().is_some_and(|e| etag_matches(&headers, e)) {
+        return with_validator(StatusCode::NOT_MODIFIED.into_response(), etag.as_deref());
+    }
     let res_hint = terrain_res_hint(&st);
     let (tw, th) = tile_dims(&view, q.w, q.h, res_hint, res_hint);
     let Ok(_permit) = st.slots.try_acquire() else {
         return (StatusCode::TOO_MANY_REQUESTS, "renderer busy").into_response();
     };
-    let (base, tint_lock) = match q.layer {
+    let (base, tint_layer) = match q.layer {
         1 => (BaseLayer::HillshadePopulation, st.layers.population.as_ref()),
         2 => (BaseLayer::HillshadeClutter, st.layers.clutter.as_ref()),
         _ => (BaseLayer::Hillshade, None),
@@ -1937,26 +2810,16 @@ async fn basemap_bin(
     // a neighbour each side. See `CogReader::window_max`.
     let (rw, rh) = ((tw as usize) * 2, (th as usize) * 2);
 
-    let terrain = {
-        let mut r = st.layers.terrain.lock().await;
-        match tokio::task::block_in_place(|| r.window_max(lo, hi, rw, rh)) {
-            Ok(g) => g,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
-    };
-    let classes = match st.layers.classes.as_ref() {
-        Some(m) => {
-            let mut r = m.lock().await;
-            tokio::task::block_in_place(|| r.window_max(lo, hi, rw, rh)).ok()
-        }
-        None => None,
-    };
-    let tint = match tint_lock {
-        Some(m) => {
-            let mut r = m.lock().await;
-            tokio::task::block_in_place(|| r.window_max(lo, hi, rw, rh)).ok()
-        }
-        None => None,
+    let (terrain, classes, tint) = tokio::task::block_in_place(|| {
+        (
+            st.layers.terrain.window_max(lo, hi, rw, rh),
+            st.layers.classes.as_ref().and_then(|l| l.window_max(lo, hi, rw, rh).ok()),
+            tint_layer.and_then(|l| l.window_max(lo, hi, rw, rh).ok()),
+        )
+    });
+    let terrain = match terrain {
+        Ok(g) => g,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
     let opts = RenderOpts { width: tw, height: th, base, ..Default::default() };
@@ -1994,15 +2857,10 @@ async fn basemap_bin(
     out.extend_from_slice(&view.max_x.to_le_bytes());
     out.extend_from_slice(&view.max_y.to_le_bytes());
     out.append(&mut rgba);
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        out,
+    with_validator(
+        ([(header::CONTENT_TYPE, "application/octet-stream")], out).into_response(),
+        etag.as_deref(),
     )
-        .into_response()
 }
 
 /// Road geometry for a region, flattened for the WASM renderer:
@@ -2079,6 +2937,12 @@ struct LossQuery {
     /// asks this and is spared the rest of the ladder.
     #[serde(default)]
     whole: bool,
+    /// `/loss/start` only: the caller's name for this sweep, with the view
+    /// and cells (`minx`…`h`) it will ask `/loss.bin` for once the sweep is
+    /// whole. sim-mesh's front names a node's sweep by its coverage key, and
+    /// `/coverage/bands.bin` then shows the node's coverage while the ladder
+    /// grows (`SweepTag`).
+    key: Option<String>,
     /// Radials to sweep. Omit for the resolution-matched count.
     ///
     /// Exposed because the right value is a MEASUREMENT, not a constant: the
@@ -2132,8 +2996,8 @@ fn merge_building_tops(
     else {
         return Some(c);
     };
-    let top = bt.blocking_lock().window(lo, hi).ok()?;
-    let frac = bf.blocking_lock().window(lo, hi).ok()?;
+    let top = bt.window(lo, hi).ok()?;
+    let frac = bf.window(lo, hi).ok()?;
     if top.data.len() != c.data.len() || frac.data.len() != c.data.len() {
         // Windows must line up cell for cell; if they do not, something about
         // the pack's grids disagrees and silently pairing them by index would
@@ -2198,9 +3062,10 @@ fn run_sweep(
     let (_, tx_lat) = st.to_lonlat(tx);
     let lo = st.clamp(Xy { x: tx.x - radius_m, y: tx.y - radius_m });
     let hi = st.clamp(Xy { x: tx.x + radius_m, y: tx.y + radius_m });
-    let terrain =
-        st.layers.terrain.blocking_lock().window(lo, hi).map_err(|e| e.to_string())?;
-    let clutter = st.layers.clutter.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
+    // Without the layers' locks: a 20 km sweep reads a 40 km box, and held
+    // through it the lock kept every tile of the map waiting for the read.
+    let terrain = st.layers.terrain.window(lo, hi).map_err(|e| e.to_string())?;
+    let clutter = st.layers.clutter.as_ref().and_then(|l| l.window(lo, hi).ok());
     // The obstacle the SWEEP gets, which until now was the blended clutter
     // raster alone — the layer whose own documentation calls it a cell mean
     // and the wrong input for one specific path. /link.json had been using
@@ -2354,6 +3219,16 @@ fn run_sweep(
 /// Never computes. A sweep is started by `/loss/start` and this serves what
 /// has landed, so the map can paint a finished inner band while the outer
 /// ones are still running.
+/// A loss as `/loss.bin` sends it: decibels ×100 as u16, 0–655 dB covering
+/// everything, and NaN as the maximum.
+fn loss_centibels(v: f32) -> u16 {
+    if v.is_finite() {
+        (v * 100.0).clamp(0.0, 65534.0) as u16
+    } else {
+        u16::MAX
+    }
+}
+
 async fn loss_bin(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>) -> Response {
     let tx = match (q.x, q.y) {
         (Some(x), Some(y)) => Xy { x, y },
@@ -2368,7 +3243,7 @@ async fn loss_bin(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>) -
     let band_km = cached.key.radius_km;
     let (_, tx_lat) = st.to_lonlat(tx);
     let _ = tx_lat;
-    let g = &cached.loss;
+    let g: &planner_terrain::Grid = &cached.loss;
     // Cut to the view when the page asked for one. See `window_raster` for the
     // measured reason: the whole raster is 128 MB at 20 km and 288 MB at 30 km,
     // per band, all of it sampled down to one value per screen pixel on
@@ -2410,10 +3285,8 @@ async fn loss_bin(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>) -
     out.extend_from_slice(&origin.y.to_le_bytes());
     out.extend_from_slice(&res_x.to_le_bytes());
     out.extend_from_slice(&res_y.to_le_bytes());
-    // Loss in decibels ×100 as u16: 0–655 dB covers everything; NaN → max.
-    for v in data.iter() {
-        let u = if v.is_finite() { (v * 100.0).clamp(0.0, 65534.0) as u16 } else { u16::MAX };
-        out.extend_from_slice(&u.to_le_bytes());
+    for &v in data.iter() {
+        out.extend_from_slice(&loss_centibels(v).to_le_bytes());
     }
     let mut resp = (
         StatusCode::OK,
@@ -2492,6 +3365,12 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started = std::time::Instant::now();
     let bands: &'static [f64] = if q.whole { &[1.0] } else { SWEEP_BANDS };
+    let tag = match (&q.key, requested_view(q.minx, q.miny, q.maxx, q.maxy), q.w, q.h) {
+        (Some(k), Some(view), Some(w), Some(h)) if valid_key(k) => {
+            Some(Arc::new(SweepTag { key: k.clone(), view, w, h }))
+        }
+        _ => None,
+    };
     {
         let mut g = st.sweep.lock().await;
         *g = ProgressiveSweep::Running {
@@ -2539,8 +3418,9 @@ async fn loss_start(State(st): State<Arc<AppState>>, Query(q): Query<LossQuery>)
                     band_key.radius_km = band_m / 1000.0;
                     *st2.coverage_cache.blocking_lock() = Some(CachedCoverage {
                         key: band_key,
-                        loss,
+                        loss: Arc::new(loss),
                         compute_ms: t0.elapsed().as_millis(),
+                        tag: tag.clone(),
                     });
                     // Same guard: a band that finished just as this sweep
                     // was superseded must not publish itself over the new
@@ -2619,6 +3499,551 @@ fn sweep_status(
         }),
         ProgressiveSweep::Failed(e) => serde_json::json!({ "state": "failed", "error": e }),
     }
+}
+
+/// A number the page sends as JavaScript writes it, in a string, read
+/// exactly. serde_json's own reading of a 17-digit number can land an ulp
+/// away (see `LinksRequest`), and a view or a node an ulp away can be
+/// another cell.
+fn exact<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let text = String::deserialize(d)?;
+    text.parse().map_err(serde::de::Error::custom)
+}
+
+fn exact_opt<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    match Option::<String>::deserialize(d)? {
+        None => Ok(None),
+        Some(text) => text.parse().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+/// `POST /coverage/bands.bin`'s body: a view, the bands, and the nodes whose
+/// coverage it shows. Every number is a string (`exact`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BandsRequest {
+    /// The geodata whose rasters these are: the front caches them as
+    /// `<coverage-dir>/<geodata>/<key>.bin`.
+    geodata: String,
+    /// The view: its centre in the pack's metres, metres per CSS pixel, its
+    /// size in CSS pixels, and the side of a cell in them.
+    #[serde(deserialize_with = "exact")]
+    cx: f64,
+    #[serde(deserialize_with = "exact")]
+    cy: f64,
+    #[serde(deserialize_with = "exact")]
+    mpp: f64,
+    #[serde(deserialize_with = "exact")]
+    w: f64,
+    #[serde(deserialize_with = "exact")]
+    h: f64,
+    #[serde(deserialize_with = "exact")]
+    px: f64,
+    /// Each band's least margin in dB, the best band first.
+    bands: Vec<String>,
+    /// The receiver's height above the ground, the one the rasters were
+    /// swept to.
+    #[serde(deserialize_with = "exact")]
+    rx_h: f64,
+    nodes: Vec<BandsNode>,
+}
+
+/// One node: its raster's key, where it stands, what it has to spend and
+/// its antenna.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BandsNode {
+    key: String,
+    #[serde(deserialize_with = "exact")]
+    x: f64,
+    #[serde(deserialize_with = "exact")]
+    y: f64,
+    /// The antenna's height above the ground under it.
+    #[serde(deserialize_with = "exact")]
+    height_m: f64,
+    /// Transmit power plus the receiver's gain, less the decoding threshold:
+    /// the margin at a point is this, plus the antenna's gain toward it,
+    /// less the loss.
+    #[serde(deserialize_with = "exact")]
+    budget_db: f64,
+    /// Its pattern, `None` for an antenna the catalogue does not have.
+    antenna: Option<BandsAntenna>,
+}
+
+/// An antenna's pattern, as sim-mesh's catalogue gives it (testbed/antennas.py,
+/// the page's lib/antennas.ts), and its aim.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BandsAntenna {
+    directional: bool,
+    #[serde(deserialize_with = "exact")]
+    peak_dbi: f64,
+    #[serde(deserialize_with = "exact")]
+    vbw_deg: f64,
+    #[serde(deserialize_with = "exact")]
+    tilt_deg: f64,
+    #[serde(default, deserialize_with = "exact_opt")]
+    hbw_deg: Option<f64>,
+    #[serde(deserialize_with = "exact")]
+    floor_db: f64,
+    #[serde(deserialize_with = "exact")]
+    azimuth_deg: f64,
+    #[serde(deserialize_with = "exact")]
+    elevation_deg: f64,
+}
+
+/// What `/coverage/bands.bin` answers for a cell where no band is reached.
+const NO_BAND: u8 = 255;
+/// A raster cell nothing was evaluated for.
+const NEVER_LOSS: u16 = u16::MAX;
+/// The cells of one view, at most.
+const MAX_BAND_CELLS: f64 = 4_000_000.0;
+/// What the read rasters may hold, the terrain under them included. About
+/// what the page itself held for 20 nodes on a 2048-cell raster each, when
+/// it combined them.
+const COVERAGE_KEPT_BYTES: usize = 512 << 20;
+
+impl BandsRequest {
+    fn check(&self) -> Result<Vec<f64>, String> {
+        if !valid_name(&self.geodata) {
+            return Err(format!("{:?} is not a geodata name", self.geodata));
+        }
+        if let Some(n) = self.nodes.iter().find(|n| !valid_key(&n.key)) {
+            return Err(format!("{:?} is not a coverage key", n.key));
+        }
+        let good = |v: f64| v.is_finite() && v > 0.0;
+        if !(good(self.mpp) && good(self.w) && good(self.h) && good(self.px)) || !self.cx.is_finite()
+            || !self.cy.is_finite()
+        {
+            return Err("the view needs a finite centre and positive scale, size and cell".into());
+        }
+        if (self.w / self.px).ceil() * (self.h / self.px).ceil() > MAX_BAND_CELLS {
+            return Err("the view has more cells than one reply holds".into());
+        }
+        let bands: Vec<f64> =
+            self.bands.iter().map(|b| b.parse::<f64>()).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+        if bands.is_empty() || bands.len() >= usize::from(NO_BAND) {
+            return Err("name between one and 254 bands".into());
+        }
+        Ok(bands)
+    }
+}
+
+/// A geodata name as sim-mesh's store has them (store.NAME_RE).
+fn valid_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    let inner = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-';
+    let end = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    !b.is_empty() && b.len() <= 32 && end(&b[0]) && end(&b[b.len() - 1]) && b.iter().all(inner)
+}
+
+/// A coverage key as the front makes them (coverage.key): 16 hex digits.
+fn valid_key(key: &str) -> bool {
+    key.len() == 16 && key.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// `Math.round`: the nearest whole number, a half rounding up, as the page
+/// rounds. `f64::round` takes a half away from zero instead.
+fn js_round(x: f64) -> f64 {
+    let f = x.floor();
+    if x - f >= 0.5 {
+        f + 1.0
+    } else {
+        f
+    }
+}
+
+/// `Math.hypot` of two, as V8 computes it: each scaled by the larger, the
+/// squares summed with Kahan's compensation, the root scaled back.
+fn js_hypot(a: f64, b: f64) -> f64 {
+    let (a, b) = (a.abs(), b.abs());
+    if a.is_infinite() || b.is_infinite() {
+        return f64::INFINITY;
+    }
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    let max = a.max(b);
+    if max == 0.0 {
+        return 0.0;
+    }
+    let (mut sum, mut compensation) = (0.0f64, 0.0f64);
+    for v in [a, b] {
+        let n = v / max;
+        let summand = n * n - compensation;
+        let preliminary = sum + summand;
+        compensation = (preliminary - sum) - summand;
+        sum = preliminary;
+    }
+    sum.sqrt() * max
+}
+
+/// `Math.min` of two: NaN when either is.
+fn js_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if b < a {
+        b
+    } else {
+        a
+    }
+}
+
+impl BandsAntenna {
+    /// Gain in dBi toward azimuth `az` (clockwise from grid north) and
+    /// elevation `el`, degrees: the page's `gain` (lib/antennas.ts). The loss
+    /// below the peak is 12·((el − tilt)/vbw)², plus for a directional
+    /// antenna 12·(az/hbw)², together never more than the floor.
+    fn gain(&self, az: f64, el: f64) -> f64 {
+        let wrap180 = |deg: f64| ((deg + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
+        let (mut tilt, mut off) = (self.tilt_deg, 0.0);
+        if self.directional {
+            tilt += self.elevation_deg;
+            off = wrap180(az - self.azimuth_deg);
+        }
+        let v = (el - tilt) / self.vbw_deg;
+        let mut down = 12.0 * (v * v);
+        if let Some(hbw) = self.hbw_deg.filter(|&h| self.directional && h != 0.0 && !h.is_nan()) {
+            let o = off / hbw;
+            down += 12.0 * (o * o);
+        }
+        self.peak_dbi - js_min(down, self.floor_db)
+    }
+}
+
+/// Azimuth and elevation in degrees of the line from one antenna tip to
+/// another, the far one dropped by the earth's curvature at k = 4/3: the
+/// page's `direction` (lib/antennas.ts).
+fn tip_direction(ax: f64, ay: f64, a_top: f64, bx: f64, by: f64, b_top: f64) -> (f64, f64) {
+    const EARTH_RADIUS_M: f64 = 6371008.8;
+    const K_FACTOR: f64 = 4.0 / 3.0;
+    let (dx, dy) = (bx - ax, by - ay);
+    let d = js_hypot(dx, dy);
+    let az = ((dx.atan2(dy) * 180.0 / std::f64::consts::PI) % 360.0 + 360.0) % 360.0;
+    let drop = d * d / (2.0 * K_FACTOR * EARTH_RADIUS_M);
+    let el = (b_top - a_top - drop).atan2(d.max(1e-6)) * 180.0 / std::f64::consts::PI;
+    (az, el)
+}
+
+/// A tile's terrain as the page reads it: rows south from the top-left
+/// cell's centre, a cell `dm * 0.1` metres held as an f32.
+struct TerrainTile {
+    w: usize,
+    h: usize,
+    ox: f64,
+    oy: f64,
+    rx: f64,
+    ry: f64,
+    dm: Vec<i16>,
+}
+
+impl TerrainTile {
+    /// The terrain `tile.bin?…&terrain_only=1` sends for `view` at `w`×`h`
+    /// cells, as that route computes it. Blocking.
+    fn read(st: &AppState, view: &ViewRect, w: u32, h: u32) -> Result<Self, String> {
+        let res_hint = terrain_res_hint(st);
+        let (tw, th) = tile_dims(view, w, h, res_hint, res_hint);
+        let lo = st.clamp(Xy { x: view.min_x, y: view.min_y });
+        let hi = st.clamp(Xy { x: view.max_x, y: view.max_y });
+        let g = st
+            .layers
+            .terrain
+            .window_max(lo, hi, (tw as usize) * 2, (th as usize) * 2)
+            .map_err(|e| e.to_string())?;
+        let bytes = tile_block(&g, view, tw, th, 2, &terrain_decimetres);
+        let (rx, ry) = (view.width_m() / tw as f64, view.height_m() / th as f64);
+        Ok(TerrainTile {
+            w: tw as usize,
+            h: th as usize,
+            ox: view.min_x + 0.5 * rx,
+            oy: view.max_y - 0.5 * ry,
+            rx,
+            ry,
+            dm: bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect(),
+        })
+    }
+
+    /// The nearest cell's terrain at (x, y), `None` off the tile or where it
+    /// has none: the page's `terrainAt`.
+    fn at(&self, x: f64, y: f64) -> Option<f64> {
+        let col = js_round((x - self.ox) / self.rx.abs());
+        let row = js_round((self.oy - y) / self.ry.abs());
+        if col < 0.0 || row < 0.0 || col >= self.w as f64 || row >= self.h as f64 {
+            return None;
+        }
+        let dm = self.dm[row as usize * self.w + col as usize];
+        (dm != i16::MIN).then(|| (f64::from(dm) * 0.1) as f32 as f64)
+    }
+}
+
+/// A node's coverage raster as the front caches it (sim-mesh's
+/// testbed/coverage.py): "PLS2" | u32 w | u32 h | f64 ox | f64 oy | f64 rx |
+/// f64 ry | u16 loss·100 [w·h], row-major from the north-west, (ox, oy) the
+/// first cell's centre, 65535 where nothing was evaluated. With it the
+/// terrain under it, on its own grid: what the page fetched beside each
+/// raster for each cell's elevation, `None` where that could not be read.
+struct CoverageRaster {
+    w: usize,
+    h: usize,
+    ox: f64,
+    oy: f64,
+    rx: f64,
+    ry: f64,
+    loss: Vec<u16>,
+    terrain: Option<TerrainTile>,
+}
+
+impl CoverageRaster {
+    fn parse(data: &[u8]) -> Option<(usize, usize, [f64; 4], Vec<u16>)> {
+        if data.len() < 44 || &data[..4] != b"PLS2" {
+            return None;
+        }
+        let u32_at = |i: usize| u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
+        let f64_at = |i: usize| f64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        let (w, h) = (u32_at(4), u32_at(8));
+        let cells = data.get(44..44 + w * h * 2)?;
+        let loss = cells.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        Some((w, h, [f64_at(12), f64_at(20), f64_at(28), f64_at(36)], loss))
+    }
+
+    fn bytes(&self) -> usize {
+        self.loss.len() * 2 + self.terrain.as_ref().map_or(0, |t| t.dm.len() * 2)
+    }
+}
+
+/// The raster of `key` on `geodata` with its terrain: from those read
+/// before, else from the front's cache, else, while this sidecar's sweep for
+/// that key grows, from the band it finished last; `None` when there is none
+/// of these (yet). Blocking.
+fn coverage_raster(
+    st: &AppState,
+    dir: &Path,
+    geodata: &str,
+    key: &str,
+) -> Result<Option<Arc<CoverageRaster>>, String> {
+    let path = dir.join(geodata).join(format!("{key}.bin"));
+    let held = |name: &str| {
+        let mut held = st.coverage_rasters.lock().expect("coverage rasters lock");
+        let i = held.iter().position(|(n, _)| n == name)?;
+        let hit = held.remove(i);
+        let raster = Arc::clone(&hit.1);
+        held.push(hit);
+        Some(raster)
+    };
+    let name = path.display().to_string();
+    if let Some(raster) = held(&name) {
+        return Ok(Some(raster));
+    }
+    let (name, (w, h, [ox, oy, rx, ry], loss)) = match std::fs::read(&path) {
+        Ok(data) => match CoverageRaster::parse(&data) {
+            Some(parsed) => (name, parsed),
+            None => return Err(format!("{name} is not a PLS2 raster")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Not cached yet: the band of its sweep finished last, when this
+            // sidecar is sweeping it, as `/loss.bin` will cut and send it.
+            let Some(band) = st.coverage_cache.blocking_lock().as_ref().and_then(|c| {
+                let tag = c.tag.as_ref().filter(|t| t.key == key)?;
+                Some((Arc::clone(&c.loss), Arc::clone(tag), c.key.radius_km))
+            }) else {
+                return Ok(None);
+            };
+            let (grid, tag, band_km) = band;
+            let name = format!("{name}@{band_km}");
+            if let Some(raster) = held(&name) {
+                return Ok(Some(raster));
+            }
+            let (w, h, rx, ry, o, data) =
+                window_raster(&*grid, &tag.view, tag.w, tag.h, Resample::Bilinear);
+            let loss = data.into_iter().map(loss_centibels).collect();
+            (name, (w as usize, h as usize, [o.x, o.y, rx, ry], loss))
+        }
+        Err(e) => return Err(format!("{name}: {e}")),
+    };
+    // The box the page asked `tile.bin` for: the raster's cells, out to their edges.
+    let view = ViewRect {
+        min_x: ox - rx / 2.0,
+        max_x: ox + (w as f64 - 0.5) * rx,
+        max_y: oy + ry / 2.0,
+        min_y: oy - (h as f64 - 0.5) * ry,
+    };
+    let terrain = TerrainTile::read(st, &view, w as u32, h as u32).ok();
+    let raster = Arc::new(CoverageRaster { w, h, ox, oy, rx, ry, loss, terrain });
+    let mut held = st.coverage_rasters.lock().expect("coverage rasters lock");
+    held.retain(|(n, _)| *n != name);
+    held.push((name, Arc::clone(&raster)));
+    let mut total: usize = held.iter().map(|(_, r)| r.bytes()).sum();
+    while total > COVERAGE_KEPT_BYTES && held.len() > 1 {
+        total -= held.remove(0).1.bytes();
+    }
+    Ok(Some(raster))
+}
+
+/// One node's margin over its raster's cells, read as a raster: a cell's is
+/// the node's budget plus its antenna's gain toward the cell (from the tip
+/// to a receiver `rx_h` above the terrain there) less the cell's loss; NaN
+/// where the raster evaluated nothing. Read NEAREST, as the page read it: a
+/// point's margin is its cell's, the gain worked out for the cell's centre.
+struct NodeMargins<'a> {
+    raster: &'a CoverageRaster,
+    node: &'a BandsNode,
+    rx_h: f64,
+    /// The ground under the node, from the raster's terrain (0 where there
+    /// is none), and its antenna's tip above sea level.
+    ground: f64,
+    top: f64,
+}
+
+impl<'a> NodeMargins<'a> {
+    fn new(raster: &'a CoverageRaster, node: &'a BandsNode, rx_h: f64) -> Self {
+        let ground = raster.terrain.as_ref().and_then(|t| t.at(node.x, node.y)).unwrap_or(0.0);
+        NodeMargins { raster, node, rx_h, ground, top: ground + node.height_m }
+    }
+}
+
+impl ViewSource for NodeMargins<'_> {
+    fn origin(&self) -> Xy {
+        Xy { x: self.raster.ox, y: self.raster.oy }
+    }
+    fn dx_m(&self) -> f64 {
+        self.raster.rx
+    }
+    fn dy_m(&self) -> f64 {
+        -self.raster.ry
+    }
+    fn width(&self) -> usize {
+        self.raster.w
+    }
+    fn height(&self) -> usize {
+        self.raster.h
+    }
+    /// The nearest cell, found as `Grid::sample_nearest` finds it.
+    fn sample(&self, p: Xy, _how: Resample) -> Option<f32> {
+        let r = self.raster;
+        let fx = (p.x - r.ox) / r.rx;
+        let fy = (p.y - r.oy) / -r.ry;
+        let eps = 1e-9;
+        if fx < -0.5 - eps || fy < -0.5 - eps || fx > r.w as f64 - 0.5 + eps || fy > r.h as f64 - 0.5 + eps
+        {
+            return None;
+        }
+        let col = (fx.round() as isize).clamp(0, r.w as isize - 1) as usize;
+        let row = (fy.round() as isize).clamp(0, r.h as isize - 1) as usize;
+        let v = r.loss[row * r.w + col];
+        if v == NEVER_LOSS {
+            return Some(f32::NAN);
+        }
+        let (x, y) = (r.ox + col as f64 * r.rx, r.oy - row as f64 * r.ry);
+        let gain = match &self.node.antenna {
+            None => 0.0,
+            Some(a) => {
+                let rx_ground = r.terrain.as_ref().and_then(|t| t.at(x, y)).unwrap_or(self.ground);
+                let (az, el) =
+                    tip_direction(self.node.x, self.node.y, self.top, x, y, rx_ground + self.rx_h);
+                a.gain(az, el)
+            }
+        };
+        Some((self.node.budget_db + gain - f64::from(v) / 100.0) as f32)
+    }
+}
+
+/// The coverage band of every cell of a view over a set of nodes, each
+/// node's margin from its raster in the front's cache.
+///
+/// The page did this itself: it fetched each node's raster (3.4 MB on the
+/// berlin-centre pack) and the terrain under it (as much again), kept both
+/// for the page's life, and combined them into one grid of the best margin,
+/// an antenna gain worked out per cell, before it could draw anything: 6 s
+/// of its main thread for two nodes. Here the rasters stay beside the
+/// planner, and a view is a few hundred thousand cells whatever the pack.
+///
+/// Each node's margins are resampled onto the view's cells as a coverage
+/// window is (`window_cells`, read nearest), and a cell's margin is the best
+/// of them, held as an f32 as the page's grid held it. Its band is the first
+/// whose least margin it reaches; below 0 dB, or where no raster reaches,
+/// there is none. The cells are the page's, `px` CSS pixels square from the
+/// view's top-left corner, so the page draws exactly the picture it drew.
+///
+/// Reply: "PCB1" | u32 cols | u32 rows | u8 band[cols·rows], rows from the
+/// top, 255 for none. A node whose raster the cache does not have is left
+/// out, as the page left it out until its raster came.
+async fn coverage_bands(
+    State(st): State<Arc<AppState>>,
+    axum::Json(req): axum::Json<BandsRequest>,
+) -> Response {
+    let Some(dir) = st.coverage_dir.clone() else {
+        return (StatusCode::NOT_FOUND, "no coverage cache: planner-web runs without --coverage-dir")
+            .into_response();
+    };
+    let bands = match req.check() {
+        Ok(bands) => bands,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let Ok(_permit) = st.slots.try_acquire() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "renderer busy").into_response();
+    };
+    match tokio::task::block_in_place(|| band_grid(&st, &dir, &req, &bands)) {
+        Ok(out) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            out,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// `/coverage/bands.bin`'s reply. Blocking.
+fn band_grid(st: &AppState, dir: &Path, req: &BandsRequest, bands: &[f64]) -> Result<Vec<u8>, String> {
+    let rasters: Vec<Option<Arc<CoverageRaster>>> = req
+        .nodes
+        .par_iter()
+        .map(|n| coverage_raster(st, dir, &req.geodata, &n.key))
+        .collect::<Result<_, _>>()?;
+    let (cols, rows) = ((req.w / req.px).ceil() as u32, (req.h / req.px).ceil() as u32);
+    // The page's cells: their centres `(i + 0.5)·px` CSS pixels from the
+    // view's top-left corner.
+    let (left, top) = (req.cx - req.w / 2.0 * req.mpp, req.cy + req.h / 2.0 * req.mpp);
+    let view = ViewRect {
+        min_x: left,
+        max_x: left + f64::from(cols) * req.px * req.mpp,
+        max_y: top,
+        min_y: top - f64::from(rows) * req.px * req.mpp,
+    };
+    let (w, h) = (cols as usize, rows as usize);
+    let mut best = vec![f32::NAN; w * h];
+    for (node, raster) in req.nodes.iter().zip(&rasters) {
+        let Some(raster) = raster else { continue };
+        let margins = NodeMargins::new(raster, node, req.rx_h);
+        let (ow, oh, res_x, res_y, origin, data) =
+            window_cells(&margins, &view, cols, rows, Resample::Nearest);
+        // Where the window, cut to the raster, starts among the view's cells.
+        let c0 = ((origin.x - view.min_x) / res_x - 0.5).round() as usize;
+        let r0 = ((view.max_y - origin.y) / res_y - 0.5).round() as usize;
+        for row in 0..oh as usize {
+            let line = &mut best[(r0 + row) * w + c0..(r0 + row) * w + c0 + ow as usize];
+            for (b, &m) in line.iter_mut().zip(&data[row * ow as usize..(row + 1) * ow as usize]) {
+                if !m.is_nan() && (b.is_nan() || m > *b) {
+                    *b = m;
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(12 + w * h);
+    out.extend_from_slice(b"PCB1");
+    out.extend_from_slice(&cols.to_le_bytes());
+    out.extend_from_slice(&rows.to_le_bytes());
+    out.extend(best.iter().map(|&m| {
+        if !(m >= 0.0) {
+            return NO_BAND;
+        }
+        let m = f64::from(m);
+        bands.iter().position(|&from| m >= from).unwrap_or(bands.len() - 1) as u8
+    }));
+    Ok(out)
 }
 
 /// Radio presets with the link budget SPELLED OUT.
@@ -2732,6 +4157,9 @@ fn resolve_loc_pct(loc_pct: Option<f64>) -> Result<f64, String> {
     }
 }
 
+/// The model a link reply names when P.1812 answered it.
+const P1812_MODEL: &str = "ITU-R P.1812-8";
+
 /// The loss a link reply gives, and the model it came from: P.1812's own
 /// answer, or on a path inside its 0.25 km floor the near-field model's.
 ///
@@ -2746,7 +4174,7 @@ fn link_model(
     near_field: impl FnOnce() -> Option<f64>,
 ) -> Result<(f64, &'static str), (StatusCode, String)> {
     match p1812 {
-        Ok(lb) => Ok((lb, "ITU-R P.1812-8")),
+        Ok(lb) => Ok((lb, P1812_MODEL)),
         Err(planner_core::model::ModelError::OutOfRange(_)) if d_total_km < 0.25 => near_field()
             .map(|v| (v, "free space + P.526 diffraction (inside P.1812's 0.25 km floor)"))
             .ok_or_else(|| (StatusCode::BAD_REQUEST, "path too short to evaluate".into())),
@@ -2857,8 +4285,8 @@ fn estimate_height_at(st: &AppState, p: Xy) -> serde_json::Value {
     let reach = params.clutter_radius_m.max(params.building_search_radius_m) + 2.0 * terrain_res_hint(st);
     let lo = st.clamp(Xy { x: p.x - reach, y: p.y - reach });
     let hi = st.clamp(Xy { x: p.x + reach, y: p.y + reach });
-    let clutter = st.layers.clutter.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
-    let classes = st.layers.classes.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
+    let clutter = st.layers.clutter.as_ref().and_then(|l| l.window(lo, hi).ok());
+    let classes = st.layers.classes.as_ref().and_then(|l| l.window(lo, hi).ok());
     let (index_state, hints) = {
         let guard = st.buildings.read().unwrap_or_else(|e| e.into_inner());
         let hints = guard
@@ -2890,7 +4318,105 @@ fn estimate_height_at(st: &AppState, p: Xy) -> serde_json::Value {
     })
 }
 
+/// A pair's two ends as `/link.json` takes them, held into the pack.
+#[derive(Clone, Copy)]
+struct LinkEnds {
+    a: Xy,
+    b: Xy,
+    dist: f64,
+    loc_pct: f64,
+}
+
+/// What refuses a pair before any of its ground is read, checked in the
+/// order `/link.json` always checked it.
+fn link_ends(st: &AppState, q: &LinkQuery) -> Result<LinkEnds, (StatusCode, String)> {
+    let loc_pct = resolve_loc_pct(q.loc_pct).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let a = st.clamp(Xy { x: q.ax, y: q.ay });
+    let b = st.clamp(Xy { x: q.bx, y: q.by });
+    let dist = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+    // No longer a refusal. P.1812 is not valid below 0.25 km and this used to
+    // stop there, which made the tool useless for the neighbour-to-neighbour
+    // hop a mesh is actually built from; the near-field model below answers
+    // it instead, and the reply says which model produced the number.
+    //
+    // A floor still exists, because free space diverges at zero range and a
+    // profile of two points has no obstacle to diffract over.
+    if dist < 20.0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the two ends are within 20 m of each other — there is no path to model".into(),
+        ));
+    }
+    if dist > MAX_COVERAGE_RADIUS_KM * 2.0 * 1000.0 {
+        return Err((StatusCode::BAD_REQUEST, "path longer than the pack window cap".into()));
+    }
+    Ok(LinkEnds { a, b, dist, loc_pct })
+}
+
 async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) -> Response {
+    let ends = match link_ends(&st, &q) {
+        Ok(ends) => ends,
+        Err(refused) => return refused.into_response(),
+    };
+    let Ok(_permit) = st.link_slots.try_acquire() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "every link slot is busy").into_response();
+    };
+    // The whole pair off the async workers, not only its reads and its
+    // P.1812 runs: the profile walks the building index at every sample, and
+    // run on a worker it kept the handlers of tiles from being polled while
+    // a pack table filled.
+    let reply = tokio::task::block_in_place(|| {
+        // The windows over the pair's box, read for it alone.
+        let windows = LinkWindows::read(&st.layers, link_box(&st, ends))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Read-locked ONCE for the whole profile, not per sample: forty
+        // thousand lock acquisitions would cost more than the lookups, and —
+        // more to the point — a profile half-sampled before the background
+        // index lands and half after would mix two obstacle sources with one
+        // `from_lod2` count to describe them. One guard means one answer from
+        // one state.
+        let index = st.buildings.read().expect("buildings lock");
+        link_reply(&st, &q, ends, windows.views(), index.get(), index.label())
+    });
+    match reply {
+        Ok(reply) => axum::Json(reply).into_response(),
+        Err(refused) => refused.into_response(),
+    }
+}
+
+/// The box `/link.json` reads for a pair: both ends and four cells around
+/// them, held into the pack.
+fn link_box(st: &AppState, ends: LinkEnds) -> (Xy, Xy) {
+    let LinkEnds { a, b, .. } = ends;
+    let res = terrain_res_hint(st).max(1.0);
+    (
+        st.clamp(Xy { x: a.x.min(b.x) - res * 4.0, y: a.y.min(b.y) - res * 4.0 }),
+        st.clamp(Xy { x: a.x.max(b.x) + res * 4.0, y: a.y.max(b.y) + res * 4.0 }),
+    )
+}
+
+/// The four layers a pair's profile samples, each as the window over the
+/// pair's box: terrain, clutter, building top, built fraction.
+#[derive(Clone, Copy)]
+struct LinkViews<'a> {
+    terrain: planner_terrain::GridView<'a>,
+    clutter: Option<planner_terrain::GridView<'a>>,
+    building_top: Option<planner_terrain::GridView<'a>>,
+    built_fraction: Option<planner_terrain::GridView<'a>>,
+}
+
+/// `/link.json`'s reply for a pair `link_ends` let through, from its layers'
+/// windows and the building index as it stands, `bldg` (`None` while it
+/// loads or where the pack has none), whose state is `index_label`.
+/// Blocking.
+fn link_reply(
+    st: &AppState,
+    q: &LinkQuery,
+    ends: LinkEnds,
+    views: LinkViews<'_>,
+    bldg: Option<&BuildingIndex>,
+    index_label: &'static str,
+) -> Result<serde_json::Value, (StatusCode, String)> {
     // ---- the budget, and where every decibel of it comes from --------------
     //
     // Three cases, in order: an explicit `budget_db` wins; otherwise, if the
@@ -2905,72 +4431,13 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
         rx_gain_dbi: rx_gain,
         gains_given,
     } = resolve_budget(q.budget_db, q.tx_gain_dbi, q.rx_gain_dbi);
-    let loc_pct = match resolve_loc_pct(q.loc_pct) {
-        Ok(p) => p,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
-    };
-    let a = st.clamp(Xy { x: q.ax, y: q.ay });
-    let b = st.clamp(Xy { x: q.bx, y: q.by });
-    let dist = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
-    // No longer a refusal. P.1812 is not valid below 0.25 km and this used to
-    // stop there, which made the tool useless for the neighbour-to-neighbour
-    // hop a mesh is actually built from; the near-field model below answers
-    // it instead, and the reply says which model produced the number.
-    //
-    // A floor still exists, because free space diverges at zero range and a
-    // profile of two points has no obstacle to diffract over.
-    if dist < 20.0 {
-        return (
-            StatusCode::BAD_REQUEST,
-            "the two ends are within 20 m of each other — there is no path to model",
-        )
-            .into_response();
-    }
-    if dist > MAX_COVERAGE_RADIUS_KM * 2.0 * 1000.0 {
-        return (StatusCode::BAD_REQUEST, "path longer than the pack window cap").into_response();
-    }
-    let Ok(_permit) = st.slots.try_acquire() else {
-        return (StatusCode::TOO_MANY_REQUESTS, "renderer busy").into_response();
-    };
-
-    let res = terrain_res_hint(&st).max(1.0);
-    let lo = st.clamp(Xy { x: a.x.min(b.x) - res * 4.0, y: a.y.min(b.y) - res * 4.0 });
-    let hi = st.clamp(Xy { x: a.x.max(b.x) + res * 4.0, y: a.y.max(b.y) + res * 4.0 });
-
+    let LinkEnds { a, b, dist, loc_pct } = ends;
     // The two unblended layers. `building_top` is the obstacle a path
     // crossing a building actually meets; `built_fraction` says how much of
     // the cell that building covers, which is what separates "this sample is
     // inside a Vorderhaus" from "this sample is on the street beside one".
-    //
-    // No lock is held past its own read. Held to the end of the request, as
-    // they once were, the locks made every other request wait out this one's
-    // profile, both P.1812 runs and the Fresnel trace, so however many render
-    // slots there were, one pair was computed at a time.
-    let [terrain, clutter, building_top, built_fraction] =
-        tokio::task::block_in_place(|| link_windows_unlocked(&st.layers, lo, hi));
-    let terrain = match terrain {
-        Some(g) => Ok(g),
-        None => locked_window(&st.layers.terrain, lo, hi).await,
-    };
-    let clutter = match (clutter, st.layers.clutter.as_ref()) {
-        (Some(g), _) => Some(g),
-        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
-        (None, None) => None,
-    };
-    let building_top = match (building_top, st.layers.building_top.as_ref()) {
-        (Some(g), _) => Some(g),
-        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
-        (None, None) => None,
-    };
-    let built_fraction = match (built_fraction, st.layers.built_fraction.as_ref()) {
-        (Some(g), _) => Some(g),
-        (None, Some(m)) => locked_window(m, lo, hi).await.ok(),
-        (None, None) => None,
-    };
-    let terrain = match terrain {
-        Ok(g) => g,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    let LinkViews { terrain, clutter, building_top, built_fraction } = views;
+    let res = terrain_res_hint(st).max(1.0);
 
     // Sample at HALF the raster cell for this one path. A point-to-point link
     // is a single profile, not a whole sweep, so the extra samples are free —
@@ -2996,13 +4463,6 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     // bare ground. The advice differs completely: a rooftop can be gone round
     // or over, a hill cannot.
     let mut bf_at: Vec<f32> = Vec::with_capacity(steps + 1);
-    // Read-locked ONCE for the whole profile, not per sample: forty thousand
-    // lock acquisitions would cost more than the lookups, and — more to the
-    // point — a profile half-sampled before the background index lands and
-    // half after would mix two obstacle sources with one `from_lod2` count to
-    // describe them. One guard means one answer from one state.
-    let bldg_guard = st.buildings.read().expect("buildings lock");
-    let bldg = bldg_guard.get();
     // An end whose antenna is inside a building: its own building is not an
     // obstacle on the path out of it (the walls are its entry loss, below).
     let f_ghz = planner_core::model::LinkParams::eu868_defaults().freq_mhz / 1000.0;
@@ -3018,7 +4478,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
         let t = k as f64 / steps as f64;
         let p = Xy { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
         let Some(h) = terrain.sample_bilinear(p) else {
-            return (StatusCode::BAD_REQUEST, "path leaves the pack").into_response();
+            return Err((StatusCode::BAD_REQUEST, "path leaves the pack".into()));
         };
         let h = h as f64;
         let raster_c =
@@ -3150,7 +4610,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     let rev_g: Vec<f64> = g_masl.iter().rev().copied().collect();
     let (rd_km, rh_masl, rg_masl) = decimate(&rev_h, &rev_g);
     if md_km.len() < 3 {
-        return (StatusCode::BAD_REQUEST, "path too short for a §3.2 profile").into_response();
+        return Err((StatusCode::BAD_REQUEST, "path too short for a §3.2 profile".into()));
     }
 
     let (_, lat) = st.to_lonlat(Xy { x: (a.x + b.x) / 2.0, y: (a.y + b.y) / 2.0 });
@@ -3254,12 +4714,9 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
     let mut link_rev = link.clone();
     std::mem::swap(&mut link_rev.tx_h_agl_m, &mut link_rev.rx_h_agl_m);
     let t0 = std::time::Instant::now();
-    let loss = tokio::task::block_in_place(|| {
-        let fwd = planner_propag::p1812::lb_from_arrays(&x, &link)?;
+    let loss = planner_propag::p1812::lb_from_arrays(&x, &link).and_then(|fwd| {
         let rev = planner_propag::p1812::lb_from_arrays(&x_rev, &link_rev)?;
-        Ok::<_, planner_core::model::ModelError>(planner_core::model::Loss {
-            lb_db: (fwd.lb_db + rev.lb_db) / 2.0,
-        })
+        Ok(planner_core::model::Loss { lb_db: (fwd.lb_db + rev.lb_db) / 2.0 })
     });
     let ms = t0.elapsed().as_millis();
     // Under 0.25 km P.1812 refuses (§1). That refusal is not an answer: the
@@ -3287,10 +4744,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
         }))
         .map(|(f, r)| (f + r) / 2.0)
     };
-    let (lb_p1812, model_used) = match link_model(loss.map(|l| l.lb_db), d_total, near_field) {
-        Ok(answer) => answer,
-        Err(refused) => return refused.into_response(),
-    };
+    let (lb_p1812, model_used) = link_model(loss.map(|l| l.lb_db), d_total, near_field)?;
     let lb = lb_p1812 + ah_tx + ah_rx;
 
     // ---- Fresnel clearance -------------------------------------------------
@@ -3598,7 +5052,7 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
             // being read both answer from the clutter raster and both look
             // identical in the counts above — but one is the best this pack can
             // do and the other is a number that will change in a few seconds.
-            "buildings_index": bldg_guard.label(),
+            "buildings_index": index_label,
             // Which §3.2 branch this path was evaluated under, and therefore
             // which spacing floor applied. Reported because the two give
             // different answers and nothing else in the reply says which was
@@ -3660,7 +5114,188 @@ async fn link_json(State(st): State<Arc<AppState>>, Query(q): Query<LinkQuery>) 
             map.remove("profile");
         }
     }
-    axum::Json(reply).into_response()
+    Ok(reply)
+}
+
+/// `POST /links.json`'s body: the nodes, and the pairs among them to answer.
+/// `deny_unknown_fields` for `LinkQuery`'s reason: a misspelled field is
+/// refused rather than answered with its default.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinksRequest {
+    /// Each node as `[x, y, h]`: the pack's CRS metres, and its antenna's
+    /// height above ground in metres, as `/link.json`'s `tx_h` or `rx_h`.
+    ///
+    /// Coordinates given to the millimetre, as the front gives
+    /// `/link.json`'s (`%.3f`), are read here as `/link.json` reads them
+    /// from its query. One of 17 significant digits can be read an ulp away:
+    /// serde_json's default reading of long numbers is not correctly
+    /// rounded, and its exact one would change how every JSON file here is
+    /// read, the buildings among them.
+    nodes: Vec<[f64; 3]>,
+    /// The pairs, as `[a, b]` indices into `nodes`, `a` the end
+    /// `/link.json` calls `a`.
+    #[serde(default)]
+    pairs: Vec<[u32; 2]>,
+    /// Instead of `pairs`: this node against every other, in node order.
+    from: Option<u32>,
+    /// As `/link.json`'s.
+    loc_pct: Option<f64>,
+}
+
+impl LinksRequest {
+    /// The pairs asked for, each naming two of the nodes.
+    fn pairs(&self) -> Result<Vec<[u32; 2]>, String> {
+        let n = self.nodes.len();
+        let pairs = match (self.from, self.pairs.is_empty()) {
+            (Some(_), false) => return Err("name the `pairs` or a node `from`, not both".into()),
+            (None, true) => return Err("name the `pairs` to answer, or a node `from`".into()),
+            (Some(f), true) if f as usize >= n => {
+                return Err(format!("node {f} is not among the {n} nodes"))
+            }
+            (Some(f), true) => (0..n as u32).filter(|&k| k != f).map(|k| [f, k]).collect(),
+            (None, false) => self.pairs.clone(),
+        };
+        match pairs.iter().flatten().find(|&&i| i as usize >= n) {
+            Some(bad) => Err(format!("node {bad} is not among the {n} nodes")),
+            None => Ok(pairs),
+        }
+    }
+}
+
+/// Many pairs at once, each answered as `/link.json` answers it: a pack's
+/// loss table, or one node against the rest.
+///
+/// A table asked `/link.json` twice for every pair, once each way, and each
+/// ask read four windows over its pair's box: on the berlin-centre pack a
+/// long pair's box is the whole pack. Here each pair is computed once, and
+/// its loss is the table's both ways: `/link.json` gives a pair the mean of
+/// P.1812 run in both directions plus both ends' terminal terms, the same
+/// whichever end asks. The layers are read once for the batch, over the box
+/// holding every pair's, and each pair samples the part its own window would
+/// have held, at that window's origin (`GridView`), so its numbers are
+/// `/link.json`'s for the same query, to the bit. Past `BATCH_SHARED_CELLS`
+/// each pair reads its own windows, as many at once as one shared read would
+/// hold. A batch takes one link slot, and its pairs run in the sweep pool,
+/// never the tiles'.
+///
+/// Reply: `buildings_index` as `/link.json`'s (the batch waits out a loading
+/// index, as a sweep does), `read` "once" or "per pair", `compute_ms`, and
+/// one entry per pair in the order asked in each of `lb_db` (`/link.json`'s,
+/// `null` for a pair it refuses) and `flags` (1: the near-field model
+/// answered, inside P.1812's 0.25 km floor; 2: the Fresnel verdict is
+/// "clear"). `refused` lists `[pair, status, text]`, what `/link.json`
+/// answers that pair.
+async fn links_json(
+    State(st): State<Arc<AppState>>,
+    axum::Json(req): axum::Json<LinksRequest>,
+) -> Response {
+    let pairs = match req.pairs() {
+        Ok(pairs) => pairs,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    if let Err(e) = resolve_loc_pct(req.loc_pct) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    let Ok(_permit) = st.link_slots.try_acquire() else {
+        return (StatusCode::TOO_MANY_REQUESTS, "every link slot is busy").into_response();
+    };
+    let st2 = Arc::clone(&st);
+    match tokio::task::spawn_blocking(move || link_rows(&st2, &req, &pairs)).await {
+        Ok(reply) => axum::Json(reply).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `/links.json`'s reply. Blocking.
+fn link_rows(st: &AppState, req: &LinksRequest, pairs: &[[u32; 2]]) -> serde_json::Value {
+    let t0 = std::time::Instant::now();
+    // Never a row from the clutter raster while the index loads: that is a
+    // different number from the same row a moment later, and a table keeps
+    // what it is given.
+    let _ = wait_for_index(&st.buildings, &AtomicBool::new(false));
+    let (index, index_label) = {
+        let state = st.buildings.read().expect("buildings lock");
+        (state.ready(), state.label())
+    };
+    let queries: Vec<LinkQuery> = pairs
+        .iter()
+        .map(|&[i, j]| {
+            let ([ax, ay, tx_h], [bx, by, rx_h]) = (req.nodes[i as usize], req.nodes[j as usize]);
+            LinkQuery {
+                ax,
+                ay,
+                bx,
+                by,
+                tx_h,
+                rx_h,
+                budget_db: None,
+                tx_gain_dbi: None,
+                rx_gain_dbi: None,
+                loc_pct: req.loc_pct,
+                lean: true,
+            }
+        })
+        .collect();
+    let ends: Vec<_> = queries.iter().map(|q| link_ends(st, q)).collect();
+    let union = ends.iter().flatten().map(|&e| link_box(st, e)).reduce(|(lo, hi), (l, h)| {
+        (Xy { x: lo.x.min(l.x), y: lo.y.min(l.y) }, Xy { x: hi.x.max(h.x), y: hi.y.max(h.y) })
+    });
+    let shared = union.and_then(|bx| SharedLinkWindows::read(&st.layers, bx));
+    let row = |k: usize| -> Result<serde_json::Value, (StatusCode, String)> {
+        let ends = ends[k].clone()?;
+        let bx = link_box(st, ends);
+        match shared.as_ref().and_then(|s| s.views(bx)) {
+            Some(views) => link_reply(st, &queries[k], ends, views, index.as_deref(), index_label),
+            None => {
+                let windows = LinkWindows::read(&st.layers, bx)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                link_reply(st, &queries[k], ends, windows.views(), index.as_deref(), index_label)
+            }
+        }
+    };
+    // Pairs reading their own windows hold them while they compute: no more
+    // of them at once than would hold what one shared read holds.
+    let at_once = if shared.is_some() {
+        queries.len().max(1)
+    } else {
+        let cells = |&e: &LinkEnds| {
+            let (lo, hi) = link_box(st, e);
+            st.layers.terrain.meta.window_box(lo, hi).map_or(1, |(_, _, w, h)| w * h)
+        };
+        let most = ends.iter().flatten().map(cells).max().unwrap_or(1);
+        (BATCH_SHARED_CELLS / most.max(1)).max(1)
+    };
+    let all: Vec<usize> = (0..queries.len()).collect();
+    let rows: Vec<Result<serde_json::Value, (StatusCode, String)>> = st.sweep_pool.install(|| {
+        all.chunks(at_once)
+            .flat_map(|c| c.par_iter().map(|&k| row(k)).collect::<Vec<_>>())
+            .collect()
+    });
+    let (mut lb_db, mut flags, mut refused) = (Vec::new(), Vec::new(), Vec::new());
+    for (k, row) in rows.into_iter().enumerate() {
+        match row {
+            Ok(reply) => {
+                let near_field = reply["profile_evidence"]["model"] != P1812_MODEL;
+                let clear = reply["fresnel"]["verdict"] == "clear";
+                lb_db.push(reply["lb_db"].clone());
+                flags.push(u8::from(near_field) | u8::from(clear) << 1);
+            }
+            Err((status, text)) => {
+                lb_db.push(serde_json::Value::Null);
+                flags.push(0);
+                refused.push(serde_json::json!([k, status.as_u16(), text]));
+            }
+        }
+    }
+    serde_json::json!({
+        "buildings_index": index_label,
+        "read": if shared.is_some() { "once" } else { "per pair" },
+        "compute_ms": t0.elapsed().as_millis(),
+        "lb_db": lb_db,
+        "flags": flags,
+        "refused": refused,
+    })
 }
 
 #[derive(Deserialize)]
@@ -3911,10 +5546,9 @@ fn run_census(st: &AppState, q: &NetworkQuery) -> Result<NetworkResult, String> 
     // rather than a view.
     let lo = st.clamp(Xy { x: st.extent.min_x, y: st.extent.min_y });
     let hi = st.clamp(Xy { x: st.extent.max_x, y: st.extent.max_y });
-    let terrain = st.layers.terrain.blocking_lock().window(lo, hi).map_err(|e| e.to_string())?;
-    let clutter = st.layers.clutter.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
-    let population =
-        st.layers.population.as_ref().and_then(|m| m.blocking_lock().window(lo, hi).ok());
+    let terrain = st.layers.terrain.window(lo, hi).map_err(|e| e.to_string())?;
+    let clutter = st.layers.clutter.as_ref().and_then(|l| l.window(lo, hi).ok());
+    let population = st.layers.population.as_ref().and_then(|l| l.window(lo, hi).ok());
 
     let mut assumed = 0usize;
     let sites: Vec<planner_coverage::gaps::SiteSpec> = st
@@ -4056,7 +5690,7 @@ fn run_census(st: &AppState, q: &NetworkQuery) -> Result<NetworkResult, String> 
         .collect();
 
     Ok(NetworkResult {
-        served: rep.served,
+        served: Arc::new(rep.served),
         k_target: gp.k_target,
         sites: rep.sites.len(),
         skipped: rep.skipped.len(),
@@ -4095,7 +5729,7 @@ async fn network_bin(State(st): State<Arc<AppState>>, Query(q): Query<TileQuery>
     let NetworkCensus::Ready(r) = &*g else {
         return (StatusCode::NOT_FOUND, "no census computed yet").into_response();
     };
-    let s = &r.served;
+    let s: &planner_coverage::gaps::CountGrid = &r.served;
     let view = ViewRect { min_x: q.minx, min_y: q.miny, max_x: q.maxx, max_y: q.maxy };
     // Same rule as loss_bin: rayon work under block_in_place, never bare on a
     // tokio worker.
@@ -4174,7 +5808,11 @@ async fn pack_info(State(st): State<Arc<AppState>>) -> Response {
         // it does not know.
         "link_options": ["lean"],
         // And what `/loss/start` takes beyond the page's.
-        "loss_options": ["whole"],
+        "loss_options": ["whole", "key"],
+        // Where many pairs are asked at once, on a sidecar that has the route.
+        "link_batch": "/links.json",
+        // And many tiles.
+        "tile_batch": "/tiles.bin",
         "licenses": st.manifest.licenses.iter()
             .map(|l| serde_json::json!({"source": l.source, "notice": l.notice}))
             .collect::<Vec<_>>(),
@@ -4201,9 +5839,23 @@ async fn main() {
     let path_of = |k: LayerKind| -> Option<PathBuf> {
         manifest.layers.iter().find(|l| l.kind == k).map(|l| cli.pack.join(&l.path))
     };
+    let manifest_layer_paths: Vec<PathBuf> =
+        manifest.layers.iter().map(|l| cli.pack.join(&l.path)).collect();
     let terrain_path = path_of(LayerKind::TerrainDtm)
         .or_else(|| path_of(LayerKind::SurfaceDsm))
         .expect("pack has a terrain layer");
+    if cli.index_buildings {
+        let Some(p) = path_of(LayerKind::Buildings) else {
+            println!("buildings: this pack has no buildings layer, so nothing to index");
+            return;
+        };
+        let m = *CogReader::open(&terrain_path).expect("open terrain").meta();
+        if let Err(e) = building_index(&p, (m.origin.x, m.origin.y), &IndexProgress::new()) {
+            eprintln!("buildings layer {}: {e}", p.display());
+            std::process::exit(1);
+        }
+        return;
+    }
     let clutter_path = path_of(LayerKind::ClutterHeight);
     let population_path = path_of(LayerKind::Population);
     let classes_path = path_of(LayerKind::ClutterClass);
@@ -4314,156 +5966,64 @@ async fn main() {
     proj4rs::transform::transform(&utm, &ll, &mut c).ok();
 
     // Index the buildings behind the bind. A plain OS thread rather than
-    // `spawn_blocking`: this runs once, is CPU-bound for tens of seconds, and
-    // has no business occupying a slot in the pool that serves requests.
+    // `spawn_blocking`: this runs once, is CPU-bound for seconds when the file
+    // must be parsed, and has no business occupying a slot in the pool that
+    // serves requests.
+    let buildings_progress = Arc::new(IndexProgress::new());
     if let Some(p) = buildings_path {
         let slot = Arc::clone(&buildings);
+        let progress = Arc::clone(&buildings_progress);
         // The frame every stored building coordinate is relative to. The pack
         // origin rather than an arbitrary point, so the offsets stay inside
         // the raster's own extent and f32 keeps millimetre resolution.
         let origin = (m.origin.x, m.origin.y);
         std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            let f = match std::fs::File::open(&p) {
-                Ok(f) => f,
+            let state = match building_index(&p, origin, &progress) {
+                Ok(idx) => BuildingsIndexState::Ready(Arc::new(idx)),
                 Err(e) => {
                     eprintln!(
                         "buildings layer {}: {e} — links fall back to the clutter raster",
                         p.display()
                     );
-                    *slot.write().expect("buildings lock") = BuildingsIndexState::Absent;
-                    return;
+                    BuildingsIndexState::Absent
                 }
             };
-            use std::io::BufRead;
-            let mut idx = BuildingIndex { origin, ..Default::default() };
-            let mut bad = 0usize;
-            // Footprints too wide to be real. Counted rather than dropped:
-            // the record is still a building, it just cannot be trusted to
-            // bound itself.
-            let mut suspect = 0usize;
-            for line in BufReader::new(f).lines().map_while(Result::ok) {
-                let Ok(r) = serde_json::from_str::<BuildingRecord>(&line) else {
-                    bad += 1;
-                    continue;
-                };
-                if !(r.e.is_finite() && r.n.is_finite() && r.area_m2 > 0.0 && r.height_m.is_finite())
-                {
-                    bad += 1;
-                    continue;
-                }
-                // Vertices are stored as offsets from this building's own
-                // centroid, so f32 is exact to ~3e-5 m across any footprint;
-                // storing them absolutely would quantize northings to 0.5 m.
-                let poly_start = idx.polys.len() as u32;
-                let mut had_geometry = false;
-                // Farthest vertex from the centroid, i.e. the real bounding
-                // radius. Accumulated here rather than derived from the area,
-                // because an equal-area disc is not a bound.
-                let mut far2: f64 = 0.0;
-                for poly in &r.rings {
-                    if poly.exterior.len() < 3 {
-                        continue;
-                    }
-                    for ring in
-                        std::iter::once(&poly.exterior).chain(poly.interiors.iter())
-                    {
-                        if ring.len() < 3 {
-                            continue;
-                        }
-                        for &(vx, vy) in ring {
-                            let (ox, oy) = (vx - r.e, vy - r.n);
-                            far2 = far2.max(ox * ox + oy * oy);
-                            idx.verts.push([ox as f32, oy as f32]);
-                        }
-                        idx.rings.push(idx.verts.len() as u32);
-                    }
-                    idx.polys.push(idx.rings.len() as u32);
-                    had_geometry = true;
-                }
-                if had_geometry {
-                    idx.with_geometry += 1;
-                }
-                let poly_end = idx.polys.len() as u32;
-                let r_eq = (r.area_m2 / std::f64::consts::PI).sqrt() as f32;
-                let br = if had_geometry { far2.sqrt() as f32 } else { r_eq };
-                if idx.insert(Bldg {
-                    x: (r.e - origin.0) as f32,
-                    y: (r.n - origin.1) as f32,
-                    r: r_eq,
-                    br,
-                    top_masl: (r.ground_z + r.height_m) as f32,
-                    poly_start,
-                    poly_end,
-                }) {
-                    suspect += 1;
-                }
-                idx.area_height.push([r.area_m2 as f32, r.height_m as f32]);
-            }
-            // Say whether the footprints are REAL or approximated. A pack
-            // built without --lod2-geometry answers every containment test
-            // with an equal-area disc, which is a different and much coarser
-            // claim than a polygon — and the two are indistinguishable from
-            // the record count alone.
-            println!(
-                "buildings: {} LoD2 record(s) indexed in {:.1} s{} — {} with real \
-                 footprints ({} vertices), {} as equal-area discs",
-                idx.count,
-                started.elapsed().as_secs_f64(),
-                if bad > 0 { format!(", {bad} unparseable") } else { String::new() },
-                idx.with_geometry,
-                idx.verts.len(),
-                idx.count - idx.with_geometry
-            );
-            if suspect > 0 {
-                println!(
-                    "  {suspect} footprint(s) wider than 1 km — geometry ignored for those"
-                );
-            }
             // Published in one write, so a reader sees either the whole index
             // or none of it — never a half-filled one that would answer a link
             // with some buildings missing and no way to tell.
-            *slot.write().expect("buildings lock") = BuildingsIndexState::Ready(idx);
+            *slot.write().expect("buildings lock") = state;
         });
     }
 
+    let render_slots = cli
+        .render_slots
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            cores.saturating_sub(2).max(4)
+        })
+        .max(1);
     let state = Arc::new(AppState {
         centre_lat: c.1.to_degrees(),
         centre_lon: c.0.to_degrees(),
         manifest,
-        layers: {
-            let clutter = clutter_path.and_then(open);
-            let built_fraction = built_fraction_path.and_then(open);
-            let building_top = building_top_path.and_then(open);
-            #[cfg(unix)]
-            let unlocked = Unlocked {
-                terrain: terrain.shared_rows(),
-                clutter: clutter.as_ref().and_then(CogReader::shared_rows),
-                building_top: building_top.as_ref().and_then(CogReader::shared_rows),
-                built_fraction: built_fraction.as_ref().and_then(CogReader::shared_rows),
-            };
-            Layers {
-                terrain: Mutex::new(terrain),
-                clutter: clutter.map(Mutex::new),
-                population: population_path.and_then(open).map(Mutex::new),
-                classes: classes_path.and_then(open).map(Mutex::new),
-                built_fraction: built_fraction.map(Mutex::new),
-                building_top: building_top.map(Mutex::new),
-                #[cfg(unix)]
-                unlocked,
-            }
+        layers: Layers {
+            terrain: Layer::new(terrain),
+            clutter: clutter_path.and_then(open).map(Layer::new),
+            population: population_path.and_then(open).map(Layer::new),
+            classes: classes_path.and_then(open).map(Layer::new),
+            built_fraction: built_fraction_path.and_then(open).map(Layer::new),
+            building_top: building_top_path.and_then(open).map(Layer::new),
         },
         roads,
         places,
         nodes,
         buildings,
+        buildings_progress,
         extent,
         utm,
         ll,
-        slots: Semaphore::new(cli.render_slots.unwrap_or_else(|| {
-            let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-            cores.saturating_sub(2).max(4)
-        }).max(1)),
+        slots: Semaphore::new(render_slots),
+        link_slots: Semaphore::new(cli.link_slots.unwrap_or(render_slots).max(1)),
         sweep_slots: Semaphore::new(cli.sweep_slots.max(1)),
         sweep_pool: {
             let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -4482,6 +6042,9 @@ async fn main() {
         pack_dir: cli.pack.clone(),
         network: Mutex::new(NetworkCensus::default()),
         coverage_cache: Mutex::new(None),
+        coverage_dir: cli.coverage_dir.clone(),
+        ground_stamp: ground_stamp(&manifest_layer_paths),
+        coverage_rasters: std::sync::Mutex::new(Vec::new()),
         sweep: Mutex::new(ProgressiveSweep::default()),
     });
 
@@ -4493,16 +6056,23 @@ async fn main() {
         .route("/coverage.png", get(coverage_png))
         // Data endpoints for the browser-side renderer.
         .route("/tile.bin", get(tile_bin))
+        .route("/tiles.bin", axum::routing::post(tiles_bin))
         .route("/basemap.bin", get(basemap_bin))
         .route("/roads.bin", get(roads_bin))
         .route("/buildings.bin", get(buildings_bin))
         .route("/buildings/values.bin", get(buildings_values_bin))
+        .route("/buildings/status", get(buildings_status))
         .route("/loss.bin", get(loss_bin))
         .route("/loss/start", get(loss_start))
         .route("/loss/status", get(loss_status))
         .route("/search", get(search))
         .route("/area.bin", get(area_bin))
         .route("/link.json", get(link_json))
+        .route(
+            "/links.json",
+            axum::routing::post(links_json).layer(axum::extract::DefaultBodyLimit::max(32 << 20)),
+        )
+        .route("/coverage/bands.bin", axum::routing::post(coverage_bands))
         .route("/height.json", get(height_json))
         .route("/api/presets", get(presets_json))
         .route("/nodes.json", get(nodes_json))
@@ -4770,12 +6340,12 @@ mod tests {
     fn a_loading_index_is_reported_as_neither_ready_nor_absent() {
         assert_eq!(BuildingsIndexState::Loading.label(), "loading");
         assert_eq!(BuildingsIndexState::Absent.label(), "absent");
-        assert_eq!(BuildingsIndexState::Ready(BuildingIndex::default()).label(), "ready");
+        assert_eq!(BuildingsIndexState::Ready(Arc::default()).label(), "ready");
         // Only Ready hands out an index; the other two must fall back rather
         // than answer from a half-filled one.
         assert!(BuildingsIndexState::Loading.get().is_none());
         assert!(BuildingsIndexState::Absent.get().is_none());
-        assert!(BuildingsIndexState::Ready(BuildingIndex::default()).get().is_some());
+        assert!(BuildingsIndexState::Ready(Arc::default()).get().is_some());
     }
 
     /// The background thread parses through `BuildingRecord`, not `Value`.
@@ -4798,6 +6368,126 @@ mod tests {
             serde_json::from_str(r#"{"e":1.0,"n":2.0,"area_m2":10.0,"height_m":8.0}"#)
                 .expect("ground_z is optional");
         assert_eq!(r.ground_z, 0.0);
+    }
+
+    /// Lines of a building file that the parse treats each its own way: a
+    /// block with a courtyard, a record with no geometry, a footprint too wide
+    /// to trust, polygons and rings too short to keep, and two lines that are
+    /// not buildings.
+    fn building_lines() -> String {
+        [
+            r#"{"e":1100.0,"n":2100.0,"area_m2":300.0,"height_m":22.0,"ground_z":34.5,"rings":[{"exterior":[[1090.0,2090.0],[1110.0,2090.0],[1110.0,2110.0],[1090.0,2110.0]],"interiors":[[[1095.0,2095.0],[1105.0,2095.0],[1105.0,2105.0]]]}]}"#,
+            r#"{"e":1300.5,"n":2050.25,"area_m2":80.0,"height_m":9.5}"#,
+            r#"{"e":1500.0,"n":2500.0,"area_m2":50.0,"height_m":12.0,"ground_z":30.0,"rings":[{"exterior":[[1500.0,2500.0],[3200.0,2500.0],[1500.0,2501.0]]}]}"#,
+            r#"{"e":1700.0,"n":2700.0,"area_m2":40.0,"height_m":6.0,"rings":[{"exterior":[[1700.0,2700.0],[1701.0,2700.0]]},{"exterior":[[1695.0,2695.0],[1705.0,2695.0],[1705.0,2705.0],[1695.0,2705.0]],"interiors":[[[1700.0,2700.0],[1701.0,2701.0]]]}]}"#,
+            "not a record",
+            r#"{"e":1.0,"n":2.0,"area_m2":0.0,"height_m":8.0}"#,
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    /// A start that loads the saved index has the index a start that parsed
+    /// the file built, value for value: the records bit for bit, the cells a
+    /// query reads, and so every footprint and every link.
+    #[test]
+    fn a_saved_index_is_the_parsed_one_value_for_value() {
+        let dir = std::env::temp_dir().join(format!("planner_web_saved_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join("buildings.jsonl");
+        std::fs::write(&jsonl, building_lines()).unwrap();
+        let origin = (1000.0, 2000.0);
+
+        let first = IndexProgress::new();
+        let parsed = building_index(&jsonl, origin, &first).unwrap();
+        assert!(!first.from_saved.load(Ordering::Relaxed), "nothing was saved to load");
+        let saved = saved_index_path(&jsonl);
+        assert_eq!(saved, dir.join(".buildings.idx"), "a dot file beside the building file");
+        assert!(saved.exists(), "the first start saves the index");
+        let second = IndexProgress::new();
+        let loaded = building_index(&jsonl, origin, &second).unwrap();
+        assert!(second.from_saved.load(Ordering::Relaxed), "the next start loads it");
+        assert_eq!(second.json("ready")["source"], "saved index");
+
+        assert_eq!((parsed.count, parsed.with_geometry), (4, 3), "two lines are no buildings");
+        let items = |ix: &BuildingIndex| -> Vec<[u32; 7]> {
+            ix.items
+                .iter()
+                .map(|b| {
+                    [b.x, b.y, b.r, b.br, b.top_masl]
+                        .map(f32::to_bits)
+                        .iter()
+                        .copied()
+                        .chain([b.poly_start, b.poly_end])
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap()
+                })
+                .collect()
+        };
+        let flat = |v: &[[f32; 2]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(items(&loaded), items(&parsed));
+        assert_eq!(loaded.cells, parsed.cells);
+        assert_eq!((loaded.count, loaded.with_geometry), (parsed.count, parsed.with_geometry));
+        assert_eq!(loaded.origin, parsed.origin);
+        assert_eq!((&loaded.polys, &loaded.rings), (&parsed.polys, &parsed.rings));
+        assert_eq!(flat(&loaded.verts), flat(&parsed.verts));
+        assert_eq!(flat(&loaded.area_height), flat(&parsed.area_height));
+
+        // A rewritten file is parsed again, and its index saved over the old.
+        std::fs::write(&jsonl, building_lines() + &building_lines()).unwrap();
+        let third = IndexProgress::new();
+        let again = building_index(&jsonl, origin, &third).unwrap();
+        assert!(!third.from_saved.load(Ordering::Relaxed), "the saved index is stale");
+        assert_eq!(again.count, 8);
+        let fourth = IndexProgress::new();
+        assert_eq!(building_index(&jsonl, origin, &fourth).unwrap().count, 8);
+        assert!(fourth.from_saved.load(Ordering::Relaxed));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A saved index is used only for the file, grid and version it was
+    /// saved for, and only whole: anything else is parsed again rather than
+    /// loaded and trusted.
+    #[test]
+    fn a_saved_index_is_refused_for_any_other_file_grid_or_version() {
+        let dir = std::env::temp_dir().join(format!("planner_web_refused_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join("buildings.jsonl");
+        std::fs::write(&jsonl, building_lines()).unwrap();
+        let origin = (1000.0, 2000.0);
+        let (ix, _, _) =
+            parse_buildings(File::open(&jsonl).unwrap(), origin, &IndexProgress::new());
+        std::fs::remove_dir_all(&dir).ok();
+        let stamp = FileStamp { bytes: 1234, mtime_s: 1_790_000_000, mtime_ns: 5 };
+        let bytes = ix.to_bytes(stamp);
+        let load = |b: &[u8], s: FileStamp, o: (f64, f64)| BuildingIndex::from_bytes(b, s, o);
+        let refused = |b: &[u8], s: FileStamp, o: (f64, f64)| {
+            load(b, s, o).err().expect("a saved index that does not fit is refused")
+        };
+        let (back, suspect) = load(&bytes, stamp, origin).unwrap();
+        assert_eq!((back.count, suspect), (4, 1), "the wide footprint is still suspect");
+
+        for other in [
+            FileStamp { bytes: 1235, ..stamp },
+            FileStamp { mtime_s: 1_790_000_001, ..stamp },
+            FileStamp { mtime_ns: 6, ..stamp },
+        ] {
+            let why = refused(&bytes, other, origin);
+            assert!(why.contains("changed"), "{why}");
+        }
+        assert!(refused(&bytes, stamp, (1000.0, 2000.000001)).contains("grid"));
+        let mut newer = bytes.clone();
+        newer[4] = INDEX_VERSION as u8 + 1;
+        assert!(refused(&newer, stamp, origin).contains("version"));
+        refused(&bytes[..bytes.len() - 1], stamp, origin);
+        refused(&[bytes.as_slice(), &[0]].concat(), stamp, origin);
+        refused(&bytes[..INDEX_HEADER - 1], stamp, origin);
+        // A ring ending past the vertices would panic a footprint query later.
+        let last_ring = bytes.len() - ix.verts.len() * 8 - 4;
+        let mut corrupt = bytes.clone();
+        corrupt[last_ring..last_ring + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(refused(&corrupt, stamp, origin).contains("outside"));
     }
 
     /// A building's value is read at its centroid from the FULL raster, and a
@@ -4877,6 +6567,162 @@ mod tests {
         assert_eq!(lens.len(), 2, "two footprints, one ring each");
         assert_eq!(ids, vec![0, 1]);
         assert_eq!(ids, from_outlines);
+    }
+
+    /// A reply without values is the reply with values, geometry for
+    /// geometry, with NaN ("not evaluated") where the values were: readers
+    /// that skip them, as sim-mesh's page does, read the same bytes.
+    #[test]
+    fn a_footprint_reply_without_values_is_the_same_geometry_with_nan_values() {
+        let mut ix = BuildingIndex { origin: (1000.0, 2000.0), ..Default::default() };
+        for k in 0..3u32 {
+            let base = ix.verts.len() as u32;
+            for (dx, dy) in [(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)] {
+                ix.verts.push([dx, dy]);
+            }
+            ix.rings.push(base + 4);
+            ix.polys.push(ix.rings.len() as u32);
+            let (start, end) = (ix.polys.len() as u32 - 1, ix.polys.len() as u32);
+            let x = 50.0 + 100.0 * k as f32;
+            let b = Bldg {
+                x,
+                y: 50.0,
+                r: 5.0,
+                br: 7.1,
+                top_masl: 40.0,
+                poly_start: start,
+                poly_end: end,
+            };
+            assert!(!ix.insert(b));
+        }
+        let (lo, hi) = (Xy { x: 1000.0, y: 2000.0 }, Xy { x: 1300.0, y: 2100.0 });
+        let loss = ramp(Xy { x: 1000.0, y: 2100.0 }, 5.0, 60, 21);
+        let with = footprints_reply(&ix, lo, hi, Some(&loss), None);
+        let without = footprints_reply(&ix, lo, hi, None, None);
+        assert_eq!(with.len(), without.len());
+        // Header, then per ring: id, count, top, loss, census, 4 vertices.
+        let ring = 20 + 4 * 8;
+        assert_eq!(with.len(), 25 + 3 * ring);
+        for k in 0..3 {
+            let at = 25 + k * ring;
+            assert_eq!(with[at..at + 12], without[at..at + 12], "id, vertex count and top");
+            assert_eq!(with[at + 20..at + ring], without[at + 20..at + ring], "the outline");
+            let f = |b: &[u8], o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            assert_eq!(f(&with, at + 12), 1050.0 + 100.0 * k as f32, "the loss at the centroid");
+            assert!(f(&with, at + 16).is_nan(), "no census was run");
+            assert!(f(&without, at + 12).is_nan() && f(&without, at + 16).is_nan());
+        }
+        assert_eq!(with[..25], without[..25]);
+    }
+
+    /// The validator changes with anything a reply is made from, and only
+    /// with that: the file the index was built from, the grid, the box.
+    #[test]
+    fn a_footprint_validator_follows_the_file_the_grid_and_the_box() {
+        let stamp = FileStamp { bytes: 1234, mtime_s: 1_790_000_000, mtime_ns: 5 };
+        let ix =
+            BuildingIndex { origin: (1000.0, 2000.0), stamp: Some(stamp), ..Default::default() };
+        let (lo, hi) = (Xy { x: 1000.0, y: 2000.0 }, Xy { x: 2000.0, y: 3000.0 });
+        let etag = footprints_etag(&ix, lo, hi).unwrap();
+        assert!(etag.starts_with("\"pbo3-") && etag.ends_with('"'), "{etag}");
+        assert_eq!(footprints_etag(&ix, lo, hi).unwrap(), etag, "the same reply, the same tag");
+        let other_box = footprints_etag(&ix, lo, Xy { x: 2000.0, y: 3000.5 }).unwrap();
+        let rewritten = BuildingIndex {
+            stamp: Some(FileStamp { mtime_ns: 6, ..stamp }),
+            origin: ix.origin,
+            ..Default::default()
+        };
+        let regridded =
+            BuildingIndex { stamp: Some(stamp), origin: (1000.0, 2000.5), ..Default::default() };
+        for other in [
+            other_box,
+            footprints_etag(&rewritten, lo, hi).unwrap(),
+            footprints_etag(&regridded, lo, hi).unwrap(),
+        ] {
+            assert_ne!(other, etag);
+        }
+        assert!(footprints_etag(&BuildingIndex::default(), lo, hi).is_none(), "no stamp, no tag");
+
+        let ask = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(header::IF_NONE_MATCH, axum::http::HeaderValue::from_str(v).unwrap());
+            etag_matches(&h, &etag)
+        };
+        assert!(ask(&etag));
+        assert!(ask(&format!("W/{etag}")), "a weak match is a match for a GET");
+        assert!(ask(&format!("\"pbo3-0\", {etag}")), "one of a list");
+        assert!(ask("*"));
+        assert!(!ask("\"pbo3-0\""));
+        assert!(!etag_matches(&axum::http::HeaderMap::new(), &etag), "no header, no match");
+    }
+
+    /// A pair answered from a batch's shared read samples exactly what its
+    /// own window would have given it: every box inside the shared one, at
+    /// points along and around it, to the bit.
+    #[test]
+    fn a_shared_read_gives_each_pair_its_own_window() {
+        let g = planner_terrain::Grid::with_axes(
+            Xy { x: 382_644.288_685_023_9, y: 5_824_457.805_585_69 },
+            10.0,
+            -10.0,
+            130,
+            300,
+            (0..130 * 300).map(|i| ((i as f32) * 0.37).cos() * 25.0 + 35.0).collect(),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("planner_web_shared_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.tif");
+        planner_terrain::cog::write_geotiff_f32(&path, &g).unwrap();
+        let layer = Layer::new(CogReader::open(&path).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+        let m = layer.meta;
+        let at = |c: f64, r: f64| Xy { x: m.origin.x + c * m.dx, y: m.origin.y + r * m.dy };
+        // The batch's box, and pairs' boxes inside it, one across the strip
+        // boundary at row 256 and one its whole size.
+        let union = (at(3.3, 2.6), at(121.7, 290.2));
+        let shared = SharedWindow::read(&layer, union).unwrap();
+        for (lo, hi) in [union, (at(10.4, 250.1), at(40.6, 270.3)), (at(80.0, 3.0), at(81.0, 4.0))]
+        {
+            let own = layer.window(lo, hi).unwrap();
+            let view = shared.view((lo, hi)).expect("inside the shared read");
+            assert_eq!((view.origin, view.width, view.height), (own.origin, own.width, own.height));
+            for k in 0..=500 {
+                let t = k as f64 / 500.0;
+                let p = Xy { x: lo.x + (hi.x - lo.x) * t + 3.1, y: lo.y + (hi.y - lo.y) * t - 2.9 };
+                assert_eq!(
+                    view.sample_bilinear(p).map(f32::to_bits),
+                    own.sample_bilinear(p).map(f32::to_bits),
+                    "box {lo:?}-{hi:?} at {p:?}"
+                );
+            }
+        }
+        assert!(shared.view((at(0.0, 0.0), at(5.0, 5.0))).is_none(), "outside the shared read");
+    }
+
+    /// `/links.json` asks exactly the pairs named, or one node against every
+    /// other, and refuses a request that names neither, both, or a node it
+    /// does not have.
+    #[test]
+    fn a_batch_asks_the_pairs_it_names() {
+        let req = |pairs: Vec<[u32; 2]>, from: Option<u32>| LinksRequest {
+            nodes: vec![[1.0, 2.0, 3.0]; 4],
+            pairs,
+            from,
+            loc_pct: None,
+        };
+        assert_eq!(req(vec![[0, 3], [2, 1]], None).pairs().unwrap(), vec![[0, 3], [2, 1]]);
+        assert_eq!(req(vec![], Some(2)).pairs().unwrap(), vec![[2, 0], [2, 1], [2, 3]]);
+        assert!(req(vec![], None).pairs().is_err(), "nothing asked");
+        assert!(req(vec![[0, 1]], Some(2)).pairs().is_err(), "both asked");
+        assert!(req(vec![[0, 4]], None).pairs().unwrap_err().contains("node 4"));
+        assert!(req(vec![], Some(4)).pairs().unwrap_err().contains("node 4"));
+        // As axum reads the body: a misspelled field is refused, not ignored.
+        assert!(serde_json::from_str::<LinksRequest>(r#"{"nodes":[],"from":0,"loc":50}"#).is_err());
+        let r: LinksRequest =
+            serde_json::from_str(r#"{"nodes":[[1,2,3],[4,5,6]],"pairs":[[0,1]],"loc_pct":50}"#)
+                .unwrap();
+        assert_eq!((r.pairs().unwrap(), r.loc_pct), (vec![[0, 1]], Some(50.0)));
     }
 
     /// `/height.json`'s building evidence: the buildings whose centroid is
@@ -5101,5 +6947,118 @@ mod tests {
         let bytes = pack(&adata);
         assert!(bytes.iter().any(|b| *b == 255), "some cell is not evaluated");
         assert!(bytes.iter().any(|b| *b > 0 && *b < 255), "and some cell is a real count");
+    }
+
+    /// The page rounds with `Math.round`, a half up; the sidecar, standing
+    /// in for its arithmetic, must too, or a view cell exactly between two
+    /// raster cells would read the other one.
+    #[test]
+    fn a_half_rounds_up_as_the_page_rounds_it() {
+        assert_eq!(js_round(2.5), 3.0);
+        assert_eq!(js_round(-2.5), -2.0);
+        assert_eq!(js_round(-0.4), 0.0);
+        assert_eq!(js_round(0.499_999_999_999_999_94), 0.0);
+        assert_eq!(js_round(7.5), 8.0);
+        assert_eq!(js_hypot(3.0, 4.0), 5.0);
+        assert_eq!(js_hypot(0.0, 0.0), 0.0);
+        assert!(js_hypot(f64::NAN, 1.0).is_nan());
+    }
+
+    /// A cell's terrain is read as the page read its tile.bin: the nearest
+    /// cell, its decimetres a tenth held as an f32, nothing off the tile or
+    /// where it has none.
+    #[test]
+    fn a_terrain_tile_is_read_at_its_nearest_cell() {
+        let t = TerrainTile { w: 2, h: 2, ox: 100.0, oy: 200.0, rx: 10.0, ry: 10.0,
+                              dm: vec![345, i16::MIN, -7, 0] };
+        assert_eq!(t.at(104.0, 196.0), Some(f64::from((345.0f64 * 0.1) as f32)));
+        assert_eq!(t.at(106.0, 199.0), None, "no terrain there");
+        assert_eq!(t.at(101.0, 189.0), Some(f64::from((-7.0f64 * 0.1) as f32)));
+        assert_eq!(t.at(80.0, 200.0), None, "off the tile");
+    }
+
+    fn a_raster() -> CoverageRaster {
+        let (w, h) = (4usize, 3usize);
+        let loss = (0..w * h).map(|i| if i == 5 { NEVER_LOSS } else { 10_000 + 100 * i as u16 }).collect();
+        CoverageRaster { w, h, ox: 1000.0, oy: 5000.0, rx: 10.0, ry: 10.0, loss, terrain: None }
+    }
+
+    fn a_node(antenna: Option<BandsAntenna>) -> BandsNode {
+        BandsNode { key: "0123456789abcdef".into(), x: 1015.0, y: 4990.0, height_m: 10.0, budget_db: 140.0, antenna }
+    }
+
+    /// A node's margin at a point is its nearest raster cell's: the budget
+    /// and the antenna's gain toward that cell's centre, less the cell's
+    /// loss; nothing where the raster evaluated nothing, and outside it no
+    /// answer at all.
+    #[test]
+    fn a_nodes_margin_is_its_nearest_cells() {
+        let r = a_raster();
+        let plain = a_node(None);
+        let m = NodeMargins::new(&r, &plain, 2.0);
+        // Cell (2, 1): 3 m off its centre still reads it.
+        assert_eq!(m.sample(Xy { x: 1023.0, y: 4988.0 }, Resample::Nearest), Some((140.0 - 106.0) as f32));
+        assert!(m.sample(Xy { x: 1011.0, y: 4991.0 }, Resample::Nearest).unwrap().is_nan(), "cell 5 is never");
+        assert_eq!(m.sample(Xy { x: 1100.0, y: 4990.0 }, Resample::Nearest), None);
+        // With an antenna, its gain toward the cell's centre (a receiver 2 m
+        // over the ground at 0 m, the tip 10 m up), whatever point in it.
+        let whip = BandsAntenna { directional: false, peak_dbi: 2.0, vbw_deg: 75.0, tilt_deg: 10.0, hbw_deg: None,
+                                  floor_db: 18.0, azimuth_deg: 0.0, elevation_deg: 0.0 };
+        let node = a_node(Some(whip));
+        let m = NodeMargins::new(&r, &node, 2.0);
+        let (_, el) = tip_direction(1015.0, 4990.0, 10.0, 1020.0, 4990.0, 2.0);
+        let gain = node.antenna.as_ref().unwrap().gain(0.0, el);
+        let want = (140.0 + gain - 106.0) as f32;
+        assert_eq!(m.sample(Xy { x: 1023.0, y: 4988.0 }, Resample::Nearest), Some(want));
+        assert_eq!(m.sample(Xy { x: 1017.0, y: 4994.0 }, Resample::Nearest), Some(want));
+    }
+
+    /// `window_cells` is `window_raster` on the cells it is given: where the
+    /// screen asks no finer than the source, the two are one window.
+    #[test]
+    fn a_window_of_given_cells_is_the_window_raster_gives() {
+        let src = ramp(Xy { x: 1000.0, y: 2000.0 }, 5.0, 400, 400);
+        let view = ViewRect { min_x: 900.0, min_y: 0.0, max_x: 2900.0, max_y: 2200.0 };
+        let (w, h) = tile_dims(&view, 200, 220, 5.0, 5.0);
+        let a = window_raster(&src, &view, 200, 220, Resample::Bilinear);
+        let b = window_cells(&src, &view, w, h, Resample::Bilinear);
+        assert_eq!((a.0, a.1, a.2, a.3, a.4.x, a.4.y), (b.0, b.1, b.2, b.3, b.4.x, b.4.y));
+        assert!(a.5.iter().zip(&b.5).all(|(p, q)| p.to_bits() == q.to_bits()));
+        // And it keeps cells finer than the source's when asked for them.
+        let (fw, ..) = window_cells(&src, &view, 4000, 220, Resample::Nearest);
+        assert!(fw > 2000, "{fw}");
+    }
+
+    /// The names the bands route reads files by are the store's, so a
+    /// request cannot walk out of the coverage cache.
+    #[test]
+    fn a_bands_request_names_only_store_names_and_keys() {
+        assert!(valid_name("berlin-centre") && valid_name("a") && valid_name("x9"));
+        let long = "a".repeat(33);
+        for bad in ["", "-a", "a-", "A", "a/b", "..", "a.b", long.as_str()] {
+            assert!(!valid_name(bad), "{bad:?}");
+        }
+        assert!(valid_key("0123456789abcdef"));
+        for bad in ["0123456789abcde", "0123456789abcdeg", "0123456789ABCDEF", "../../etc/passwd"] {
+            assert!(!valid_key(bad), "{bad:?}");
+        }
+    }
+
+    /// A tile's validator follows the ground it is made of and every word
+    /// of its query, and is the same on every machine for the same ones.
+    #[test]
+    fn a_tile_validator_follows_the_ground_and_the_query() {
+        let q = [1.5f64.to_bits(), 2.0f64.to_bits(), 3.0f64.to_bits(), 4.0f64.to_bits(), 100, 50, 1];
+        let e = ground_etag(Some(7), b"PTL2", &q).unwrap();
+        assert_eq!(e, ground_etag(Some(7), b"PTL2", &q).unwrap());
+        assert!(e.starts_with("\"ptl2-") && e.ends_with('"'));
+        assert_ne!(e, ground_etag(Some(8), b"PTL2", &q).unwrap(), "another pack or program");
+        assert_ne!(e, ground_etag(Some(7), b"PBM1", &q).unwrap(), "the other route");
+        for k in 0..q.len() {
+            let mut other = q;
+            other[k] ^= 1;
+            assert_ne!(e, ground_etag(Some(7), b"PTL2", &other).unwrap(), "word {k}");
+        }
+        assert_eq!(ground_etag(None, b"PTL2", &q), None, "no stamp, no validator");
     }
 }

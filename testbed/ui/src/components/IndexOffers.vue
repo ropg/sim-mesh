@@ -39,6 +39,10 @@
                 <span class="io-sub">{{ progressText(fetchingOf(ix.name, e.name)!) }}</span>
                 <q-btn flat dense no-caps size="sm" label="Cancel" @click="cancel(ix.name, e.name)" />
               </template>
+              <q-btn v-else-if="e.installed && kind === 'geodata'" flat dense no-caps size="sm" color="primary"
+                     label="Open" @click="emit('open', e.name)">
+                <q-tooltip>Installed here: open it</q-tooltip>
+              </q-btn>
               <span v-else-if="e.installed" class="io-ok">installed{{ e.changed ? ', changed here' : '' }}</span>
               <span v-else-if="e.taken" class="io-warn"
                     title="Something else here has this name: rename or delete it to add this one">name taken here</span>
@@ -74,10 +78,10 @@
 
 <script setup lang="ts">
 /* What the listed indexes offer of one kind, geodata or nodesets: each
- * index with its entries, each entry installed here, its name taken by
- * something else, being fetched (with Cancel), or to Add. sim-mesh's own
- * index is always listed; one a person added has a trash can that forgets
- * it. The indexes are one list for both kinds. */
+ * index with its entries, each entry installed here (geodata to Open), its
+ * name taken by something else, being fetched (with Cancel), or to Add.
+ * sim-mesh's own index is always listed; one a person added has a trash can
+ * that forgets it. The indexes are one list for both kinds. */
 import { onMounted, ref } from 'vue'
 import { useQuasar } from 'quasar'
 import { matDeleteOutline } from '@quasar/extras/material-icons'
@@ -86,6 +90,8 @@ import { request } from '../lib/front'
 import { sizeText } from '../lib/size'
 
 const props = defineProps<{ kind: IndexKind }>()
+/** An installed geodata entry's Open: its name, for the page to open. */
+const emit = defineEmits<{ open: [name: string] }>()
 const catalog = useCatalog()
 const quasar = useQuasar()
 const adding = ref(false)

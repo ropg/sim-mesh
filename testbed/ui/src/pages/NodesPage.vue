@@ -68,7 +68,14 @@
       </div>
       <div v-else-if="!nodes.attached && !nodes.geodata" class="np-empty">
         <div class="np-empty-title">No geodata chosen</div>
-        <div class="np-empty-text">Open one on the Geodata tab: its nodesets are the layers here.</div>
+        <template v-if="installed.length">
+          <div class="np-empty-text">Open one: its nodesets are the layers here.</div>
+          <div class="np-empty-list">
+            <q-btn v-for="g in installed" :key="g.name" flat dense no-caps color="primary" :label="g.name"
+                   @click="nodes.chooseGeodata(g.name)" />
+          </div>
+        </template>
+        <div v-else class="np-empty-text">None is installed: add one on the Geodata tab.</div>
       </div>
       <div v-else-if="nodes.open && !nodes.names.length" class="np-empty">
         <div class="np-empty-text">Right-click the map ▸ New node here</div>
@@ -261,7 +268,8 @@
 
 <script setup lang="ts">
 /* The Nodes tab: always the map. Standalone, it is empty until a geodata is
- * opened on the Geodata tab; then the nodesets with a node on it are layers
+ * opened, on the Geodata tab or from the list it shows meanwhile; then the
+ * nodesets with a node on it are layers
  * (LayersPanel): the active one is edited here, its nodes off the geodata
  * left out and kept, the other shown ones are drawn hollow, and a click on
  * one of their nodes makes its layer active. Attached to a running
@@ -412,6 +420,13 @@ const waiting = ref(false)
  * Simulations tab as an open simulation's live map. */
 const shown = computed(() => sim.view === (socket.front && nodes.attached ? 'sims' : 'nodes'))
 
+/* With none chosen, the installed geodata, each to open from here; the only
+ * one installed is opened at once. */
+const installed = computed(() => catalog.geodata.filter(g => !g.error))
+watch(() => [shown.value, nodes.geodata, installed.value.length] as const, ([on, chosen, count]) => {
+  if (on && !chosen && !nodes.attached && socket.front && count === 1) void nodes.chooseGeodata(installed.value[0]!.name)
+}, { immediate: true })
+
 /* The ground under the map: the run's when attached, else the one chosen. */
 const groundName = computed(() => (nodes.attached ? sim.geodata?.name ?? null : nodes.geodata))
 watch(() => [shown.value, groundName.value] as const, ([on, name]) => {
@@ -513,7 +528,11 @@ const coverageLabel = computed(() => {
   const sel = nodes.selection
   const parts = [sel.length === 0 ? 'coverage of the whole network'
     : sel.length === 1 ? `coverage of ${sel[0]}` : `coverage of the ${sel.length} selected`]
-  if (coverage.pending.length) parts.push(`computing ${coverage.pending.length}…`)
+  if (coverage.pending.length) {
+    // The node being edited grows band by band: how far out it has got.
+    const km = Math.max(0, ...Object.values(coverage.growing))
+    parts.push(`computing ${coverage.pending.length}…${km ? `, out to ${km.toFixed(1)} km` : ''}`)
+  }
   if (coverage.problem) parts.push(coverage.problem)
   if (!catalog.globals) parts.push(`no radio to cover with: ${catalog.globalsError ?? 'scripts/globals.py gives none'}`)
   return parts.join(' · ')
@@ -873,6 +892,8 @@ watch(() => sim.selected, () => {
 }
 .np-empty-title { font-size: 15px; color: #9ca3af; padding: 6px 0; }
 .np-empty-text { font-size: 12px; color: #6b7280; max-width: 420px; line-height: 1.5; }
+.np-empty-list { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; max-width: 520px;
+  pointer-events: auto; }
 .np-results { max-height: 46vh; overflow-y: auto; border-top: 1px solid #2b313b; }
 .np-result { display: flex; gap: 10px; padding: 3px 0; }
 .np-result-node { flex: none; width: 84px; font: 12px ui-monospace, monospace; color: #7dd3fc; }
