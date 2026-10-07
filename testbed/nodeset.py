@@ -784,21 +784,19 @@ def from_imported(rows, source, height_m=15.0):
 
     Each row is {label, lat, lon, kind, position, height_m?}. A node is named
     after its label, made usable and unique, else `<source>-<n>`; it
-    stands at the row's height where the source gives one
-    (measured) and else at `height_m` (assumed), and is tagged with the source, its kind and its position's quality
-    (`position-gps`, `position-fixed`, …).
+    stands at the row's height where the source gives one (measured) and
+    else at `height_m` (assumed), and its one tag is its kind.
     """
     data = blank()
     for row in rows:
         node_id = len(data["nodes"]) + 1
         name = unique_name(store.slug(row.get("label"), "%s-%d" % (source, node_id)), data["nodes"])
         height = row.get("height_m")
-        tags = [source, store.slug(row.get("kind"), ""),
-                store.slug("position-%s" % row.get("position"), "") if row.get("position") else ""]
+        kind = store.slug(row.get("kind"), "")
         data["nodes"][name] = node_record(
             node_id, row["lat"], row["lon"], height if height is not None else height_m,
             "measured" if height is not None else "assumed",
-            tags=check_tags(t for t in tags if t))
+            tags=[kind] if kind else [])
     return data
 
 
