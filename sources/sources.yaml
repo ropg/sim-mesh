@@ -415,6 +415,75 @@ europe:
         format: { type: gpkg-grid, value: aantal_inwoners, crs: EPSG:28992, cell_m: 100,
                   members: "*.gpkg" }
 
+  AT:
+    name: Austria
+    sources:
+      - id: bev-als-dtm
+        title: BEV ALS DTM 1 m terrain
+        holds: >-
+          Austria's terrain model from airborne lidar (BEV, the national
+          survey's 2025 mosaic): the bare ground's height at 1 m, as
+          cloud-optimised GeoTIFF in 50 km squares of LAEA Europe of about
+          6.5 GB each. A build reads only its rectangle, at a quarter of a
+          cell.
+        licence: CC BY 4.0
+        notice: "Datenquelle: BEV – Bundesamt für Eich- und Vermessungswesen, ALS DTM Höhenraster 1 m, Stichtag 15.09.2025 — CC BY 4.0"
+        redistributable: true
+        layers: { terrain: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: template
+          url: "https://data.bev.gv.at/download/ALS/DTM/20250915/ALS_DTM_{tile}.tif"
+          tile: "CRS3035RES50000mN{y}E{x}"
+          size_m: 50000
+          crs: EPSG:3035
+          missing: no-data
+        read: window
+        format: { type: geotiff, band: 1, nodata: -9999 }
+
+      - id: bev-als-dsm
+        title: BEV ALS DSM 1 m surface
+        holds: >-
+          Austria's surface model from airborne lidar (BEV, the national
+          survey's 2025 mosaic): the height of whatever is on top, roofs and
+          tree crowns, at 1 m, as cloud-optimised GeoTIFF in 50 km squares of
+          LAEA Europe of about 7.5 GB each. A build reads only its rectangle,
+          at a quarter of a cell.
+        licence: CC BY 4.0
+        notice: "Datenquelle: BEV – Bundesamt für Eich- und Vermessungswesen, ALS DSM Höhenraster 1 m, Stichtag 15.09.2025 — CC BY 4.0"
+        redistributable: true
+        layers: { surface: 100 }
+        resolution_m: 1
+        coverage: outline
+        find:
+          method: template
+          url: "https://data.bev.gv.at/download/ALS/DSM/20250915/ALS_DSM_{tile}.tif"
+          tile: "CRS3035RES50000mN{y}E{x}"
+          size_m: 50000
+          crs: EPSG:3035
+          missing: no-data
+        read: window
+        format: { type: geotiff, band: 1, nodata: -9999 }
+
+      - id: statistik-austria-population
+        title: Statistik Austria 100 m population grid 2026
+        holds: >-
+          Austria's residents per 100 m square on 1 January 2026 (Statistik
+          Austria, from the population register), as INSPIRE GML for the
+          country.
+        licence: Statistik Austria terms, free reuse with the source named
+        notice: "Datenquelle: STATISTIK AUSTRIA, Bevölkerung nach 100m ETRS-LAEA Raster, Stichtag 1.1.2026 — bearbeitet (onto the pack's grid)"
+        redistributable: true
+        layers: { population: 100 }
+        resolution_m: 100
+        coverage: outline
+        find:
+          method: file
+          url: "https://www.statistik.at/gs-inspire/www/inspire2/download/daten/pd_popreg_100m_7767c33f-302c-11e3-beb4-0000c1ab0db6.zip"
+        read: whole
+        format: { type: inspire-pd-grid, members: "*.gml" }
+
 north-america:
   US:
     name: United States

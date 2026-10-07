@@ -108,6 +108,107 @@ def test_3deps_tiles_are_named_by_their_north_west_corner_in_lower_case_and_read
     assert sources.template_pattern(usgs).match("USGS_13_N38W123.tif") is None
 
 
+def test_laea_europe_is_snyders_ellipsoidal_projection_both_ways():
+    import crs
+    laea = crs.plane("EPSG:3035")
+    # EPSG Guidance Note 7-2's worked example: 50° N 5° E.
+    assert laea.forward(50.0, 5.0) == pytest.approx((3962799.45, 2999718.85), abs=0.01)
+    for lat, lon in ((47.26, 11.39), (35.0, -9.0), (70.5, 31.0)):
+        assert laea.inverse(*laea.forward(lat, lon)) == pytest.approx((lat, lon), abs=1e-8)
+
+
+def test_bevs_tiles_are_50_km_squares_of_laea_named_by_their_corner_in_metres():
+    dtm = SHIPPED["bev-als-dtm"]
+    tm = geodata.TransverseMercator(32, True, geodata.WGS84)
+    hull = sources.degree_hull([11.30, 47.22, 11.48, 47.31], tm)    # Innsbruck
+    [tile] = sources.template_files(dtm, hull, 10)
+    assert tile.url == ("https://data.bev.gv.at/download/ALS/DTM/20250915/"
+                        "ALS_DTM_CRS3035RES50000mN2650000E4400000.tif")
+    # Its window is the grid's reach in metres of LAEA, 4 cells round it,
+    # read at a quarter of a cell.
+    x0, y0, x1, y1 = tile.window["box"]
+    assert 4419000 < x0 < 4419100 and 4433500 < x1 < 4433600 and 2690000 < y1 < 2690100
+    assert tile.window["want"] == 2.5
+    # A rectangle across a tile edge takes both tiles, west to east.
+    across = sources.degree_hull([11.62, 47.12, 11.78, 47.22], tm)      # the Zillertal
+    assert [f.name[len("ALS_DTM_"):-4] for f in sources.template_files(dtm, across)] == [
+        "CRS3035RES50000mN2650000E4400000", "CRS3035RES50000mN2650000E4450000"]
+    # A cached name is read back as its square, drawn in degrees.
+    m = sources.template_pattern(dtm).match("ALS_DTM_CRS3035RES50000mN2650000E4400000.tif")
+    corner = sources.template_corner(dtm, m)
+    assert corner == (4400000.0, 2650000.0)
+    [ring] = sources.template_square(dtm, corner)
+    assert ring[0] == ring[-1] and len(ring) == 33
+    assert sources.holds({"type": "Polygon", "coordinates": [ring]}, [11.35, 47.25, 11.4, 47.3])
+
+
+def test_an_inspire_population_grid_becomes_the_compilers_csv(tmp_path):
+    cache = sources.Cache(None, str(tmp_path / "cache"))
+    f = sources.File("pop", "https://example.org/pop.zip", "pop.zip", "*.gml")
+    os.makedirs(os.path.dirname(f.path(cache.root)))
+
+    def value(v, cell):
+        return ('<pd:value><pd:StatisticalValue><pd:value>%s</pd:value><pd:dimensions>'
+                '<pd:Dimensions><pd:spatial xlink:href="https://data.inspire.gv.at/x/'
+                'su.StatisticalGridCell/AT_%s"/></pd:Dimensions></pd:dimensions>'
+                '</pd:StatisticalValue></pd:value>' % (v, cell))
+    gml = ('<wfs:FeatureCollection xmlns:wfs="http://www.opengis.net/wfs/2.0" '
+           'xmlns:pd="http://inspire.ec.europa.eu/schemas/pd/4.0" '
+           'xmlns:xlink="http://www.w3.org/1999/xlink"><wfs:member><pd:StatisticalDistribution>'
+           + value(7, "CRS3035RES100mN2599300E4671800") + value(12, "CRS3035RES100mN2603000E4647800")
+           + '</pd:StatisticalDistribution></wfs:member></wfs:FeatureCollection>')
+    with zipfile.ZipFile(f.path(cache.root), "w") as zf:
+        zf.writestr("pd_popreg_100m.gml", gml)
+    path, system, cell = cache.inspire_grid_csv(f)
+    assert (system, cell) == ("EPSG:3035", 100.0)
+    assert open(path).read() == "x,y,value\n4671850.0,2599350.0,7\n4647850.0,2603050.0,12\n"
+    # Once written, it is read back without parsing the GML again.
+    os.remove(os.path.join(os.path.dirname(path), "pd_popreg_100m.gml"))
+    assert cache.inspire_grid_csv(f) == (path, "EPSG:3035", 100.0)
+
+    mixed = sources.File("mixed", "https://example.org/mixed.zip", "mixed.zip", "*.gml")
+    os.makedirs(os.path.dirname(mixed.path(cache.root)))
+    with zipfile.ZipFile(mixed.path(cache.root), "w") as zf:
+        zf.writestr("m.gml", gml.replace("RES100mN2603000", "RES1000mN2603000"))
+    with pytest.raises(store.StoreError, match="mixes grids"):
+        cache.inspire_grid_csv(mixed)
+
+
+def test_an_austrian_rectangle_hands_the_compiler_bevs_pair_and_the_census_grid(tmp_path):
+    cache = sources.Cache(None, str(tmp_path / "cache"))
+    files = {}
+
+    def cached(source_id, name, members=None, content=b"tif"):
+        f = sources.File(source_id, "https://example.org/" + name, name, members)
+        path = f.path(cache.root)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "wb").write(content)
+        files.setdefault(source_id, []).append(f)
+    cached("glo30", "Copernicus_DSM_COG_10_N47_00_E011_00_DEM.tif")
+    cached("bev-als-dtm", "ALS_DTM_CRS3035RES50000mN2650000E4400000.tif")
+    cached("bev-als-dsm", "ALS_DSM_CRS3035RES50000mN2650000E4400000.tif")
+    pop = tmp_path / "pop.zip"
+    with zipfile.ZipFile(pop, "w") as zf:
+        zf.writestr("pd.gml", '<c xmlns:pd="p" xmlns:xlink="http://www.w3.org/1999/xlink">'
+                    '<pd:StatisticalValue><pd:value>3</pd:value><pd:spatial xlink:href='
+                    '"x/AT_CRS3035RES100mN2650000E4400000"/></pd:StatisticalValue></c>')
+    cached("statistik-austria-population", "pd_popreg_100m.zip", "*.gml", pop.read_bytes())
+    build = packbuild.Build(cache, {"name": "innsbruck", "bbox": [11.30, 47.22, 11.48, 47.31],
+                                    "res_m": 30}, "planner-job", lambda row: None,
+                            sources_=SHIPPED)
+    build.inputs = str(tmp_path / "inputs")
+    params = build.params({"files": files, "grid": {"zone": 32}}, SHIPPED)
+    [pair] = params["elevation"]
+    assert [os.path.basename(p) for p in pair["terrain"] + pair["surface"]] == [
+        "ALS_DTM_CRS3035RES50000mN2650000E4400000.tif",
+        "ALS_DSM_CRS3035RES50000mN2650000E4400000.tif"]
+    assert pair["proj"].startswith("+proj=laea") and pair["pixel_m"] == 7.5
+    assert pair["nodata"] == -9999.0
+    population = params["population"]
+    assert population["proj"].startswith("+proj=laea") and population["cell_m"] == 100.0
+    assert open(population["csv"]).read() == "x,y,value\n4400050.0,2650050.0,3\n"
+
+
 def test_nad83_and_conus_albers_are_systems_sim_mesh_knows():
     import crs
     assert crs.known("EPSG:4269") and crs.known("EPSG:5070") and crs.known("EPSG:26910")
@@ -328,6 +429,7 @@ def test_the_shipped_sources_hold_together():
                              "berlin-bdom", "berlin-lod2", "zensus", "brandenburg-dgm1",
                              "brandenburg-bdom", "brandenburg-lod2", "mv-dgm1", "mv-dom1",
                              "mv-lod2", "ahn-dtm", "ahn-dsm", "3dbag", "cbs-population",
+                             "bev-als-dtm", "bev-als-dsm", "statistik-austria-population",
                              "usgs-3dep-13", "nlcd", "worldpop-us"]
     for source in SHIPPED.values():
         assert source.worldwide == (source.continent == sourcefile.GLOBAL)
@@ -384,7 +486,9 @@ def test_a_source_that_does_not_hold_together_is_refused_saying_why(tmp_path, ch
     ("nlcd", lambda e: e.update(layers={"landcover": 1, "population": 1}), "a GeoTIFF feeds one layer"),
     ("nlcd", lambda e: e["format"].update(crs="EPSG:2263"), "format.crs EPSG:2263 is not a system"),
     ("worldpop-us", lambda e: e.update(read="window"), "a window is read of the files an index or a"),
-    ("usgs-3dep-13", lambda e: e["find"].update(crs="EPSG:26910"), "whole number of degrees"),
+    ("usgs-3dep-13", lambda e: e["find"].update(size_deg=0.5), "whole number of them (size_deg)"),
+    ("usgs-3dep-13", lambda e: e["find"].update(crs="EPSG:26910"),
+     "tiles in metres are size_m wide"),
     ("usgs-3dep-13", lambda e: e["find"].update(corner="north-east"), "a template's corner is"),
     ("usgs-3dep-13", lambda e: e["find"].update(letters="title"), "a template's letters are"),
 ])

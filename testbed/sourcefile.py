@@ -80,7 +80,7 @@ METHODS = {
 }
 INDEX_FORMATS = {"regions": ("geofabrik",), "index": ("geojson", "flatgeobuf")}
 CRS_RE = re.compile(r"^EPSG:(\d+)$")
-TILE_FIELD_RE = re.compile(r"\{(ns|ew|lat|lon)(?::0(\d))?\}")
+TILE_FIELD_RE = re.compile(r"\{(ns|ew|lat|lon|x|y)(?::0(\d))?\}")
 FORMATS = {
     # format: the layers it can feed
     "geotiff": ("surface", "terrain", "landcover", "population"),
@@ -90,6 +90,7 @@ FORMATS = {
     "osm-pbf": ("roads", "places", "buildings"),
     "csv-grid": ("population",),
     "gpkg-grid": ("population",),
+    "inspire-pd-grid": ("population",),
     "itu-p1812-maps": ("radio-climate",),
 }
 # A format's own parameters, each needed.
@@ -97,6 +98,7 @@ FORMAT_NEEDS = {
     "cityjson": ("crs", "ground", "roof"),
     "csv-grid": ("delimiter", "x", "y", "value", "crs", "cell_m", "members"),
     "gpkg-grid": ("value", "crs", "cell_m", "members"),
+    "inspire-pd-grid": ("members",),
 }
 # What the compiler's readers assume, which a source's parameters must be
 # until it takes them from the source.
@@ -270,15 +272,27 @@ def _check_find(source):
     if method == "template":
         if any("{tile}" not in u for u in source.addresses("url")):
             raise _fault(path, ident, "a template's url holds {tile}")
-        size = find.get("size_deg")
-        if not crs_module.geographic(find["crs"]) or not isinstance(size, int) \
-                or isinstance(size, bool) or size < 1:
-            raise _fault(path, ident, "a template's tiles are a whole number of degrees "
-                                      "(size_deg) of EPSG:4326 or 4269")
         fields = {m.group(1) for m in TILE_FIELD_RE.finditer(find["tile"])}
-        if fields != {"ns", "ew", "lat", "lon"}:
-            raise _fault(path, ident, "a template's tile names its corner with {ns}, {lat}, "
-                                      "{ew} and {lon}")
+        if crs_module.geographic(find["crs"]):
+            size = find.get("size_deg")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+                raise _fault(path, ident, "a template's tiles in degrees are a whole number of "
+                                          "them (size_deg)")
+            if fields != {"ns", "ew", "lat", "lon"}:
+                raise _fault(path, ident, "a template's tile in degrees names its corner with "
+                                          "{ns}, {lat}, {ew} and {lon}")
+        else:
+            try:
+                crs_module.plane(find["crs"])
+            except store.StoreError as err:
+                raise _fault(path, ident, str(err)) from err
+            if not (_number(find.get("size_m")) and find["size_m"] > 0) or not (
+                    _number(find.get("unit_m", 1)) and find.get("unit_m", 1) > 0):
+                raise _fault(path, ident, "a template's tiles in metres are size_m wide, their "
+                                          "corner named in unit_m")
+            if fields != {"x", "y"}:
+                raise _fault(path, ident, "a template's tile in metres names its corner with "
+                                          "{x} and {y}")
         if find.get("corner", CORNERS[0]) not in CORNERS:
             raise _fault(path, ident, "a template's corner is %s" % " or ".join(CORNERS))
         if find.get("letters", LETTERS[0]) not in LETTERS:
