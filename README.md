@@ -2421,8 +2421,8 @@ sender ── sent, acknowledged ──► its driver ──► msg.status {mid,
 receiver ── the message, mid in its text ──► its driver ──► msg.received {mid, text, sender | chan}
 ```
 
-A firmware of category `meshcore` is a MeshCore node: a companion, which a
-person drives through meshcore-cli, a repeater or a room server. Its
+A firmware of category `meshcore` is a MeshCore node: a companion, a
+repeater or a room server. Its
 `DRIVER` subclasses `sim_mesh.meshcore.driver.MeshcoreDriver` and implements
 every firmware's verbs and the category's, each taking the station first; a
 verb it cannot do raises `CommandError` (`self.cannot(verb)`), which the
