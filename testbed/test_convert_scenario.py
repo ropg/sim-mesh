@@ -193,7 +193,8 @@ def test_links_walls_gains_kinds_and_first_boot_lines_carry_over():
     ground = yaml.safe_load(conv["geodata"])
     assert ground["synthetic"]["exponent"] == 3.1
     assert (ground["shadowing_db"], ground["shadowing_seed"]) == (5, 3)
-    assert conv["medium"] == "--noise-figure 7 --bench-capture --crc-margin-db 1.5\n"
+    assert conv["medium"] == "--noise-figure 7 --bench-capture\n"
+    assert any(w.startswith("crc_band_db 1.5:") for w in conv["warnings"])
     assert any("globals.py in freq_mhz, sf" in w for w in conv["warnings"])
     assert not any("differ among the nodes" in w for w in conv["warnings"])
     s = conv["summary"]
@@ -312,8 +313,9 @@ def test_the_medium_flags_say_what_the_old_physics_did():
     # capture margin, whatever its spreading factor.
     assert flags() == ("--noise-figure 6 --pairwise", [])
     got, warnings = flags(capture_db=8, sf_orthogonality="croce", crc_band_db=2)
-    assert got == "--noise-figure 6 --pairwise --crc-margin-db 2"
-    assert [re.split(r"[ :]", w)[0] for w in warnings] == ["capture_db", "sf_orthogonality"]
+    assert got == "--noise-figure 6 --pairwise"
+    assert [re.split(r"[ :]", w)[0] for w in warnings] == [
+        "capture_db", "crc_band_db", "sf_orthogonality"]
     got, warnings = flags(capture_model="bench", noise_figure_db=4.5)
     assert got == "--noise-figure 4.5 --bench-capture"
     assert [re.split(r"[ :]", w)[0] for w in warnings] == ["sf_orthogonality", "capture_model"]

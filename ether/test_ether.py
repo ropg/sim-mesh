@@ -64,7 +64,8 @@ def expected_snr(level):
 def radio(mode="RX", **over):
     """The radio fields shared by a state and a transmission."""
     fields = {"mode": mode, "ready_at": 0, "mod": "lora", "freq": FREQ, "bw": BW, "sf": SF,
-              "cr": 5, "sync": SYNC, "hdr": "explicit", "crc": True, "pre": 8}
+              "cr": 5, "sync": SYNC, "hdr": "explicit", "crc": True, "pre": 8,
+              "iq": "normal"}
     fields.update(over)
     return fields
 
@@ -397,12 +398,13 @@ def test_a_pair_the_table_does_not_have_is_never_heard(ether):
     absent.expect_nothing()
 
 
-def test_a_frame_under_its_spreading_factors_threshold_is_not_delivered(ether):
-    """At SF9 a frame must clear the −117.03 dBm floor by −12.5 dB: −129.53
-    dBm. At 14 dBm that is a loss of 143.53 dB; 144 is out of range and 143
-    in it."""
-    ether.link(1, 2, 143.0)
-    ether.link(1, 3, 144.0)
+def test_a_frame_well_under_its_spreading_factors_threshold_is_not_delivered(ether):
+    """At SF9 the threshold is −12.5 dB over the −117.03 dBm floor: −129.53
+    dBm, a loss of 143.53 dB at 14 dBm. 3 dB inside it (140.5) a short frame
+    is certain to arrive; 10 dB outside it (153.5) its preamble is found
+    about once in 120 000 frames."""
+    ether.link(1, 2, 140.5)
+    ether.link(1, 3, 153.5)
     sender, inside, outside = ether(1), ether(2), ether(3)
     sender.hello()
     listen(inside, outside)
@@ -452,6 +454,21 @@ def test_wrong_sync_word_is_not_decoded(ether):
 
     sender.tx(12)
     receiver.expect_nothing()
+
+
+def test_inverted_iq_is_energy_to_a_receiver_set_for_normal(ether):
+    """The chirps run the other way: no preamble found, only the energy of a
+    frame loud enough to cross the sense threshold."""
+    ether.link(1, 2, 90.0)
+    ether.link(1, 3, FAR_DB)
+    sender, near, far = ether(1), ether(2), ether(3)
+    sender.hello()
+    listen(near, far)
+
+    sender.tx(13, iq="inverted")
+    assert near.expect("rx_begin")["cad"] is True
+    near.expect_nothing(timeout=FRAME_US / 1e6 + 0.2)
+    far.expect_nothing()
 
 
 def test_a_modulation_the_ether_does_not_model_is_refused(ether):
@@ -723,68 +740,415 @@ def test_a_receiver_retuned_mid_frame_is_not_told_how_it_ended(ether):
     b.expect_nothing(timeout=LONG_US / 1e6 + 0.2)
 
 
-# ---- the CRC band ----------------------------------------------------------
+# ---- noise: the error curve and its stages ----------------------------------
 
-def test_the_crc_band_fails_frames_in_proportion_to_how_near_the_threshold_they_are():
-    """Certain at the threshold, never at the band's top, and in between in
-    proportion: a straight line down, over many frames."""
-    band = 2.0
-    for margin, expected in ((-1.0, 1.0), (0.0, 1.0), (0.5, 0.75), (1.0, 0.5),
-                             (1.5, 0.25), (2.0, 0.0), (5.0, 0.0)):
-        failed = sum(ether_module.crc_margin_fails(7, eid, 2, 0, margin, band)
-                     for eid in range(4000))
-        assert failed / 4000 == pytest.approx(expected, abs=0.03), margin
-    assert not any(ether_module.crc_margin_fails(7, eid, 2, 0, -3.0, 0.0)
-                   for eid in range(100)), "no band, no failures"
+def test_the_symbol_error_curve_is_the_ideal_receivers():
+    """Non-coherent detection of 2^SF orthogonal signals, no implementation
+    loss: reference values at each datasheet threshold, and monotonic."""
+    assert ether_module.symbol_error(7, -7.5) == pytest.approx(5.2e-4, rel=0.03)
+    assert ether_module.symbol_error(9, -12.5) == pytest.approx(1.0e-4, rel=0.05)
+    assert ether_module.symbol_error(12, -20.0) == pytest.approx(2.2e-6, rel=0.05)
+    for sf in (7, 9, 12):
+        start = ether_module.SENSITIVITY_DB[sf] - 15.0
+        curve = [ether_module.symbol_error(sf, start + 0.5 * i) for i in range(40)]
+        assert all(a >= b for a, b in zip(curve, curve[1:])), sf
+        assert curve[0] > 0.9 and curve[-1] < 1e-6
 
 
-def test_a_physics_without_a_crc_band_says_nothing_of_one():
-    """A run records what was asked for: no band, no key; a band round-trips."""
+def test_the_reference_frame_fails_at_the_anchor_rate_at_each_threshold():
+    """The implementation loss puts the datasheet's own test frame at its
+    stated packet error rate exactly at its stated sensitivity."""
+    ref = ether_module.REFERENCE_FRAME
+    for sf, threshold in ether_module.SENSITIVITY_DB.items():
+        snr = threshold - ether_module.implementation_loss(sf)
+        per = 1.0 - ether_module.frame_odds(sf, snr, ref["payload"], ref["cr"],
+                                            ref["implicit"], ref["crc"], ref["bw"])
+        assert per == pytest.approx(ether_module.ANCHOR_PER, rel=0.25), sf
+
+
+def test_frame_blocks_follow_the_time_on_air_arithmetic():
+    """SF7, 4/5, 64 bytes with CRC and a header: (512 − 28 + 28 + 16) / 28
+    rounds up to 19 blocks of 5; at SF12 and 125 kHz a symbol lasts 32.8 ms,
+    so low-data-rate optimisation divides by 4·(12 − 2)."""
+    assert ether_module.frame_blocks(7, 125_000, 5, 64, False, True) == (8, 19, 5, False)
+    assert ether_module.frame_blocks(12, 125_000, 8, 64, False, True) == (8, 13, 8, True)
+    assert ether_module.frame_blocks(7, 125_000, 5, 0, True, False)[1] == 0
+
+
+def margin_loss(margin_db, sf=SF):
+    """The loss that puts a link `margin_db` over its spreading factor's
+    threshold, at 14 dBm on FREQ."""
+    return (POWER_DBM - 20.0 * math.log10(FREQ / 868_000_000)
+            - (NOISE_DBM + ether_module.SENSITIVITY_DB[sf] + margin_db))
+
+
+def shaped_frame(eid, payload_len, cr=5, sf=SF, hdr="explicit", sid=1, **over):
+    """A frame from `sid` with a payload this long, frame `eid` on the air
+    for 1000 µs from eid ms, its preamble over the first 100 and its header
+    the next 100."""
+    msg = dict(radio("TX", sf=sf, cr=cr, hdr=hdr, **over), power_dbm=POWER_DBM,
+               payload=base64.b64encode(bytes(payload_len)).decode())
+    t0 = eid * 1000
+    return ether_module.Frame(eid, eid, sid, msg, t0, t0 + 1000, t0 + 100, t0 + 200)
+
+
+def arrives(medium, frame, rsid, slot=0):
+    """The three stages for one frame at one receiver, in-process."""
+    if not medium.locks_on(frame, rsid, slot, frame.start_us):
+        return False
+    if not medium.header_ok(frame, rsid, slot):
+        return False
+    reception = ether_module.Reception(frame, rsid, slot, medium.level_of(frame, rsid))
+    return medium.payload_survives(reception, medium.payload_blocks(frame, rsid))
+
+
+def noisy_medium(medium, margin_db, seed=5, receivers=(9,)):
+    links = {(1, r): margin_loss(margin_db) for r in receivers}
+    table = make_table("868", [1] + list(receivers), links)
+    medium.set_losses({"868": table}, {name(s): s for s in [1] + list(receivers)})
+    medium.seed = seed
+    return medium
+
+
+def failures(medium, frames, rsid=9):
+    return sum(not arrives(medium, f, rsid) for f in frames) / len(frames)
+
+
+def test_a_longer_frame_is_more_fragile_at_the_same_snr(medium):
+    noisy_medium(medium, -1.0)
+    short = failures(medium, [shaped_frame(n, 20) for n in range(2000)])
+    long = failures(medium, [shaped_frame(n, 200) for n in range(2000, 4000)])
+    expected = [1.0 - ether_module.frame_odds(SF, -13.5 - ether_module.implementation_loss(SF),
+                                              n, 5, False, True, BW) for n in (20, 200)]
+    assert short == pytest.approx(expected[0], abs=0.025)
+    assert long == pytest.approx(expected[1], abs=0.04)
+    assert long > short + 0.2
+
+
+def test_a_correcting_coding_rate_survives_where_4_5_fails(medium):
+    noisy_medium(medium, -1.0)
+    plain = failures(medium, [shaped_frame(n, 200, cr=5) for n in range(2000)])
+    correcting = failures(medium, [shaped_frame(n, 200, cr=8) for n in range(2000, 4000)])
+    assert correcting < plain / 2
+
+
+def test_the_stages_read_the_same_whatever_order_receivers_are_ruled_in():
+    """Every draw is the seed's, the frame's and the receiver's, so ruling on
+    two receivers in either order — fading on — gives each the same."""
+    def rule(order):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            m = ether_module.Ether(None, physics=ether_module.Physics(
+                fading_db=4.0, coherence_s=0.0005))
+            noisy_medium(m, -1.0, receivers=(2, 3))
+            got = {}
+            for f in [shaped_frame(n, 60) for n in range(300)]:
+                for rsid in order:
+                    got[(f.eid, rsid)] = arrives(m, f, rsid)
+            return got
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    one, other = rule((2, 3)), rule((3, 2))
+    assert one == other
+    assert len(set(one.values())) == 2
+
+
+def stage_seed(key, receiver, snr, payload_len, want, sf=SF):
+    """A seed under which the stages of the frame keyed `key` (`frame_key`)
+    at node `receiver`, slot 0, go as `want` says ({"lock": True, "hdr":
+    False, ...}), with room on each side of every draw for rounding."""
+    loss = ether_module.implementation_loss(sf)
+    first, blocks, per_block, correcting = ether_module.frame_blocks(
+        sf, BW, 5, payload_len, False, True)
+
+    def odds(stage, at):
+        p = ether_module.symbol_error(sf, at - loss)
+        if stage == "lock":
+            return ether_module.lock_odds(p)
+        if stage == "hdr":
+            return ether_module.block_survives(p, first, True)
+        return ether_module.block_survives(p, per_block, correcting) ** blocks
+
+    for seed in range(20_000):
+        ok = True
+        for stage, passes in want.items():
+            draw = ether_module.seeded_draw(seed, key, receiver, 0, stage)
+            if passes and not draw < odds(stage, snr - 0.2):
+                ok = False
+            if not passes and not draw >= odds(stage, snr + 0.2):
+                ok = False
+        if ok:
+            return seed
+    raise AssertionError("no seed gives %r" % (want,))
+
+
+class Air:
+    """An ether in-process on a clock the test moves, every station in RX and
+    what it is sent kept: a frame's start, and so its draws, are known before
+    it goes out. `links` maps a pair of station ids to dB, both ways;
+    `states` a station id to what its RX state says beside `radio()`'s."""
+
+    ADDR = ("127.0.0.1", 0)
+
+    def __init__(self, medium, links, seed=0, states=None):
+        state = states or {}
+        self.medium = medium
+        medium.clock = ether_module.VirtualClock()
+        medium.seed = seed
+        self.sent = []
+        medium.send = lambda sid, msg: self.sent.append((sid, msg))
+        sids = sorted({s for pair in links for s in pair})
+        both = dict(links)
+        both.update({(b, a): db for (a, b), db in links.items()})
+        medium.set_losses({"868": make_table("868", sids, both)},
+                          {name(s): s for s in sids})
+        for sid in sids:
+            over = dict(state.get(sid, {}))
+            mode = over.pop("mode", "RX")
+            medium.recv_state(sid, self.ADDR, dict({"type": "state", "slot": 0},
+                                                   **radio(mode, **over)))
+
+    def tx(self, sid, payload, span_us=300_000, **over):
+        t0 = self.medium.clock.t
+        self.medium.recv_tx(sid, self.ADDR, dict(
+            {"type": "tx", "slot": 0, "id": 1, "t0": t0, "t_pre": t0 + span_us // 10,
+             "t_hdr": t0 + span_us // 5, "t_end": t0 + span_us, "power_dbm": POWER_DBM,
+             "payload": base64.b64encode(payload).decode()}, **radio("TX", **over)))
+
+    def run_to(self, t):
+        self.medium.clock.t = t
+        due = self.medium.clock.pop_due()
+        while due is not None:
+            callback, args = due
+            callback(*args)
+            due = self.medium.clock.pop_due()
+
+    def told(self, sid, kind):
+        return [m for s, m in self.sent if s == sid and m["type"] == kind]
+
+
+def seeded_air(medium, margin_db, want, payload, extra=None, at=0):
+    """Station 1 `margin_db` over its threshold at station 2, the seed one
+    under which station 1's frame of `payload`, sent at `at`, meets the
+    stages there as `want` says; `extra` more links."""
+    loss = margin_loss(margin_db)
+    key = ether_module.frame_key(name(1), at, base64.b64encode(payload).decode())
+    seed = stage_seed(key, name(2), level_for(loss) - NOISE_DBM, len(payload), want)
+    links = {(1, 2): loss}
+    links.update(extra or {})
+    air = Air(medium, links, seed)
+    air.medium.clock.t = at
+    return air
+
+
+def test_a_header_error_ends_the_reception_at_t_hdr_and_frees_the_slot(medium):
+    air = seeded_air(medium, -3.0, {"lock": True, "hdr": False}, b"weak!",
+                     {(3, 2): NEAR_DB})
+    air.tx(1, b"weak!")
+    begin, = air.told(2, "rx_begin")
+    assert begin["hdr_ok"] is False and "cad" not in begin
+    air.run_to(begin["t_hdr"])
+    end, = air.told(2, "rx_end")
+    assert (end["verdict"], end["cause"], end["t"]) == ("hdr", "noise", begin["t_hdr"])
+
+    air.run_to(begin["t_hdr"] + 1000)
+    air.tx(3, b"after the header")
+    later = air.told(2, "rx_begin")[-1]
+    assert "cad" not in later and "hdr_ok" not in later, "the slot locks again"
+    air.run_to(begin["t_end"] + 400_000)
+    ends = air.told(2, "rx_end")
+    assert [(e["id"], e["verdict"]) for e in ends] == [
+        (begin["id"], "hdr"), (later["id"], "clean")], "the failed frame ends once"
+
+
+def test_a_header_error_does_not_reach_a_receiver_that_transmitted_first(medium):
+    air = seeded_air(medium, -3.0, {"lock": True, "hdr": False}, b"weak!")
+    air.tx(1, b"weak!")
+    begin, = air.told(2, "rx_begin")
+    assert begin["hdr_ok"] is False
+    air.run_to(1000)
+    air.tx(2, b"b speaks", span_us=10_000)
+    air.run_to(begin["t_end"])
+    end, = [e for e in air.told(2, "rx_end") if e["id"] == begin["id"]]
+    assert (end["verdict"], end["cause"], end["t"]) == ("crc", "talked_over", begin["t_end"])
+
+
+def test_a_payload_that_fails_is_a_crc_error_at_t_end(medium):
+    payload = bytes(200)
+    air = seeded_air(medium, -1.0, {"lock": True, "hdr": True, "payload": False}, payload)
+    air.tx(1, payload)
+    begin, = air.told(2, "rx_begin")
+    assert "hdr_ok" not in begin
+    air.run_to(begin["t_end"])
+    end, = air.told(2, "rx_end")
+    assert (end["verdict"], end["cause"], end["t"]) == ("crc", "noise", begin["t_end"])
+
+
+def test_a_frames_draws_are_its_channels_not_the_runs_numbering():
+    """Two arms differing only in a frame sent before, which renumbers every
+    frame after it, rule the same on every frame they share."""
+    def arm(before):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            air = Air(ether_module.Ether(None), {(1, 2): margin_loss(-1.5),
+                                                 (3, 4): NEAR_DB}, seed=9)
+            if before:
+                air.tx(3, b"only in this arm", span_us=1000)
+            got = []
+            for n in range(60):
+                at = 10_000 + n * 400_000
+                air.run_to(at)
+                air.tx(1, b"frame %d" % n)
+                air.run_to(at + 300_000)
+            for msg in air.told(2, "rx_begin") + air.told(2, "rx_end"):
+                got.append((msg["type"], msg["t0"] if "t0" in msg else msg["t"],
+                            msg.get("hdr_ok"), msg.get("verdict")))
+            return got
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    one, other = arm(False), arm(True)
+    assert one == other
+    assert {g[3] for g in one if g[0] == "rx_end"} >= {"clean", "crc"}
+
+
+# ---- fading ----------------------------------------------------------------
+
+def unit_process(seed=3, coherence=1.0):
+    def knot(k):
+        return ether_module.fade_knot(seed, "n1", "n2", k)
+    return lambda t: ether_module.fade_unit(knot, t, coherence)
+
+
+def test_without_fading_a_level_is_the_tables(medium):
+    noisy_medium(medium, 3.0)
+    f = shaped_frame(1, 20)
+    assert all(medium.level_at(f, 9, t) == medium.level_of(f, 9)
+               for t in (0, 1e6, 7.3e6, 1e9))
+
+
+def test_fading_is_a_unit_gaussian_continuous_at_its_knots():
+    g = unit_process()
+    samples = [g(i + 0.37) for i in range(20_000)]
+    mean = sum(samples) / len(samples)
+    var = sum((s - mean) ** 2 for s in samples) / len(samples)
+    assert abs(mean) < 0.05
+    assert var == pytest.approx(1.0, abs=0.06)
+    for k in range(1, 50):
+        assert g(k - 1e-9) == pytest.approx(g(k), abs=1e-6)
+
+
+def test_fading_is_the_pairs_whichever_way_it_is_asked(medium):
+    medium.physics = ether_module.Physics(fading_db=5.0)
+    noisy_medium(medium, 3.0, receivers=(2,))
+    for t in (0, 3.3e6, 123.4e6):
+        assert medium.fade_db(1, 2, t) == medium.fade_db(2, 1, t)
+    assert medium.fade_db(1, 2, 3.3e6) != 0.0
+
+
+def test_fading_is_correlated_over_its_coherence_time_and_not_beyond():
+    g = unit_process()
+    rng = __import__("random").Random(1)
+    starts = [rng.uniform(0, 40_000) for _ in range(20_000)]
+
+    def corr(lag):
+        return sum(g(t) * g(t + lag) for t in starts) / len(starts)
+
+    assert corr(0.1) > 0.9
+    assert corr(1.0) == pytest.approx(1.0 / math.pi, abs=0.04)
+    assert abs(corr(2.0)) < 0.04
+
+
+def rician_gains(k, n=20_000):
+    return [10.0 ** (ether_module.rician_db(
+        k, lambda part, i=i: ether_module.seeded_draw(4, i, part)) / 10.0) for i in range(n)]
+
+
+def test_rician_fading_has_unit_mean_power_and_shrinks_with_k():
+    for k in (0.0, 3.0, 20.0):
+        gains = rician_gains(k)
+        assert sum(gains) / len(gains) == pytest.approx(1.0, abs=0.03), k
+    rayleigh = rician_gains(0.0, 4000)
+    assert sum(g < 0.1 for g in rayleigh) / len(rayleigh) == pytest.approx(
+        1.0 - math.exp(-0.1), abs=0.02), "Rayleigh power is exponential"
+    assert all(abs(10 * math.log10(g)) < 1.0 for g in rician_gains(1000.0, 1000))
+
+
+def test_rician_fading_is_one_draw_per_frame_and_receiver(medium):
+    medium.physics = ether_module.Physics(rician_k=2.0)
+    noisy_medium(medium, 3.0, receivers=(2, 3))
+    f = shaped_frame(1, 20)
+    at = [medium.level_at(f, 2, t) - medium.level_of(f, 2) for t in (1000, 1500, 1999)]
+    assert at[0] == at[1] == at[2] != 0.0
+    assert medium.rice_db(f, 3) != medium.rice_db(f, 2)
+    assert medium.rice_db(shaped_frame(2, 20), 2) != at[0]
+
+
+def test_a_physics_says_only_what_was_asked_and_round_trips():
     assert ether_module.Physics().as_dict() == {"noise_figure_db": 6.0}
-    physics = ether_module.Physics(5.0, 2.5)
-    assert physics.as_dict() == {"noise_figure_db": 5.0, "crc_margin_db": 2.5}
-    assert ether_module.Physics.from_dict(physics.as_dict()).crc_margin_db == 2.5
-    with pytest.raises(ValueError):
-        ether_module.Physics(6.0, -1.0)
+    assert ether_module.Physics().coherence_s == 3600.0
+    physics = ether_module.Physics(5.0, fading_db=4.0, coherence_s=3.0, rician_k=6.0)
+    assert physics.as_dict() == {"noise_figure_db": 5.0, "fading_db": 4.0,
+                                 "coherence_s": 3.0, "rician_k": 6.0}
+    again = ether_module.Physics.from_dict(physics.as_dict())
+    assert (again.fading_db, again.coherence_s, again.rician_k) == (4.0, 3.0, 6.0)
+    assert "fading 4.0 dB over 3 s" in physics.describe()
+    assert "Rician K 6" in physics.describe()
+    for bad in ({"fading_db": -1.0}, {"coherence_s": 0.0}, {"rician_k": -0.5}):
+        with pytest.raises(ValueError):
+            ether_module.Physics(**bad)
 
 
-def test_the_crc_band_verdict_is_the_draw_for_that_frame_and_receiver(tmp_path):
-    """A frame 1 dB over SF9's threshold, in a 2 dB band, fails half the
-    time: each one as its own draw from the seed says, whichever that is."""
-    bench = Bench(tmp_path, "real", False, "--crc-margin-db", "2", "--seed", "11")
-    try:
-        loss = POWER_DBM - (NOISE_DBM - 12.5 + 1.0)       # 1 dB over the threshold
-        bench.link(1, 2, loss)
-        a, b = bench(1), bench(2)
-        seed = a.hello()["seed"]
-        assert seed == 11
-        b.hello()
-        b.state("RX")
-        time.sleep(0.1)
-        margin = level_for(loss) - NOISE_DBM + 12.5
-        verdicts = []
-        for n in range(8):
-            a.tx(70 + n, payload=b"near the edge %d" % n, span_us=100_000)
-            begin = b.expect("rx_begin")
-            end = b.expect("rx_end")
-            assert end["id"] == begin["id"]
-            fails = ether_module.crc_margin_fails(seed, end["id"], 2, 0, margin, 2.0)
-            assert end["verdict"] == ("crc" if fails else "clean")
-            verdicts.append(end["verdict"])
-        assert set(verdicts) == {"crc", "clean"}
-    finally:
-        bench.close()
+# ---- side detectors ----------------------------------------------------------
+
+def test_a_side_detector_decodes_its_own_sf_and_sync_word_on_the_main_carrier():
+    detector = ether_module.Ether.detector
+    state = radio("RX", side=[{"sf": 10, "sync": 0x12, "iq": "normal"},
+                              {"sf": 11, "sync": SYNC, "iq": "normal"}])
+    assert detector(state, radio("TX")) == 0
+    assert detector(state, radio("TX", sf=10, sync=0x12)) == 1
+    assert detector(state, radio("TX", sf=11)) == 2
+    assert detector(state, radio("TX", sf=10)) is None, "side 1 has its own sync word"
+    assert detector(state, radio("TX", sf=10, sync=0x12, iq="inverted")) is None
+    assert detector(state, radio("TX", sf=10, sync=0x12, bw=250_000)) is None
+    assert detector(state, radio("TX", sf=10, sync=0x12, freq=FREQ + 200_000)) is None
+    assert detector(radio("RX"), radio("TX", sf=10, sync=0x12)) is None
 
 
-def test_without_a_crc_band_a_frame_over_its_threshold_is_clean(ether):
-    """Off by default: a frame half a dB over its threshold is delivered."""
-    loss = POWER_DBM - (NOISE_DBM - 12.5 + 0.5)
-    ether.link(1, 2, loss)
-    a, b = ether(1), ether(2)
-    listen(a, b)
-    for n in range(4):
-        a.tx(80 + n, span_us=100_000)
-        assert b.expect("rx_end")["verdict"] == "clean"
+def test_a_side_detectors_preamble_miss_follows_the_bench():
+    miss = ether_module.side_preamble_miss
+    assert [miss(n) for n in (8, 12, 13, 14, 15, 16, 32)] == pytest.approx(
+        [0.019, 0.019, 0.0115, 0.004, 0.002, 0.0, 0.0])
+
+
+def test_a_side_detector_misses_short_preambles_where_noise_does_not(medium):
+    noisy_medium(medium, 25.0)
+    for pre, rate in ((12, 0.019), (16, 0.0)):
+        frames = [shaped_frame(n, 20, pre=pre) for n in range(6000)]
+        main = sum(not medium.locks_on(f, 9, 0, f.start_us) for f in frames)
+        side = sum(not medium.locks_on(f, 9, 0, f.start_us, det=1) for f in frames)
+        assert main == 0
+        assert side / len(frames) == pytest.approx(rate, abs=0.005), pre
+
+
+def test_a_side_detector_lock_says_which_and_cad_is_the_main_detectors(medium):
+    side = [{"sf": 10, "sync": 0x12, "iq": "normal"}]
+    air = Air(medium, {(1, 2): NEAR_DB, (1, 3): NEAR_DB},
+              states={2: {"side": side}, 3: {"mode": "CAD", "side": side}})
+    air.tx(1, b"to the side", sf=10, sync=0x12, pre=16)
+    begin, = air.told(2, "rx_begin")
+    assert begin["det"] == 1 and "cad" not in begin
+    air.run_to(begin["t_end"])
+    assert air.told(2, "rx_end")[0]["verdict"] == "clean"
+    assert air.told(3, "rx_begin") == [], "CAD finds the main detector's frames only"
+    air.run_to(begin["t_end"] + 1000)
+    air.tx(1, b"to the main one", pre=16)
+    assert "det" not in air.told(2, "rx_begin")[-1]
 
 
 # ---- bench capture ---------------------------------------------------------
@@ -866,7 +1230,13 @@ def test_bench_capture_frames_a_decibel_apart_end_as_their_pairs_draw(bench):
         c.tx(170 + n, payload=b"c %d" % n, pre_us=100_000, hdr_us=120_000)
         first, second = b.expect("rx_begin"), b.expect("rx_begin")
         ends = b.ends(2)
-        want = ether_module.bench_outcome(seed, first["id"], second["id"], 2, lead, False)
+
+        def key(sender, begin, payload):
+            return ether_module.frame_key(sender, begin["t0"],
+                                          base64.b64encode(payload).decode())
+
+        want = ether_module.bench_outcome(seed, key("n1", first, b"a %d" % n),
+                                          key("n3", second, b"c %d" % n), "n2", lead, False)
         assert ends[b"a %d" % n]["verdict"] == ("clean" if want[0] else "crc")
         assert ends[b"c %d" % n]["verdict"] == ("clean" if want[1] else "crc")
         assert ("cad" in second) == (not want[1]), "the second takes b only if it survives"
@@ -940,7 +1310,9 @@ def test_a_station_is_deaf_while_its_own_frame_is_going_out(ether):
     a.expect("rx_begin")
     a.tx(62, payload=b"and so is a")
     b.expect_nothing(timeout=0.2)
-    assert a.expect("rx_end")["verdict"] == "crc", "a talked over the frame it heard"
+    end = a.expect("rx_end")
+    assert end["verdict"] == "crc", "a talked over the frame it heard"
+    assert end["cause"] == "talked_over"
 
 
 def test_frames_that_share_a_station_id_are_still_told_apart(ether):
@@ -993,7 +1365,9 @@ def test_a_louder_frame_takes_the_receiver_at_its_preamble(ether):
 
     ends = b.ends(2)
     assert ends[b"quiet"]["verdict"] == "crc"
+    assert ends[b"quiet"]["cause"] == "lost"
     assert ends[b"loud"]["verdict"] == "clean"
+    assert "cause" not in ends[b"loud"]
 
 
 def test_two_frames_within_the_same_sf_figure_spoil_each_other(ether):
@@ -1048,6 +1422,7 @@ def summed_interference(bench):
 def test_interference_is_summed_within_a_class(ether):
     ends = summed_interference(ether)
     assert ends[b"signal"]["verdict"] == "crc"
+    assert ends[b"signal"]["cause"] == "interference"
 
 
 def test_the_pairwise_rule_takes_each_interferer_alone(pairwise):
@@ -1099,6 +1474,7 @@ def test_without_interference_a_receiver_still_cannot_hear_while_it_sends(oracle
     b.tx(2, payload=b"from b")
     end = b.expect("rx_end")
     assert end["verdict"] == "crc", "half duplex is the radio's, not interference"
+    assert end["cause"] == "talked_over"
 
 
 def test_without_interference_is_said_and_kept_with_the_run():
@@ -1123,6 +1499,9 @@ def test_without_interference_is_said_and_kept_with_the_run():
 #   same-SF figure     SAME_SF_REJECTION_DB                   = 6 dB
 #   SF9 over SF7       INTER_SF_REJECTION_DB[9][7]            = −15 dB
 #   sense threshold    10·log10(125) − 117 + 15               = −81.03 dBm
+#
+# Every frame below is more than 15 dB over its threshold, where the three
+# stages against noise pass with certainty: only interference decides.
 #
 # Same SF (both at SF9). Loss A→B 120 dB, C→B 127 dB:
 #   S_A = 14 − 120 = −106 dBm, SNR 11.03 ≥ −12.5: decodable.
@@ -1245,7 +1624,7 @@ def verdict(medium, signal, others, rsid=9):
     for other in others:
         signal.interferers.append(other)
     level = medium.level_of(signal, rsid)
-    return medium.verdict_for(ether_module.Reception(signal, rsid, 0, level))
+    return medium.verdict_for(ether_module.Reception(signal, rsid, 0, level))[0]
 
 
 def test_the_worst_piece_decides_and_only_overlap_is_summed(medium):

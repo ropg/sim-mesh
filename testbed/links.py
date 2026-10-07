@@ -179,6 +179,9 @@ def model(view, nodes, forwarders, args):
     e = view.medium()
     return {"sf": sf, "bw": bw, "power_dbm": power,
             "noise_figure_db": e.physics.noise_figure_db,
+            "fading_db": e.physics.fading_db,
+            "coherence_s": e.physics.coherence_s,
+            "rician_k": e.physics.rician_k,
             "threshold_dbm": e.noise(bw) + e.sensitivity(sf) if sf else None,
             "links_one_way": len(pairs),
             "distance_m": quantiles([dist(pos, a, b) for a, b in pairs]),

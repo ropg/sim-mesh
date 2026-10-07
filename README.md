@@ -1170,11 +1170,23 @@ L = P_tx + G_tx + G_rx − loss(tx → rx) − offset − 20·log10(f / f0)
 with `P_tx` the power the frame went out at, `G_tx` and `G_rx` each antenna's
 gain toward the other end in three dimensions ([Antennas](#antennas)), the
 loss the table's (or the link's), with the geodata's shadowing draw on it
-when there is one, and the offset the nodeset's. A frame that arrives below
-the signal-to-noise ratio its spreading factor needs — −7.5 dB at SF7, down
-to −20 dB at SF12 — is not delivered at all, and that is what "out of range"
-means here. So a link is in range only if it is one the modem could actually
-hold, and moving to a slower spreading factor really does reach further.
+when there is one, and the offset the nodeset's. Against noise a frame goes
+through the chip's own stages — its preamble found, its header read, every
+block of its payload decoded — each a seeded draw on one symbol error curve
+per spreading factor, anchored so that the datasheet's test frame arrives 99
+times in 100 at the datasheet's threshold: −7.5 dB of signal-to-noise ratio
+at SF7, down to −20 dB at SF12. A frame whose preamble is not found is not
+delivered at all, and that is what "out of range" means here; one that
+locks but fails later is a header error or a CRC failure, and a longer frame
+fails more often at the same level. So a link is in range only if it is one
+the modem could actually hold, moving to a slower spreading factor really
+does reach further, and a link within a dB or two of its threshold is
+neither good nor dead. With `--fading-db`, every link's level also wanders
+over time around the table's, and with `--rician-k` each frame takes a fast
+fade of its own. Every one of those draws is keyed on the channel — the
+seed, the frame's sender, start and bytes, the receiver — never on the order
+of events, so two runs that differ in their routing see the same channel
+for every frame they share.
 
 Every transmission whose channel overlaps a receiver's is interference
 there, whatever its spreading factor, and each receiver rules for itself: a
@@ -1645,7 +1657,9 @@ run directory, default `testbed/runs/simd/`; a run loaded later that would
 land on one there goes beside it as `-2`, `-3`…), `--build`, `--sidecar` (the
 planner-web a pack's moved rows are recomputed through), `--stagger`,
 `--net`, `--time`, `--noise-figure`, `--pairwise` or `--bench-capture`,
-`--crc-margin-db` (the ether's receivers, its rule and its CRC band), and
+`--fading-db`, `--coherence-s` and `--rician-k` (the ether's receivers, its
+rule, how far and how fast every link's level wanders over time, and the K
+factor of a fast fade per frame; no fading of either kind unless given), and
 `--no-interference` (an oracle: every frame judged against noise alone),
 `--clock-ppm` (in virtual time, each station's crystal off by a draw within
 that many parts per million), and `--seed` and `--epoch` (the seed the ether's welcome
@@ -2458,10 +2472,10 @@ A real-time run:
 ```
 station → ether   hello {sid, slots}
 ether → station   welcome {t, mode: "real", rate: 1, epoch, seed}
-station → ether   state {slot, mode, mod, freq, bw, sf, cr, sync, hdr, crc, pre}   on every change
+station → ether   state {slot, mode, mod, freq, bw, sf, cr, sync, hdr, crc, pre, iq[, side]}   on every change
 station → ether   tx {slot, id, t0, t_pre, t_hdr, t_end, power_dbm, mod, freq, bw, sf, …, payload}
-ether → station   rx_begin {slot, id, t0, t_pre, t_hdr, t_end, level[, cad]}    each receiver it reaches
-ether → station   rx_end {slot, id, verdict, payload, rssi, snr}               at the frame's end
+ether → station   rx_begin {slot, id, t0, t_pre, t_hdr, t_end, level[, cad][, hdr_ok][, det]}   each receiver it reaches
+ether → station   rx_end {slot, id, t, verdict, [cause,] payload, rssi, snr}   at the frame's end, or at t_hdr for a header that failed
 ```
 
 A virtual-time run is the same conversation with the ether as conductor:
@@ -2488,15 +2502,18 @@ receiver → ether  idle {seq: 7, until: …}
 | Ether → station | Says |
 |---|---|
 | `welcome` | joined: `t`, `mode` (`real` or `virtual`), `rate`, `epoch`, `seed` |
-| `rx_begin` | a frame is arriving: its instants and its level; `cad: true` when it is energy to this station, not a frame to demodulate |
-| `rx_end` | that frame is over: the verdict (`clean`, `crc`), the payload, RSSI and SNR |
+| `rx_begin` | a frame is arriving: its instants and its level; `cad: true` when it is energy to this station, not a frame to demodulate; `hdr_ok: false` when its header will fail at `t_hdr`, where the chip raises a header error and lets go; `det`, from 1, the side detector that found it |
+| `rx_end` | that frame is over: the verdict (`clean`, `crc`, or `hdr` at `t_hdr`), why when not clean (`cause`: `noise`, `interference`, `talked_over`, `lost`; for the record, ignored by the station), the payload, RSSI and SNR |
 | `run` | virtual time: T has reached what this station asked for, or it has input to work on |
 | `go` | virtual time: a TCP write asked for may go ahead |
 
 - **`mod`** is the modulation; a receiver hears only a frame in its own. The
-  ether models `lora` (with `bw`, `sf`, `cr`, `sync`, `hdr`, `crc`, `pre`);
-  a `state` or `tx` naming another is refused. It does not model preamble
-  length.
+  ether models `lora` (with `bw`, `sf`, `cr`, `sync`, `hdr`, `crc`, `pre`,
+  and `iq`, the IQ polarity, `normal` or `inverted`, matched like the sync
+  word); a `state` or `tx` naming another is refused. A `state` may list
+  side detectors (`side`: `{sf, sync, iq}` each, an LR2021's), which decode
+  beside the main one on its carrier. It matches on preamble length nowhere,
+  and only a side detector's lock reads it.
 - The `id` in a `tx` is the transmitter's own count; in `rx_begin` and
   `rx_end` it is the ether's, unique across stations.
 - **Virtual time.** Every message the ether sends carries `t` and `seq`; the

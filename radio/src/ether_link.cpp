@@ -79,9 +79,10 @@ void appendState(char* p, size_t cap, size_t* at, const EtherState& s)
 {
     *at += (size_t)snprintf(p + *at, cap - *at,
         "\"slot\":%d,\"mod\":\"lora\",\"freq\":%u,\"bw\":%u,\"sf\":%d,\"cr\":%d,\"sync\":%d,"
-        "\"hdr\":\"%s\",\"crc\":%s,\"pre\":%d",
+        "\"hdr\":\"%s\",\"crc\":%s,\"pre\":%d,\"iq\":\"%s\"",
         s.slot, (unsigned)s.freqHz, (unsigned)s.bwHz, s.sf, s.cr, s.syncWord,
-        s.hdrImplicit ? "implicit" : "explicit", s.crc ? "true" : "false", s.preamble);
+        s.hdrImplicit ? "implicit" : "explicit", s.crc ? "true" : "false", s.preamble,
+        s.iqInverted ? "inverted" : "normal");
 }
 
 /* ---- Inbound ---- */
@@ -128,6 +129,8 @@ void handleMessage(const char* text, size_t len)
             f.tEnd     = msg.num("t_end", 0);
             f.levelDbm = (int)msg.num("level", kNoiseFloorDbm);
             f.energyOnly = msg.num("cad", 0) != 0;
+            f.hdrOk      = msg.num("hdr_ok", 1) != 0;
+            f.det        = (int)msg.num("det", 0);
             modelRxBegin(chip, f);
         }
     } else if (type == "rx_end") {
@@ -145,8 +148,7 @@ void handleMessage(const char* text, size_t len)
             f.id       = (int)msg.num("id", 0);
             f.payload  = payload;
             f.len      = (size_t)plen;
-            f.crcOk    = verdict != "crc" && verdict != "hdr";
-            f.headerOk = verdict != "hdr";
+            f.crcOk    = verdict == "clean";
             f.rssiDbm  = (int)msg.num("rssi", -80);
             f.snrDb    = (int)msg.num("snr", 10);
             modelRxEnd(chip, f);
@@ -225,6 +227,15 @@ void etherPublishState(const EtherState& s)
         "{\"type\":\"state\",\"sid\":%d,\"t\":%lld,\"mode\":\"%s\",\"ready_at\":%lld,",
         s_sid, (long long)S()->now_us(), s.mode, (long long)s.readyAt);
     appendState(line, sizeof line, &at, s);
+    if (s.nSide > 0) {
+        at += (size_t)snprintf(line + at, sizeof line - at, ",\"side\":[");
+        for (int i = 0; i < s.nSide && i < kMaxSideDetectors; i++)
+            at += (size_t)snprintf(line + at, sizeof line - at,
+                "%s{\"sf\":%d,\"sync\":%d,\"iq\":\"%s\"}", i ? "," : "",
+                s.side[i].sf, s.side[i].syncWord,
+                s.side[i].iqInverted ? "inverted" : "normal");
+        at += (size_t)snprintf(line + at, sizeof line - at, "]");
+    }
     at += (size_t)snprintf(line + at, sizeof line - at, "}");
     sendLine(line, at);
 }

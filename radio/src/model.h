@@ -25,12 +25,17 @@
 /** A frame arriving at this receiver: when its stages land, relative to the
  *  `t0` the sender stamped, and how strongly it arrives. `energyOnly` is the
  *  ether's `"cad": true`: the frame is in the air at this antenna and the
- *  demodulator is not to follow it. */
+ *  demodulator is not to follow it. `hdrOk` false is the ether's `"hdr_ok":
+ *  false`: the header fails at `tHdr`, and the chip lets go of the frame.
+ *  `det` is the ether's `"det"`: which side detector found the frame, 0 the
+ *  main one; a chip with none only ever sees 0. */
 struct VirtualRxBegin {
     int     id;
     int64_t t0, tPre, tHdr, tEnd;   /* the sender's own microsecond stamps */
     int     levelDbm;
     bool    energyOnly;
+    bool    hdrOk;
+    int     det;
 };
 
 /** The same frame, finished: what it carried and how it came out. */
@@ -39,7 +44,6 @@ struct VirtualRxEnd {
     const uint8_t* payload;
     size_t         len;
     bool           crcOk;       /* false when the ether's verdict is not clean */
-    bool           headerOk;    /* false when the header itself did not survive */
     int            rssiDbm;
     int            snrDb;
 };

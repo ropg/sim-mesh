@@ -76,8 +76,8 @@ How each part goes over, and why:
   table reads; the old ether drew none for a pair with a stated link.
 - **Medium.** Main's medium figures are simd's flags: `--noise-figure`;
   `capture_model: bench` is `--bench-capture`, and the old default, a frame
-  surviving each audible interferer by the capture margin, is `--pairwise`;
-  a CRC band is `--crc-margin-db`. What has no flag is warned of.
+  surviving each audible interferer by the capture margin, is `--pairwise`.
+  What has no flag, a CRC band among them, is warned of.
 """
 
 import argparse
@@ -439,7 +439,9 @@ def medium_flags(physics, links, warnings):
                             "flag sets it"
                             % (store.scalar(float(physics["capture_db"])), MAIN_SAME_SF_DB))
     if float(physics["crc_band_db"]):
-        flags += ["--crc-margin-db", store.scalar(float(physics["crc_band_db"]))]
+        warnings.append("crc_band_db %s: main's frames fail against noise by an error curve "
+                        "anchored at the datasheet's sensitivity, and no flag sets a CRC band"
+                        % store.scalar(float(physics["crc_band_db"])))
     if physics["sf_orthogonality"] == "croce" and not bench:
         warnings.append("sf_orthogonality croce: main's pairwise rule rejects no other "
                         "spreading factor by Croce's table; only its summed rule does")

@@ -190,31 +190,165 @@ The table is read in the frame's direction, because a measured loss is per
 direction. Gains are the nodeset's and the power is the frame's own, so the
 same table serves a nodeset whose antennas or transmit powers change.
 
-A frame's level at each station is fixed the first time it is asked for —
-at the frame's start for its receivers, at a verdict for an interferer — and
-kept on the frame. A node moved mid-run has its row recomputed and put in
-with `update_node()`, which copies the band's table, writes the row and
+A frame's table level at each station is fixed the first time it is asked
+for — at the frame's start for its receivers, at a verdict for an interferer
+— and kept on the frame. A node moved mid-run has its row recomputed and put
+in with `update_node()`, which copies the band's table, writes the row and
 column into the copy and swaps it in: until then the old row stands, and a
 frame already on the air keeps the levels it started with.
 
-## The noise, and the demodulation threshold
+With fading on, every use of a level adds the pair's fade at the instant in
+question to that fixed figure (`level_at`); `levels()`, the map's answer to
+who can decode whom, does not.
+
+## The noise: one error curve, three stages
 
 `N = −174 + 10·log10(BW) + NF` (BW the bandwidth in Hz, NF the noise
-figure), and a frame that does not clear the signal-to-noise ratio (SNR) its
-spreading factor (SF) needs above it cannot be decoded: no lock, and for a frame
-nothing else makes audible, no `rx_begin` at all.
+figure). Against it, what decides is the **symbol error rate** of the
+spreading factor (SF) at the frame's signal-to-noise ratio (SNR). Demodulation
+— dechirp, a Fourier transform, the largest bin — is non-coherent detection
+of M = 2^SF orthogonal signals in white noise, and its rate is exact: the
+right bin is Rician and each of the others Rayleigh, so with Es/N0 = M·SNR
+and a = √(2·Es/N0)
 
-A table says where a pair is silent, but a finite loss is not yet a link:
-something has to say where decoding stops, and the only honest place is the
-noise.
+```
+Pc = ∫₀^∞ x · exp(−(x² + a²)/2) · I0(a·x) · (1 − exp(−x²/2))^(M−1) dx,   SER = 1 − Pc
+```
 
-It is **per spreading factor** because that is the whole point of one: SF12 buys
-17.5 dB of reach over SF7 and pays for it in air time, and a flat cut would make
-the two identical to the medium. A flat cut low enough for SF12 delivers frames
-no SF7 receiver could demodulate, and a nodeset laid out against it draws links
-that do not exist and behaves far worse than it looks. The CRC band just above the
-threshold, where a frame locks but fails its cyclic redundancy check (CRC) at a
-probability, is there when asked for (`--crc-margin-db`; below).
+`symbol_error` integrates it by Simpson's rule with an exponentially scaled
+I0, in pure Python (the ether imports nothing outside the standard
+library), and keeps each result per 0.05 dB of SNR: only the SNRs a run
+meets are ever computed, at about a quarter of a millisecond each.
+
+The chip is not the ideal receiver. `implementation_loss(sf)` is the offset
+the curve is read at (SNR − L), found by bisection on first use, such that
+the SX1261/2 datasheet's own test frame — `REFERENCE_FRAME`: 64 bytes, coding
+rate 4/5, CRC on, explicit header, 8-symbol preamble — fails `ANCHOR_PER`, 1%,
+of the time at the datasheet's sensitivity, the conditions its section 3.5
+states that table under. So the datasheet's threshold, −7.5 dB at SF7 and
+2.5 dB lower per step to −20 dB at SF12, keeps its meaning, and `audible()`
+still answers "reachable" there; what is new is the shape around it. The
+offset comes out between −1.3 dB (SF5) and +1.1 dB (SF12): the datasheet's
+2.5 dB steps are wider than the ideal curve's, so it is better than ideal
+below SF9. A bench sweep through the threshold is what would fix it instead.
+
+The threshold is **per spreading factor** because that is the whole point of
+one: SF12 buys 17.5 dB of reach over SF7 and pays for it in air time, and a
+flat cut would make the two identical to the medium.
+
+With p the symbol error at a block's level, a frame goes through three
+stages, each one draw of `seeded_draw(seed, frame, receiver, slot, stage)`
+(`Ether.draw`; what the frame and the receiver are to a draw is under
+"Draws", below):
+
+1. **The lock** (`locks_on`), at `arrive` and `arrive_pairwise`, at the
+   faded level of the lock instant: `(1 − p)^(4 + 2)`, four preamble symbols
+   (`PREAMBLE_FOUND_SYMBOLS`) and the two of the sync word. It is the
+   "decodable" test, for RX and CAD slots alike, and one draw per frame and
+   slot, so a lock on time, a late one and a CAD agree. A frame that fails it
+   is energy only.
+2. **The header** (`header_ok`), decided at the lock, explicit headers only:
+   the first block, 8 symbols at coding rate 4/8, at the faded level in the
+   middle of [`t_pre`, `t_hdr`]. A header that fails is said in the
+   `rx_begin` (`"hdr_ok": false`), and a timer at `t_hdr`
+   (`deliver_header_error`) closes the reception there: `rx_end` verdict
+   `hdr`, cause `noise`, the slot's lock released so it can take another
+   frame, as a chip in continuous RX hunts again after a header error.
+   `Reception.ended` makes the frame's own `t_end` timer a no-op (no timer
+   can be cancelled), and `followed_at` says no from `t_hdr` on. When the
+   receiver had already stopped following the frame by `t_hdr` — taken off
+   it, out of RX, or transmitting — the timer does nothing, and the frame's
+   end rules on it as on any other.
+3. **The payload** (`payload_survives`), at `t_end`, for a reception that
+   came through interference clean: every block decoded, the blocks spread
+   evenly over [`t_hdr`, `t_end`], each at its own faded level (and, without
+   a header, the first block before them at 4/8). A failure is `crc`, cause
+   `noise`.
+
+The blocks are AN1200.13's, the arithmetic of `radio/src/toa.h`
+(`frame_blocks`): after the preamble a first block of 8 symbols at 4/8, then
+`max(⌈(8·P − 4·SF + 28 + 16·crc − 20·implicit) / (4·(SF − 2·DE))⌉, 0)`
+blocks of the coding rate's denominator in symbols. Interleaving gives each
+codeword one bit of every symbol, so a wrong symbol is at most one bit error
+per codeword: a block survives `(1 − p)^n` at 4/5 and 4/6, which only
+detect, and `(1 − p)^n + n·p·(1 − p)^(n−1)` at 4/7 and 4/8, which correct
+one. Two simplifications, both pessimistic: the first block's reduced rate,
+which shrugs off a symbol landing in the next bin, is treated as any other;
+and two wrong symbols are taken to defeat a correcting block, which they do
+only when both flip the same bit position.
+
+All three stages apply under both rules and without interference: they are
+the medium's noise, and the rules differ only in what interference does. A
+frame failing inside the waterfall — about 2 dB from nine in ten lost to nine
+in ten received — fails its CRC far more often than its lock, because the
+payload is many more symbols than the six of the lock. So the rarity of CRC
+errors on real hardware is not the chain's shape but how rarely a link sits
+in that window, and time variation decides how often it passes through: that
+is what fading is for.
+
+## Fading
+
+`Physics.fading_db` (σ, `--fading-db`) and `Physics.coherence_s` (Tc,
+`--coherence-s`, an hour unless given); off at σ = 0, the default. The hour
+is from runs of Sergey's fork (sergeyculum) with per-link fading: shorter
+periods let retries through too easily, and hour-scale ones gave the most
+believable verdicts. Per unordered pair of node
+names — the channel is reciprocal even where the table is not, and a name
+outlives a station's restart where an id does not — a unit-variance Gaussian
+process on the ether's clock:
+
+```
+k = ⌊t / Tc⌋,  u = t/Tc − k
+z_k = Φ⁻¹(seeded_draw(seed, "fade", name_lo, name_hi, k))
+g(t) = cos(π·u/2)·z_k + sin(π·u/2)·z_{k+1},   fade = σ·g(t)
+```
+
+cos² + sin² = 1 keeps the variance 1 everywhere; it is continuous, needs no
+state, and is the same in whatever order it is asked. Its correlation at
+lag Tc is 1/π averaged over the phase, and nothing from 2·Tc. The knots are
+kept per pair in `Ether.knots` and pruned with the frames.
+
+It is applied to every level after the table's: the lock, the header and
+each payload block, every piece of interference (taken at the piece's
+middle, the air cut at the knots too so no piece spans one), the energy
+carrier sense reads, the lead a frame needs to take a receiver, and the
+levels in `rx_begin` (at the lock instant) and `rx_end` (the mean over the
+payload blocks, what the chip's packet status reports). Gaussian in dB is
+slow variation, things moving in the path of fixed stations, not multipath.
+The testbed's shadowing stays as well: that is spread over places, this over
+time.
+
+**Fast fading** is `Physics.rician_k` (`--rician-k`), off (None) unless
+given: per frame at each receiver, one Rician power gain of that K factor,
+unit mean, `|√(K/(K+1)) + √(1/(2(K+1)))·(x + i·y)|²` with x and y standard
+normals drawn from the frame's and the receiver's key (`rician_db`,
+`Ether.rice_db`), held for the whole frame and added in dB wherever the
+slow fade is. Each interferer has its own draw at the receiver. K = 0 is
+Rayleigh. It is per frame and not within one, so it stands for a frame that
+is short beside the channel's own coherence; and a draw per frame lets a
+retry through more easily than the channel would, which is why the slow
+kind is the one to start from.
+
+## Draws
+
+Every random thing the ether decides — the three stages, bench capture's
+outcomes, the Rician draws and fading's knots — is `seeded_draw`, a SHA-256
+of the seed and what the draw is about, never a generator's next number and
+never a count of events. What it is about is the channel:
+
+- a frame is `frame_key`: its sender's node name, its start on the ether's
+  clock and a hash of its bytes (`Ether.key_of`);
+- a receiver is its node name (`Ether.node`) and the slot;
+- a pair of nodes is their two names, in order.
+
+Node names, not station ids, because a name outlives a restart; and not the
+ether's own frame number, which counts every transmission before it. So a
+verdict is the same whatever order receptions end in, and two arms of a
+comparison that differ in their routing — and so in which frames go out and
+when — draw the same for every frame they both send at the same instant.
+What differs between them is then theirs, not the channel's. A frame sent
+again unchanged has another start, so it is another draw: a retry is not
+doomed to repeat its first fate.
 
 ## Who is affected, and who can decode
 
@@ -229,11 +363,38 @@ nothing.
 
 **Can decode** is narrower. For each other station, for each of its slots: it
 must have a finite loss in the table, it must not be transmitting itself, the
-slot must have last said `RX` or `CAD` (channel activity detection), its stated `bw`, `sf` and `sync` must
-equal the transmission's, its `freq` must be within a quarter of its
-bandwidth of the transmission's, and the frame must clear the demodulation
-threshold. The matching keys are one constant — the thing to extend when the
-medium learns to care about coding rate, header type or preamble length.
+slot must have last said `RX` or `CAD` (channel activity detection), its stated `bw`, `sf`, `sync` and `iq`
+must equal the transmission's — or `bw` its, and `sf`, `sync` and `iq` one of
+its side detectors' — its `freq` must be within a quarter of its bandwidth of
+the transmission's, and the frame must pass the lock stage there. The
+matching keys are one constant, `MATCH_KEYS`, and a side detector's
+`SIDE_KEYS` — the things to extend when the medium learns to care about
+coding rate, header type or preamble length.
+
+`iq` is the IQ polarity, `normal` or `inverted`: swapping the in-phase and
+quadrature halves of the baseband mirrors the spectrum, so the chirps sweep
+down instead of up, and a demodulator dechirping with the other polarity
+smears the energy across its bins and finds no preamble. LoRaWAN uses it to
+keep uplinks and downlinks apart. A frame of the other polarity is energy to
+a receiver, nothing more.
+
+**Side detectors** are listening hardware beside the main one — an LR2021
+has up to three, each set with its own spreading factor, low-data-rate
+optimisation and IQ polarity (`SetLoraSideDetConfig`) and its own sync word
+(`SetLoraSideDetSyncword`, 0x24 for each unless set), on the main detector's
+carrier and bandwidth. A station states them in its `state` as `side`, a list
+of `{sf, sync, iq}` (low-data-rate optimisation follows from the spreading
+factor and bandwidth, and the ether does not match on it for the main
+detector either). `Ether.detector` returns which detector matches: 0 the
+main one, k the k-th side one, None none. The chip still demodulates one
+frame at a time, so the lock, `takes()` and the verdicts are as for the main
+detector; the `rx_begin` carries `det` so the chip can report which one.
+Two differences: a side detector misses a short preamble at a rate of its
+own, whatever the SNR (`SIDE_DETECTOR_PREAMBLE_MISS`, from Sergey's bench of
+LR2021 side detectors: 1.9% at 12 symbols, 0.4% at 14, none from 16, a
+straight line between and the 12-symbol figure held below), folded into the
+lock's odds; and a CAD uses the main detector alone, so a side detector's
+frame is energy to a slot in CAD.
 
 The carrier is matched within a tolerance, not exactly, because the
 synthesizer steps in 32 MHz / 2^25: two drivers asked for 869.525 MHz round it
@@ -280,29 +441,32 @@ frame. "Starts listening" is a `state` into RX or CAD from another mode, or
 one that retunes it; a chip reports standby at the end of its own
 transmission, so a station back from sending is always one.
 
-## Reception: two tests, the worst piece deciding
+## Reception: interference, the worst piece deciding
 
-Per receiver, per frame it is locked on to, at that frame's `rx_end`. The
-frame's air is cut at every instant an overlapping transmission starts or
-ends, so the set of transmissions on the air is constant within each piece,
-and in every piece:
+Per receiver, per frame it is locked on to, at that frame's `rx_end`, before
+the payload stage. The frame's air is cut at every instant an overlapping
+transmission starts or ends (and, with fading, at every knot of it), so the
+set of transmissions on the air is constant within each piece, and in every
+piece the frame's **signal over each class of interference** is at or above
+that class's rejection figure. A class is every overlapping transmission at
+one spreading factor, and its powers are summed, in milliwatts, before the
+test. The frame's own spreading factor needs 6 dB; another needs the
+inter-SF figure, which is negative: a frame at SF12 survives an SF7
+interferer 25 dB louder than itself.
 
-1. **signal over thermal noise** at or above the spreading factor's
-   demodulation threshold;
-2. **signal over each class of interference** at or above that class's
-   rejection figure. A class is every overlapping transmission at one
-   spreading factor, and its powers are summed, in milliwatts, before the
-   test. The frame's own spreading factor needs 6 dB; another needs the
-   inter-SF figure, which is negative: a frame at SF12 survives an SF7
-   interferer 25 dB louder than itself.
+A single failing piece makes the frame `crc`, cause `interference`. Noise
+is not added in: the stages are against noise and the rejection figures
+against a chirp, and adding noise to a chirp's power would make neither mean
+what its source measured. Nor are the classes summed into each other: each
+figure was measured against one interfering spreading factor, and
+orthogonality between two others says nothing about their sum.
 
-A single failing piece makes the frame `crc`. The two tests are not one
-weighted sum: the demodulation threshold is against noise and is negative,
-the same-SF figure is against a chirp and is positive, and adding noise to
-a chirp's power would make neither mean what its source measured. Nor are
-the classes summed into each other: each figure was measured against one
-interfering spreading factor, and orthogonality between two others says
-nothing about their sum.
+The verdict functions answer (verdict, cause): `lost` for a frame another
+took the receiver off, or that arrived while it followed another;
+`talked_over` when the receiver transmitted during it; `interference` for a
+rejection figure, the pairwise margin or bench capture. A real chip cannot
+know the cause; the `rx_end` carries it for the record and the testbed's
+tools, and `on_rx` passes it on.
 
 This is the difference between a medium and a referee. A collision is not a
 property of a transmission — it is what happened at one antenna. Two stations
@@ -331,6 +495,11 @@ its source beside it:
 | thermal noise | −174 dBm/Hz | kTB at 290 K |
 | noise figure | 6 dB (setting) | the SX1262's order of magnitude |
 | demodulation threshold | −7.5 dB at SF7, 2.5 dB lower per step | SX1261/2 datasheet |
+| the curve's anchor | 1% of a 64-byte frame (4/5, CRC, explicit header, 8-symbol preamble) lost at the threshold | SX1261/2 datasheet rev. 1.2, section 3.5, the conditions of its sensitivity table |
+| symbols to lock | 4 of the preamble, 2 of the sync word | the bench's blind window; AN1200.13 |
+| fading | σ 0 dB (setting), coherence 3600 s (setting) | the hour from sergeyculum's runs; both to be fitted to deployed nodes' frame-to-frame RSSI |
+| fast fading | Rician K, off (setting) | — |
+| side detector preamble miss | 1.9% at 12 symbols, 0.4% at 14, 0 from 16 | Sergey's bench of LR2021 side detectors |
 | same-SF rejection | 6 dB | Semtech's specification, as Croce et al. quote it |
 | inter-SF rejection | −8 … −25 dB | Croce et al., IEEE Comm. Letters 22(4), 2018, Table II (SX1272) |
 | sense threshold | 10·log10(BW/1 kHz) − 102 dBm | ETSI EN 300 220-1 V3.1.1, 5.21.2 |
@@ -356,19 +525,22 @@ one by one would compare each new one to the one it has and nothing else,
 and would decide differently from the verdict the ether then gives it.
 
 The lock is released when the frame ends, when its `rx_end` goes out, when
-the slot states any mode but `RX`, and when the station transmits.
+its header fails at `t_hdr`, when the slot states any mode but `RX`, and when
+the station transmits. The chip model lets go at a failed header on its own,
+from the `hdr_ok` it was given at the lock.
 
 ## The pairwise rule
 
 `Ether(pairwise=True)`, or `--pairwise`, rules the way a simpler medium does,
 on the same levels from the same table: a frame is delivered where it matches
-and clears the demodulation threshold; a later frame takes the receiver only
-when its level, rounded to the whole dB the station is shown, leads the one
-in progress by 6 dB; and a frame survives only by leading each interferer on
-its carrier that this receiver could decode at the interferer's own settings
-by 6 dB, one at a time, with nothing summed and no spreading factor spared.
-CAD is told only of frames it could decode. It is there so a run can be
-compared, frame for frame, with one ruled that way.
+and locks; a later frame takes the receiver only when its level, rounded to
+the whole dB the station is shown, leads the one in progress by 6 dB; and a
+frame survives only by leading by 6 dB each interferer on its carrier that
+reaches this receiver over its own datasheet threshold, one at a time, the
+two levels taken in the middle of their overlap, with nothing summed and
+no spreading factor spared. CAD is told only of frames it could decode. The
+header and payload stages are as under the receiver-centred rule. It is
+there so a run can be compared, frame for frame, with one ruled that way.
 
 ## Bench capture
 
@@ -391,7 +563,9 @@ outcome is the strongest of them, and "locked" is read off the first frame's
 reception at that receiver, whether it was being followed when the second
 started. With two frames that is the bench's pair exactly, and the outcome
 drawn at the lock is the one the verdicts read, because every draw is a hash
-of the seed, the pair and the receiver (`seeded_draw`). With three or more,
+of the seed, the pair and the receiver (`seeded_draw`); with fading on, the
+lead at the lock and the lead in the worst stretch differ, and the two can
+read different rows of the table. With three or more,
 the sum stands in for the second frame, which is an assumption, as are other
 spreading factors, bandwidths and starts further apart than the bench's.
 Inter-SF classes are judged by the matrix as without it.
@@ -418,14 +592,16 @@ across the air, and only the medium can issue one.
 
 `rx_begin` goes out immediately, so the receiver can arm its preamble, sync and
 header interrupts on the offsets. `rx_end` is a timer at the frame's stated
-span. Nothing re-reads the frame in between — a receiver that leaves `RX`
-mid-frame, or is retuned, discards the reception itself, and the ether sends
-it no `rx_end` for it either: nothing was received that the record, and every
-tool reading it, could count. Its own transmission is the exception, ruled on
-at the frame's end as talked over, `crc`, because that loss is the medium's.
+span, or at `t_hdr` for a header that failed. Nothing re-reads the frame in
+between — a receiver that leaves `RX` mid-frame, or is retuned, discards the
+reception itself, and the ether sends it no `rx_end` for it either: nothing
+was received that the record, and every tool reading it, could count. Its own
+transmission is the exception, ruled on at the frame's end as talked over,
+`crc`, because that loss is the medium's.
 
-Both carry the link's level: `rx_begin` as `level`, which is what an
-instantaneous RSSI reads and what carrier sense acts on, and `rx_end` as `rssi`
+Both carry the link's level: `rx_begin` as `level`, the faded level at the
+lock instant, which is what an instantaneous RSSI reads and what carrier
+sense acts on, and `rx_end` as `rssi`, the mean over the payload's blocks,
 with `snr` the same figure above the noise floor. Both are rounded to whole dB
 on the wire, because the station reads them as integers; the lock and the
 verdict are decided on the unrounded figures, so a frame 6.4 dB up takes the
@@ -447,20 +623,24 @@ medium: the ether's job is the frames, and everything watching is optional.
 
 ## What is deliberately not here
 
-- **Fading and per-frame variation.** A pair's loss is the table's and is
-  the same for every frame between them. No shadowing beyond what the tables
-  are handed with (the testbed's is one static draw per pair), no multipath,
-  no antenna pattern, no rain.
-- **The CRC band by default.** The threshold is the spreading factor's own,
-  and above it a frame is delivered. A real receiver also has a few dB above
-  that threshold where a frame locks but fails its CRC at a probability.
-  `Physics.crc_margin_db` (`--crc-margin-db`) gives that band a width: a
-  frame judged clean that stands m dB over its threshold, m under the width,
-  fails with probability 1 − m/width. The straight line stands in for the
-  S-shaped curve a bench measures. The draw is `seeded_draw` of the seed, the
-  frame's number and the receiving slot, not a generator's next number, so a
-  verdict is the same whatever order the receptions end in. It is off unless
-  given, so a run that does not ask is judged as before.
+- **Fading within a frame.** Fast fading, when asked for, is one Rician
+  draw per frame and receiver; multipath that varies within a frame, at
+  walking pace, is not modelled. No antenna pattern beyond what the tables
+  are handed with, no rain.
+- **Soft interference.** Interference is ruled by rejection figures, not fed
+  into the symbol error curve as a signal-to-interference-plus-noise ratio.
+- **Interference in the header.** A header spoiled by interference is not a
+  header error: the frame runs to `t_end` and ends `crc` there, through the
+  interference rule. Only noise and fading fail a header at `t_hdr`.
+- **A payload with its CRC off.** A frame sent without a CRC whose payload
+  fails is still reported `crc`; a real chip would hand over the corrupted
+  bytes as good, but the ether never opens a payload. Reticulum and the
+  reticulous firmware always run the CRC.
+- **The reduced rate of the first block.** It tolerates a symbol landing in
+  the next bin; the curve treats it as any other block, which is pessimistic.
+- **Preamble length at the main detector.** It is not matched, and it does
+  not change the main detector's lock: four of its symbols are what is
+  needed, however many there are. Only a side detector's lock reads it.
 - **Bandwidth and offset in the rejection figures.** The inter-SF figures
   were measured at one bandwidth on one carrier; a transmission at another
   bandwidth, or partly overlapping the band, is classed by its spreading
