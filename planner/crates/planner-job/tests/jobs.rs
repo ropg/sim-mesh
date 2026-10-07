@@ -177,7 +177,13 @@ fn small_build(buildings: &str, out: &Path) -> Option<(Vec<Value>, Value)> {
         &json!({
             "name": format!("mitte-{buildings}"), "out_dir": out,
             "bbox": [13.38, 52.51, 13.42, 52.53], "res_m": 30, "utm_zone": 33,
-            "dsm_tiles": [inputs[0]], "worldcover_tiles": [inputs[1]],
+            "dsm_tiles": [inputs[0]],
+            "landcover": [{
+                "tiles": [inputs[1]], "proj": "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs",
+                "classes": [[10, 3], [20, 2], [30, 2], [40, 0], [50, 5], [60, 0], [70, 0],
+                            [80, 1], [90, 2], [95, 2], [100, 0]],
+                "source": "ESA WorldCover 2021 land cover", "notice": "ESA WorldCover"
+            }],
             "itu_maps_dir": c.join("itu"), "osm_pbf": inputs[3],
             "osm_buildings": buildings != "lod2",
             "lod2_dir": lod2_input(buildings, &inputs[5], out),

@@ -19,8 +19,10 @@ front ── GET <file>, Range: bytes=<n>- ► the source's host         into th
 
 **Finding a rectangle's files**, by the method a source names:
 
-- `template`: the size_deg tiles of EPSG:4326 meeting the rectangle's grid,
-  each named by its south-west corner, its address the url with {tile}.
+- `template`: the size_deg tiles of degrees meeting the rectangle's grid,
+  each named by its south-west corner (or its north-west one, as USGS
+  names 3DEP's), its address the url with {tile}; read as a window, the
+  part of each the grid needs.
 - `atom`: the tiles a feed lists whose square, its corner read off the file
   name in the feed's units, meets the rectangle's grid in the feed's zone.
 - `regions`: the smallest region of the index whose outline holds the whole
@@ -198,48 +200,75 @@ def zone_of(crs):
 
 # ---- finding: template -----------------------------------------------------------
 
-def tile_name(pattern, lat, lon):
-    """A template's tile named by its south-west corner: {ns} and {ew} the
-    hemispheres, {lat} and {lon} the whole degrees without sign, `:0n`
-    padding them to n digits."""
+def _north_west(source):
+    return source.find.get("corner") == "north-west"
+
+
+def tile_name(source, lat, lon):
+    """A template's tile whose south-west corner is (lat, lon), named by the
+    corner its source says (south-west unless north-west): {ns} and {ew}
+    the hemispheres, upper case unless `letters: lower`, {lat} and {lon} the
+    whole degrees without sign, `:0n` padding them to n digits."""
+    find = source.find
+    if _north_west(source):
+        lat += find["size_deg"]
+    lower = find.get("letters") == "lower"
+
     def field(m):
         what, pad = m.group(1), m.group(2)
-        if what == "ns":
-            return "N" if lat >= 0 else "S"
-        if what == "ew":
-            return "E" if lon >= 0 else "W"
+        if what in ("ns", "ew"):
+            letter = ("N" if lat >= 0 else "S") if what == "ns" else ("E" if lon >= 0 else "W")
+            return letter.lower() if lower else letter
         value = abs(lat if what == "lat" else lon)
         return "%0*d" % (int(pad), value) if pad else "%d" % value
-    return sourcefile.TILE_FIELD_RE.sub(field, pattern)
+    return sourcefile.TILE_FIELD_RE.sub(field, find["tile"])
 
 
-def template_files(source, hull):
-    """The tiles meeting the degrees `hull` [lon0, lat0, lon1, lat1]."""
+def template_files(source, hull, res_m=30.0):
+    """The tiles meeting the degrees `hull` [lon0, lat0, lon1, lat1]; for a
+    source read as a window, each with the box it needs of its tile."""
     size = source.find["size_deg"]
     lon0, lat0, lon1, lat1 = hull
+    want = window_want(source, res_m)
     out = []
     for lat in range(math.floor(lat0 / size) * size, math.floor((lat1 - 1e-9) / size) * size + 1,
                      size):
         for lon in range(math.floor(lon0 / size) * size,
                          math.floor((lon1 - 1e-9) / size) * size + 1, size):
-            tile = tile_name(source.find["tile"], lat, lon)
+            tile = tile_name(source, lat, lon)
             urls = [u.replace("{tile}", tile) for u in source.addresses("url")]
-            out.append(File(source.id, urls, urls[0].rsplit("/", 1)[-1], missing=_missing(source)))
+            window = None
+            if want:
+                box = crs.box_in(source.find["crs"], hull, margin=4 * float(res_m)
+                                 * crs.per_metre(source.find["crs"]))
+                window = {"box": box, "want": want}
+            out.append(File(source.id, urls, urls[0].rsplit("/", 1)[-1], missing=_missing(source),
+                            window=window))
     return out
 
 
 def template_pattern(source):
     """A template's cached file names as a pattern, its corner's groups ns,
-    lat, ew, lon."""
+    lat, ew, lon: the corner its name gives (`template_corner` makes it the
+    south-west one)."""
     name = source.address("url").rsplit("/", 1)[-1].replace("{tile}", source.find["tile"])
+    lower = source.find.get("letters") == "lower"
     out, at = "", 0
     for m in sourcefile.TILE_FIELD_RE.finditer(name):
         out += re.escape(name[at:m.start()])
         what, pad = m.group(1), m.group(2)
-        out += "(?P<%s>[%s])" % (what, "NS" if what == "ns" else "EW") if what in ("ns", "ew") \
-            else "(?P<%s>\\d%s)" % (what, "{%s}" % pad if pad else "+")
+        letters = "NS" if what == "ns" else "EW"
+        out += "(?P<%s>[%s])" % (what, letters.lower() if lower else letters) \
+            if what in ("ns", "ew") else "(?P<%s>\\d%s)" % (what, "{%s}" % pad if pad else "+")
         at = m.end()
     return re.compile("^" + out + re.escape(name[at:]) + "$")
+
+
+def template_corner(source, m):
+    """A cached tile's south-west corner (lat, lon), from its name's match."""
+    lat = int(m.group("lat")) * (-1 if m.group("ns").upper() == "S" else 1)
+    lon = int(m.group("lon")) * (-1 if m.group("ew").upper() == "W" else 1)
+    return (lat - source.find["size_deg"] if _north_west(source) else lat), lon
 
 
 # ---- finding: atom -----------------------------------------------------------------
@@ -329,15 +358,19 @@ def _ring_box(rings):
 
 def window_want(source, res_m):
     """The pixel a window reads a source at for a pack's resolution: a
-    quarter of a cell, so each cell takes a few samples a side."""
-    return float(res_m) / 4.0 if source.read == "window" else None
+    quarter of a cell, so each cell takes a few samples a side, in the
+    units of the source's system."""
+    if source.read != "window":
+        return None
+    return float(res_m) / 4.0 * crs.per_metre(source.find.get("crs") or "EPSG:4326")
 
 
 def index_files(source, features, bbox, res_m=30.0):
     """The files of an index whose footprint meets the rectangle's grid in
     the index's system; for a source read as a window, each with the box it
     needs of its file."""
-    box = crs.box_in(source.find["crs"], bbox, margin=4 * float(res_m))
+    box = crs.box_in(source.find["crs"], bbox,
+                     margin=4 * float(res_m) * crs.per_metre(source.find["crs"]))
     want = window_want(source, res_m)
     out = []
     for props, rings in features:
@@ -970,7 +1003,7 @@ async def source_map(cache, source_id, sources=None):
     feed lists, where its data is (its outline when the feed cannot be had);
     any other's is its outline. What is cached is read off the file names,
     as its method names them: a
-    template's tile its south-west corner, a feed's tile its corner in the
+    template's tile the corner it is named by, a feed's tile its corner in the
     feed's units, a region's file its region, whose outline the index gives,
     and a single file the whole coverage. A source that needs its index to
     say this and cannot have it says so in `error`."""
@@ -988,8 +1021,7 @@ async def source_map(cache, source_id, sources=None):
             for name in names:
                 m = pattern.match(name)
                 if m:
-                    lat = int(m.group("lat")) * (-1 if m.group("ns") == "S" else 1)
-                    lon = int(m.group("lon")) * (-1 if m.group("ew") == "W" else 1)
+                    lat, lon = template_corner(source, m)
                     cached.append(_box(lon, lat, lon + size, lat + size))
         elif method == "atom":
             # Its data is where its feed has a tile: inside its outline, and
@@ -1105,7 +1137,7 @@ async def plan(cache, spec, sizes=True, sources=None):
             continue
         method = source.find["method"]
         if method == "template":
-            found = template_files(source, hull)
+            found = template_files(source, hull, spec.get("res_m", 30))
         elif method == "atom":
             found = atom_files(source, await cache.feed(source), bbox)
         elif method == "index":

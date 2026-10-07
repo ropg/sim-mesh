@@ -1,21 +1,23 @@
 //! Terrain and surface from GeoTIFFs in any coordinate system: a source's
 //! bare-ground model and its surface model (AHN's DTM and DSM in RD New, at
-//! 0.5 m), sampled onto the pack grid.
+//! 0.5 m), sampled onto the pack grid; or a bare-ground model alone (3DEP's,
+//! in degrees), which gives a cell its terrain and leaves its clutter be.
 //!
 //! Each pack cell is sampled k × k times, k its size over the tiles' pixel
 //! (at most 8 a side), each sample projected from the pack's UTM into the
 //! tiles' system and read at the nearest pixel of the image whose pixel
 //! suits the build (`CogReader::open_level`). A cell's terrain is the mean
-//! of its terrain samples; its clutter is the representative height of
-//! surface less terrain (`MeanAccum::representative`), as Berlin's 1 m pairs
-//! give theirs. `count` says how many samples had both; the build leaves a
-//! cell with too few to the sources below it.
+//! of its terrain samples; with a surface, its clutter is the representative
+//! height of surface less terrain (`MeanAccum::representative`), as Berlin's
+//! 1 m pairs give theirs. `count` says how many samples had what the input
+//! has (both, or the terrain); the build leaves a cell with too few to the
+//! sources below it.
 
 use crate::berlin1m::MeanAccum;
+use crate::system::{transform, System};
 use crate::PackError;
 use planner_core::geo::Xy;
 use planner_terrain::cog::{CogMeta, CogReader};
-use proj4rs::Proj;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::BufReader;
@@ -31,13 +33,15 @@ const NO_DATA_ABOVE: f32 = 1.0e20;
 /// pass the 256 open files macOS allows a process.
 const OPEN_PER_WORKER: usize = 8;
 
-/// One source pair's tiles, and the system they are in (a proj string).
+/// One source pair's tiles, and the system they are in (a proj string). No
+/// surface tiles: the terrain stands alone.
 #[derive(Debug, Clone)]
 pub struct ElevationInput {
     pub terrain: Vec<PathBuf>,
     pub surface: Vec<PathBuf>,
     pub proj: String,
-    /// The pixel the build reads them at, in their units (metres).
+    /// The pixel the build reads them at, in their units (metres, or degrees
+    /// for a geographic system).
     pub pixel_m: f64,
     /// The tiles' no-data value, where they have one in range (Brandenburg's
     /// −9999).
@@ -47,8 +51,8 @@ pub struct ElevationInput {
     pub notice: String,
 }
 
-/// What a pair gave each pack cell: its terrain, its clutter, and how many
-/// of its samples both models had.
+/// What a pair gave each pack cell: its terrain, its clutter (NaN for a
+/// terrain alone), and how many of its samples had what the input has.
 pub struct CellValues {
     pub terrain: Vec<f32>,
     pub clutter: Vec<f32>,
@@ -159,17 +163,17 @@ pub fn sample(
     res: f64,
     nx: usize,
     ny: usize,
-    pack: &Proj,
+    pack: &System,
 ) -> Result<CellValues, PackError> {
-    let src = Proj::from_proj_string(&input.proj)
-        .map_err(|e| PackError::Proj(format!("{}: {e}", input.proj)))?;
+    let src = System::new(&input.proj)?;
+    let alone = input.surface.is_empty();
     // Every tile opened once for its grid; each worker opens its own readers.
     let terrain_tiles = Tiles::new(&input.terrain, input.pixel_m, input.nodata)?;
     let surface_tiles = Tiles::new(&input.surface, input.pixel_m, input.nodata)?;
     let pixel = terrain_tiles
         .metas
         .first()
-        .map(|m| m.dx.abs())
+        .map(|m| m.dy.abs() / src.units_per_metre())
         .unwrap_or(res);
     let k = ((res / pixel).round() as usize).clamp(1, MAX_SAMPLES_SIDE);
     let mut terrain = vec![f32::NAN; nx * ny];
@@ -188,30 +192,34 @@ pub fn sample(
                 for col in 0..nx {
                     let cx = origin.x + col as f64 * res;
                     let mut t_sum = 0.0f32;
+                    let mut t_n = 0u32;
                     for iy in 0..k {
                         for ix in 0..k {
                             let x = cx - res / 2.0 + (ix as f64 + 0.5) * res / k as f64;
                             let y = cy + res / 2.0 - (iy as f64 + 0.5) * res / k as f64;
-                            let mut p = (x, y, 0.0);
-                            if proj4rs::transform::transform(pack, &src, &mut p).is_err() {
-                                continue;
-                            }
-                            let (Some(t), Some(s)) =
-                                (ter.value_at(p.0, p.1), sur.value_at(p.0, p.1))
-                            else {
+                            let Some((sx, sy)) = transform(pack, &src, x, y) else {
                                 continue;
                             };
+                            let Some(t) = ter.value_at(sx, sy) else { continue };
+                            if !alone {
+                                let Some(s) = sur.value_at(sx, sy) else { continue };
+                                above.add(col, (s - t).max(0.0));
+                            }
                             t_sum += t;
-                            above.add(col, (s - t).max(0.0));
+                            t_n += 1;
                         }
                     }
-                    let Some(clutter) = above.representative(col) else {
+                    if t_n == 0 {
                         continue;
-                    };
-                    let n = above.count[col];
-                    t_row[col] = t_sum / n as f32;
-                    c_row[col] = clutter;
-                    n_row[col] = n;
+                    }
+                    if !alone {
+                        let Some(clutter) = above.representative(col) else {
+                            continue;
+                        };
+                        c_row[col] = clutter;
+                    }
+                    t_row[col] = t_sum / t_n as f32;
+                    n_row[col] = t_n;
                 }
             },
         );

@@ -2,9 +2,13 @@
 the compiler need of each.
 
     EPSG:4326              degrees
+    EPSG:4269              degrees on NAD83 (USGS's 3DEP): within two metres of WGS84's,
+                           taken as them
     EPSG:326zz, 327zz      UTM on WGS84, north and south
     EPSG:258zz             UTM on ETRS89 (Berlin's data)
+    EPSG:269zz             UTM on NAD83, zones 1 to 23 (the US state and federal surveys)
     EPSG:3035              ETRS89 / LAEA Europe (Zensus's grid)
+    EPSG:5070              NAD83 / Conus Albers (NLCD)
     EPSG:28992             Amersfoort / RD New (the Netherlands' AHN, 3DBAG, CBS)
     EPSG:7415              RD New with NAP heights (3DBAG's CityJSON): RD New across
 
@@ -14,6 +18,12 @@ degrees and the system's metres: Krüger's series for UTM (geodata.py), and
 for RD New the published polynomial between RD and WGS84 coordinates
 (Schreutelkamp and Strang van Hees, 2001), good to about a metre across the
 Netherlands, which is all that choosing tiles and drawing a map asks for.
+Conus Albers has no plane here: a source in it is one file, found without
+projecting.
+
+`per_metre(crs)` is a system's units in a metre, for a distance in metres
+said in them: one for the projected systems, a degree of latitude's share
+for the geographic ones.
 """
 
 import re
@@ -27,10 +37,15 @@ RD_NEW = ("+proj=sterea +lat_0=52.15616055555555 +lon_0=5.38763888888889 +k=0.99
           "+towgs84=565.417,50.3319,465.552,-0.398957,0.343988,-1.8774,4.0725 +units=m +no_defs")
 FIXED = {
     4326: "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs",
+    4269: "+proj=longlat +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +no_defs",
     3035: "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80 +units=m +no_defs",
+    5070: "+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 +x_0=0 +y_0=0 +ellps=GRS80 "
+          "+towgs84=0,0,0,0,0,0,0 +units=m +no_defs",
     28992: RD_NEW,
     7415: RD_NEW,
 }
+GEOGRAPHIC = (4326, 4269)
+M_PER_DEGREE = 111320.0             # a degree of latitude, near enough for a margin or a pixel
 
 
 def epsg(crs):
@@ -43,10 +58,18 @@ def known(crs):
     return code is not None and (code in FIXED or _utm(code) is not None)
 
 
+def geographic(crs):
+    return epsg(crs) in GEOGRAPHIC
+
+
+def per_metre(crs):
+    return 1.0 / M_PER_DEGREE if geographic(crs) else 1.0
+
+
 def _utm(code):
-    for base, south, ellps in ((32600, False, "WGS84"), (32700, True, "WGS84"),
-                               (25800, False, "GRS80")):
-        if 1 <= code - base <= 60:
+    for base, south, ellps, last in ((32600, False, "WGS84", 60), (32700, True, "WGS84", 60),
+                                     (25800, False, "GRS80", 60), (26900, False, "GRS80", 23)):
+        if 1 <= code - base <= last:
             return code - base, south, ellps
     return None
 
@@ -107,7 +130,7 @@ def plane(crs):
     """forward(lat, lon) → (x, y) and inverse(x, y) → (lat, lon) for a known
     system."""
     code = epsg(crs)
-    if code == 4326:
+    if code in GEOGRAPHIC:
         return Degrees()
     if code in (28992, 7415):
         return RdNew()
