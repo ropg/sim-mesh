@@ -1205,8 +1205,9 @@ def test_a_frame_arrives_faded_at_its_start_and_unfaded_without_fading(medium):
 
     medium.physics = ether_module.Physics(fading_db=4.0)
     there = frame(medium, 1, 2_000_000, 2_300_000)
-    expected = medium.fade_db("n1", "n2", 2_000_000)
-    assert expected == medium.fade_db("n2", "n1", 2_000_000)
+    expected = medium.fade_db(1, 2, 2_000_000)
+    assert expected != 0.0
+    assert expected == medium.fade_db(2, 1, 2_000_000)
     assert medium.level_at(there, 2, 2_000_000) == pytest.approx(
         medium.level(1, 2, FREQ, POWER_DBM) + expected)
 
