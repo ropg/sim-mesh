@@ -143,6 +143,8 @@ export interface ScriptRow {
   inputs?: ScriptInput[]
   /** The scripts that include or import this one: it is part of them, not run on its own. */
   included_by?: string[]
+  /** One sim-mesh ships: never saved over, kept changed with Save as. */
+  example?: boolean
 }
 
 export interface ScriptRun {

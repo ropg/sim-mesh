@@ -1,30 +1,26 @@
 <template>
   <q-page class="sp">
     <div class="sp-list">
-      <div class="sp-head">
-        <span class="sp-heading">Scripts</span>
-        <q-space />
-        <q-btn flat dense no-caps color="primary" label="New" @click="askNew" />
-      </div>
-      <q-list dense>
-        <q-item v-for="s in runnable" :key="s.name" clickable :active="s.name === current"
-                active-class="sp-active" @click="openScript(s.name)">
-          <q-item-section>
-            <q-item-label>{{ s.name }}</q-item-label>
-            <q-item-label caption class="sp-doc">{{ s.error ?? s.doc }}</q-item-label>
-          </q-item-section>
-        </q-item>
-      </q-list>
-      <!-- Scripts others include: parts of those, opened here to edit, never run alone. -->
-      <template v-if="included.length">
-        <div class="sp-head sp-subhead"><span class="sp-heading">Included by scripts</span></div>
+      <!-- The examples sim-mesh ships, kept changed only with Save as, then
+           one's own. A script others include is part of those, never run
+           alone, and says so with its badge. -->
+      <template v-for="section in sections" :key="section.title">
+        <div class="sp-head" :class="{ 'sp-subhead': section.local }">
+          <span class="sp-heading">{{ section.title }}</span>
+          <q-space />
+          <q-btn v-if="section.local" flat dense no-caps color="primary" label="New" @click="askNew" />
+        </div>
         <q-list dense>
-          <q-item v-for="s in included" :key="s.name" clickable :active="s.name === current"
+          <q-item v-for="s in section.scripts" :key="s.name" clickable :active="s.name === current"
                   active-class="sp-active" @click="openScript(s.name)">
             <q-item-section>
-              <q-item-label>{{ s.name }}</q-item-label>
-              <q-item-label caption class="sp-doc">{{ s.error ?? `part of ${s.included_by!.join(', ')}` }}</q-item-label>
+              <q-item-label>{{ s.name }}<span v-if="s.included_by?.length" class="sp-ro">library</span></q-item-label>
+              <q-item-label caption class="sp-doc">{{ s.error ?? (s.included_by?.length
+                ? `part of ${s.included_by.join(', ')}` : s.doc) }}</q-item-label>
             </q-item-section>
+          </q-item>
+          <q-item v-if="section.local && !section.scripts.length">
+            <q-item-section class="sp-doc">None yet: New, or Save as from an example</q-item-section>
           </q-item>
         </q-list>
       </template>
@@ -34,8 +30,8 @@
       <template v-if="current || setup">
         <q-toolbar class="sp-bar">
           <span class="sp-title">{{ current ?? `${setup} setup` }}<span v-if="anyDirty" class="sp-dirty"> •</span></span>
-          <q-btn flat dense no-caps label="Save" :disable="!tab || tab.readonly || (!tabDirty(tab) && !tab.fresh)"
-                 @click="save" />
+          <q-btn v-if="!tab || !isExample(tab)" flat dense no-caps label="Save"
+                 :disable="!tab || tab.readonly || (!tabDirty(tab) && !tab.fresh)" @click="save" />
           <q-btn v-if="!setup" flat dense no-caps label="Save as" :disable="!tab || tab.readonly || !!tab.nodeset"
                  @click="askSaveAs" />
           <q-space />
@@ -205,9 +201,16 @@ const shownRun = ref<string | null>(null)
 const outputEl = ref<HTMLPreElement>()
 
 const tab = computed(() => tabs.value.find(t => t.key === tabKey.value) ?? null)
-/** The scripts to run, and those other scripts include (startup, globals). */
-const runnable = computed(() => catalog.scripts.filter(s => !s.included_by?.length))
-const included = computed(() => catalog.scripts.filter(s => !!s.included_by?.length))
+/** The examples, then one's own scripts; in each, those to run first, then
+ *  those other scripts include (startup, globals). */
+const sections = computed(() => {
+  const ordered = [...catalog.scripts.filter(s => !s.included_by?.length),
+                   ...catalog.scripts.filter(s => !!s.included_by?.length)]
+  return [{ title: 'Examples', local: false, scripts: ordered.filter(s => s.example) },
+          { title: 'Local scripts', local: true, scripts: ordered.filter(s => !s.example) }]
+})
+/** A tab of an example: Save as keeps its changes, Save never. */
+function isExample(t: Tab) { return !!t.script && !!catalog.scripts.find(s => s.name === t.script)?.example }
 const includedBy = computed(() => catalog.scripts.find(s => s.name === current.value)?.included_by ?? [])
 function tabDirty(t: Tab) { return !t.readonly && t.text !== t.saved }
 const anyDirty = computed(() => tabs.value.some(tabDirty))
@@ -400,6 +403,7 @@ async function saveTab(t: Tab): Promise<boolean> {
     return true
   }
   if (!t.script) return true
+  if (isExample(t)) { tell(`${t.script} is an example: Save as to keep the changes under a name of your own`); return false }
   const r = await request('script_save', { name: t.script, text: t.text })
   if (!r.ok) { tell(r.error); return false }
   t.saved = t.text
