@@ -203,7 +203,7 @@ def test_an_austrian_rectangle_hands_the_compiler_bevs_pair_and_the_census_grid(
         "ALS_DTM_CRS3035RES50000mN2650000E4400000.tif",
         "ALS_DSM_CRS3035RES50000mN2650000E4400000.tif"]
     assert pair["proj"].startswith("+proj=laea") and pair["pixel_m"] == 7.5
-    assert pair["nodata"] == -9999.0
+    assert pair["nodata"] == [-9999.0]
     population = params["population"]
     assert population["proj"].startswith("+proj=laea") and population["cell_m"] == 100.0
     assert open(population["csv"]).read() == "x,y,value\n4400050.0,2650050.0,3\n"
@@ -428,7 +428,14 @@ def test_the_shipped_sources_hold_together():
     assert list(SHIPPED) == ["glo30", "worldcover", "itu", "geofabrik", "berlin-dgm1",
                              "berlin-bdom", "berlin-lod2", "zensus", "brandenburg-dgm1",
                              "brandenburg-bdom", "brandenburg-lod2", "mv-dgm1", "mv-dom1",
-                             "mv-lod2", "ahn-dtm", "ahn-dsm", "3dbag", "cbs-population",
+                             "mv-lod2", "by-dgm1", "by-dom20", "by-lod2", "bw-dgm1", "bw-dom1",
+                             "bw-lod2", "hb-dgm1", "hb-dom1", "hb-lod2", "hh-dgm1", "hh-bdom",
+                             "hh-lod2", "he-dgm1", "he-dom1", "ni-dgm1", "ni-dom1", "ni-lod2",
+                             "nrw-dgm1", "nrw-dom1", "nrw-lod2", "rp-dgm1", "rp-dom1", "rp-lod2",
+                             "sl-dgm1", "sl-dom1", "sl-lod2", "sn-dgm1", "sn-dom1", "sn-lod2",
+                             "st-dgm1", "st-dom1", "st-lod2", "sh-dgm1", "sh-bdom", "sh-lod2",
+                             "th-dgm1", "th-dom1", "th-lod2",
+                             "ahn-dtm", "ahn-dsm", "3dbag", "cbs-population",
                              "bev-als-dtm", "bev-als-dsm", "statistik-austria-population",
                              "usgs-3dep-13", "nlcd", "worldpop-us"]
     for source in SHIPPED.values():
@@ -451,6 +458,20 @@ def test_the_shipped_sources_hold_together():
         assert not sources.meets(outline, [13.38, 52.51, 13.42, 52.53])
     assert sources.meets(SHIPPED["nlcd"].outline, [-74.1, 40.6, -73.9, 40.8])
     assert not sources.meets(SHIPPED["nlcd"].outline, [-150.0, 61.1, -149.8, 61.3])
+    # Every German state has its terrain, its surface and its buildings,
+    # Hessen's buildings OpenStreetMap's.
+    capitals = {"by": (11.57, 48.13), "bw": (9.18, 48.77), "hb": (8.80, 53.07),
+                "hh": (9.99, 53.55), "he": (8.24, 50.08), "ni": (9.73, 52.37),
+                "nrw": (6.78, 51.22), "rp": (8.27, 50.00), "sl": (7.00, 49.23),
+                "sn": (13.74, 51.05), "st": (11.63, 52.13), "sh": (10.13, 54.32),
+                "th": (11.03, 50.98), "berlin": (13.40, 52.52), "brandenburg": (13.06, 52.40),
+                "mv": (11.41, 53.63)}
+    for state, (lon, lat) in capitals.items():
+        here = {layer for s in SHIPPED.values() if s.id.startswith(state + "-")
+                and sources.meets(s.outline, [lon, lat, lon + 0.01, lat + 0.01])
+                for layer in s.layers}
+        assert here == ({"terrain", "surface"} if state == "he"
+                        else {"terrain", "surface", "buildings"}), state
 
 
 @pytest.mark.parametrize("change, why", [
@@ -508,6 +529,55 @@ def test_a_us_source_that_does_not_hold_together_is_refused_saying_why(tmp_path,
         sourcefile.read_file(str(tmp_path / "sources.yaml"))
 
 
+@pytest.mark.parametrize("source, change, why", [
+    ("nrw-lod2", lambda e: e["format"].update(crs="EPSG:4326"), "the compiler reads citygml in a UTM"),
+    ("bw-dgm1", lambda e: e["find"].update(origin_m=[1000]), "origin_m is [x, y]"),
+    ("he-dgm1", lambda e: e["find"].update(tile="{x2}_{y2}"), "names its corner with {x} and {y}"),
+    ("he-dgm1", lambda e: e["find"].update(file="a/{x}_{y}.tif"), "the name a tile is kept under"),
+    ("hh-lod2", lambda e: e["find"].update(archives="https://h/a.zip"), "find.archives is a list"),
+    ("hh-lod2", lambda e: e["find"].update(name="(?P<x>\\d+)"), "(?P<x>…) and (?P<y>…)"),
+    ("ni-dgm1", lambda e: e["find"].pop("tile_property"), "both tile_property and newest_property"),
+    ("ni-dgm1", lambda e: e.update(pairs_with="ni-dom1"), "pairs_with is a GeoTIFF surface's"),
+])
+def test_a_german_source_that_does_not_hold_together_is_refused_saying_why(tmp_path, source,
+                                                                            change, why):
+    import copy
+    import yaml
+    entry = copy.deepcopy(SHIPPED[source].entry)
+    change(entry)
+    (tmp_path / "outlines").mkdir()
+    shutil.copy(os.path.join(os.path.dirname(sourcefile.SHIPPED), "outlines", source + ".geojson"),
+                tmp_path / "outlines" / (source + ".geojson"))
+    (tmp_path / "sources.yaml").write_text(yaml.safe_dump(
+        {"europe": {"DE": {"name": "Germany", "sources": [entry]}}}, allow_unicode=True))
+    with pytest.raises(store.StoreError, match=re.escape(why)):
+        sourcefile.read_file(str(tmp_path / "sources.yaml"))
+
+
+def test_a_surface_pairs_with_the_xyz_terrain_it_names_and_only_that(tmp_path):
+    import yaml
+    given = {"xyz": ["bw-dgm1"], "elevation_terrain": ["by-dgm1"],
+             "elevation_surface": ["by-dom20", "bw-dom1"]}
+    packbuild.Build.surfaces_to_xyz(given, SHIPPED)
+    assert given == {"xyz": ["bw-dgm1", "bw-dom1"], "elevation_terrain": ["by-dgm1"],
+                     "elevation_surface": ["by-dom20"]}
+    # Its partner absent from the rectangle, it stays a GeoTIFF surface.
+    given = {"elevation_surface": ["bw-dom1"]}
+    packbuild.Build.surfaces_to_xyz(given, SHIPPED)
+    assert given == {"elevation_surface": ["bw-dom1"]}
+    # A partner that is no XYZ terrain is refused when the files are read.
+    (tmp_path / "outlines").mkdir()
+    for source in ("bw-dom1", "by-dgm1"):
+        shutil.copy(os.path.join(os.path.dirname(sourcefile.SHIPPED), "outlines",
+                                 source + ".geojson"), tmp_path / "outlines" / (source + ".geojson"))
+    dom = dict(SHIPPED["bw-dom1"].entry, id="bw-dom1", pairs_with="by-dgm1")
+    (tmp_path / "sources.yaml").write_text(yaml.safe_dump(
+        {"europe": {"DE": {"name": "Germany", "sources": [dom, SHIPPED["by-dgm1"].entry]}}},
+        allow_unicode=True))
+    with pytest.raises(store.StoreError, match="pairs_with names the XYZ terrain"):
+        sourcefile.load((str(tmp_path / "sources.yaml"),))
+
+
 def test_a_us_rectangle_hands_the_compiler_3dep_alone_nlcd_over_worldcover_and_worldpop(tmp_path):
     """The compiler's inputs from what the cache holds: 3DEP's terrain with no
     surface beside it, read in degrees; land cover worldwide source first,
@@ -538,7 +608,7 @@ def test_a_us_rectangle_hands_the_compiler_3dep_alone_nlcd_over_worldcover_and_w
     params = build.params({"files": files, "grid": {"zone": 10}}, SHIPPED)
     [terrain] = params["elevation"]
     assert [os.path.basename(p) for p in terrain["terrain"]] == ["USGS_13_n38w123.tif"]
-    assert terrain["surface"] == [] and terrain["nodata"] == -999999.0
+    assert terrain["surface"] == [] and terrain["nodata"] == [-999999.0]
     assert terrain["proj"].startswith("+proj=longlat +ellps=GRS80")
     assert terrain["pixel_m"] == pytest.approx(7.5 / 111320.0)
     assert [c["source"] for c in params["landcover"]] == [
@@ -668,8 +738,14 @@ def test_a_build_fetches_what_it_needs_and_hands_the_compiler_its_inputs(tmp_pat
         assert build.row["state"] == "done", build.row["error"]
         params = json.loads(saw.read_text())
         assert params["osm_buildings"] and params["utm_zone"] == 33
-        assert os.path.basename(params["lod2_dir"]) == "lod2"
-        assert params["berlin_1m_dir"] and params["elevation"] == [] and params["cityjson"] is None
+        [lod2] = params["lod2"]
+        assert os.path.basename(lod2["dir"]) == "lod2-berlin-lod2" and lod2["zone"] == 33
+        assert lod2["source"] == "Berlin LoD2 building models"
+        assert lod2["notice"].startswith("Geoportal Berlin: 3D-Gebäudemodelle LoD2")
+        [xyz] = params["xyz"]
+        assert xyz["zone"] == 33 and "terrain" in xyz and "surface" in xyz
+        assert xyz["source"] == "Berlin DGM1, 1 m terrain and Berlin bDOM, 1 m surface"
+        assert params["elevation"] == [] and params["cityjson"] is None
         # Zensus's grid as a population input, its layout and system from its source.
         population = params["population"]
         assert population["csv"].endswith("Zensus2022_Bevoelkerungszahl_100m-Gitter.csv")
@@ -729,6 +805,9 @@ class StandInCache:
 
     async def index_features(self, source):
         raise store.StoreError("no index in this test")
+
+    async def zip_listing(self, source):
+        raise store.StoreError("no archives in this test")
 
 
 def test_a_sources_area_and_its_cache_come_from_names_feeds_and_outlines(tmp_path):

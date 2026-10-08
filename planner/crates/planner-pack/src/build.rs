@@ -2,7 +2,7 @@
 //! into terrain and clutter, with whatever else the build is given merged in
 //! (buildings from CityGML LoD2 or CityJSON where their tiles cover the grid
 //! and from OpenStreetMap everywhere else; measured terrain and surface from
-//! Berlin's 1 m XYZ or from GeoTIFFs in any projection, or a measured
+//! the state surveys' 1 m XYZ or from GeoTIFFs in any projection, or a measured
 //! terrain alone in place of the split's; land cover through each source's class
 //! table; a population grid or raster; OpenStreetMap roads and places), and
 //! the manifest.
@@ -119,17 +119,18 @@ pub struct BuildParams {
     /// Directory holding the locally-downloaded ITU maps (DN50.TXT/N050.TXT).
     /// None → world-median ΔN/N0 defaults with a loud warning.
     pub itu_maps_dir: Option<PathBuf>,
-    /// Directory of extracted Berlin 1 m XYZ tiles (DGM1 + bDOM pairs).
-    /// Where pairs cover the region, the GLO-30 pseudo-split is OVERRIDDEN
-    /// with real terrain and real clutter (means over each pack cell).
-    pub berlin_1m_dir: Option<PathBuf>,
-    /// Directory of extracted LoD2 CityGML files: per-building sidecar
+    /// 1 m XYZ terrain and surface tile pairs (DGM1 + bDOM or DOM1), one
+    /// input per source. Where pairs cover the region, the GLO-30
+    /// pseudo-split is OVERRIDDEN with real terrain and real clutter (means
+    /// over each pack cell).
+    pub xyz: Vec<crate::xyz::XyzInput>,
+    /// LoD2 CityGML, one directory per source: per-building sidecar
     /// (`buildings.jsonl`) + building-height merged into the clutter layer
-    /// (cell-mean, before any 1 m override). Only the 1 km tiles meeting the
+    /// (cell-mean, before any 1 m override). Only the tiles meeting the
     /// grid are read, and only buildings meeting it are kept. The tiles read
     /// are the ground LoD2 covers: with `osm_buildings` as well, an
     /// OpenStreetMap building whose centroid lies in one of them is left out.
-    pub lod2_dir: Option<PathBuf>,
+    pub lod2: Vec<crate::lod2::Lod2Input>,
     /// Write LoD2 footprint POLYGONS into `buildings.jsonl` as well as
     /// centroids. OpenStreetMap buildings always carry theirs.
     ///
@@ -143,7 +144,7 @@ pub struct BuildParams {
     /// household-weighted siting.
     pub population: Option<PopulationInput>,
     /// Terrain and surface GeoTIFFs in their own system (AHN's DTM and DSM):
-    /// where they cover a cell, both halves measured, as Berlin's 1 m pairs.
+    /// where they cover a cell, both halves measured, as the XYZ 1 m pairs.
     /// A terrain alone (3DEP's) replaces only the split's terrain; each cell
     /// keeps its clutter.
     pub elevation: Vec<crate::elevation::ElevationInput>,
@@ -159,7 +160,7 @@ pub struct BuildParams {
     pub osm_pbf: Option<PathBuf>,
     /// Buildings from `osm_pbf`: the same sidecar, clutter merge,
     /// `BuiltFraction` and `BuildingTop` that LoD2 fills, on the ground the
-    /// LoD2 tiles of `lod2_dir` do not cover.
+    /// LoD2 tiles of `lod2` do not cover.
     pub osm_buildings: bool,
     /// Worker threads for the parallel stages (0 = auto: min(100, available)).
     pub threads: usize,
@@ -205,8 +206,8 @@ impl BuildParams {
             out_dir,
             name: "berlin-test".into(),
             itu_maps_dir: None,
-            berlin_1m_dir: None,
-            lod2_dir: None,
+            xyz: Vec::new(),
+            lod2: Vec::new(),
             lod2_geometry: false,
             population: None,
             elevation: Vec::new(),
@@ -295,8 +296,14 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
             check(Some(p), "dsm_tiles", false);
         }
         check(params.itu_maps_dir.as_ref(), "itu_maps_dir", true);
-        check(params.berlin_1m_dir.as_ref(), "berlin_1m_dir", true);
-        check(params.lod2_dir.as_ref(), "lod2_dir", true);
+        for x in &params.xyz {
+            for p in x.terrain.iter().chain(&x.surface) {
+                check(Some(p), "xyz tile", false);
+            }
+        }
+        for l in &params.lod2 {
+            check(Some(&l.dir), "lod2 dir", true);
+        }
         check(params.population.as_ref().map(|p| p.path()), "population grid", false);
         check(params.cityjson.as_ref().map(|c| &c.dir), "cityjson dir", true);
         for e in &params.elevation {
@@ -330,9 +337,9 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         names: [
             Some("terrain"),
             params.osm_pbf.as_ref().map(|_| "osm"),
-            (params.lod2_dir.is_some() || params.cityjson.is_some() || params.osm_buildings)
+            (!params.lod2.is_empty() || params.cityjson.is_some() || params.osm_buildings)
                 .then_some("buildings"),
-            (params.berlin_1m_dir.is_some() || !params.elevation.is_empty()).then_some("lidar"),
+            (!params.xyz.is_empty() || !params.elevation.is_empty()).then_some("lidar"),
             (!params.landcover.is_empty()).then_some("landcover"),
             Some("clutter"),
             params.population.as_ref().map(|_| "population"),
@@ -416,29 +423,17 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         }
     };
     let project = |lat: f64, lon: f64| to_utm(&utm, &ll, lon, lat).unwrap_or((f64::NAN, f64::NAN));
-    // The 1 m pairs and the LoD2 tiles are EPSG:25833, ETRS89 / UTM 33. In a
-    // zone-33 pack that IS the grid (within a metre; berlin1m.rs) and they are
-    // used as they are. A pack west of 12° E is in zone 32 (Schwerin, Wismar,
-    // the Prignitz), and there the same coordinates land ~400 km east of where
-    // they belong, so they are projected into the pack's zone point by point.
-    let utm33 = if params.utm_zone == 33 { None } else { Some(utm_proj(33)?) };
-    let from_33 = |x: f64, y: f64| -> Option<(f64, f64)> {
-        let Some(src) = &utm33 else { return Some((x, y)) };
-        let mut pt = (x, y, 0.0);
-        proj4rs::transform::transform(src, &utm, &mut pt).ok()?;
-        Some((pt.0, pt.1))
-    };
-    // The grid in zone 33, for choosing those tiles by the corner in their
-    // names.
-    let grid_extent_33 = match &utm33 {
-        None => grid_extent,
-        Some(dst) => reproject_extent(grid_extent, |x, y| {
-            let mut pt = (x, y, 0.0);
-            proj4rs::transform::transform(&utm, dst, &mut pt).ok()?;
-            Some((pt.0, pt.1))
-        })
-        .ok_or_else(|| PackError::Proj("grid → utm33".into()))?,
-    };
+    // The XYZ pairs and the LoD2 tiles are each in their source's ETRS89 UTM
+    // zone. In the pack's own zone that IS the grid (within a metre; xyz.rs)
+    // and they are used as they are. In the next zone the same coordinates
+    // land ~400 km from where they belong (Mecklenburg-Vorpommern's zone-33
+    // tiles in a zone-32 pack over Schwerin), so they are projected into the
+    // pack's zone point by point.
+    let zones = ZoneSet::new(
+        params.utm_zone,
+        params.xyz.iter().map(|x| x.zone).chain(params.lod2.iter().map(|l| l.zone)),
+        grid_extent,
+    )?;
 
     // Parallel resample: one row per task, per-worker tile readers.
     use rayon::prelude::*;
@@ -566,8 +561,10 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     let mut n_cityjson = 0usize;
     // Whether the sidecar was started by the measured buildings, so
     // OpenStreetMap's lines are appended after theirs.
-    let sidecar_started = params.lod2_dir.is_some() || params.cityjson.is_some();
-    if params.lod2_dir.is_some() || params.cityjson.is_some() || params.osm_buildings {
+    let sidecar_started = !params.lod2.is_empty() || params.cityjson.is_some();
+    // The LoD2 sources that gave buildings, for the manifest.
+    let mut used_lod2: Vec<&crate::lod2::Lod2Input> = Vec::new();
+    if !params.lod2.is_empty() || params.cityjson.is_some() || params.osm_buildings {
         steps.begin("buildings");
         let mut acc = BuiltAccum::new(nx * ny);
         // The ground LoD2 covers: each tile read, by its name, or for a file
@@ -580,10 +577,15 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         } else {
             None
         };
-        if let Some(dir) = &params.lod2_dir {
+        for input in &params.lod2 {
             let sidecar = sidecar.as_mut().expect("started for LoD2");
             use std::io::Write as _;
-            // Only the 1 km tiles meeting the grid: a district of a city-wide
+            let dir = &input.dir;
+            let zone = input.zone;
+            let grid_in_zone = zones.grid_in(zone);
+            let from_zone = |x: f64, y: f64| zones.into_pack(zone, x, y);
+            let before = n_lod2;
+            // Only the tiles meeting the grid: a district of a city-wide
             // LoD2 set reads megabytes, not the whole set.
             let files: Vec<PathBuf> = std::fs::read_dir(dir)
                 .map_err(|e| PackError::Invalid(format!("LoD2 directory {}: {e}", dir.display())))?
@@ -591,8 +593,9 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 .map(|f| f.path())
                 .filter(|p| {
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    (name.ends_with(".xml") || name.ends_with(".gml"))
-                        && crate::lod2::tile_extent(name).map_or(true, |t| meets(t, grid_extent_33))
+                    let lower = name.to_ascii_lowercase();
+                    (lower.ends_with(".xml") || lower.ends_with(".gml"))
+                        && crate::lod2::tile_extent(name).map_or(true, |t| meets(t, grid_in_zone))
                 })
                 .collect();
             // Parse in parallel, as many at once as memory holds; scatter
@@ -613,9 +616,9 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 for (path, mut buildings) in chunk.iter().zip(parsed?) {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     let mut tile = crate::lod2::tile_extent(name);
-                    if utm33.is_some() {
-                        buildings.retain_mut(|b| reproject_building(b, from_33));
-                        tile = tile.and_then(|t| reproject_extent(t, from_33));
+                    if zones.projects(zone) {
+                        buildings.retain_mut(|b| reproject_building(b, from_zone));
+                        tile = tile.and_then(|t| reproject_extent(t, from_zone));
                     }
                     let mut reach = tile;
                     for b in &buildings {
@@ -635,7 +638,15 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 parsed_files += chunk.len() as u64;
                 steps.part("buildings", parsed_files, files.len() as u64);
             }
-            eprintln!("lod2: {} files parsed, {n_lod2} buildings", files.len());
+            eprintln!(
+                "lod2: {}: {} files parsed, {} buildings",
+                input.source,
+                files.len(),
+                n_lod2 - before
+            );
+            if n_lod2 > before {
+                used_lod2.push(input);
+            }
         }
         if let Some(cj) = &params.cityjson {
             use std::io::Write as _;
@@ -776,36 +787,44 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
         }
         steps.end("buildings");
     }
-    let used_lod2 = n_lod2 > 0;
     let used_cityjson = n_cityjson > 0;
     let used_osm_buildings = !osm_buildings.is_empty();
 
-    // Real 1 m override where Berlin DGM1+bDOM pairs cover the region
-    // (EPSG:25833 ≈ 32633 within <1 m — used as-is in zone 33, projected in
-    // any other; berlin1m.rs).
-    let mut used_berlin_1m = false;
-    let measured = params.berlin_1m_dir.is_some() || !params.elevation.is_empty();
+    // Real 1 m override where XYZ terrain and surface pairs cover the region
+    // (each in its source's ETRS89 UTM zone: as it is in the pack's, projected
+    // from any other; xyz.rs).
+    let mut used_xyz: Vec<&crate::xyz::XyzInput> = Vec::new();
+    let measured = !params.xyz.is_empty() || !params.elevation.is_empty();
     if measured {
         steps.begin("lidar");
     }
-    if let Some(dir) = &params.berlin_1m_dir {
+    if !params.xyz.is_empty() {
         // Only the tiles meeting the grid. A key is the tile's south-west
         // corner in km; tiles are 1 or 2 km, so 2 km is the safe extent.
-        let pairs: Vec<_> = crate::berlin1m::find_pairs(dir)?
-            .into_iter()
-            .filter(|(key, _, _)| {
-                let mut it = key.split('_').map(|v| v.parse::<f64>().ok());
-                match (it.next().flatten(), it.next().flatten()) {
-                    (Some(e), Some(n)) => {
-                        meets([e * 1000.0, n * 1000.0, (e + 2.0) * 1000.0, (n + 2.0) * 1000.0], grid_extent_33)
-                    }
-                    _ => true,
-                }
+        let pairs: Vec<(usize, String, PathBuf, PathBuf)> = params
+            .xyz
+            .iter()
+            .enumerate()
+            .flat_map(|(i, input)| {
+                let grid_in_zone = zones.grid_in(input.zone);
+                crate::xyz::pairs(input).into_iter().filter_map(move |(key, t, s)| {
+                    let mut it = key.split('_').map(|v| v.parse::<f64>().ok());
+                    let keep = match (it.next().flatten(), it.next().flatten()) {
+                        (Some(e), Some(n)) => meets(
+                            [e * 1000.0, n * 1000.0, (e + 2.0) * 1000.0, (n + 2.0) * 1000.0],
+                            grid_in_zone,
+                        ),
+                        _ => true,
+                    };
+                    keep.then_some((i, key, t, s))
+                })
             })
             .collect();
         if !pairs.is_empty() {
-            let mut dtm_acc = crate::berlin1m::MeanAccum::new(nx * ny);
-            let mut clut_acc = crate::berlin1m::MeanAccum::new(nx * ny);
+            let mut dtm_acc = crate::xyz::MeanAccum::new(nx * ny);
+            let mut clut_acc = crate::xyz::MeanAccum::new(nx * ny);
+            // Which inputs reached the grid.
+            let mut reached = vec![false; params.xyz.len()];
             // Parse tile pairs in parallel (the expensive part: two XYZ
             // texts of 100–160 MB each), as many at once as memory holds;
             // scatter serially per batch.
@@ -814,22 +833,25 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
             while !rest.is_empty() {
                 let chunk = next_batch(
                     rest,
-                    |(_, dgm1, dom1)| (file_bytes(dgm1) + file_bytes(dom1)) * XYZ_BYTES_PER_BYTE,
+                    |(_, _, dgm1, dom1)| (file_bytes(dgm1) + file_bytes(dom1)) * XYZ_BYTES_PER_BYTE,
                     n_threads,
                 );
                 rest = &rest[chunk.len()..];
                 let parsed: Result<Vec<_>, PackError> = chunk
                     .par_iter()
-                    .map(|(key, dgm1, dom1)| {
-                        let d = crate::berlin1m::parse_xyz(std::fs::File::open(dgm1)?)?;
-                        let s = crate::berlin1m::parse_xyz(std::fs::File::open(dom1)?)?;
-                        Ok((key.clone(), d, s))
+                    .map(|(i, key, dgm1, dom1)| {
+                        let d = crate::xyz::read_tile(dgm1)?;
+                        let s = crate::xyz::read_tile(dom1)?;
+                        Ok((*i, key.clone(), d, s))
                     })
                     .collect();
-                for (key, dgm, dom) in parsed? {
-                    eprintln!("berlin-1m: ingesting tile {key}");
-                    let target = |x: f64, y: f64| from_33(x, y).and_then(|(x, y)| cell_of(x, y));
-                    crate::berlin1m::accumulate_grids(&dgm, &dom, target, &mut dtm_acc, &mut clut_acc);
+                for (i, key, dgm, dom) in parsed? {
+                    let zone = params.xyz[i].zone;
+                    eprintln!("xyz: {}: ingesting tile {key}", params.xyz[i].source);
+                    let target =
+                        |x: f64, y: f64| zones.into_pack(zone, x, y).and_then(|(x, y)| cell_of(x, y));
+                    reached[i] |=
+                        crate::xyz::accumulate_grids(&dgm, &dom, target, &mut dtm_acc, &mut clut_acc) > 0;
                 }
                 pairs_done += chunk.len() as u64;
                 steps.part("lidar", pairs_done, pairs.len() as u64);
@@ -855,9 +877,11 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     overridden += 1;
                 }
             }
-            used_berlin_1m = overridden > 0;
+            if overridden > 0 {
+                used_xyz = params.xyz.iter().zip(&reached).filter(|(_, r)| **r).map(|(x, _)| x).collect();
+            }
             eprintln!(
-                "berlin-1m: {} tile pair(s), {overridden}/{} pack cells overridden with real DTM/clutter",
+                "xyz: {} tile pair(s), {overridden}/{} pack cells overridden with real DTM/clutter",
                 pairs.len(),
                 nx * ny
             );
@@ -1165,7 +1189,7 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     res_m: Some(res),
                 },
             ];
-            if used_lod2 || used_cityjson || used_osm_buildings {
+            if !used_lod2.is_empty() || used_cityjson || used_osm_buildings {
                 layers.push(LayerMeta {
                     kind: LayerKind::Buildings,
                     path: "buildings.jsonl".into(),
@@ -1224,17 +1248,11 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                 source: "Copernicus GLO-30 DSM".into(),
                 notice: GLO30_NOTICE.into(),
             }];
-            if used_berlin_1m {
-                l.push(LicenseNotice {
-                    source: "Berlin DGM1 + bDOM (1 m)".into(),
-                    notice: crate::berlin1m::BERLIN_1M_NOTICE.into(),
-                });
+            for x in &used_xyz {
+                l.push(LicenseNotice { source: x.source.clone(), notice: x.notice.clone() });
             }
-            if used_lod2 {
-                l.push(LicenseNotice {
-                    source: "Berlin LoD2 3D building models".into(),
-                    notice: crate::lod2::BERLIN_LOD2_NOTICE.into(),
-                });
+            for b in &used_lod2 {
+                l.push(LicenseNotice { source: b.source.clone(), notice: b.notice.clone() });
             }
             for e in &used_elevation {
                 l.push(LicenseNotice { source: e.source.clone(), notice: e.notice.clone() });
@@ -1276,6 +1294,61 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     std::fs::write(params.out_dir.join("manifest.json"), manifest.to_json())?;
     steps.end("manifest");
     Ok(manifest)
+}
+
+/// The UTM zones a build's XYZ and LoD2 sources are in, and how a point of
+/// each comes into the pack's zone: as it is in the pack's own (ETRS89 and
+/// WGS 84 differ by well under a metre), projected from any other.
+struct ZoneSet {
+    pack: u8,
+    utm: Proj,
+    /// Each other zone, its projection, and the pack's grid in it.
+    others: Vec<(u8, Proj, [f64; 4])>,
+    grid_extent: [f64; 4],
+}
+
+impl ZoneSet {
+    fn new(pack: u8, zones: impl Iterator<Item = u8>, grid_extent: [f64; 4]) -> Result<Self, PackError> {
+        let utm = utm_proj(pack)?;
+        let mut others: Vec<(u8, Proj, [f64; 4])> = Vec::new();
+        for zone in zones {
+            if zone == pack || others.iter().any(|(z, _, _)| *z == zone) {
+                continue;
+            }
+            let src = utm_proj(zone)?;
+            let grid = reproject_extent(grid_extent, |x, y| {
+                let mut pt = (x, y, 0.0);
+                proj4rs::transform::transform(&utm, &src, &mut pt).ok()?;
+                Some((pt.0, pt.1))
+            })
+            .ok_or_else(|| PackError::Proj(format!("grid → utm{zone}")))?;
+            others.push((zone, src, grid));
+        }
+        Ok(Self { pack, utm, others, grid_extent })
+    }
+
+    fn other(&self, zone: u8) -> Option<&(u8, Proj, [f64; 4])> {
+        self.others.iter().find(|(z, _, _)| *z == zone)
+    }
+
+    /// Whether a source in `zone` is projected into the pack's.
+    fn projects(&self, zone: u8) -> bool {
+        zone != self.pack
+    }
+
+    /// A point of `zone` in the pack's zone; `None` where it fails.
+    fn into_pack(&self, zone: u8, x: f64, y: f64) -> Option<(f64, f64)> {
+        let Some((_, src, _)) = self.other(zone) else { return Some((x, y)) };
+        let mut pt = (x, y, 0.0);
+        proj4rs::transform::transform(src, &self.utm, &mut pt).ok()?;
+        Some((pt.0, pt.1))
+    }
+
+    /// The pack's grid in `zone`, for choosing tiles by the corner in their
+    /// names.
+    fn grid_in(&self, zone: u8) -> [f64; 4] {
+        self.other(zone).map_or(self.grid_extent, |(_, _, g)| *g)
+    }
 }
 
 /// Whether two extents `[min_x, min_y, max_x, max_y]` meet.
@@ -1529,7 +1602,12 @@ mod tests {
             source: "Zensus".into(),
             notice: "Zensus".into(),
         });
-        p.lod2_dir = Some(dir.join("nope-lod2"));
+        p.lod2 = vec![crate::lod2::Lod2Input {
+            dir: dir.join("nope-lod2"),
+            zone: 33,
+            source: "LoD2".into(),
+            notice: "LoD2".into(),
+        }];
         let err = build(&p).unwrap_err().to_string();
         assert!(err.starts_with("manifest invalid: 4 build input(s) unusable"), "{err}");
         for name in ["nope-dsm.tif", "nope-berlin.osm.pbf", "nope-zensus.csv", "nope-lod2"] {

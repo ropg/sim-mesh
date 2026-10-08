@@ -721,9 +721,11 @@ pack-build's steps, each only when it applies: `terrain`, `osm`,
 `buildings`, `lidar`, `landcover`, `clutter`, `population`, `manifest`. Its
 input names every file (the GLO-30 tiles, each land cover source's tiles
 with their projection and class table, the ITU maps' directory, the PBF
-extract, a directory of LoD2 CityGML, one of CityJSON, one of Berlin's 1 m
-XYZ pairs, terrain and surface GeoTIFFs with their projection, a population
-CSV with its layout or a population GeoTIFF); it reads only the LoD2
+extract, a directory of LoD2 CityGML per source, one of CityJSON, the 1 m
+XYZ terrain and surface tiles of each UTM zone, terrain and surface
+GeoTIFFs with their projection, a population CSV with its layout or a
+population GeoTIFF), each source's name and notice with its files, so the
+manifest credits each source for what it gave; it reads only the LoD2
 tiles and lidar pairs that meet its grid, and the front hands it a directory of links
 to just the tiles this rectangle needs, since the cache holds every tile any
 build fetched.
@@ -749,7 +751,7 @@ method or reader in sim-mesh, which every source can then use.
 **The front chooses the sources; the compiler takes what it is given.**
 `sources.plan` takes every source of the source files whose coverage meets
 the rectangle (with the shipped ones: the state surveys' terrain, surface
-and LoD2 where it touches Berlin, Brandenburg or Mecklenburg-Vorpommern,
+and LoD2 where it touches a German state, Hessen's LoD2 excepted,
 the Zensus grid where it touches Germany, AHN, 3DBAG and CBS where it
 touches the Netherlands, BEV's terrain and surface and Statistik
 Austria's grid where it touches Austria, 3DEP, NLCD and WorldPop where it
@@ -760,16 +762,22 @@ to the compiler input its format and layer go to (`packbuild.INPUTS`), never
 by the source's name, and refuses two sources for an input that takes one.
 The 1 m pairs, LoD2, the GeoTIFF terrain and surface and land cover take
 several, so a rectangle across Berlin and Potsdam, or across a state border,
-takes both states'.
+takes both states'. GeoTIFF terrains and surfaces pair by projection, each
+sample taking whichever tile covers it, so two states in one zone make one
+pair; XYZ tiles pair tile by tile, by the corner in their names, so a
+GeoTIFF surface measured against an XYZ terrain says so (`pairs_with`)
+rather than being guessed into a pair by its zone, which on a border would
+take a neighbour's surface away from its own terrain.
 
 **Sources are data; some of the compiler's readers are still fixed.** A
 GeoTIFF terrain, surface, land cover or population raster comes with its
 proj string (land cover with its class table as well), a population grid
 with its delimiter, columns, projection and cell, CityJSON with its
 projection and height attributes, so those are any source's. XYZ and
-CityGML are read as the German state surveys deliver them, in EPSG:25833
-(used as the grid in a zone-33 pack, projected in another), a
-worldwide surface as EPSG:4326 (`sourcefile.COMPILER_READS` and the
+CityGML are read as the German state surveys deliver them, in an ETRS89
+UTM zone (used as the grid in a pack of that zone, projected point by point
+in another: Hessen's zone-32 tiles in a pack centred east of 12° E), XYZ at
+1 m, a worldwide surface as EPSG:4326 (`sourcefile.COMPILER_READS` and the
 GeoTIFF rules), and `sourcefile.py` refuses a source that asks otherwise
 when the file is read: an entry the compiler would misread fails in
 `sim source check` and in the tests, not halfway through a build. A
@@ -781,7 +789,23 @@ grids is refused.
 
 **A tile scheme is computed, not listed, wherever it can be.** A template
 names each tile from its corner, so finding a rectangle's tiles asks no
-host anything; a tile no host has is no data. Tiles in metres are found in
+host anything; a tile no host has is no data. A coverage service (Hessen's
+WCS) is a template too, its request naming a square's two corners. Where
+the name carries something no rule gives (a survey year per tile), the
+listing is read: a feed, a directory listing, an index of footprints, an
+ArcGIS layer (dumped a page at a time into one GeoJSON kept as a meta file,
+the newest survey of each tile kept), or the central directories of the
+zips a state publishes whole. A zip is never fetched whole for a tile:
+its directory is read by range (its last 64 KB, the zip64 end record where
+there is one, then the directory), and each tile's member fetched alone and
+inflated, so Sachsen-Anhalt's 10 GB archives cost a district's megabytes. A
+zip stored uncompressed inside another (Bremen's LoD2) is read in place,
+its members' offsets the outer archive's. A host's quirks are met where
+they are general, never per source: one that refuses HEAD is asked for two
+bytes (GeoSN's shares answer `bytes=0-0` with the whole file), one that
+omits its intermediate certificate is reached through the intermediates
+shipped beside the source file, and a CityGML or XYZ file with a page
+appended after it (Schleswig-Holstein's) is read up to its end. Tiles in metres are found in
 the source's own system: the rectangle's reach projected there
 (`crs.plane`, LAEA Europe by Snyder's ellipsoidal formulas for BEV's 50 km
 squares), the squares meeting it, and a cached square drawn back in
@@ -857,10 +881,12 @@ redistributable (the ITU maps) stays in the cache, and only values taken
 from it enter a pack. A pull request that adds a source is reviewed for its
 licence before anything else.
 
-Given both `lod2_dir` and `osm_buildings`, the compiler takes
-LoD2's buildings on the 1 km tiles in that directory that meet the grid and
-OpenStreetMap's everywhere else: an OpenStreetMap building whose centroid
-lies on one of those tiles is left out, so no building is counted twice.
+Given both `lod2` and `osm_buildings`, the compiler takes
+LoD2's buildings on the tiles of its sources that meet the grid (a tile's
+extent read off its name, `LoD2_<zone>_<E>_<N>_<size>_…`, else the extent of
+its buildings) and OpenStreetMap's everywhere else: an OpenStreetMap
+building whose centroid lies on one of those tiles is left out, so no
+building is counted twice.
 The tile is the unit of LoD2's coverage, not the city boundary, so on a
 tile that Berlin's border crosses the part outside Berlin has no buildings.
 CityJSON's coverage is each file's extent, an OpenStreetMap building on it

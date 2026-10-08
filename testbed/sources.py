@@ -65,10 +65,12 @@ import math
 import os
 import re
 import shutil
+import ssl
 import struct
 import time
 import urllib.parse
 import zipfile
+import zlib
 
 import aiohttp
 
@@ -86,6 +88,10 @@ TRIES = 4
 BACKOFF_S = 5.0
 META_MAX_AGE_S = 7 * 86400          # a feed or an index kept this long unless the source says
 HEAD_PARALLEL = 6
+HEAD_REFUSED = (401, 403, 405)      # a host answering these to HEAD is asked for two bytes
+ARCGIS_PAGE = 2000                  # features an ArcGIS layer is asked for at a time
+ZIP_TAIL = 1 << 16                  # a remote zip's last bytes, read for its directory's end
+INTERMEDIATES = os.path.join(sourcefile.SIM_MESH_ROOT, "sources", "intermediates.pem")
 MAX_CELLS = 25_000_000              # a grid past this is refused: rasters are held whole
 RESOLUTIONS = (30.0, 10.0)
 PLAIN_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -116,8 +122,12 @@ class File:
     reads (extracted into `x/` beside it)."""
 
     def __init__(self, source, url, name, members=None, missing="no-data", sha256=None,
-                 window=None):
+                 window=None, member=None):
         self.source, self.name, self.members, self.missing = source, name, members, missing
+        # One member of a remote zip, its archive the url: {archive, name,
+        # method, csize, size, offset} as the archive's central directory
+        # lists it, fetched alone by range.
+        self.member = member
         self.urls = list(url) if isinstance(url, (list, tuple)) else [url]
         self.sha256 = sha256            # what the index says the file is, checked on arrival
         # A window of a cloud-optimised GeoTIFF: {box, want}, the box in the
@@ -228,19 +238,22 @@ def tile_name(source, lat, lon):
     return sourcefile.TILE_FIELD_RE.sub(field, find["tile"])
 
 
-def tile_name_xy(source, x, y):
+def tile_name_xy(source, x, y, pattern=None):
     """A template's tile in metres whose south-west corner is (x, y) in its
     system, named by the corner its source says: {x} and {y} the corner in
-    `unit_m` (1 unless given), `:0n` padding them to n digits."""
+    `unit_m` (1 unless given), {x2} and {y2} the opposite one (a WCS
+    request's box), `:0n` padding them to n digits. `pattern` is the
+    `tile` unless given (its `file`)."""
     find = source.find
-    unit = float(find.get("unit_m", 1))
+    unit, size = float(find.get("unit_m", 1)), float(find["size_m"])
     if _north_west(source):
-        y += float(find["size_m"])
+        y += size
+    values = {"x": x, "y": y, "x2": x + size, "y2": y - size if _north_west(source) else y + size}
 
     def field(m):
-        value = int(round((x if m.group(1) == "x" else y) / unit))
+        value = int(round(values[m.group(1)] / unit))
         return "%0*d" % (int(m.group(2)), value) if m.group(2) else "%d" % value
-    return sourcefile.TILE_FIELD_RE.sub(field, find["tile"])
+    return sourcefile.TILE_FIELD_RE.sub(field, pattern or find["tile"])
 
 
 def _in_metres(source):
@@ -254,10 +267,11 @@ def template_corners(source, hull):
     find = source.find
     if _in_metres(source):
         size = float(find["size_m"])
+        ox, oy = (float(v) for v in find.get("origin_m", (0, 0)))
         x0, y0, x1, y1 = crs.box_in(find["crs"], hull)
-        return [(x * size, y * size)
-                for y in range(math.floor(y0 / size), math.floor((y1 - 1e-6) / size) + 1)
-                for x in range(math.floor(x0 / size), math.floor((x1 - 1e-6) / size) + 1)]
+        return [(ox + x * size, oy + y * size)
+                for y in range(math.floor((y0 - oy) / size), math.floor((y1 - oy - 1e-6) / size) + 1)
+                for x in range(math.floor((x0 - ox) / size), math.floor((x1 - ox - 1e-6) / size) + 1)]
     size = find["size_deg"]
     lon0, lat0, lon1, lat1 = hull
     return [(lat, lon)
@@ -281,7 +295,9 @@ def template_files(source, hull, res_m=30.0):
     for a, b in template_corners(source, hull):
         tile = name(source, a, b)
         urls = [u.replace("{tile}", tile) for u in source.addresses("url")]
-        out.append(File(source.id, urls, urls[0].rsplit("/", 1)[-1], missing=_missing(source),
+        kept = tile_name_xy(source, a, b, source.find["file"]) if source.find.get("file") \
+            else urls[0].rsplit("/", 1)[-1]
+        out.append(File(source.id, urls, kept, source.members(), missing=_missing(source),
                         window=dict(window) if window else None))
     return out
 
@@ -316,7 +332,8 @@ def template_pattern(source):
     """A template's cached file names as a pattern, its corner's groups ns,
     lat, ew, lon, or x and y: the corner its name gives (`template_corner`
     makes it the south-west one)."""
-    name = source.address("url").rsplit("/", 1)[-1].replace("{tile}", source.find["tile"])
+    name = source.find.get("file") or \
+        source.address("url").rsplit("/", 1)[-1].replace("{tile}", source.find["tile"])
     lower = source.find.get("letters") == "lower"
     out, at = "", 0
     for m in sourcefile.TILE_FIELD_RE.finditer(name):
@@ -387,6 +404,88 @@ def atom_files(source, feed_text, bbox):
             if e < x1 and e + size > x0 and n < y1 and n + size > y0]
 
 
+# ---- finding: members of remote zips ------------------------------------------------
+
+def zip_tiles(source, listing):
+    """A `zip` source's tiles: [(member, x, y)], each member as its
+    archives' central directories list it, its corner read off its name."""
+    name = re.compile(source.find["name"])
+    out = []
+    for member in listing:
+        m = name.search(member["name"])
+        if m:
+            out.append((member, int(m.group("x")), int(m.group("y"))))
+    return out
+
+
+def zip_files(source, listing, bbox):
+    """The members of a `zip` source's archives that meet the rectangle's
+    grid, each a file of its own; a tile two archives hold (Saarland's
+    districts share their border tiles) from the first."""
+    x0, y0, x1, y1 = atom_box(source, bbox)
+    size = float(source.find["size_m"]) / float(source.find["unit_m"])
+    out = {}
+    for member, e, n in zip_tiles(source, listing):
+        name = member["name"].rsplit("/", 1)[-1]
+        if e < x1 and e + size > x0 and n < y1 and n + size > y0 and name not in out:
+            out[name] = File(source.id, member["archive"], name, source.members(),
+                             missing=_missing(source), member=member)
+    return list(out.values())
+
+
+ZIP_FULL = 0xFFFFFFFF                # a 32-bit field whose value is in the zip64 extra
+
+
+def zip_directory_at(tail):
+    """Where a zip's central directory is, from the archive's last bytes:
+    (offset, size), or (None, offset of its zip64 end record) for a zip64
+    archive, whose record says."""
+    at = tail.rfind(b"PK\x05\x06")
+    if at < 0 or len(tail) - at < 22:
+        raise SourceError("no end of a zip's central directory in its last %d bytes" % len(tail))
+    size, offset = struct.unpack("<II", tail[at + 12:at + 20])
+    if size != ZIP_FULL and offset != ZIP_FULL:
+        return offset, size
+    locator = tail.rfind(b"PK\x06\x07", 0, at)
+    if locator < 0:
+        raise SourceError("a zip64 archive without its zip64 locator")
+    return None, struct.unpack("<Q", tail[locator + 8:locator + 16])[0]
+
+
+def zip64_directory_at(record):
+    """(offset, size) of the central directory, from a zip64 end record."""
+    if record[:4] != b"PK\x06\x06":
+        raise SourceError("a zip64 locator points at no zip64 end record")
+    size, offset = struct.unpack("<QQ", record[40:56])
+    return offset, size
+
+
+def directory_members(raw, archive):
+    """A central directory's members: [{archive, name, method, csize, size,
+    offset}], zip64 sizes and offsets read from their extra field."""
+    out, at = [], 0
+    while at + 46 <= len(raw) and raw[at:at + 4] == b"PK\x01\x02":
+        method, = struct.unpack("<H", raw[at + 10:at + 12])
+        csize, size, n_name, n_extra, n_comment = struct.unpack("<IIHHH", raw[at + 20:at + 34])
+        offset, = struct.unpack("<I", raw[at + 42:at + 46])
+        name = raw[at + 46:at + 46 + n_name].decode("utf-8", "replace")
+        extra = raw[at + 46 + n_name:at + 46 + n_name + n_extra]
+        e = 0
+        while e + 4 <= len(extra):
+            tag, length = struct.unpack("<HH", extra[e:e + 4])
+            if tag == 1:
+                wide = iter(struct.unpack("<%dQ" % (length // 8), extra[e + 4:e + 4 + length // 8 * 8]))
+                size = next(wide, size) if size == ZIP_FULL else size
+                csize = next(wide, csize) if csize == ZIP_FULL else csize
+                offset = next(wide, offset) if offset == ZIP_FULL else offset
+            e += 4 + length
+        if not name.endswith("/"):
+            out.append({"archive": archive, "name": name, "method": method, "csize": csize,
+                        "size": size, "offset": offset})
+        at += 46 + n_name + n_extra + n_comment
+    return out
+
+
 # ---- finding: regions and single files -------------------------------------------
 
 def region_file(source, feature):
@@ -403,10 +502,11 @@ def region_file(source, feature):
 
 def read_index(source, raw):
     """An index's features: [(properties, outer rings in its system)], from
-    GeoJSON (AHN's kaartbladindex) or FlatGeobuf (3DBAG's tile_index)."""
+    GeoJSON (AHN's kaartbladindex, an ArcGIS layer as `arcgis_file` keeps
+    it) or FlatGeobuf (3DBAG's tile_index)."""
     if source.find["index_format"] == "flatgeobuf":
         try:
-            return fgb.read(raw)
+            return newest_per_tile(source, fgb.read(raw))
         except (fgb.FgbError, struct.error) as err:
             raise SourceError("%s's index is not FlatGeobuf: %s" % (source.title, err)) from err
     try:
@@ -417,7 +517,21 @@ def read_index(source, raw):
     for feature in doc.get("features") or ():
         rings = [[tuple(p[:2]) for p in polygon[0]] for polygon in _rings(feature.get("geometry"))]
         out.append((feature.get("properties") or {}, rings))
-    return out
+    return newest_per_tile(source, out)
+
+
+def newest_per_tile(source, features):
+    """An index listing a tile once per survey (Niedersachsen's): only the
+    newest of each `tile_property`, by its `newest_property`."""
+    tile, newest = source.find.get("tile_property"), source.find.get("newest_property")
+    if not tile or not newest:
+        return features
+    best = {}
+    for props, rings in features:
+        key = props.get(tile)
+        if key not in best or (props.get(newest) or 0) > (best[key][0].get(newest) or 0):
+            best[key] = (props, rings)
+    return list(best.values())
 
 
 def _ring_box(rings):
@@ -452,7 +566,7 @@ def index_files(source, features, bbox, res_m=30.0):
             continue
         sha = props.get(source.find.get("sha256_property")) if source.find.get("sha256_property") \
             else None
-        out.append(File(source.id, url, url.rsplit("/", 1)[-1], source.members(),
+        out.append(File(source.id, url, file_name(url), source.members(),
                         missing=_missing(source), sha256=sha,
                         window={"box": box, "want": want} if want else None))
     return out
@@ -630,7 +744,7 @@ class Cache:
         pause = BACKOFF_S
         for attempt in range(TRIES):
             try:
-                resp = await self.session.request(method, url, headers=headers,
+                resp = await self.session.request(method, url, headers=headers, ssl=tls(),
                                                   timeout=aiohttp.ClientTimeout(
                                                       total=None, sock_connect=30, sock_read=120))
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
@@ -653,17 +767,34 @@ class Cache:
     async def size(self, f):
         """A file's size in bytes as its host says, asked once; None when
         the host does not say."""
+        if f.member is not None:
+            return f.member["csize"]
         if f.url in self.sizes:
             return self.sizes[f.url]
         got, error = None, None
         for url in f.urls:
             try:
                 resp = await self.request("HEAD", url)
+                if resp.status in HEAD_REFUSED:
+                    # A host that answers only GET (Sachsen's Nextcloud
+                    # shares say 401 to HEAD): its first two bytes, whose
+                    # Content-Range gives the whole. They answer `bytes=0-0`
+                    # with the whole file.
+                    resp.release()
+                    resp = await self.request("GET", url, {"Range": "bytes=0-1"})
             except SourceError as err:
                 error = err
                 continue
             try:
-                got = None if resp.status == 404 else resp.content_length
+                if resp.status == 404:
+                    got = None
+                elif resp.status == 206:
+                    whole = resp.headers.get("Content-Range", "").rsplit("/", 1)[-1]
+                    got = int(whole) if whole.isdigit() else None
+                elif resp.status == 200:
+                    got = resp.content_length
+                else:
+                    got = None
             finally:
                 resp.release()
             break
@@ -703,6 +834,8 @@ class Cache:
         `progress(bytes)` hears the bytes it holds as they arrive."""
         if f.window is not None:
             return await self.fetch_window(f, progress)
+        if f.member is not None:
+            return await self.fetch_member(f, progress)
         have = self.have(f)
         path = f.path(self.root)
         if have is not None:
@@ -761,6 +894,114 @@ class Cache:
         return path
 
     # ---- windows of cloud-optimised GeoTIFFs --------------------------------
+
+    # ---- members of remote zips --------------------------------------------
+
+    async def fetch_member(self, f, progress=None):
+        """One member of a remote zip into the cache, inflated: its local
+        header, then its data, by range. A broken fetch starts again."""
+        path = f.path(self.root)
+        if os.path.isfile(path):
+            return path
+        member = f.member
+        if member["method"] not in (0, 8):
+            raise SourceError("%s in %s is compressed by method %d, which sim-mesh does not read"
+                              % (member["name"], f.url, member["method"]))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        start = await self._member_data(f.url, member)
+        inflate = zlib.decompressobj(-15) if member["method"] == 8 else None
+        end = start + member["csize"] - 1
+        resp = await self.request("GET", f.url, {"Range": "bytes=%d-%d" % (start, end)})
+        got = 0
+        try:
+            if resp.status != 206:
+                raise SourceError("%s answers %d to a range, which a member of it needs"
+                                  % (f.url, resp.status))
+            with open(path + ".part", "wb") as out:
+                async for chunk in resp.content.iter_chunked(CHUNK):
+                    out.write(inflate.decompress(chunk) if inflate else chunk)
+                    got += len(chunk)
+                    if progress:
+                        progress(got)
+                if inflate:
+                    out.write(inflate.flush())
+        except (aiohttp.ClientError, asyncio.TimeoutError, zlib.error) as err:
+            raise SourceError("%s in %s: %s" % (member["name"], f.url,
+                                                err or type(err).__name__)) from err
+        finally:
+            resp.release()
+        if got != member["csize"] or os.path.getsize(path + ".part") != member["size"]:
+            raise SourceError("%s in %s came short" % (member["name"], f.url))
+        os.replace(path + ".part", path)
+        return path
+
+    async def _member_data(self, url, member):
+        """Where a member's data starts in its archive: past its local
+        header, whose name and extra field may differ from the directory's."""
+        header, _total = await self._range(url, member["offset"], 30)
+        if header[:4] != b"PK\x03\x04":
+            raise SourceError("%s in %s has no local header where its directory says"
+                              % (member["name"], url))
+        n_name, n_extra = struct.unpack("<HH", header[26:30])
+        return member["offset"] + 30 + n_name + n_extra
+
+    async def zip_members(self, address):
+        """A remote zip's members as its central directory lists them, read
+        by range: its last bytes, the zip64 end record where there is one,
+        and the directory. `<url>!<name>` is a zip stored uncompressed in
+        another (Bremen's LoD2), read in place: its members' offsets are
+        the outer archive's."""
+        url, _, inner = address.partition("!")
+        if inner:
+            outer = await self.zip_members(url)
+            held = next((m for m in outer if m["name"] == inner
+                         or m["name"].rsplit("/", 1)[-1] == inner), None)
+            if held is None:
+                raise SourceError("%s holds no %s" % (url, inner))
+            if held["method"] != 0:
+                raise SourceError("%s in %s is compressed, so its members cannot be read in place"
+                                  % (inner, url))
+            base, total = await self._member_data(url, held), held["size"]
+        else:
+            _two, total = await self._range(url, 0, 2)
+            base = 0
+            if total is None:
+                raise SourceError("%s does not say its length, which reading its directory needs"
+                                  % url)
+        tail_n = min(total, ZIP_TAIL)
+        tail, _total = await self._range(url, base + total - tail_n, tail_n)
+        offset, size = zip_directory_at(tail)
+        if offset is None:
+            record, _total = await self._range(url, base + size, 56)
+            offset, size = zip64_directory_at(record)
+        raw, _total = await self._range(url, base + offset, size)
+        members = directory_members(raw, url)
+        for m in members:
+            m["offset"] += base
+        return members
+
+    async def zip_listing(self, source):
+        """A `zip` source's members, every archive's, kept as a meta file is
+        and asked again after its `refresh_days`; the copy there is served
+        when an archive cannot be read."""
+        name = source.id + ".zips.json"
+        path = os.path.join(self.root, "meta", name)
+        lock = self.meta_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            if not (os.path.isfile(path) and time.time() - os.path.getmtime(path)
+                    < _max_age(source)):
+                try:
+                    listing = []
+                    for url in source.find["archives"]:
+                        listing += await self.zip_members(str(url))
+                except SourceError:
+                    if not os.path.isfile(path):
+                        raise
+                else:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    store.write_text(path, json.dumps(listing))
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
 
     async def _range(self, url, start, length):
         """Bytes [start, start + length) of a file, and its whole length."""
@@ -840,8 +1081,12 @@ class Cache:
 
     def extracted(self, f):
         """The members a build reads of a fetched zip, extracted into `x/`
-        beside it (once): their paths. `members` is names, or one `*.ext`."""
+        beside it (once): their paths. `members` is names, or one `*.ext`.
+        A file served bare, itself one of them (NRW's CityGML tiles), is
+        its own path."""
         path = f.path(self.root)
+        if f.members and self.wanted(f, f.name) and not zipfile.is_zipfile(path):
+            return [path]
         into = os.path.join(os.path.dirname(path), "x")
         done = path + ".x"
         if os.path.isfile(done):
@@ -1014,6 +1259,61 @@ class Cache:
                     raise error
             return path
 
+    async def arcgis_file(self, name, source):
+        """An ArcGIS feature layer's every feature as one GeoJSON file in the
+        source's system (Niedersachsen's tile footprints), asked a page at a
+        time and kept as a meta file is; the copy there is served when the
+        layer cannot be had."""
+        path = os.path.join(self.root, "meta", name)
+        lock = self.meta_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            if os.path.isfile(path) and time.time() - os.path.getmtime(path) < _max_age(source):
+                return path
+            error = None
+            for layer in source.addresses("index"):
+                try:
+                    features = await self._arcgis_features(layer.rstrip("/"), source)
+                except SourceError as err:
+                    error = err
+                    continue
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                store.write_text(path, json.dumps({"type": "FeatureCollection",
+                                                   "features": features}))
+                return path
+            if not os.path.isfile(path):
+                raise error
+            return path
+
+    async def _arcgis_features(self, layer, source):
+        fields = [source.find[k] for k in ("url_property", "sha256_property", "newest_property",
+                                           "tile_property") if source.find.get(k)]
+        out, offset = [], 0
+        while True:
+            query = urllib.parse.urlencode({
+                "where": "1=1", "outFields": ",".join(fields), "returnGeometry": "true",
+                "outSR": str(crs.epsg(source.find["crs"])), "geometryPrecision": "2",
+                "resultOffset": str(offset), "resultRecordCount": str(ARCGIS_PAGE),
+                "f": "geojson"})
+            url = "%s/query?%s" % (layer, query)
+            resp = await self.request("GET", url)
+            try:
+                if resp.status != 200:
+                    raise SourceError("%s answers %d" % (url, resp.status))
+                page = json.loads(await resp.read())
+            except ValueError as err:
+                raise SourceError("%s is not GeoJSON: %s" % (url, err)) from err
+            finally:
+                resp.release()
+            if "error" in page:
+                raise SourceError("%s: %s" % (url, page["error"].get("message") or page["error"]))
+            got = page.get("features") or []
+            out += got
+            offset += len(got)
+            more = (page.get("properties") or {}).get("exceededTransferLimit") \
+                or page.get("exceededTransferLimit")
+            if not got or not more:
+                return out
+
     def meta_age(self, name):
         """When a meta file was fetched, in Unix seconds, or None."""
         with contextlib.suppress(OSError):
@@ -1037,7 +1337,10 @@ class Cache:
         """An index source's features, [(properties, rings)], read again
         only when its index is fetched again."""
         name = "%s-%s" % (source.id, source.address("index").rsplit("/", 1)[-1])
-        path = await self.meta_file(name, source.addresses("index"), _max_age(source))
+        if source.find["index_format"] == "arcgis":
+            path = await self.arcgis_file(name + ".geojson", source)
+        else:
+            path = await self.meta_file(name, source.addresses("index"), _max_age(source))
         key = (path, os.path.getmtime(path))
         cached = self.features.get(source.id)
         if cached is None or cached[0] != key:
@@ -1090,6 +1393,21 @@ def _gpkg_envelope(blob):
     except (ValueError, struct.error):
         return None
     return (min(xs), max(xs), min(ys), max(ys)) if xs else None
+
+
+_tls = []
+
+
+def tls():
+    """The TLS context the sources' hosts are asked through: this machine's
+    roots, and the intermediates beside the source file for a host that
+    does not send its own (Schleswig-Holstein's)."""
+    if not _tls:
+        context = ssl.create_default_context()
+        if os.path.isfile(INTERMEDIATES):
+            context.load_verify_locations(cafile=INTERMEDIATES)
+        _tls.append(context)
+    return _tls[0]
 
 
 def _max_age(source):
@@ -1160,6 +1478,20 @@ async def source_map(cache, source_id, sources=None):
             tiles = [(int(m.group("x")), int(m.group("y")))
                      for m in (pattern.search(name) for name in names) if m]
             cached = sourcefile.tile_quads(source, tiles)
+        elif method == "zip":
+            # Its data is where its archives have a member, as for a feed.
+            try:
+                listed = zip_tiles(source, await cache.zip_listing(source))
+            except store.StoreError as err:
+                out["error"] = "its archives could not be read, so its outline is drawn: %s" % err
+            else:
+                out["covers"] = {"type": "MultiPolygon", "coordinates": sourcefile.tile_quads(
+                    source, [(x, y) for _m, x, y in listed])}
+                out["covers_from"] = "the %d tiles its archives hold" % len(listed)
+            pattern = re.compile(source.find["name"])
+            tiles = [(int(m.group("x")), int(m.group("y")))
+                     for m in (pattern.search(name) for name in names) if m]
+            cached = sourcefile.tile_quads(source, tiles)
         elif method == "index":
             # Its data is where its index has a file, as for a feed.
             try:
@@ -1175,7 +1507,7 @@ async def source_map(cache, source_id, sources=None):
                 prop = source.find["url_property"]
                 for props, rings in features:
                     url = str(props.get(prop) or "")
-                    if url.rsplit("/", 1)[-1] in here:
+                    if file_name(url) in here:
                         cached += [[crs.ring_to_degrees(system, ring)] for ring in rings]
         elif method == "regions":
             out["covers_from"] = "the whole world, in regions whose outlines its index gives"
@@ -1262,6 +1594,8 @@ async def plan(cache, spec, sizes=True, sources=None):
             found = template_files(source, hull, spec.get("res_m", 30))
         elif method == "atom":
             found = atom_files(source, await cache.feed(source), bbox)
+        elif method == "zip":
+            found = zip_files(source, await cache.zip_listing(source), bbox)
         elif method == "index":
             found = index_files(source, await cache.index_features(source), hull,
                                 spec.get("res_m", 30))

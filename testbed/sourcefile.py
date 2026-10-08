@@ -23,13 +23,14 @@ sources.py plans and fetches from what it reads.
 
 **The compiler reads what it reads.** Until it takes its readers' parameters
 from a source, a format's parameters must be the ones its reader assumes:
-an `xyz` or `citygml` the German state surveys' layout in EPSG:25833, a
-worldwide surface EPSG:4326. A source that asks for anything else is refused
-here, rather than read wrongly in a build. A land cover GeoTIFF names its
-own classes, and any GeoTIFF its own system.
+an `xyz` or `citygml` the German state surveys' layout in a UTM zone (XYZ
+at 1 m), a worldwide surface EPSG:4326. A source that asks for anything
+else is refused here, rather than read wrongly in a build. A land cover
+GeoTIFF names its own classes, and any GeoTIFF its own system.
 
 Run as a script it is `sim source`: `check` reads every file and says what
-is wrong, `outline ID` writes a source's outline from its own feed, or
+is wrong, `outline ID` writes a source's outline from its own feed or
+archives, or
 from a Geofabrik region (`--geofabrik germany`).
 """
 
@@ -74,13 +75,15 @@ METHODS = {
     # method: (parameters it needs, its addresses, which may each be a list of mirrors)
     "template": (("url", "tile", "crs"), ("url",)),
     "atom": (("feed", "name", "unit_m", "size_m", "crs"), ("feed",)),
+    # Its archives are each a part of the whole, not mirrors.
+    "zip": (("archives", "name", "unit_m", "size_m", "crs"), ()),
     "index": (("index", "index_format", "crs", "url_property"), ("index",)),
     "regions": (("index", "index_format", "file"), ("index",)),
     "file": (("url",), ("url",)),
 }
-INDEX_FORMATS = {"regions": ("geofabrik",), "index": ("geojson", "flatgeobuf")}
+INDEX_FORMATS = {"regions": ("geofabrik",), "index": ("geojson", "flatgeobuf", "arcgis")}
 CRS_RE = re.compile(r"^EPSG:(\d+)$")
-TILE_FIELD_RE = re.compile(r"\{(ns|ew|lat|lon|x|y)(?::0(\d))?\}")
+TILE_FIELD_RE = re.compile(r"\{(ns|ew|lat|lon|x2|y2|x|y)(?::0(\d))?\}")
 FORMATS = {
     # format: the layers it can feed
     "geotiff": ("surface", "terrain", "landcover", "population"),
@@ -103,8 +106,8 @@ FORMAT_NEEDS = {
 # What the compiler's readers assume, which a source's parameters must be
 # until it takes them from the source.
 COMPILER_READS = {
-    "xyz": {"crs": "EPSG:25833", "spacing_m": 1},
-    "citygml": {"lod": 2, "crs": "EPSG:25833"},
+    "xyz": {"spacing_m": 1},
+    "citygml": {"lod": 2},
     "itu-p1812-maps": {"members": {"delta_n": "DN50.TXT", "n0": "N050.TXT"}},
 }
 
@@ -245,6 +248,9 @@ def _check(source):
     if e["read"] == "window" and (e["format"]["type"] != "geotiff" or e["coverage"] == "worldwide"):
         raise _fault(path, ident, "a window is read of a regional source's cloud-optimised "
                                   "GeoTIFFs")
+    if "pairs_with" in e and not (e["format"]["type"] == "geotiff"
+                                  and set(e["layers"]) == {"surface"}):
+        raise _fault(path, ident, "pairs_with is a GeoTIFF surface's, naming its XYZ terrain")
     if e["read"] == "window" and e["find"]["method"] not in ("index", "template"):
         raise _fault(path, ident, "a window is read of the files an index or a template finds")
 
@@ -290,14 +296,28 @@ def _check_find(source):
                     _number(find.get("unit_m", 1)) and find.get("unit_m", 1) > 0):
                 raise _fault(path, ident, "a template's tiles in metres are size_m wide, their "
                                           "corner named in unit_m")
-            if fields != {"x", "y"}:
+            if not {"x", "y"} <= fields <= {"x", "y", "x2", "y2"}:
                 raise _fault(path, ident, "a template's tile in metres names its corner with "
-                                          "{x} and {y}")
+                                          "{x} and {y}, and its far corner with {x2} and {y2}")
+            if find.get("file") is not None:
+                named = {m.group(1) for m in TILE_FIELD_RE.finditer(str(find["file"]))}
+                if not {"x", "y"} <= named <= {"x", "y", "x2", "y2"} or "/" in str(find["file"]):
+                    raise _fault(path, ident, "a template's file is the name a tile is kept "
+                                              "under, its corner {x} and {y} in it")
+            origin = find.get("origin_m", [0, 0])
+            if not (isinstance(origin, list) and len(origin) == 2 and all(map(_number, origin))):
+                raise _fault(path, ident, "a template's origin_m is [x, y], a corner of one of "
+                                          "its tiles")
         if find.get("corner", CORNERS[0]) not in CORNERS:
             raise _fault(path, ident, "a template's corner is %s" % " or ".join(CORNERS))
         if find.get("letters", LETTERS[0]) not in LETTERS:
             raise _fault(path, ident, "a template's letters are %s" % " or ".join(LETTERS))
-    elif method == "atom":
+    if method == "zip":
+        archives = find["archives"]
+        if not isinstance(archives, list) or not all(
+                isinstance(u, str) and re.match(r"^https?://", u) for u in archives):
+            raise _fault(path, ident, "find.archives is a list of http(s) addresses of zips")
+    if method in ("atom", "zip"):
         try:
             pattern = re.compile(find["name"])
         except re.error as err:
@@ -307,8 +327,9 @@ def _check_find(source):
         if not (_number(find["unit_m"]) and _number(find["size_m"])):
             raise _fault(path, ident, "unit_m and size_m are numbers of metres")
         if crs_module._utm(int(CRS_RE.match(find["crs"]).group(1))) is None:
-            raise _fault(path, ident, "an atom feed's tiles are in a UTM zone (326zz, 327zz, "
-                                      "258zz, 269zz)")
+            raise _fault(path, ident, "an %s's tiles are in a UTM zone (326zz, 327zz, "
+                                      "258zz, 269zz)" % ("atom feed" if method == "atom"
+                                                         else "archive"))
     elif method in ("regions", "index"):
         if find["index_format"] not in INDEX_FORMATS[method]:
             raise _fault(path, ident, "a %s source's index_format is one of %s"
@@ -318,6 +339,9 @@ def _check_find(source):
             crs_module.plane(find["crs"])
         except store.StoreError as err:
             raise _fault(path, ident, str(err)) from err
+        if bool(find.get("tile_property")) != bool(find.get("newest_property")):
+            raise _fault(path, ident, "an index keeps the newest of each tile with both "
+                                      "tile_property and newest_property, or neither")
 
 
 def _check_format(source):
@@ -373,6 +397,11 @@ def _check_format(source):
         if fmt.get(key) != want:
             raise _fault(path, ident, "the compiler reads %s with %s %s only, so far"
                          % (kind, key, json.dumps(want, ensure_ascii=False)))
+    if kind in ("xyz", "citygml"):
+        system = CRS_RE.match(str(fmt.get("crs") or ""))
+        if system is None or crs_module._utm(int(system.group(1))) is None:
+            raise _fault(path, ident, "the compiler reads %s in a UTM zone (format.crs 258zz, "
+                                      "326zz), so far" % kind)
     if kind in ("xyz", "citygml", "itu-p1812-maps") and not fmt.get("members"):
         raise _fault(path, ident, "format.members names what a build reads of the zip")
 
@@ -468,6 +497,13 @@ def load(paths=None):
                 raise _fault(path, source.id, "that id is %s's already" % (
                     "sim-mesh's" if out[source.id].path == SHIPPED else "another source"))
             out[source.id] = source
+    for source in out.values():
+        partner = out.get(source.entry.get("pairs_with"))
+        if "pairs_with" in source.entry and not (
+                partner is not None and partner.format_type == "xyz"
+                and "terrain" in partner.layers):
+            raise _fault(source.path, source.id, "pairs_with names the XYZ terrain its surface "
+                                                 "is measured against")
     _cache.clear()
     _cache[key] = out
     return out
@@ -476,8 +512,8 @@ def load(paths=None):
 # ---- outlines --------------------------------------------------------------------
 
 def tile_quads(source, tiles):
-    """An atom source's tiles as polygons in degrees: [(x, y)] corners in its
-    feed's units."""
+    """An atom or zip source's tiles as polygons in degrees: [(x, y)]
+    corners in its units."""
     import geodata
     find = source.find
     zone = geodata.TransverseMercator(*geodata.utm_zone_of(int(find["crs"].split(":")[1])))
@@ -526,8 +562,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="verb", required=True)
     sub.add_parser("check", help="read every source file and say what is wrong")
     sub.add_parser("list", help="every source, where it stands and what it feeds")
-    p = sub.add_parser("outline", help="write a source's outline: an atom feed's tiles, or a "
-                                       "Geofabrik region's outline")
+    p = sub.add_parser("outline", help="write a source's outline: an atom feed's or its "
+                                       "archives' tiles, or a Geofabrik region's outline")
     p.add_argument("id")
     p.add_argument("--geofabrik", metavar="REGION", nargs="+",
                    help="the outline of this Geofabrik region, or of these together")
@@ -561,10 +597,14 @@ def main(argv=None):
                             polygons += sources_module._rings(geometry)
                         return {"type": "MultiPolygon", "coordinates": polygons}, (
                             "outline © OpenStreetMap contributors, ODbL 1.0, by Geofabrik")
-                    if source.find.get("method") != "atom":
+                    method = source.find.get("method")
+                    if method == "zip":
+                        tiles = sources_module.zip_tiles(source, await cache.zip_listing(source))
+                    elif method == "atom":
+                        tiles = sources_module.atom_tiles(source, await cache.feed(source))
+                    else:
                         raise SourceFault("%s finds no tiles to outline: give --geofabrik REGION"
                                           % source.id)
-                    tiles = sources_module.atom_tiles(source, await cache.feed(source))
                     return {"type": "MultiPolygon",
                             "coordinates": tile_quads(source, [(x, y) for _u, x, y in tiles])}, None
             geometry, attribution = asyncio.run(make())

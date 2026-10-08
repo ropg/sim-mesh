@@ -13,7 +13,7 @@
 //! has (both, or the terrain); the build leaves a cell with too few to the
 //! sources below it.
 
-use crate::berlin1m::MeanAccum;
+use crate::xyz::MeanAccum;
 use crate::system::{transform, System};
 use crate::PackError;
 use planner_core::geo::Xy;
@@ -43,9 +43,10 @@ pub struct ElevationInput {
     /// The pixel the build reads them at, in their units (metres, or degrees
     /// for a geographic system).
     pub pixel_m: f64,
-    /// The tiles' no-data value, where they have one in range (Brandenburg's
-    /// −9999).
-    pub nodata: Option<f32>,
+    /// The values the tiles write where they have no data, where those are
+    /// in range (Brandenburg's −9999); one source's may differ from the
+    /// other's.
+    pub nodata: Vec<f32>,
     /// The source's name and notice, for the manifest.
     pub source: String,
     pub notice: String,
@@ -71,13 +72,13 @@ fn open(path: &Path, pixel_m: f64) -> Result<CogReader<BufReader<File>>, PackErr
 struct Tiles<'a> {
     paths: &'a [PathBuf],
     pixel_m: f64,
-    nodata: Option<f32>,
+    nodata: &'a [f32],
     metas: Vec<CogMeta>,
     open: Vec<(usize, CogReader<BufReader<File>>)>,
 }
 
 impl<'a> Tiles<'a> {
-    fn new(paths: &'a [PathBuf], pixel_m: f64, nodata: Option<f32>) -> Result<Self, PackError> {
+    fn new(paths: &'a [PathBuf], pixel_m: f64, nodata: &'a [f32]) -> Result<Self, PackError> {
         let metas = paths
             .iter()
             .map(|p| open(p, pixel_m).map(|r| *r.meta()))
@@ -151,7 +152,7 @@ impl<'a> Tiles<'a> {
     fn read(&mut self, col: u32, row: u32) -> Option<f32> {
         // A chunk a window never fetched does not decode: no data there.
         let v = self.open[0].1.pixel(col, row).ok()?;
-        (v.is_finite() && v.abs() < NO_DATA_ABOVE && Some(v) != self.nodata).then_some(v)
+        (v.is_finite() && v.abs() < NO_DATA_ABOVE && !self.nodata.contains(&v)).then_some(v)
     }
 }
 
@@ -168,8 +169,8 @@ pub fn sample(
     let src = System::new(&input.proj)?;
     let alone = input.surface.is_empty();
     // Every tile opened once for its grid; each worker opens its own readers.
-    let terrain_tiles = Tiles::new(&input.terrain, input.pixel_m, input.nodata)?;
-    let surface_tiles = Tiles::new(&input.surface, input.pixel_m, input.nodata)?;
+    let terrain_tiles = Tiles::new(&input.terrain, input.pixel_m, &input.nodata)?;
+    let surface_tiles = Tiles::new(&input.surface, input.pixel_m, &input.nodata)?;
     let pixel = terrain_tiles
         .metas
         .first()

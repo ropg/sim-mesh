@@ -19,6 +19,8 @@ use planner_pack::build::{
 };
 use planner_pack::cityjson::Heights;
 use planner_pack::elevation::ElevationInput;
+use planner_pack::lod2::Lod2Input;
+use planner_pack::xyz::XyzInput;
 use planner_pack::landcover::{ClutterClass, LandcoverInput};
 use planner_pack::zensus::GridCsv;
 use serde::Deserialize;
@@ -94,14 +96,16 @@ struct PackBuild {
     itu_maps_dir: Option<PathBuf>,
     #[serde(default)]
     osm_pbf: Option<PathBuf>,
-    /// LoD2 buildings from this directory's tiles, where they cover the grid.
+    /// LoD2 buildings, a directory of tiles per source, where they cover
+    /// the grid.
     #[serde(default)]
-    lod2_dir: Option<PathBuf>,
+    lod2: Vec<Lod2Job>,
     /// OpenStreetMap buildings from `osm_pbf`, where LoD2 does not cover.
     #[serde(default)]
     osm_buildings: bool,
+    /// 1 m XYZ terrain and surface tiles, per source.
     #[serde(default)]
-    berlin_1m_dir: Option<PathBuf>,
+    xyz: Vec<XyzJob>,
     /// A population grid as CSV or as a GeoTIFF, in its own system.
     #[serde(default)]
     population: Option<PopulationJob>,
@@ -151,7 +155,7 @@ struct LandcoverJob {
     notice: String,
 }
 
-/// {terrain: [path], surface: [path], proj, pixel_m, nodata?, source, notice}
+/// {terrain: [path], surface: [path], proj, pixel_m, nodata: [value], source, notice}
 #[derive(Debug, Deserialize)]
 struct ElevationJob {
     terrain: Vec<PathBuf>,
@@ -159,7 +163,27 @@ struct ElevationJob {
     proj: String,
     pixel_m: f64,
     #[serde(default)]
-    nodata: Option<f32>,
+    nodata: Vec<f32>,
+    source: String,
+    notice: String,
+}
+
+/// {dir, zone, source, notice}: CityGML tiles in an ETRS89 UTM zone.
+#[derive(Debug, Deserialize)]
+struct Lod2Job {
+    dir: PathBuf,
+    zone: u8,
+    source: String,
+    notice: String,
+}
+
+/// {terrain: [path], surface: [path], zone, source, notice}: XYZ tiles in an
+/// ETRS89 UTM zone.
+#[derive(Debug, Deserialize)]
+struct XyzJob {
+    terrain: Vec<PathBuf>,
+    surface: Vec<PathBuf>,
+    zone: u8,
     source: String,
     notice: String,
 }
@@ -205,8 +229,22 @@ fn pack_build(input: &str) -> Result<Value, String> {
         out_dir: job.out_dir.clone(),
         name: job.name,
         itu_maps_dir: job.itu_maps_dir,
-        berlin_1m_dir: job.berlin_1m_dir,
-        lod2_dir: job.lod2_dir,
+        xyz: job
+            .xyz
+            .into_iter()
+            .map(|x| XyzInput {
+                terrain: x.terrain,
+                surface: x.surface,
+                zone: x.zone,
+                source: x.source,
+                notice: x.notice,
+            })
+            .collect(),
+        lod2: job
+            .lod2
+            .into_iter()
+            .map(|l| Lod2Input { dir: l.dir, zone: l.zone, source: l.source, notice: l.notice })
+            .collect(),
         lod2_geometry: true,
         population: match job.population {
             Some(PopulationJob::Csv { csv, proj, delimiter, x, y, value, cell_m, source, notice }) => {
