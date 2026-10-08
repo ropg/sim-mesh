@@ -560,14 +560,16 @@ sim-mesh ships:
 - **terrain and clutter**: the state surveys' 1 m terrain and their surface
   models where the rectangle touches Berlin, Brandenburg or
   Mecklenburg-Vorpommern, AHN's (0.5 m) where it touches the Netherlands,
+  BEV's 1 m terrain and surface where it touches Austria,
   Copernicus GLO-30 everywhere else; in the United States, USGS 3DEP's
   10 m terrain under GLO-30's clutter;
 - **buildings**: the same states' LoD2 models, 3DBAG's in the Netherlands,
   OpenStreetMap's everywhere else (an OpenStreetMap building on a LoD2 or
   3DBAG tile is left out);
 - **population**: the Zensus 2022 grid where the rectangle touches Germany,
-  CBS's 2023 grid where it touches the Netherlands, WorldPop's 2025 grid in
-  the United States, none elsewhere;
+  CBS's 2023 grid where it touches the Netherlands, Statistik Austria's
+  2026 grid where it touches Austria, WorldPop's 2025 grid in the United
+  States, none elsewhere;
 - **land cover**: ESA WorldCover, with NLCD's classes over it in the
   conterminous United States;
 
@@ -585,8 +587,10 @@ other, or says why it failed. One
 build runs at a time, as a child process the front never waits on; the
 compiler's diagnostics go to `testbed/geodata/.cache/logs/<name>.log`. A
 compiler killed for want of memory says so, and which limit to raise: the
-Podman machine's or Docker Desktop's, where the front runs in one (a city
-in a US state's OpenStreetMap extract takes about 2.5 GB).
+Podman machine's or Docker Desktop's, where the front runs in one. What
+the compiler holds grows with the rectangle, not with the OpenStreetMap
+extract it lies in: a city of 15 km takes about half a gigabyte, from
+Massachusetts's 310 MB extract or Austria's 812 MB alike.
 
 **The sources** are fetched into `testbed/geodata/.cache/<source>/`, shared by every
 build, so a second region beside the first fetches only what is new; a file
@@ -608,6 +612,8 @@ is fetched once, resumed where it stopped, and one its host does not have
 | CBS 2023 100 m grid | the Netherlands | `download.cbs.nl` |
 | 3DEP 1/3 arc-second terrain, 1° tiles | the United States | `prd-tnm.s3.amazonaws.com`: only the windows of the tiles meeting the rectangle |
 | Annual NLCD 2025 land cover, 30 m | the conterminous United States | `mrlc.gov`: one 1.5 GB zip |
+| BEV ALS DTM and DSM, 1 m, 50 km squares | Austria | `data.bev.gv.at`: only the windows of the squares meeting the rectangle |
+| Statistik Austria 2026 100 m grid | Austria | `statistik.at`'s INSPIRE download |
 | WorldPop 2025 population, 3 arc-seconds | the United States | `data.worldpop.org`: one 1.5 GB GeoTIFF; the host does not resume a broken download |
 
 Geofabrik's index, Berlin's feeds and the MeshCore node list are kept in
@@ -678,7 +684,9 @@ europe:                             # a continent
 - **Finding**: `template` (tiles of whole degrees, EPSG:4326 or 4269, named
   by their south-west corner, or by their north-west one with
   `corner: north-west`: `{ns}`, `{lat}`, `{ew}`, `{lon}`, `:0n` padding,
-  the letters upper case unless `letters: lower`), `atom` (an
+  the letters upper case unless `letters: lower`; or squares of `size_m`
+  in a projected `crs`, their corner named by `{x}` and `{y}` in `unit_m`,
+  as BEV names its 50 km squares of EPSG:3035), `atom` (an
   INSPIRE download feed, each tile's corner read off its file name),
   `index` (a file of footprints, GeoJSON or FlatGeobuf, in the `crs` it
   names: each footprint meeting the rectangle is a file, its address the
@@ -696,7 +704,8 @@ europe:                             # a continent
   larger than a quarter of the pack's cell, fetched by HTTP range into a
   sparse copy of the file (its `.ranges` beside it says what it holds). A
   Delft-sized pack takes about 10 MB of an AHN sheet's 330 MB, a
-  Providence-sized one 8 MB of a 3DEP tile's 500 MB.
+  Providence-sized one 8 MB of a 3DEP tile's 500 MB, an Innsbruck-sized
+  one about 40 MB of each of BEV's 7 GB squares.
 - **Formats**, with their parameters:
   - `geotiff` (`band`; `crs` when it is not EPSG:4326; `classes` for land
     cover, each code the file writes and the clutter class it is, a code
@@ -714,8 +723,11 @@ europe:                             # a continent
   - `cityjson` (`crs`, and the attributes that hold the `ground` and `roof`
     heights): each Building's LoD0 footprint, as tall as roof less ground.
   - `csv-grid` (`delimiter`, the `x`, `y` and `value` columns, `crs`,
-    `cell_m`) and `gpkg-grid` (a GeoPackage of square cells: `value`, `crs`,
-    `cell_m`; a negative value is withheld).
+    `cell_m`), `gpkg-grid` (a GeoPackage of square cells: `value`, `crs`,
+    `cell_m`; a negative value is withheld) and `inspire-pd-grid` (an
+    INSPIRE population distribution in GML, each value naming its cell by
+    the EU grid code, `CRS3035RES100mN<y>E<x>`, which gives its projection
+    and size: `members`).
   - `osm-pbf` and `itu-p1812-maps`.
 
   A file that does not fit its format is refused when it is read, with the
@@ -727,15 +739,18 @@ europe:                             # a continent
 - **Layers** are `surface`, `terrain`, `landcover`, `buildings`,
   `population`, `roads`, `places` and `radio-climate`, each source with its
   priority in each. Berlin's, Mecklenburg-Vorpommern's and the Netherlands'
-  terrain, surface and buildings are 100 to GLO-30's and OpenStreetMap's
+  terrain, surface and buildings, and Austria's terrain and surface, are 100
+  to GLO-30's and OpenStreetMap's
   10; Brandenburg's are 90, since its outline holds Berlin, whose own come
   first there. NLCD's land cover is 100 to WorldCover's 10.
 
 Shipped beyond the worldwide set: Germany (Berlin's, Brandenburg's and
 Mecklenburg-Vorpommern's terrain, surface and LoD2, and the Zensus 2022
 grid), the Netherlands (AHN's 0.5 m terrain and surface, the 3DBAG
-buildings and CBS's 100 m population grid) and the United States (3DEP's
-1/3 arc-second terrain, NLCD land cover and WorldPop's population grid).
+buildings and CBS's 100 m population grid), Austria (BEV's 1 m terrain and
+surface, and Statistik Austria's 100 m population grid) and the United
+States (3DEP's 1/3 arc-second terrain, NLCD land cover and WorldPop's
+population grid).
 
 An id is one source: a person's file may not take one sim-mesh ships (a
 second address for the same data is a mirror, in the shipped entry). Every

@@ -19,10 +19,11 @@ front ── GET <file>, Range: bytes=<n>- ► the source's host         into th
 
 **Finding a rectangle's files**, by the method a source names:
 
-- `template`: the size_deg tiles of degrees meeting the rectangle's grid,
-  each named by its south-west corner (or its north-west one, as USGS
-  names 3DEP's), its address the url with {tile}; read as a window, the
-  part of each the grid needs.
+- `template`: the size_deg tiles of degrees, or the size_m tiles of a
+  projected system (BEV's 50 km squares of LAEA Europe), meeting the
+  rectangle's grid, each named by its south-west corner (or its north-west
+  one, as USGS names 3DEP's), its address the url with {tile}; read as a
+  window, the part of each the grid needs.
 - `atom`: the tiles a feed lists whose square, its corner read off the file
   name in the feed's units, meets the rectangle's grid in the feed's zone.
 - `regions`: the smallest region of the index whose outline holds the whole
@@ -88,6 +89,9 @@ HEAD_PARALLEL = 6
 MAX_CELLS = 25_000_000              # a grid past this is refused: rasters are held whole
 RESOLUTIONS = (30.0, 10.0)
 PLAIN_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# The EU grid's cell code (INSPIRE, the EEA reference grid): its system, its
+# size and its south-west corner, in metres.
+INSPIRE_CELL_RE = re.compile(r"CRS(?P<crs>\d+)RES(?P<res>\d+)mN(?P<y>\d+)E(?P<x>\d+)")
 WORLD = [-180.0, -85.0, 180.0, 85.0]
 
 # What the cache holds that is no source's, for the page's tooltip on its row.
@@ -224,33 +228,94 @@ def tile_name(source, lat, lon):
     return sourcefile.TILE_FIELD_RE.sub(field, find["tile"])
 
 
+def tile_name_xy(source, x, y):
+    """A template's tile in metres whose south-west corner is (x, y) in its
+    system, named by the corner its source says: {x} and {y} the corner in
+    `unit_m` (1 unless given), `:0n` padding them to n digits."""
+    find = source.find
+    unit = float(find.get("unit_m", 1))
+    if _north_west(source):
+        y += float(find["size_m"])
+
+    def field(m):
+        value = int(round((x if m.group(1) == "x" else y) / unit))
+        return "%0*d" % (int(m.group(2)), value) if m.group(2) else "%d" % value
+    return sourcefile.TILE_FIELD_RE.sub(field, find["tile"])
+
+
+def _in_metres(source):
+    return "size_m" in source.find
+
+
+def template_corners(source, hull):
+    """The south-west corners of the tiles meeting the degrees `hull`
+    [lon0, lat0, lon1, lat1]: (lat, lon) for tiles in degrees, (x, y) in
+    the source's system for tiles in metres."""
+    find = source.find
+    if _in_metres(source):
+        size = float(find["size_m"])
+        x0, y0, x1, y1 = crs.box_in(find["crs"], hull)
+        return [(x * size, y * size)
+                for y in range(math.floor(y0 / size), math.floor((y1 - 1e-6) / size) + 1)
+                for x in range(math.floor(x0 / size), math.floor((x1 - 1e-6) / size) + 1)]
+    size = find["size_deg"]
+    lon0, lat0, lon1, lat1 = hull
+    return [(lat, lon)
+            for lat in range(math.floor(lat0 / size) * size,
+                             math.floor((lat1 - 1e-9) / size) * size + 1, size)
+            for lon in range(math.floor(lon0 / size) * size,
+                             math.floor((lon1 - 1e-9) / size) * size + 1, size)]
+
+
 def template_files(source, hull, res_m=30.0):
     """The tiles meeting the degrees `hull` [lon0, lat0, lon1, lat1]; for a
     source read as a window, each with the box it needs of its tile."""
-    size = source.find["size_deg"]
-    lon0, lat0, lon1, lat1 = hull
     want = window_want(source, res_m)
+    name = tile_name_xy if _in_metres(source) else tile_name
+    window = None
+    if want:
+        box = crs.box_in(source.find["crs"], hull, margin=4 * float(res_m)
+                         * crs.per_metre(source.find["crs"]))
+        window = {"box": box, "want": want}
     out = []
-    for lat in range(math.floor(lat0 / size) * size, math.floor((lat1 - 1e-9) / size) * size + 1,
-                     size):
-        for lon in range(math.floor(lon0 / size) * size,
-                         math.floor((lon1 - 1e-9) / size) * size + 1, size):
-            tile = tile_name(source, lat, lon)
-            urls = [u.replace("{tile}", tile) for u in source.addresses("url")]
-            window = None
-            if want:
-                box = crs.box_in(source.find["crs"], hull, margin=4 * float(res_m)
-                                 * crs.per_metre(source.find["crs"]))
-                window = {"box": box, "want": want}
-            out.append(File(source.id, urls, urls[0].rsplit("/", 1)[-1], missing=_missing(source),
-                            window=window))
+    for a, b in template_corners(source, hull):
+        tile = name(source, a, b)
+        urls = [u.replace("{tile}", tile) for u in source.addresses("url")]
+        out.append(File(source.id, urls, urls[0].rsplit("/", 1)[-1], missing=_missing(source),
+                        window=dict(window) if window else None))
     return out
+
+
+def template_square(source, corner):
+    """A tile as a ring in degrees, from its south-west corner as
+    `template_corners` gives it."""
+    if not _in_metres(source):
+        lat, lon = corner
+        size = source.find["size_deg"]
+        return _box(lon, lat, lon + size, lat + size)
+    x, y = corner
+    size = float(source.find["size_m"])
+    p, ring = crs.plane(source.find["crs"]), []
+    for f in range(9):
+        t = f / 8.0
+        ring += [(x + t * size, y)]
+    for f in range(1, 9):
+        ring += [(x + size, y + f / 8.0 * size)]
+    for f in range(1, 9):
+        ring += [(x + size - f / 8.0 * size, y + size)]
+    for f in range(1, 9):
+        ring += [(x, y + size - f / 8.0 * size)]
+    out = []
+    for px, py in ring:
+        lat, lon = p.inverse(px, py)
+        out.append([round(lon, 6), round(lat, 6)])
+    return [out]
 
 
 def template_pattern(source):
     """A template's cached file names as a pattern, its corner's groups ns,
-    lat, ew, lon: the corner its name gives (`template_corner` makes it the
-    south-west one)."""
+    lat, ew, lon, or x and y: the corner its name gives (`template_corner`
+    makes it the south-west one)."""
     name = source.address("url").rsplit("/", 1)[-1].replace("{tile}", source.find["tile"])
     lower = source.find.get("letters") == "lower"
     out, at = "", 0
@@ -265,7 +330,12 @@ def template_pattern(source):
 
 
 def template_corner(source, m):
-    """A cached tile's south-west corner (lat, lon), from its name's match."""
+    """A cached tile's south-west corner, (lat, lon) or (x, y) as
+    `template_corners` gives it, from its name's match."""
+    if _in_metres(source):
+        unit = float(source.find.get("unit_m", 1))
+        x, y = int(m.group("x")) * unit, int(m.group("y")) * unit
+        return x, (y - float(source.find["size_m"]) if _north_west(source) else y)
     lat = int(m.group("lat")) * (-1 if m.group("ns").upper() == "S" else 1)
     lon = int(m.group("lon")) * (-1 if m.group("ew").upper() == "W" else 1)
     return (lat - source.find["size_deg"] if _north_west(source) else lat), lon
@@ -843,6 +913,59 @@ class Cache:
         os.replace(out + ".part", out)
         return out
 
+    def inspire_grid_csv(self, f):
+        """An INSPIRE population grid (Statistik Austria's 100 m squares: a
+        GML of statistical values, each naming its cell by the EU grid code
+        `CRS3035RES100mN<y>E<x>`, the cell's south-west corner) as the CSV
+        the compiler's grid reader takes, `x,y,value` of each cell's centre,
+        written once beside the GML with a `.json` saying its system and
+        cell. (path, crs, cell_m)."""
+        gml = next((p for p in self.extracted(f) if p.lower().endswith(".gml")), None)
+        if gml is None:
+            raise SourceError("%s holds no GML" % f.url)
+        out = gml[:-len(".gml")] + ".csv"
+        if os.path.isfile(out) and os.path.isfile(out + ".json"):
+            with open(out + ".json", encoding="utf-8") as handle:
+                got = json.load(handle)
+            return out, got["crs"], float(got["cell_m"])
+        import xml.etree.ElementTree as ET
+        grid = None
+        try:
+            with open(out + ".part", "w", encoding="utf-8") as handle:
+                handle.write("x,y,value\n")
+                for _event, el in ET.iterparse(gml, events=("end",)):
+                    if el.tag.rsplit("}", 1)[-1] != "StatisticalValue":
+                        continue
+                    value, cell = None, None
+                    for child in el.iter():
+                        local = child.tag.rsplit("}", 1)[-1]
+                        if local == "value" and child is not el and child.text:
+                            value = child.text.strip()
+                        elif local == "spatial":
+                            cell = INSPIRE_CELL_RE.search(
+                                child.get("{http://www.w3.org/1999/xlink}href") or "")
+                    el.clear()
+                    if value is None or cell is None:
+                        continue
+                    this = ("EPSG:" + cell.group("crs"), float(cell.group("res")))
+                    if grid is None:
+                        grid = this
+                    elif this != grid:
+                        raise SourceError("%s mixes grids: %s %g m and %s %g m"
+                                          % (gml, grid[0], grid[1], this[0], this[1]))
+                    handle.write("%.1f,%.1f,%s\n" % (float(cell.group("x")) + grid[1] / 2,
+                                                     float(cell.group("y")) + grid[1] / 2, value))
+        except ET.ParseError as err:
+            raise SourceError("%s is not GML: %s" % (gml, err)) from err
+        if grid is None:
+            raise SourceError("%s holds no statistical value on a grid cell" % gml)
+        if not crs.known(grid[0]):
+            raise SourceError("%s is on a grid in %s, a system sim-mesh does not know"
+                              % (gml, grid[0]))
+        os.replace(out + ".part", out)
+        store.write_text(out + ".json", json.dumps({"crs": grid[0], "cell_m": grid[1]}) + "\n")
+        return out, grid[0], grid[1]
+
     @staticmethod
     def wanted(f, base):
         members = f.members if isinstance(f.members, (list, tuple)) else (f.members,)
@@ -1017,12 +1140,11 @@ async def source_map(cache, source_id, sources=None):
     cached = []
     try:
         if method == "template":
-            pattern, size = template_pattern(source), source.find["size_deg"]
+            pattern = template_pattern(source)
             for name in names:
                 m = pattern.match(name)
                 if m:
-                    lat, lon = template_corner(source, m)
-                    cached.append(_box(lon, lat, lon + size, lat + size))
+                    cached.append(template_square(source, template_corner(source, m)))
         elif method == "atom":
             # Its data is where its feed has a tile: inside its outline, and
             # no more of it than that.
