@@ -569,7 +569,7 @@ async def prebuilt(index_url=None, firmware_dir=None, arch=None):
 # ---- publishing --------------------------------------------------------------
 
 PUBLISH_REPO = "sim-mesh/sim-mesh"
-PUBLISH_SITE = "sim-mesh/sim-mesh.github.io"
+PUBLISH_SITE = "sim-mesh/sim-mesh.net"
 PUBLISH_TAG = "firmware"
 PUBLISHED_FACTS = ("base", "arch", "version", "category", "radio", "title", "hardware")
 GITHUB_API = os.environ.get("SIM_MESH_GITHUB_API", "https://api.github.com")

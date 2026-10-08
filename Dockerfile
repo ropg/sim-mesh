@@ -17,6 +17,7 @@
 #   - gcc, g++, make and cmake (the radio libraries and the time shim)
 #   - cargo via rustup, with the wasm32 target (the planner, the ether's
 #     conductor)
+#   - Ruby and bundler (`sim dev`'s Jekyll preview of the site, sim-mesh.net)
 #   - the station runtime the contract promises: libc, libstdc++
 # By its full name: podman will not guess a registry for a short one without a
 # terminal to ask on, and Docker reads it the same.
@@ -31,7 +32,8 @@ RUN set -eux; \
         python3 python3-aiohttp python3-yaml python3-pytest \
         build-essential cmake pkg-config \
         libstdc++6 \
-        procps; \
+        procps \
+        ruby-dev ruby-bundler zlib1g-dev; \
     mkdir -p /etc/apt/keyrings; \
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg; \
