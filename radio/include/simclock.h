@@ -20,6 +20,8 @@ struct simclock_ops {
     int     (*wake_create)(void (*due)(void*), void* arg);  /* a wake the caller owns */
     void    (*wake_at)(int wake, int64_t node_us);          /* INT64_MAX clears it */
     void    (*idle)(void);                                  /* nothing to do before the wakes */
+    int64_t (*chip_next_us)(void);                          /* the chips' next timer, node µs;
+                                                             * INT64_MAX with none */
 };
 
 /** The shim's entry point, looked up with dlsym(RTLD_DEFAULT). */

@@ -659,7 +659,8 @@ class Physics:
     figure, the slow fading of every link over time (its spread in dB and its
     coherence time; off unless given), fast fading per frame (a Rician K
     factor; off unless given), and whether frames on the air interfere with
-    one another at all.
+    one another at all. The loss on a multi-SF receiver's side detectors is
+    not a setting here: it is fixed, at the lock stage (`side_preamble_miss`).
 
     Without interference (`--no-interference`, an oracle, never so unless
     asked) a frame is judged against noise alone, as though nothing else were
@@ -687,6 +688,20 @@ class Physics:
             raise ValueError("the Rician K factor is a power ratio, 0 or more, not %g"
                              % self.rician_k)
 
+    @property
+    def fading(self):
+        """True when frames' levels fade."""
+        return bool(self.fading_db) or self.rician_k is not None
+
+    # Sergey's fork (sergeyculum) named this same spread/coherence/Rician
+    # setting by an older model's terms (slow + fast terms, two draws per
+    # link). Read-only aliases, so a script of its that reads a Physics back
+    # (the sweep's fw_sim_mesh_oracle.py, _reach_graph_for.py) still finds
+    # them; --slow-fading-db etc. alias the CLI flags themselves (`main`).
+    slow_fading_db = property(lambda self: self.fading_db)
+    slow_fading_s = property(lambda self: self.coherence_s)
+    fast_fading_k = property(lambda self: self.rician_k)
+
     def describe(self):
         text = "noise figure %.1f dB" % self.noise_figure_db
         if self.fading_db:
@@ -702,9 +717,9 @@ class Physics:
         data = data or {}
         return cls(data.get("noise_figure_db", DEFAULT_NOISE_FIGURE_DB),
                    data.get("interference", True),
-                   data.get("fading_db", DEFAULT_FADING_DB),
-                   data.get("coherence_s", DEFAULT_COHERENCE_S),
-                   data.get("rician_k", DEFAULT_RICIAN_K))
+                   data.get("fading_db", data.get("slow_fading_db", DEFAULT_FADING_DB)),
+                   data.get("coherence_s", data.get("slow_fading_s", DEFAULT_COHERENCE_S)),
+                   data.get("rician_k", data.get("fast_fading_k", DEFAULT_RICIAN_K)))
 
     def as_dict(self):
         out = {"noise_figure_db": self.noise_figure_db}
@@ -726,6 +741,7 @@ class Station:
         self.sid = sid
         self.slots = slots
         self.states = {}        # slot -> the last `state` message for it
+        self.ready = {}         # slot -> when its radio is ready in that state, on our clock
         self.locks = {}         # slot -> the Reception its demodulator follows
         self.tx_until = 0       # while its own frame is on the air, it is deaf
         self.on_idle = []       # callbacks for its next idle
@@ -809,6 +825,7 @@ class Frame:
         self.sf = msg.get("sf")
         self.sync = msg.get("sync")
         self.power_dbm = msg.get("power_dbm", DEFAULT_POWER_DBM)
+        self.preamble = msg.get("pre")      # its preamble, in symbols, as the sender set it
         self.payload = msg.get("payload", "")
         # What the error curve needs of the frame's shape: the payload is
         # passed through as it came and never read, only its length taken.
@@ -1505,7 +1522,9 @@ class Ether(asyncio.DatagramProtocol):
                 + self.gains.get(rx_sid, 0.0) - loss)
 
     def level_of(self, frame, rsid):
-        """The level `frame` arrives at `rsid`, fixed on first asking."""
+        """The level `frame` arrives at `rsid`, fixed on first asking: the
+        table's, unfaded (`level_at` adds the pair's slow fade and the
+        frame's own fast one)."""
         if rsid not in frame.levels:
             frame.levels[rsid] = self.level(frame.sid, rsid, frame.freq, frame.power_dbm)
         return frame.levels[rsid]
@@ -1818,6 +1837,10 @@ class Ether(asyncio.DatagramProtocol):
         slot = msg.get("slot", 0)
         before = station.state(slot) or {}
         station.states[slot] = msg
+        # Its radio is deaf until `ready_at`, after a retune whose BUSY the
+        # chip model charges (`busy_us` in SIM_MESH_BOARD); with none, never.
+        busy = int(msg.get("ready_at") or 0) - int(msg.get("t") or 0)
+        station.ready[slot] = self.now() + busy if busy > 0 else 0
         mode = msg.get("mode")
         retuned = any(before.get(key) != msg.get(key)
                       for key in ("freq", "side") + MATCH_KEYS)
@@ -1996,7 +2019,9 @@ class Ether(asyncio.DatagramProtocol):
 
         `now` is when a slot that started listening after the frame began is
         told of it (`tell_late`): it can lock on only while enough of the
-        preamble is still to come, and is otherwise told the energy.
+        preamble is still to come, and is otherwise told the energy. A slot
+        whose radio is not ready yet (its state's `ready_at`) is deaf: a frame
+        starting before then is energy to it, and lost.
         """
         state = rstation.state(slot)
         if not in_band(frame.freq, frame.bw, state.get("freq"), state.get("bw")):
@@ -2013,7 +2038,8 @@ class Ether(asyncio.DatagramProtocol):
                     sense_threshold_dbm(state.get("bw")):
                 self.send(rstation.sid, self.begin_message(frame, slot, faded, energy=True, t0=now))
             return
-        if rstation.sensing(slot) or (late and not frame.preamble_left(now)):
+        if (rstation.sensing(slot) or (late and not frame.preamble_left(now))
+                or now < rstation.ready.get(slot, 0)):
             self.send(rstation.sid, self.begin_message(frame, slot, faded, energy=True, t0=now))
             return
         held = self.current_lock(rstation, slot, now)
@@ -2068,7 +2094,7 @@ class Ether(asyncio.DatagramProtocol):
         station is shown, the one in progress by the capture margin; otherwise
         it is energy and lost to this receiver. A CAD slot is told of every
         frame it could decode, and so is a slot that started listening too
-        late in the preamble (`arrive`).
+        late in the preamble, or whose radio is not ready yet (`arrive`).
         """
         state = rstation.state(slot)
         late = now is not None and now > frame.start_us
@@ -2079,7 +2105,8 @@ class Ether(asyncio.DatagramProtocol):
         if det is None or not self.locks_on(frame, rstation.sid, slot, now, det):
             return
         faded = self.level_at(frame, rstation.sid, now)
-        if rstation.sensing(slot) or (late and not frame.preamble_left(now)):
+        if (rstation.sensing(slot) or (late and not frame.preamble_left(now))
+                or now < rstation.ready.get(slot, 0)):
             self.send(rstation.sid, self.begin_message(frame, slot, faded, energy=True, t0=now))
             return
         held = self.current_lock(rstation, slot, now)
@@ -2741,15 +2768,20 @@ def main(argv=None):
     ap.add_argument("--bench-capture", action="store_true",
                     help="rule on two frames of one spreading factor as a bench saw them "
                          "meet, instead of by the same-SF figure")
-    ap.add_argument("--fading-db", type=float, default=DEFAULT_FADING_DB,
+    ap.add_argument("--fading-db", "--slow-fading-db", dest="fading_db",
+                    type=float, default=DEFAULT_FADING_DB,
                     help="fading: the spread in dB of every link's level over time "
-                         "(default %g: none)" % DEFAULT_FADING_DB)
-    ap.add_argument("--coherence-s", type=float, default=DEFAULT_COHERENCE_S,
+                         "(default %g: none; --slow-fading-db is Sergey's fork's name "
+                         "for this same setting)" % DEFAULT_FADING_DB)
+    ap.add_argument("--coherence-s", "--slow-fading-s", dest="coherence_s",
+                    type=float, default=DEFAULT_COHERENCE_S,
                     help="fading: how long, in seconds, a link's level stays alike "
-                         "(default %g)" % DEFAULT_COHERENCE_S)
-    ap.add_argument("--rician-k", type=float, default=DEFAULT_RICIAN_K, metavar="K",
+                         "(default %g; --slow-fading-s aliases this)" % DEFAULT_COHERENCE_S)
+    ap.add_argument("--rician-k", "--fast-fading-k", dest="rician_k",
+                    type=float, default=DEFAULT_RICIAN_K, metavar="K",
                     help="fast fading: one Rician draw per frame at each receiver, of "
-                         "this K factor, 0 for Rayleigh (default: none)")
+                         "this K factor, 0 for Rayleigh (default: none; --fast-fading-k "
+                         "aliases this)")
     ap.add_argument("--no-interference", action="store_true",
                     help="an oracle: judge every frame against noise alone and never take "
                          "a receiver off the frame it follows; what overlapping frames "

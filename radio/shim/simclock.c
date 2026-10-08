@@ -31,7 +31,9 @@
  * the chip library runs when a grant reaches the instant writes to. So a thread
  * waiting in node time is woken by the grant, and a signal still ends its wait
  * the way it ends a real one — which a host whose threads are switched by
- * signals depends on.
+ * signals depends on. A wait ends on a whole millisecond of node time, and
+ * with SIM_MESH_SHORT_WAITS=chip one shorter than that ends at the chips' next
+ * event when that comes first (wait_end).
  *
  * With SIM_MESH_IDLE=threads the shim also keeps a census of the process's
  * threads: every thread created through pthread_create, and the first. A
@@ -130,6 +132,7 @@
 
 static int s_virtual = -1;
 static int s_census;
+static int s_shortWaits;
 static int64_t s_epochEnv;
 static const struct simclock_ops* _Atomic s_ops;
 
@@ -206,8 +209,10 @@ static void load_mode(void)
     const char* e = getenv("SIM_MESH_EPOCH_US");
     const char* seed = getenv("SIM_MESH_SEED");
     const char* id = getenv("SIM_MESH_NODE_ID");
+    const char* w = getenv("SIM_MESH_SHORT_WAITS");
     int virt = v && strcmp(v, "virtual") == 0;
     s_census = i && strcmp(i, "threads") == 0;
+    s_shortWaits = w && strcmp(w, "chip") == 0;
     s_epochEnv = e && *e ? strtoll(e, NULL, 10) : 0;
     s_sid = id ? atoi(id) : 0;
     if (virt && seed && *seed) {
@@ -252,6 +257,22 @@ static int64_t resolve(int64_t deadline)
 {
     if (deadline == NEVER || deadline <= 0) return deadline;
     return ((deadline + RESOLUTION_US - 1) / RESOLUTION_US) * RESOLUTION_US;
+}
+
+/* With SIM_MESH_SHORT_WAITS=chip, a wait shorter than the resolution ends at
+ * the chips' next event (simclock_ops.chip_next_us) when that comes before
+ * the millisecond it would end on, or at its own end when the event comes
+ * sooner still. A driver that polls BUSY in 10 µs sleeps then sees it fall
+ * when it falls, as on a board, at an instant the run stops at anyway, where
+ * on the millisecond every command it waits out costs it up to one more. */
+static int64_t wait_end(const struct simclock_ops* o, int64_t deadline)
+{
+    int64_t end = resolve(deadline);
+    if (!s_shortWaits || end == deadline || deadline - o->node_us() >= RESOLUTION_US)
+        return end;
+    int64_t next = o->chip_next_us();
+    if (next >= end) return end;
+    return next > deadline ? next : deadline;
 }
 
 /* Node time now, on a clock's own scale. Before the chip library attaches it
@@ -574,7 +595,7 @@ static int node_wait(const struct simclock_ops* o, struct pollfd* extra, nfds_t 
 {
     struct thread_rec* r = ready_rec(o);
     if (!r || r->efd < 0) return -2;
-    deadline = resolve(deadline);
+    deadline = wait_end(o, deadline);
     struct pollfd local[64];
     struct pollfd* fds = n + 1 <= 64 ? local : (struct pollfd*)malloc((n + 1) * sizeof *fds);
     if (!fds) return -2;

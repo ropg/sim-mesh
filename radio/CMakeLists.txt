@@ -21,6 +21,7 @@ find_package(Threads REQUIRED)
 
 add_library(simradio-sx1262 SHARED
     src/model.cpp
+    src/busy.cpp
     src/ether_link.cpp
     src/conductor.cpp
     src/json.cpp

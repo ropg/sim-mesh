@@ -39,7 +39,10 @@ struct EtherState {
     bool        iqInverted;  /* SetPacketParams' InvertIQ: the chirps run down */
     /* Side detectors, listening beside the main one on its carrier and
      * bandwidth (an LR2021's SetLoraSideDetConfig and SetLoraSideDetSyncword):
-     * each its own spreading factor, sync word and IQ. An SX1262 has none. */
+     * each its own spreading factor, sync word and IQ. An SX1262 has none.
+     * A multi-SF receiver (SIM_MESH_MULTI_SF, model.cpp's multiSfSet(), or
+     * model_lr2021.cpp's own side detectors) states the faster SFs it also
+     * hears here, one per side detector. */
     int         nSide;
     struct { int sf; int syncWord; bool iqInverted; } side[kMaxSideDetectors];
 };
