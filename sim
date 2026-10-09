@@ -9,7 +9,10 @@
 #                                      served live from its sources, on the same
 #                                      port, each edit in the browser at once; the
 #                                      front's own Python is read when it starts,
-#                                      so a change to it wants a restart
+#                                      so a change to it wants a restart; with the
+#                                      site (sim-mesh.net) checked out beside
+#                                      sim-mesh, it is served live as well, on
+#                                      port 4000
 #     sim new [NAME] (--geodata G --nodeset N | --snapshot S)
 #             [--time max|<k>x|real] [--stagger N] [--build B] [--pairwise]
 #                                      start a simulation (and the front, when none runs);
@@ -122,6 +125,9 @@ if [ -n "${SIM_MESH_FRONT:-}" ]; then
 fi
 URL="http://localhost:$PORT/"
 DEV_PORT=9000                       # `sim dev`: the page's development server, inside only
+SITE=$(dirname "$ROOT")/sim-mesh.net    # `sim dev`: the site, served when it is checked out here
+SITE_PORT=4000                      # its Jekyll server
+SITE_RELOAD_PORT=35729              # and that server's live-reload socket
 PLANNER=$ROOT/planner
 FRONT_CONTAINER=sim-mesh-front
 
@@ -253,6 +259,9 @@ in_container() {
             # Edits on a Mac or Windows reach a container as no file events:
             # `sim dev`'s server looks for them itself.
             [ "$mode" != dev ] || args+=(-e CHOKIDAR_USEPOLLING=1)
+            if [ "$mode" = dev ] && [ -d "$SITE" ]; then
+                args+=(-p "$SITE_PORT:$SITE_PORT/tcp" -p "$SITE_RELOAD_PORT:$SITE_RELOAD_PORT/tcp")
+            fi
             say "the page: $URL"
             open_when_up "$URL"
         fi
@@ -504,19 +513,42 @@ cmd_dev() {
     [ -d "$ui/node_modules" ] || (cd "$ui" && npm install --no-fund --no-audit)
     (cd "$ui" && exec npx quasar dev --hostname 127.0.0.1 --port "$DEV_PORT") &
     local page=$!
+    local site=
+    if [ -d "$SITE" ]; then
+        serve_site &
+        site=$!
+    fi
     say "the page, live from its sources: $URL"
     [ -n "${SIM_MESH_IN_CONTAINER:-}" ] || open_when_up "$URL"
     "$py" "$ROOT/testbed/front.py" --bind "0.0.0.0:$PORT" \
         --page-dev "http://127.0.0.1:$DEV_PORT" "$@" &
     local front=$!
-    trap 'kill -TERM "$front" "$page" 2>/dev/null || true' INT TERM
+    trap 'kill -TERM "$front" "$page" $site 2>/dev/null || true' INT TERM
     trap 'sweep_group' EXIT
     local status=0
     while kill -0 "$front" 2>/dev/null; do
         wait "$front" && status=0 || status=$?
     done
-    kill -TERM "$page" 2>/dev/null || true
+    kill -TERM "$page" $site 2>/dev/null || true
     return "$status"
+}
+
+# serve_site: the site beside sim-mesh from Jekyll, live-reloading, its gems
+# installed first when the Gemfile wants any not there. Neither a missing
+# bundler nor a failed install stops `sim dev`: the page goes on without it.
+serve_site() {
+    command -v bundle >/dev/null || { say "the site wants Ruby's bundler; not serving it"; return 0; }
+    cd "$SITE" || return 0
+    if ! bundle check >/dev/null 2>&1; then
+        say "installing the site's gems (a first run takes a few minutes)"
+        bundle install --quiet || { say "the site's gems did not install; not serving it"; return 0; }
+    fi
+    # In a container the published port must be bound on every address, and
+    # edits made outside it arrive as no file events.
+    local serve=(--port "$SITE_PORT" --livereload --livereload-port "$SITE_RELOAD_PORT")
+    [ -z "${SIM_MESH_IN_CONTAINER:-}" ] || serve+=(--host 0.0.0.0 --force_polling)
+    say "the site, live from its sources: http://localhost:$SITE_PORT/"
+    exec bundle exec jekyll serve "${serve[@]}"
 }
 
 cmd_firmware() {

@@ -2857,6 +2857,13 @@ once. The front's own Python is read when it starts, so a change to it still
 wants a restart. In a container the server looks for edits itself, since
 edits made outside it arrive as no file events.
 
+With the site, [sim-mesh.net](https://github.com/sim-mesh/sim-mesh.net),
+checked out beside sim-mesh, `sim dev` serves it as well, from Jekyll at
+`http://localhost:4000/`, live-reloading as its pages are saved. Its gems
+are installed on the first run (into the image's home volume in a
+container); natively that wants Ruby and bundler, and without them `sim dev`
+says so and goes on without the site.
+
 ## Tests
 
 None needs firmware, a planner or a network:
