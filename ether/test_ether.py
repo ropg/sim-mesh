@@ -17,6 +17,7 @@ import queue
 import re
 import select
 import socket
+import statistics
 import subprocess
 import sys
 import threading
@@ -707,6 +708,32 @@ def test_a_station_back_from_its_own_frame_is_told_of_one_that_began_meanwhile(e
     assert begin["cad"] is True
 
 
+@pytest.mark.parametrize("pairwise", [False, True])
+def test_a_slot_is_deaf_to_a_frame_that_starts_before_its_radio_is_ready(tmp_path, pairwise):
+    """A retune's BUSY, which the chip model charges when its board says so,
+    leaves the radio deaf until the `ready_at` its state gives: a frame that
+    starts before then is energy to it, and lost; one after it is received."""
+    bed = Bench(tmp_path, "real", pairwise)
+    try:
+        bed.link(1, 2, NEAR_DB)
+        a, b = bed(1), bed(2)
+        a.hello()
+        b.hello()
+        b.state("RX", ready_at=b.t + 300_000)
+        time.sleep(0.05)
+        a.tx(41, payload=b"while it retunes", span_us=100_000)
+        assert b.expect("rx_begin").get("cad") is True
+        b.expect_nothing(timeout=0.3)
+        time.sleep(0.1)
+        a.tx(42, payload=b"once it is ready", span_us=100_000)
+        assert "cad" not in b.expect("rx_begin")
+        end = b.expect("rx_end")
+        assert end["verdict"] == "clean"
+        assert base64.b64decode(end["payload"]) == b"once it is ready"
+    finally:
+        bed.close()
+
+
 def test_a_receiver_that_leaves_rx_mid_frame_is_not_told_how_it_ended(ether):
     """Out of RX into standby, the chip lets go of the frame it was following,
     and the medium rules on nothing it did not receive: no rx_end, and none in
@@ -1151,12 +1178,39 @@ def test_a_side_detector_lock_says_which_and_cad_is_the_main_detectors(medium):
     assert "det" not in air.told(2, "rx_begin")[-1]
 
 
-# ---- bench capture ---------------------------------------------------------
-#
-# The table's cases are the reticulum project's rnscale medium tests
-# (tools/rnscale/src/medium.rs): the bench at both ends of its table, a late
-# stronger frame costing both, a late weaker one lost alone, and two frames
-# each kept by the listener nearer its sender.
+# ---- the side detectors' loss --------------------------------------------------
+
+def test_without_a_side_detector_table_a_multi_sf_receiver_loses_nothing(ether):
+    """Off by default: frames of 12 symbols that side detectors catch arrive."""
+    ether.link(1, 2, NEAR_DB)
+    sender, multi = ether(1), ether(2)
+    sender.hello()
+    multi.hello()
+    multi.state("RX", sf=7, sfs=[5, 6, 7])
+    time.sleep(0.1)
+    for n in range(4):
+        sender.tx(90 + n, span_us=100_000, sf=7, pre=12)
+        assert multi.expect("rx_end")["verdict"] == "clean"
+
+
+def test_a_frame_arrives_faded_at_its_start_and_unfaded_without_fading(medium):
+    """The level a frame arrives at moves by the link's slow fade at its
+    start, alike both ways (`fade_db`); without fading it is the table's,
+    as ever (`level_of`, which `level_at` adds the fade to)."""
+    table = make_table("868", [1, 2], {(1, 2): 110.0, (2, 1): 110.0})
+    medium.set_losses({"868": table}, {"n1": 1, "n2": 2})
+    assert not medium.physics.fading
+    plain = frame(medium, 1, 2_000_000, 2_300_000)
+    assert medium.level_of(plain, 2) == medium.level(1, 2, FREQ, POWER_DBM)
+
+    medium.physics = ether_module.Physics(fading_db=4.0)
+    there = frame(medium, 1, 2_000_000, 2_300_000)
+    expected = medium.fade_db(1, 2, 2_000_000)
+    assert expected != 0.0
+    assert expected == medium.fade_db(2, 1, 2_000_000)
+    assert medium.level_at(there, 2, 2_000_000) == pytest.approx(
+        medium.level(1, 2, FREQ, POWER_DBM) + expected)
+
 
 def outcomes(lead, locked=False, pairs=3000):
     """bench_outcome over many pairs of frames at one receiver."""

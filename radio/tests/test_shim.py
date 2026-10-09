@@ -4,7 +4,8 @@ standin.c links the chip library and runs a thread that sleeps in 25 ms steps,
 one in 40 ms timed condition waits, and an interval timer at 10 ms; it is started with the shim preloaded, in a
 virtual-time run with the thread census on. The conductor here grants T only
 up to what the station last asked for, as the ether does, and every event the
-station prints must land at its own instant in node time.
+station prints must land at its own instant in node time. retuner.c switches
+channel as reticulum's SX1262 driver does, waiting BUSY out in 10 µs sleeps.
 """
 
 import json
@@ -18,27 +19,29 @@ import time
 
 import pytest
 
+from test_conductor import STOCK, XOSC
 from test_model import BUILD, LIBRARY, RADIO, load_library
 
 SHIM = os.path.join(BUILD, "libsimclock.so")
 STANDIN = os.path.join(BUILD, "standin")
+RETUNER = os.path.join(BUILD, "retuner")
 EPOCH = 1_790_000_000_000_000
 
 
-def build_standin():
+def build_standin(program=STANDIN):
     load_library()      # builds the library, and the shim with it, if they are missing
     if not os.path.exists(SHIM):
         subprocess.run(["cmake", "--build", BUILD], check=True, stdout=subprocess.DEVNULL)
-    src = os.path.join(RADIO, "tests", "standin.c")
-    if (not os.path.exists(STANDIN)
-            or os.path.getmtime(STANDIN) < os.path.getmtime(src)
-            or os.path.getmtime(STANDIN) < os.path.getmtime(LIBRARY)):
+    src = os.path.join(RADIO, "tests", os.path.basename(program) + ".c")
+    if (not os.path.exists(program)
+            or os.path.getmtime(program) < os.path.getmtime(src)
+            or os.path.getmtime(program) < os.path.getmtime(LIBRARY)):
         # Linked as a firmware is: against the radio's shared library, which
         # the process finds at run time.
         cc = shutil.which("gcc") or pytest.fail("no gcc to build the stand-in")
         subprocess.run([cc, "-O1", "-I", os.path.join(RADIO, "include"), src,
                         "-L", BUILD, "-lsimradio-sx1262", "-Wl,-rpath," + BUILD,
-                        "-lpthread", "-o", STANDIN], check=True)
+                        "-lpthread", "-o", program], check=True)
 
 
 class Station:
@@ -46,7 +49,7 @@ class Station:
     on its command line, `extra` adds to its environment, and a None there
     takes a variable out."""
 
-    def __init__(self, port, *args, **extra):
+    def __init__(self, port, *args, program=STANDIN, **extra):
         env = dict(os.environ, SIM_MESH_TIME="virtual", SIM_MESH_IDLE="threads",
                    SIM_MESH_EPOCH_US=str(EPOCH), LD_PRELOAD=SHIM)
         for key in ("SIM_MESH_SEED", "SIM_MESH_NODE_ID"):
@@ -56,7 +59,7 @@ class Station:
                 env.pop(key, None)
             else:
                 env[key] = value
-        self.proc = subprocess.Popen([STANDIN, "127.0.0.1:%d" % port, *args], env=env,
+        self.proc = subprocess.Popen([program, "127.0.0.1:%d" % port, *args], env=env,
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL)
         self.lines = []
@@ -148,6 +151,91 @@ def test_the_shim_keeps_the_station_on_node_time(conductor):
     # Twenty grants of T went by without the busy watchdog: well under its
     # 20 ms of wall each.
     assert took < grants * 0.02
+
+
+# ---- BUSY waited out, as reticulum's driver waits it ----------------------
+#
+# Under the BUSY a RAK board's SX1262 spent (test_conductor.py's STOCK and
+# XOSC), a switch took the board 12.36 ms from SetStandby until it listened
+# again on the stock path and 0.55 ms on the crystal's, 12.10 and 0.34 ms of it
+# BUSY. The driver's nine commands of a stock switch keep BUSY 12 090 µs, the
+# eight of the other 331 µs.
+
+def retune(path, switches, board, **extra):
+    """Run the retuner for `switches` switches on `path` with `board` as its
+    SIM_MESH_BOARD, granting T as the ether does, and return each switch's time
+    by the station's clock, from SetStandby until it saw BUSY low after SetRx,
+    and by the chip's, from the SetStandby state to the SetRx state's
+    `ready_at`."""
+    build_standin(RETUNER)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.settimeout(3.0)
+    station = Station(sock.getsockname()[1], path, str(switches), program=RETUNER,
+                      SIM_MESH_BOARD=json.dumps(board), **extra)
+    try:
+        _, addr = sock.recvfrom(65535)
+        t, seq = 0, 1
+        sock.sendto(json.dumps({"type": "welcome", "t": t, "mode": "virtual", "rate": None,
+                                "epoch": EPOCH, "seq": seq}).encode(), addr)
+        chip, start, listening = [], None, False
+        while True:
+            msgs = [json.loads(line) for line in sock.recvfrom(65535)[0].split(b"\n") if line]
+            for msg in msgs:
+                if msg["type"] == "state" and msg["mode"].startswith("STDBY") and listening:
+                    start, listening = msg["t"], False
+                if msg["type"] == "state" and msg["mode"] == "RX":
+                    if start is not None:
+                        chip.append(msg["ready_at"] - start)
+                    listening = True
+            idles = [m for m in msgs if m["type"] == "idle" and m["seq"] == seq]
+            if not idles:
+                continue
+            if idles[0]["until"] is None:
+                break
+            t, seq = idles[0]["until"], seq + 1
+            sock.sendto(json.dumps({"type": "run", "t": t, "seq": seq}).encode(), addr)
+        station.pump(0.2)
+        assert ["done"] in station.lines
+        switches = [line for line in station.lines if line[0] == "switch"]
+        return [int(b) - int(a) for _, a, b in switches], chip
+    finally:
+        station.close()
+        sock.close()
+
+
+def figures(busy_us, **keys):
+    return dict({"chip": "sx1262", "max_dbm": 22, "busy_us": busy_us, "busy_tcxo": 1}, **keys)
+
+
+def test_without_short_waits_each_busy_wait_ends_on_the_millisecond():
+    """As ever: every wait ends on a whole millisecond of node time, so each
+    command whose BUSY the driver waits out costs it up to one more, and the
+    radio listens again 18.14 ms after SetStandby on the stock path and 6.07
+    ms after on the crystal's."""
+    assert retune("stock", 3, figures(STOCK)) == ([19_000] * 3, [18_140] * 3)
+    assert retune("xosc", 3, figures(XOSC)) == ([7_000] * 3, [6_065] * 3)
+
+
+def test_with_short_waits_the_driver_sees_busy_fall_when_it_falls():
+    """SIM_MESH_SHORT_WAITS=chip: each 10 µs poll ends as BUSY falls, so a switch
+    costs its commands' BUSY, and the one poll that outlasts its command's
+    (SetTxParams' 1 µs) its own 10: the board's 12.10 and 0.34 ms of BUSY."""
+    station, chip = retune("stock", 3, figures(STOCK), SIM_MESH_SHORT_WAITS="chip")
+    assert station == chip == [12_090 + 9] * 3
+    station, chip = retune("xosc", 3, figures(XOSC), SIM_MESH_SHORT_WAITS="chip")
+    assert station == chip == [331 + 9] * 3
+
+
+def test_with_the_hosts_time_a_switch_takes_what_it_took_on_the_board():
+    """And with the board's own 29 µs a transaction (`host_us`), a switch is
+    within 0.1 ms of the board's: 12.351 ms against 12.36, 0.563 against 0.55."""
+    station, chip = retune("stock", 3, figures(STOCK, host_us=29), SIM_MESH_SHORT_WAITS="chip")
+    assert station == chip == [12_090 + 9 * 29] * 3
+    assert abs(station[0] - 12_360) <= 100
+    station, chip = retune("xosc", 3, figures(XOSC, host_us=29), SIM_MESH_SHORT_WAITS="chip")
+    assert station == chip == [331 + 8 * 29] * 3
+    assert abs(station[0] - 550) <= 100
 
 
 def entropy_of(**extra):

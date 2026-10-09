@@ -149,6 +149,7 @@ void handleMessage(const char* text, size_t len)
             f.payload  = payload;
             f.len      = (size_t)plen;
             f.crcOk    = verdict == "clean";
+            f.hdrOk    = verdict != "hdr";
             f.rssiDbm  = (int)msg.num("rssi", -80);
             f.snrDb    = (int)msg.num("snr", 10);
             modelRxEnd(chip, f);
@@ -234,6 +235,22 @@ void etherPublishState(const EtherState& s)
                 "%s{\"sf\":%d,\"sync\":%d,\"iq\":\"%s\"}", i ? "," : "",
                 s.side[i].sf, s.side[i].syncWord,
                 s.side[i].iqInverted ? "inverted" : "normal");
+        at += (size_t)snprintf(line + at, sizeof line - at, "]");
+        /* `sfs`: the main sf and the side detectors', merged and ascending --
+         * what a multi-SF rule needs without walking `side` itself.
+         * fillState() already dedups `side` against `sf` and each other, so
+         * a plain insertion sort over at most 1+kMaxSideDetectors ints does. */
+        int sfs[1 + kMaxSideDetectors] = {s.sf};
+        int n = 1;
+        for (int i = 0; i < s.nSide && i < kMaxSideDetectors; i++) sfs[n++] = s.side[i].sf;
+        for (int i = 1; i < n; i++) {
+            int v = sfs[i], j = i;
+            for (; j > 0 && sfs[j - 1] > v; j--) sfs[j] = sfs[j - 1];
+            sfs[j] = v;
+        }
+        at += (size_t)snprintf(line + at, sizeof line - at, ",\"sfs\":[");
+        for (int i = 0; i < n; i++)
+            at += (size_t)snprintf(line + at, sizeof line - at, "%s%d", i ? "," : "", sfs[i]);
         at += (size_t)snprintf(line + at, sizeof line - at, "]");
     }
     at += (size_t)snprintf(line + at, sizeof line - at, "}");

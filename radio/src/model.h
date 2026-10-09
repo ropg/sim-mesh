@@ -13,7 +13,8 @@
  * its interrupt, drains, and re-enables sees exactly the edges it sees on a
  * board.
  *
- * Commands take effect at once (BUSY is never busy), with one exception the
+ * Commands take effect at once (BUSY is never busy unless SIM_MESH_BOARD gives
+ * the board's figures, `busyFigures` in model.cpp), with one exception the
  * part imposes itself: with DIO3 driving a TCXO (SetDIO3AsTCXOCtrl), leaving
  * STDBY_RC or SLEEP for a mode that runs on the reference waits out the
  * start-up the driver programmed. A frame goes on the air, and a receiver or a
@@ -51,6 +52,9 @@ struct VirtualRxEnd {
     const uint8_t* payload;
     size_t         len;
     bool           crcOk;       /* false when the ether's verdict is not clean */
+    bool           hdrOk;       /* false for a "hdr" verdict: the header's fate, when
+                                  * the ether only knows it this late (rx_begin's own
+                                  * hdrOk, true here by default, said so already) */
     int            rssiDbm;
     int            snrDb;
 };

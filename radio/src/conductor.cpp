@@ -45,6 +45,7 @@ std::atomic<uint64_t> s_seq{0};
 std::atomic<bool>    s_owed{false};
 std::atomic<bool>    s_resending{false};   /* an idle is out and nothing has come back */
 std::atomic<int64_t> s_until{kNever};
+std::atomic<int64_t> s_chipNext{kNever};   /* the earliest armed timer, in T */
 std::atomic<int64_t> s_lastUntil{kNever};
 void               (*s_sendIdle)(uint64_t, int64_t) = nullptr;
 std::atomic<void (*)(void)> s_onAdvance{nullptr};
@@ -138,6 +139,7 @@ int64_t computeUntil()
     int64_t until = kNever;
     for (Timer* t : timers())
         if (t->armed) until = std::min(until, t->at);
+    s_chipNext.store(until);
     for (const Wake& w : wakes())
         if (w.atNode != kNever) until = std::min(until, conductorOf(w.atNode));
     s_until.store(until);
@@ -273,7 +275,19 @@ int     opsWakeCreate(void (*due)(void*), void* arg) { return wakeCreate(due, ar
 void    opsWakeAt(int w, int64_t node) { wakeAt(w, node); }
 void    opsIdle() { idle(); }
 
-const struct simclock_ops kOps = { opsNodeUs, opsEpochUs, opsWakeCreate, opsWakeAt, opsIdle };
+/* The chips' next event as a wait would end on it: the first node time whose T
+ * has reached the earliest armed timer. Read without the lock, which every
+ * short wait of every thread would otherwise take. */
+int64_t opsChipNextUs()
+{
+    int64_t t = s_chipNext.load();
+    if (t == kNever) return kNever;
+    int64_t n = firstNodeAt(t);
+    return conductorOf(n) < t ? n + 1 : n;
+}
+
+const struct simclock_ops kOps = { opsNodeUs, opsEpochUs, opsWakeCreate, opsWakeAt, opsIdle,
+                                   opsChipNextUs };
 
 void attachShim()
 {

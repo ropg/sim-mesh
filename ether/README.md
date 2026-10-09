@@ -108,6 +108,16 @@ whole frame. Per-frame fading lets retries through more easily than a real
 channel does, so the slow kind, with a long coherence time, is the one to
 start from.
 
+**A multi-SF receiver** hears more than one spreading factor: its `state`
+lists them, `"sfs": [5, 6, 7]`, its own among them, and it can decode a frame
+at any of them. The LR2021's model says so when its firmware sets the chip's
+side detectors, which listen for the faster SFs below the main one on its
+bandwidth; the SX1262's when its station's environment has
+`SIM_MESH_MULTI_SF`, which makes it that receiver by the LR2021's rule. It still has
+one demodulator, so a frame at any of those SFs locks it as one at its own SF
+would, and everything else is as for any receiver. No state lists `sfs`
+unless a station asks, so a run without it is as it was.
+
 **The receiver locks on at the preamble.** A decodable frame takes the
 receiver when it is not demodulating another, or when it leads the one in
 progress by the same-SF figure, 6 dB — and then the earlier one is lost
@@ -189,7 +199,6 @@ of nodes by their names. Never a count of events. So a verdict does not
 depend on the order receptions end in, and two runs that differ — in their
 routing, say — draw the same for every frame they both put on the air at
 the same instant: the same channel, so what differs between them is theirs.
-
 **Why a reception failed** is in its `rx_end` as `cause`, for the record and
 the testbed's tools; a real chip cannot know it, and the station ignores it:
 `noise` (a stage failed), `interference` (a rejection figure, the pairwise
@@ -198,6 +207,21 @@ during it) or `lost` (another frame took the receiver off it, or it arrived
 while the receiver followed another).
 
 Absent at this depth: a referee.
+
+**The side detectors' loss** (`--side-detector-loss`, none unless given) is
+what a multi-SF receiver misses of the frames its side detectors catch: those
+at any SF it states but its smallest, which is on its main detector. A side
+detector loses a frame of a short preamble now and then, at a chance by its
+length in symbols as the sender set it (`pre`), given as `n:p` entries:
+`12:0.019,14:0.004` is the reticulum project's bench, an LR2021 with SF5 on
+its main detector hearing SF7 at 14-15 dB SNR, which lost 9 of 481 frames of
+12 symbols, 1 of 240 of 14, and none of 16 or 24. A length takes the figure
+of the longest in the table not over it; one shorter than them all, the
+shortest's, a lower bound, since nothing shorter was measured; one past the
+longest, none. A frame lost so ends `crc`. Frames on the main detector, and
+every frame at a receiver that states no `sfs`, are never lost so. Each frame
+at each receiver slot draws once, from a hash of the seed, the receiver's
+name, its slot and the frame's start.
 
 ## Losses
 
