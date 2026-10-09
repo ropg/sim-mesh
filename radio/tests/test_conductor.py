@@ -18,10 +18,11 @@ import time
 
 import pytest
 
-from test_model import (ALL_IRQ, CLEAR_IRQ, GET_IRQ, GET_RSSI_INST, HEADER_VALID, PIN_CB,
-                        PREAMBLE, RX_DONE, SET_DIO_IRQ_PARAMS, SET_PACKET_PARAMS, SET_RX,
-                        SET_TX, SYNC, TSYM, TX_DONE, WRITE_BUFFER, load_library, toa_seconds,
-                        PRE)
+from test_model import (ALL_IRQ, BUILD, CLEAR_IRQ, FREQ, GET_IRQ, GET_RSSI_INST, HEADER_VALID,
+                        PIN_BUSY, PIN_CB, PREAMBLE, RX_DONE, SET_CAD, SET_CAD_PARAMS,
+                        SET_DIO_IRQ_PARAMS, SET_MODULATION, SET_PACKET_PARAMS,
+                        SET_RF_FREQUENCY, SET_RX, SET_STANDBY, SET_TX, SET_TX_PARAMS, SYNC,
+                        TSYM, TX_DONE, WRITE_BUFFER, load_library, toa_seconds, PRE)
 
 NEVER = None
 T_JOIN = 5_000_000
@@ -30,9 +31,10 @@ WAKE_CB = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
 MOVED_CB = ctypes.CFUNCTYPE(None)
 
 
-def load_copy(tmp_path, name, env):
-    """A private copy of the library, so its globals are this test's alone."""
-    lib = load_library()
+def load_copy(tmp_path, name, env, library=None):
+    """A private copy of the library (the SX1262's unless another is named), so
+    its globals are this test's alone."""
+    lib = load_library(library) if library else load_library()
     path = tmp_path / name
     shutil.copy(lib._name, path)
     saved = {k: os.environ.get(k) for k in env}
@@ -542,3 +544,401 @@ def test_a_wake_on_a_drifting_clock_fires_once_its_node_time_has_come(tmp_path):
         assert idle(lib, cond)["until"] is NEVER
     finally:
         cond.sock.close()
+
+
+# ---------------------------------------------------------------------------
+# BUSY as a board's chip spends it: SIM_MESH_BOARD's busy_us and busy_tcxo
+# ---------------------------------------------------------------------------
+#
+# Measured on a RAK board's SX1262, BUSY after each command in µs, over 200
+# switches of channel and spreading factor (radio/src/model.cpp, busyFigures).
+# The stock driver goes to STDBY_RC and calibrates the image at every
+# configure; its SetRx is 5140 µs, some 5075 of them the TCXO's start for the
+# 5 ms the firmware programs, so its own figure here is 140. The other stays
+# in STDBY_XOSC and calibrates only when the band changes.
+
+STOCK = ("CalibrateImage:6632,SetRx:140,SetModulationParams:92,SetRfFrequency:91,"
+         "SetStandby:68,SetPacketParams:33,SetTxParams:1")
+XOSC = ("SetRfFrequency:69,SetStandby:69,SetRx:65,SetModulationParams:61,SetPacketParams:33,"
+        "SetTxParams:1")
+
+SET_DIO3_TCXO, CALIBRATE_IMAGE = 0x97, 0x98
+STANDBY_RC, STANDBY_XOSC = 0x00, 0x01
+TCXO_5_MS = (0x02, 0x00, 0x01, 0x40)            # 1.8 V, 320 steps of 15.625 µs
+
+
+def frf(hz):
+    return tuple((hz * (1 << 25) // 32_000_000).to_bytes(4, "big"))
+
+
+class Driver:
+    """A chip in virtual time, driven as a driver drives it: each command,
+    then BUSY waited out, T running to the station's next wake while BUSY is
+    high. BUSY's edges are kept with their instants."""
+
+    def __init__(self, lib, cond):
+        self.lib, self.cond = lib, cond
+        join(lib, cond)
+        idle(lib, cond)
+        self.edges = []
+        self.on_pin = PIN_CB(lambda ctx, pin, level: self.edges.append(
+            (lib.simradio_node_us(), level)) if pin == PIN_BUSY else None)
+        self.chip = lib.simradio_open(0, self.on_pin, None)
+
+    def busy(self):
+        return self.lib.simradio_pin(ctypes.c_void_p(self.chip), PIN_BUSY)
+
+    def command(self, *out):
+        """One command, and what BUSY cost after it."""
+        out = bytes(out)
+        reply = ctypes.create_string_buffer(len(out))
+        self.lib.simradio_transfer(self.chip, out, len(out), reply)
+        start = self.cond.t
+        until = idle(self.lib, self.cond)["until"]
+        while self.busy():
+            self.cond.run(until)
+            until = idle(self.lib, self.cond)["until"]
+        return self.cond.t - start
+
+    def switch(self, standby, freq_hz, calibrate=True):
+        """A switch of channel and spreading factor, as the boards' driver
+        makes it: what each command cost."""
+        costs = [self.command(SET_STANDBY, standby),
+                 self.command(SET_RF_FREQUENCY, *frf(freq_hz))]
+        if calibrate:
+            costs.append(self.command(CALIBRATE_IMAGE, 0xD7, 0xDB))
+        costs += [self.command(SET_MODULATION, 8, 0x04, 1, 0),
+                  self.command(SET_PACKET_PARAMS, 0, 18, 0, 10, 1, 0),
+                  self.command(SET_TX_PARAMS, 14, 0x04),
+                  self.command(SET_RX, 0xFF, 0xFF, 0xFF)]
+        return costs
+
+
+def busy_board(monkeypatch, **keys):
+    """SIM_MESH_BOARD for the test's own copy of the library, which reads it
+    at its first command."""
+    monkeypatch.setenv("SIM_MESH_BOARD", json.dumps(dict({"chip": "sx1262", "max_dbm": 22},
+                                                         **keys)))
+
+
+def test_without_busy_figures_busy_is_never_busy(virtual, monkeypatch):
+    lib, cond = virtual
+    monkeypatch.setenv("SIM_MESH_BOARD", json.dumps({"chip": "sx1262", "max_dbm": 22}))
+    drv = Driver(lib, cond)
+    drv.command(SET_DIO3_TCXO, *TCXO_5_MS)
+    for _ in range(2):
+        assert drv.switch(STANDBY_RC, FREQ) == [0] * 7
+    assert drv.edges == [], "BUSY never rose"
+    out = bytes([SET_STANDBY, STANDBY_RC])
+    lib.simradio_transfer(drv.chip, out, len(out), ctypes.create_string_buffer(len(out)))
+    state = cond.expect("state")
+    assert state["ready_at"] == state["t"], "and the radio is ready at once"
+
+
+def test_busy_stays_high_for_exactly_its_commands_time(virtual, monkeypatch):
+    lib, cond = virtual
+    busy_board(monkeypatch, busy_us="CalibrateImage:6632")
+    drv = Driver(lib, cond)
+    t = cond.t
+    out = bytes([CALIBRATE_IMAGE, 0xD7, 0xDB])
+    lib.simradio_transfer(drv.chip, out, len(out), ctypes.create_string_buffer(len(out)))
+    assert drv.busy() == 1
+    assert idle(lib, cond)["until"] == t + 6632, "the station wakes as BUSY falls"
+    cond.run(t + 6631)
+    idle(lib, cond)
+    assert drv.busy() == 1, "a microsecond before"
+    cond.run(t + 6632)
+    idle(lib, cond)
+    assert drv.busy() == 0, "and not at its end"
+    assert drv.edges == [(t, 1), (t + 6632, 0)], "told as it rose and as it fell"
+
+
+def test_a_retune_costs_what_the_stock_driver_spent_on_a_rak_board(virtual, monkeypatch):
+    """STDBY_RC and the image calibrated at every configure: the TCXO starts
+    again for every SetRx. 12 057 µs of BUSY a switch, the figures' sum; the
+    board measured 12.10 ms with the commands not listed here."""
+    lib, cond = virtual
+    busy_board(monkeypatch, busy_us=STOCK, busy_tcxo=1)
+    drv = Driver(lib, cond)
+    assert drv.command(SET_DIO3_TCXO, *TCXO_5_MS) == 0
+    for freq in (FREQ, FREQ + 200_000):
+        costs = drv.switch(STANDBY_RC, freq)
+        assert costs == [68, 91, 6632, 92, 33, 1, 140 + 5000]
+        assert sum(costs) == 12_057
+
+
+def test_a_retune_costs_what_the_xosc_driver_spent_on_a_rak_board(virtual, monkeypatch):
+    """STDBY_XOSC, no image calibration within the band: the TCXO starts once,
+    after power-up, and then 298 µs of BUSY a switch, the figures' sum; the
+    board measured 0.34 ms with the commands not listed here."""
+    lib, cond = virtual
+    busy_board(monkeypatch, busy_us=XOSC, busy_tcxo=1)
+    drv = Driver(lib, cond)
+    drv.command(SET_DIO3_TCXO, *TCXO_5_MS)
+    first = drv.switch(STANDBY_XOSC, FREQ, calibrate=False)
+    assert first[0] == 69 + 5000, "the oscillator starts once"
+    for freq in (FREQ + 200_000, FREQ):
+        costs = drv.switch(STANDBY_XOSC, freq, calibrate=False)
+        assert costs == [69, 69, 61, 33, 1, 65]
+        assert sum(costs) == 298
+
+
+def test_a_driver_that_calibrates_each_channel_once_pays_on_the_first_visit_only(
+        virtual, monkeypatch):
+    lib, cond = virtual
+    busy_board(monkeypatch, busy_us=XOSC + ",CalibrateImage:6632")
+    drv = Driver(lib, cond)
+    seen, totals = set(), []
+    for freq in (FREQ, FREQ + 200_000, FREQ, FREQ + 200_000, FREQ + 400_000):
+        totals.append(sum(drv.switch(STANDBY_XOSC, freq, calibrate=freq not in seen)))
+        seen.add(freq)
+    assert totals == [298 + 6632, 298 + 6632, 298, 298, 298 + 6632]
+
+
+def test_after_a_retune_the_state_says_when_the_radio_is_ready(virtual, monkeypatch):
+    lib, cond = virtual
+    busy_board(monkeypatch, busy_us="SetRx:65,CalibrateImage:6632", busy_tcxo=1)
+    drv = Driver(lib, cond)
+    drv.command(SET_DIO3_TCXO, *TCXO_5_MS)
+    t = cond.t
+    out = bytes([SET_RX, 0xFF, 0xFF, 0xFF])
+    lib.simradio_transfer(drv.chip, out, len(out), ctypes.create_string_buffer(len(out)))
+    state = cond.expect("state")
+    assert (state["mode"], state["t"], state["ready_at"]) == ("FS", t, t + 5065)
+    idle(lib, cond)                                 # the state retracted the last idle
+    cond.run(t + 5000)                              # the reference started
+    state = cond.expect("state")
+    assert (state["mode"], state["t"], state["ready_at"]) == ("RX", t + 5000, t + 5065)
+    idle(lib, cond)
+    # A calibration says so too, though it changes neither mode nor carrier.
+    cond.run(t + 5065)
+    idle(lib, cond)
+    out = bytes([CALIBRATE_IMAGE, 0xD7, 0xDB])
+    lib.simradio_transfer(drv.chip, out, len(out), ctypes.create_string_buffer(len(out)))
+    state = cond.expect("state")
+    assert state["ready_at"] == t + 5065 + 6632
+
+
+def test_with_busy_tcxo_a_set_tx_holds_busy_through_the_start_up_and_sends_at_its_end(
+        virtual, monkeypatch):
+    """SetTx after STDBY_RC: the frame waits for the reference, as the start-up
+    model has it, and BUSY with it; SetTx's own figure is not charged."""
+    lib, cond = virtual
+    busy_board(monkeypatch, busy_tcxo=1)
+    drv = Driver(lib, cond)
+    drv.command(SET_DIO3_TCXO, *TCXO_5_MS)
+    drv.command(SET_PACKET_PARAMS, PRE >> 8, PRE & 0xFF, 0x00, 10, 0x01, 0x00)
+    drv.command(WRITE_BUFFER, 0x00, *range(10))
+    t = cond.t
+    out = bytes([SET_TX, 0, 0, 0])
+    lib.simradio_transfer(drv.chip, out, len(out), ctypes.create_string_buffer(len(out)))
+    assert drv.busy() == 1
+    assert idle(lib, cond)["until"] == t + 5000
+    cond.run(t + 5000)
+    assert cond.expect("tx")["t0"] == t + 5000, "on the air once the reference is ready"
+    idle(lib, cond)
+    assert drv.edges == [(t, 1), (t + 5000, 0)], "BUSY through the start-up, no longer"
+
+
+def test_without_busy_tcxo_busy_ignores_the_start_up_and_the_radio_is_ready_after_both(
+        virtual, monkeypatch):
+    """A command's own figure without busy_tcxo: BUSY falls on it, and the radio
+    is ready at the later of that and the reference's start."""
+    lib, cond = virtual
+    busy_board(monkeypatch, busy_us="SetRx:65")
+    drv = Driver(lib, cond)
+    drv.command(SET_DIO3_TCXO, *TCXO_5_MS)
+    t = cond.t
+    out = bytes([SET_RX, 0xFF, 0xFF, 0xFF])
+    lib.simradio_transfer(drv.chip, out, len(out), ctypes.create_string_buffer(len(out)))
+    state = cond.expect("state")
+    assert (state["mode"], state["t"], state["ready_at"]) == ("FS", t, t + 5000)
+    assert idle(lib, cond)["until"] == t + 65, "BUSY falls on SetRx's own figure"
+    cond.run(t + 65)
+    idle(lib, cond)
+    assert drv.edges == [(t, 1), (t + 65, 0)]
+
+
+def test_the_hosts_time_holds_busy_after_every_transaction(virtual, monkeypatch):
+    """`host_us`, the board's own time for a transaction: BUSY that much longer
+    after every one, a read as well as a command, on top of the command's own;
+    a radio retuned is ready once both are over."""
+    lib, cond = virtual
+    busy_board(monkeypatch, busy_us="SetRx:65", host_us=29)
+    drv = Driver(lib, cond)
+    assert drv.command(GET_IRQ, 0, 0, 0) == 29
+    assert drv.command(SET_STANDBY, STANDBY_XOSC) == 29
+    t = cond.t
+    out = bytes([SET_RX, 0xFF, 0xFF, 0xFF])
+    lib.simradio_transfer(drv.chip, out, len(out), ctypes.create_string_buffer(len(out)))
+    state = cond.expect("state")
+    assert (state["mode"], state["ready_at"]) == ("RX", t + 65 + 29)
+
+
+def test_a_cad_opens_its_window_once_busy_falls(virtual, monkeypatch):
+    lib, cond = virtual
+    busy_board(monkeypatch, busy_us="SetCad:100", busy_tcxo=1)
+    drv = Driver(lib, cond)
+    drv.command(SET_DIO3_TCXO, *TCXO_5_MS)
+    drv.command(SET_DIO_IRQ_PARAMS, ALL_IRQ >> 8, ALL_IRQ & 0xFF, ALL_IRQ >> 8, ALL_IRQ & 0xFF,
+                0, 0, 0, 0)
+    drv.command(SET_CAD_PARAMS, 0x01, 22, 10, 0x00, 0, 0, 0)     # two symbols, then standby
+    t = cond.t
+    out = bytes([SET_CAD])
+    lib.simradio_transfer(drv.chip, out, len(out), ctypes.create_string_buffer(len(out)))
+    window = int(2 * TSYM * 1e6)
+    assert idle(lib, cond)["until"] == t + 5000, "the TCXO's start-up first"
+    cond.run(t + 5000)
+    assert idle(lib, cond)["until"] == t + 5100, "then BUSY: SetCad's own after it"
+    cond.run(t + 5100)
+    assert idle(lib, cond)["until"] == t + 5100 + window, "then the window"
+    cond.run(t + 5100 + window)
+    idle(lib, cond)
+    out = bytes([GET_IRQ, 0, 0, 0])
+    reply = ctypes.create_string_buffer(len(out))
+    lib.simradio_transfer(drv.chip, out, len(out), reply)
+    assert (reply.raw[2] << 8 | reply.raw[3]) & 0x80, "CAD_DONE at its end"
+
+
+def test_a_standby_within_the_tcxo_start_up_stops_it_and_the_next_one_starts_afresh(virtual):
+    """STDBY_RC while the TCXO starts stops the reference: the state reads
+    STDBY_RC at once, ready then, and the next command that needs the
+    oscillator waits a whole start-up of its own, 5 ms from that command."""
+    lib, cond = virtual
+    join(lib, cond)
+    idle(lib, cond)
+    pin = PIN_CB(lambda ctx, p, level: None)
+    chip = lib.simradio_open(0, pin, None)
+
+    def send(*out):
+        out = bytes(out)
+        lib.simradio_transfer(chip, out, len(out), ctypes.create_string_buffer(len(out)))
+
+    send(SET_DIO3_TCXO, 0x02, 0x00, 0x01, 0x40)     # 1.8 V, 320 steps of 15.625 us: 5 ms
+    t = cond.t
+    send(SET_RX, 0xFF, 0xFF, 0xFF)
+    state = cond.expect("state")
+    assert (state["mode"], state["ready_at"]) == ("FS", t + 5000)
+    assert idle(lib, cond)["until"] == t + 5000
+    cond.run(t + 2000)                              # 2 ms into the start-up
+    idle(lib, cond)
+    send(SET_STANDBY, 0x00)
+    state = cond.expect("state")
+    assert (state["mode"], state["t"], state["ready_at"]) == ("STDBY_RC", t + 2000, t + 2000)
+    assert idle(lib, cond)["until"] is NEVER, "the start-up stopped with the reference"
+    send(SET_RX, 0xFF, 0xFF, 0xFF)
+    state = cond.expect("state")
+    assert (state["mode"], state["ready_at"]) == ("FS", t + 7000), "a whole start-up again"
+    assert idle(lib, cond)["until"] == t + 7000
+    cond.run(t + 7000)
+    assert cond.expect("state")["mode"] == "RX"
+    lib.simradio_close(ctypes.c_void_p(chip))
+    pin  # held for the library's sake
+
+
+def test_the_sx1262_takes_its_own_figures_bare_or_qualified_and_no_other_chips(
+        virtual, monkeypatch, capfd):
+    lib, cond = virtual
+    busy_board(monkeypatch, busy_us="lr2021.CalibFE:10500,sx1262.CalibrateImage:6632,SetRx:65")
+    drv = Driver(lib, cond)
+    assert drv.command(CALIBRATE_IMAGE, 0xD7, 0xDB) == 6632
+    assert drv.command(SET_STANDBY, STANDBY_XOSC) == 0
+    assert drv.command(SET_RX, 0xFF, 0xFF, 0xFF) == 65
+    assert "ignored" not in capfd.readouterr().err, "another chip's entry is no error here"
+
+# ---- The LR2021's BUSY: the same figures, its own commands -----------------------
+
+LR2021_LIBRARY = os.path.join(BUILD, "libsimradio-lr2021.so")
+
+
+@pytest.fixture
+def virtual_lr2021(tmp_path):
+    lib = load_copy(tmp_path, "libsimradio_lr2021_virtual.so", {"SIM_MESH_TIME": "virtual"},
+                    library=LR2021_LIBRARY)
+    cond = Conductor()
+    yield lib, cond
+    cond.sock.close()
+
+
+def lr_switch(drv, freq_hz, calibrate=True):
+    """A switch of channel and spreading factor as the reticulum-lr2021 driver
+    makes it, the commands that cost BUSY on a board: what each cost."""
+    costs = [drv.command(0x01, 0x28, 0x01),                         # SetStandby XOSC
+             drv.command(0x02, 0x00, *freq_hz.to_bytes(4, "big"))]  # SetRfFrequency
+    if calibrate:
+        costs.append(drv.command(0x01, 0x23, 0x00, 0xD9))           # CalibFE
+    costs += [drv.command(0x02, 0x20, 0x84, 0x10),                  # SetLoraModulationParams
+              drv.command(0x02, 0x21, 0x00, 0x10, 0x00, 0x02),      # SetLoraPacketParams
+              drv.command(0x02, 0x0C, 0xFF, 0xFF, 0xFF)]            # SetRx, continuous
+    return costs
+
+
+def test_an_lr2021_takes_none_of_the_sx1262s_figures(virtual_lr2021, monkeypatch):
+    """A run's bare entries are the board's own chip's, the SX1262's: an LR2021
+    beside it in a mixed network is charged none of them, and with no figures
+    of its own BUSY never rises and a retuned radio is ready at once."""
+    lib, cond = virtual_lr2021
+    busy_board(monkeypatch, busy_us=STOCK, busy_tcxo=1)
+    drv = Driver(lib, cond)
+    for freq in (FREQ, FREQ + 200_000):
+        assert lr_switch(drv, freq) == [0] * 6
+    assert drv.edges == [], "BUSY never rose"
+    out = bytes([0x01, 0x28, 0x01])
+    lib.simradio_transfer(drv.chip, out, len(out), ctypes.create_string_buffer(len(out)))
+    state = cond.expect("state")
+    assert state["ready_at"] == state["t"]
+
+
+def test_an_lr2021_switch_costs_what_its_board_spent_in_calib_fe(virtual_lr2021, monkeypatch):
+    """`lr2021.CalibFE:10500`, the stock driver's calibration at every configure:
+    each switch pays it, the radio is deaf until BUSY falls, and the SX1262's
+    figures in the same run charge the LR2021 nothing."""
+    lib, cond = virtual_lr2021
+    busy_board(monkeypatch, busy_us=STOCK + ",lr2021.CalibFE:10500")
+    drv = Driver(lib, cond)
+    for freq in (FREQ, FREQ + 200_000):
+        assert lr_switch(drv, freq) == [0, 0, 10_500, 0, 0, 0]
+    t = cond.t
+    out = bytes([0x01, 0x23, 0x00, 0xD9])
+    lib.simradio_transfer(drv.chip, out, len(out), ctypes.create_string_buffer(len(out)))
+    state = cond.expect("state")
+    assert (state["t"], state["ready_at"]) == (t, t + 10_500), "a calibration makes it deaf"
+    assert drv.busy() == 1
+    assert idle(lib, cond)["until"] == t + 10_500, "the station wakes as BUSY falls"
+    cond.run(t + 10_500)
+    idle(lib, cond)
+    assert drv.busy() == 0
+    assert drv.edges[-2:] == [(t, 1), (t + 10_500, 0)], "told as it rose and as it fell"
+
+
+def test_an_lr2021_takes_no_host_time_measured_on_another_board(virtual_lr2021, monkeypatch):
+    """`host_us` and `busy_tcxo` are the board's, measured with its own chip
+    (SIM_MESH_BOARD's `chip`, the SX1262): an LR2021 takes neither, and its own
+    qualified figures alone."""
+    lib, cond = virtual_lr2021
+    busy_board(monkeypatch, busy_us="lr2021.SetRx:65", host_us=29, busy_tcxo=1)
+    drv = Driver(lib, cond)
+    assert drv.command(0x01, 0x17) == 0                  # GetAndClearIrq
+    assert drv.command(0x00, 0x00, 0, 0, 0, 0) == 0      # and its reply
+    assert drv.command(0x01, 0x28, 0x01) == 0
+    assert drv.command(0x02, 0x0C, 0xFF, 0xFF, 0xFF) == 65
+
+
+def test_on_an_lr2021_board_the_hosts_time_follows_every_transaction(virtual_lr2021, monkeypatch):
+    """A board whose chip is the LR2021: its bare entries are the LR2021's, and
+    `host_us` holds BUSY after every transaction, a read's two frames each, a
+    command's own figure on top; SetTx is charged the host's time alone."""
+    lib, cond = virtual_lr2021
+    busy_board(monkeypatch, chip="lr2021", busy_us="SetRx:65", host_us=29)
+    drv = Driver(lib, cond)
+    assert drv.command(0x01, 0x17) == 29                 # GetAndClearIrq
+    assert drv.command(0x00, 0x00, 0, 0, 0, 0) == 29     # and its reply
+    assert drv.command(0x02, 0x0D) == 29                 # SetTx
+    assert drv.command(0x01, 0x28, 0x01) == 29
+    t = cond.t
+    out = bytes([0x02, 0x0C, 0xFF, 0xFF, 0xFF])
+    lib.simradio_transfer(drv.chip, out, len(out), ctypes.create_string_buffer(len(out)))
+    state = cond.expect("state")
+    assert (state["mode"], state["ready_at"]) == ("RX", t + 65 + 29)
+
+

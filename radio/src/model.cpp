@@ -9,6 +9,7 @@
  */
 #include "simradio.h"
 
+#include "busy.h"
 #include "conductor.h"
 #include "ether_link.h"
 #include "json.h"
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <sys/random.h>
 #include <atomic>
 #include <map>
@@ -258,6 +260,88 @@ static int connectorDbm(int chipDbm)
     return fe.ant[fe.n - 1];
 }
 
+/* BUSY as the board's chip spends it, from SIM_MESH_BOARD (busy.h, which the
+ * LR2021's model reads too): `busy_us` names the commands that keep BUSY high
+ * and for how long, `<command>:<µs>` entries separated by commas, each command
+ * named as the datasheet names it, bare or as `sx1262.<command>` (an entry
+ * qualified with another chip's name is that chip's, and nothing here); and
+ * `busy_tcxo` 1 holds BUSY through the TCXO's start-up (`oscReadyUs`, the
+ * delay the firmware programmed with SetDIO3AsTCXOCtrl) after every command
+ * that needs the oscillator, SetTx included, its own figure counted from the
+ * start-up's end. A driver waits BUSY out as on a board. While BUSY is high
+ * after a command that changes the radio's mode or tuning, or calibrates it,
+ * the radio is deaf: the state it sends says when it is ready again
+ * (`ready_at`, never before the reference has started), and the ether tells
+ * it of nothing that starts before then but energy. Unset, BUSY is never
+ * busy, as before.
+ *
+ * Measured on a RAK board's SX1262, BUSY after each command in µs over 200
+ * switches of channel and spreading factor. A driver that goes to STDBY_RC and
+ * calibrates the image at every configure: CalibrateImage 6632, SetRx 5140
+ * (some 5075 of it the TCXO's start after STDBY_RC, for the 5 ms the firmware
+ * programs), SetModulationParams 92, SetRfFrequency 91, SetStandby 68,
+ * SetPacketParams 33, SetTxParams 1: 12.36 ms a switch, 12.10 ms of it BUSY.
+ * One that stays in STDBY_XOSC and calibrates only when the band changes:
+ * SetRfFrequency 69, SetStandby 69, SetRx 65, SetModulationParams 61,
+ * SetPacketParams 33, SetTxParams 1: 0.55 ms a switch, 0.34 ms of it BUSY.
+ * (The LR2021's figures are beside its own model, model_lr2021.cpp.)
+ * SetTx is not charged: its BUSY would hold the frame back, and the frame
+ * goes on the air at the command.
+ *
+ * `host_us` holds BUSY that much longer after every transaction, reads
+ * included: the board's own time for one, its SPI and its driver around it,
+ * which a station computing in no time does not spend, and which a driver
+ * that waits BUSY out before each transaction then pays as the board's did.
+ * The switches above less their BUSY, 0.26 ms over the stock driver's nine
+ * transactions and 0.21 ms over the other's eight, give some 29 µs. */
+struct BusyFigures {
+    int32_t us[256] = {};       /* by opcode */
+    bool    tcxo = false;
+    int32_t host = 0;           /* every transaction's */
+};
+
+static const struct { const char* name; uint8_t op; } kBusyCommands[] = {
+    {"SetStandby", CMD_SET_STANDBY},         {"SetSleep", CMD_SET_SLEEP},
+    {"SetFs", CMD_SET_FS},                   {"SetRx", CMD_SET_RX},
+    {"SetCad", CMD_SET_CAD},                 {"Calibrate", CMD_CALIBRATE},
+    {"CalibrateImage", CMD_CALIBRATE_IMAGE}, {"SetRfFrequency", CMD_SET_RF_FREQUENCY},
+    {"SetPacketType", CMD_SET_PACKET_TYPE},  {"SetModulationParams", CMD_SET_MODULATION},
+    {"SetPacketParams", CMD_SET_PACKET_PARAMS}, {"SetCadParams", CMD_SET_CAD_PARAMS},
+    {"SetTxParams", CMD_SET_TX_PARAMS},      {"SetPaConfig", CMD_SET_PA_CONFIG},
+    {"SetBufferBaseAddress", CMD_SET_BUFFER_BASE}, {"SetDioIrqParams", CMD_SET_DIO_IRQ_PARAMS},
+    {"ClearIrqStatus", CMD_CLEAR_IRQ_STATUS}, {"SetRxTxFallbackMode", CMD_SET_RXTX_FALLBACK},
+    {"SetRegulatorMode", CMD_SET_REGULATOR}, {"SetDIO3AsTCXOCtrl", CMD_SET_DIO3_TCXO},
+    {"SetDIO2AsRfSwitchCtrl", CMD_SET_DIO2_RF_SWITCH}, {"WriteRegister", CMD_WRITE_REGISTER},
+    {"WriteBuffer", CMD_WRITE_BUFFER},
+};
+
+static BusyFigures loadBusy()
+{
+    BusyFigures b;
+    const BoardBusy board = readBoardBusy("sx1262");
+    b.tcxo = board.tcxo;
+    b.host = board.hostUs;
+    for (const BusyEntry& e : board.entries) {
+        bool known = false;
+        for (const auto& c : kBusyCommands) {
+            if (e.command != c.name) continue;
+            b.us[c.op] = e.us;
+            known = true;
+        }
+        if (!known)
+            fprintf(stderr, "simradio: SIM_MESH_BOARD busy_us entry \"%s:%d\" is not "
+                            "an SX1262 command BUSY is charged to; ignored\n",
+                    e.command.c_str(), (int)e.us);
+    }
+    return b;
+}
+
+static const BusyFigures& busyFigures()
+{
+    static const BusyFigures b = loadBusy();
+    return b;
+}
+
 /* SNR as the packet status reports it: x/4 dB in a signed byte. Cast straight
  * into that byte, a level past either end wraps round, so a link 54 dB over the
  * noise would read -10 dB and the strongest links would pass for the weakest,
@@ -312,6 +396,14 @@ struct ChipState {
     uint8_t     fallbackBits = ST_STDBY_RC;
     const char* fallbackMode = "STDBY_RC";
 
+    /* The reference oscillator. With DIO3 driving a TCXO (SetDIO3AsTCXOCtrl)
+     * the part powers it down in STDBY_RC and SLEEP, and leaving those for a
+     * mode that runs on it waits out the start-up the driver programmed
+     * before anything happens: the carrier, the receiver, the CAD (BUSY high
+     * on the part). No TCXO control (a crystal) is no wait, as before. */
+    int64_t tcxoUs = 0;
+    int64_t oscReadyUs = 0;    /* when the reference running now is, or was, ready; 0 stopped */
+
     uint16_t irqStatus = 0;
     uint16_t irqMask = 0;
     uint16_t dio1Mask = 0;
@@ -360,6 +452,9 @@ struct ChipState {
 
     int      txId = 0;
 
+    /* BUSY (`busyFigures()`): when the last command's falls. */
+    int64_t  busyUntil = 0;
+
     VirtualRxEnd pendingEnd = {};
     uint8_t      pendingPayload[256] = {};
     size_t       pendingLen = 0;
@@ -406,6 +501,14 @@ struct simradio {
     void* tSync = nullptr;
     void* tHdr = nullptr;
     void* tCad = nullptr;
+
+    /* The end of a TCXO start-up, and the frame SetTx asked for before it:
+     * it goes on the air when the reference is ready. */
+    void* tOscReady = nullptr;
+    bool pendTxValid = false;
+    EtherTxFrame pendTx = {};
+    uint8_t pendTxPayload[256] = {};
+    void* tBusy = nullptr;
 };
 
 namespace {
@@ -418,10 +521,11 @@ simradio* s_chips[kMaxSlots] = {};
 struct PinCall {
     void (*fn)(void*, int, int) = nullptr;
     void* ctx = nullptr;
+    int   pin = SIMRADIO_PIN_DIO1;
     bool  high = false;
 
     void operator()() const;
-    void tell() const { if (fn) fn(ctx, SIMRADIO_PIN_DIO1, high ? 1 : 0); }
+    void tell() const { if (fn) fn(ctx, pin, high ? 1 : 0); }
 };
 
 std::atomic<bool>    s_pinsHeld{false};
@@ -448,6 +552,16 @@ PinCall dio1Of(const simradio* c)
     return p;
 }
 
+PinCall busyOf(const simradio* c)
+{
+    PinCall p;
+    p.fn = c->onPin;
+    p.ctx = c->ctx;
+    p.pin = SIMRADIO_PIN_BUSY;
+    p.high = S()->now_us() < c->st.busyUntil;
+    return p;
+}
+
 /* The sync word as the ether matches on it: the two nibble-expanded register
  * bytes read back as the one 8-bit word the driver set. */
 uint8_t syncWordOf(const ChipState& d)
@@ -459,12 +573,110 @@ uint8_t syncWordOf(const ChipState& d)
     return (uint8_t)((m & 0xF0) | ((l & 0xF0) >> 4));
 }
 
+/* Whether a mode runs on the reference oscillator: all but STDBY_RC and SLEEP. */
+bool oscillates(const char* mode)
+{
+    return strcmp(mode, "STDBY_RC") != 0 && strcmp(mode, "SLEEP") != 0;
+}
+
+/* What is left of a TCXO start-up, from now. */
+int64_t oscWaitUs(const ChipState& d, int64_t now)
+{
+    return d.oscReadyUs > now ? d.oscReadyUs - now : 0;
+}
+
+/* What command `op` (its first parameter `arg`) keeps BUSY high for, from now,
+ * once it has set its mode: its own figure, after what is left of the TCXO's
+ * start-up when it needs the oscillator and the board says so (`busy_tcxo`),
+ * and the host's time for the transaction. SetTx's own is not charged (see
+ * `busyFigures`). */
+int64_t busyFor(const ChipState& d, uint8_t op, uint8_t arg)
+{
+    const BusyFigures& b = busyFigures();
+    int64_t us = op == CMD_SET_TX ? 0 : b.us[op];
+    const bool needs = op == CMD_SET_RX || op == CMD_SET_TX || op == CMD_SET_FS ||
+                       op == CMD_SET_CAD || (op == CMD_SET_STANDBY && arg == 0x01);
+    if (needs && b.tcxo) us += oscWaitUs(d, S()->now_us());
+    return us + b.host;
+}
+
+/* SIM_MESH_MULTI_SF: the station's radio has an LR2021's side detectors. Set
+ * (and not "0"), its receiver hears the faster spreading factors below its
+ * own on the same bandwidth, as that chip's multi-SF receive does: the same
+ * air, one demodulator, the frame at whichever SF it came. An SX1262 has no
+ * such thing, so it is off unless a station asks; it lets a firmware built
+ * on the SX1262's driver be judged against the LR2021's receiver
+ * (libsimradio-lr2021.so is that chip itself). */
+static bool multiSfReceiver()
+{
+    static const bool on = [] {
+        const char* v = getenv("SIM_MESH_MULTI_SF");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+/* The spreading factors an LR2021 listens for at `sf` and `bwHz` (its
+ * datasheet, §9.3 and §9.9.6): `sf` and the faster ones below it, down to
+ * SF5, as many as the chip allows. Four at most, all within 4 of each other;
+ * two side detectors above 500 kHz; the sum of their detection factors times
+ * the bandwidth under 32e6. In receive the smallest is on the main detector
+ * ("the main SF ... must be the smallest SF in normal Rx operation"), so the
+ * rule "one side detector where the main SF is 10 to 12" is on the set's
+ * lowest, `lo`: SF10 at 125 kHz hears SF7 to SF10, SF7 the main one. The
+ * faster ones go first where something has to give, so `sf` is always among
+ * them. Ascending; returns the count. */
+static int multiSfSet(int sf, uint32_t bwHz, int out[4])
+{
+    static const uint64_t kDetectionFactor[8] = {10, 10, 12, 12, 14, 14, 16, 16};
+    if (sf < 5 || sf > 12) {
+        out[0] = sf;
+        return 1;
+    }
+    int lo = sf - 3 < 5 ? 5 : sf - 3;
+    for (; lo < sf; lo++) {
+        int sides = sf - lo;
+        uint64_t factors = 0;
+        for (int s = lo; s <= sf; s++) factors += kDetectionFactor[s - 5];
+        if ((bwHz <= 500000 || sides <= 2) && (lo < 10 || sides <= 1)
+                && factors * (uint64_t)bwHz < 32000000ULL)
+            break;
+    }
+    int n = 0;
+    for (int s = lo; s <= sf; s++) out[n++] = s;
+    return n;
+}
+
+/* `multiSfSet`'s set, minus `d.sf` itself (the main detector's), as
+ * EtherState side detectors (see ether_link.h): the main one's sync word
+ * and IQ, since this sweep never models those separately per detector. A
+ * thin translation at the edge onto the wire shape `detector()` (ether.py)
+ * already matches multi-detector radios on; model_lr2021.cpp's own side
+ * detectors (`d.sideSf`) use the same shape directly. */
+static void fillMultiSfSide(const ChipState& d, EtherState& s)
+{
+    s.nSide = 0;
+    if (!multiSfReceiver())
+        return;
+    int all[4], n = multiSfSet(d.sf, d.bwHz, all);
+    for (int i = 0; i < n && s.nSide < kMaxSideDetectors; i++) {
+        if (all[i] == d.sf) continue;
+        s.side[s.nSide].sf = all[i];
+        s.side[s.nSide].syncWord = syncWordOf(d);
+        s.side[s.nSide].iqInverted = d.iqInverted;
+        s.nSide++;
+    }
+}
+
 void fillState(const simradio* c, EtherState& s)
 {
     const ChipState& d = c->st;
     s.slot        = c->slot;
-    s.mode        = d.mode;
-    s.readyAt     = S()->now_us();   /* transitions are instantaneous here */
+    int64_t now   = S()->now_us();
+    bool starting = oscWaitUs(d, now) > 0;
+    s.mode        = starting ? "FS" : d.mode;   /* the reference still starting */
+    /* Ready once BUSY has fallen (`busyFigures`) and the reference started. */
+    s.readyAt     = std::max({now, d.busyUntil, d.oscReadyUs});
     s.freqHz      = d.freqHz;
     s.bwHz        = d.bwHz;
     s.sf          = d.sf;
@@ -473,12 +685,17 @@ void fillState(const simradio* c, EtherState& s)
     s.hdrImplicit = d.hdrImplicit;
     s.crc         = d.crcOn;
     s.preamble    = d.preamble;
-    s.iqInverted  = d.iqInverted;
-    s.nSide       = 0;                /* an SX1262 has no side detectors */
+    s.iqInverted  = d.iqInverted;      /* an SX1262 has no side detectors on its own */
+    fillMultiSfSide(d, s);
 }
 
 void setMode(ChipState& d, const char* mode, uint8_t bits)
 {
+    /* A mode without the reference stops it, and a start-up under way with it. */
+    if (!oscillates(mode))
+        d.oscReadyUs = 0;
+    else if (!oscillates(d.mode))
+        d.oscReadyUs = S()->now_us() + d.tcxoUs;
     d.mode = mode;
     d.modeBits = bits;
 }
@@ -549,11 +766,13 @@ int airLevelDbm(const ChipState& d, int64_t now)
 }
 
 void txDoneCb(void* arg);
+void oscReadyCb(void* arg);
 void rxPreCb(void* arg);
 void rxSyncCb(void* arg);
 void rxHdrCb(void* arg);
 void rxEndCb(void* arg);
 void cadDoneCb(void* arg);
+void busyDoneCb(void* arg);
 
 }  // namespace
 
@@ -601,6 +820,9 @@ extern "C" simradio_t* simradio_open(int slot, void (*on_pin)(void*, int, int), 
         stopTimer(c->tSync);
         stopTimer(c->tHdr);
         stopTimer(c->tCad);
+        stopTimer(c->tOscReady);
+        c->pendTxValid = false;
+        stopTimer(c->tBusy);
         c->st = ChipState();
     }
     c->onPin = on_pin;
@@ -618,6 +840,9 @@ extern "C" void simradio_close(simradio_t* c)
     stopTimer(c->tSync);
     stopTimer(c->tHdr);
     stopTimer(c->tCad);
+    stopTimer(c->tOscReady);
+    c->pendTxValid = false;
+    stopTimer(c->tBusy);
     c->onPin = nullptr;
     c->ctx = nullptr;
     S()->unlock();
@@ -654,11 +879,13 @@ extern "C" int64_t simradio_quiet_for_us(simradio_t* c)
 extern "C" int simradio_pin(simradio_t* c, int pin)
 {
     if (!c) return 0;
-    /* BUSY is never busy: the model answers a command the moment it is
-     * handed one, so the line a driver polls is always clear. */
-    if (pin != SIMRADIO_PIN_DIO1) return 0;
+    /* BUSY is high while the last command's time lasts (`busyFigures`), and
+     * with none charged never: the model answers a command the moment it is
+     * handed one. */
+    if (pin != SIMRADIO_PIN_DIO1 && pin != SIMRADIO_PIN_BUSY) return 0;
     S()->lock();
-    int high = (c->st.irqStatus & c->st.dio1Mask) != 0;
+    int high = pin == SIMRADIO_PIN_BUSY ? S()->now_us() < c->st.busyUntil
+                                        : (c->st.irqStatus & c->st.dio1Mask) != 0;
     S()->unlock();
     return high;
 }
@@ -669,6 +896,10 @@ extern "C" void simradio_reset(simradio_t* c)
     S()->lock();
     setMode(c->st, "STDBY_RC", ST_STDBY_RC);
     c->st.irqStatus = 0;
+    c->st.tcxoUs = 0;
+    c->st.oscReadyUs = 0;
+    stopTimer(c->tOscReady);
+    c->pendTxValid = false;
     PinCall pin = dio1Of(c);
     S()->unlock();
     pin();
@@ -715,6 +946,7 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
         publishState = true;
         break;
 
+
     case CMD_SET_TX: {
         setMode(d, "TX", ST_TX);
         /* `cr` is already the denominator of 4/n, which is what the formula
@@ -735,6 +967,17 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
         for (int i = 0; i < d.payloadLen; i++) txPayload[i] = d.buf[(uint8_t)(d.txBase + i)];
         frame.payload = txPayload;
         frame.len = d.payloadLen;
+        int64_t wait = oscWaitUs(d, now);
+        if (wait > 0) {
+            /* The carrier comes when the reference is ready (oscReadyCb). */
+            c->pendTx = frame;
+            memcpy(c->pendTxPayload, txPayload, (size_t)d.payloadLen);
+            c->pendTx.payload = c->pendTxPayload;
+            c->pendTxValid = true;
+            armOnce(c, &c->tOscReady, oscReadyCb, wait);
+            publishState = true;
+            break;
+        }
         publishTx = true;
         c->txEnd = frame.tEnd;
         armOnce(c, &c->tTxDone, txDoneCb, frame.tEnd - now);
@@ -884,11 +1127,18 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
     case CMD_CALIBRATE:
     case CMD_CALIBRATE_IMAGE:
     case CMD_SET_DIO2_RF_SWITCH:
-    case CMD_SET_DIO3_TCXO:
     case CMD_STOP_TIMER_ON_PRE:
     case CMD_SET_LORA_SYMB_TO:
     case CMD_CLEAR_DEVICE_ERR:
     case CMD_RESET_STATS:
+        break;
+
+    case CMD_SET_DIO3_TCXO:
+        /* The voltage, then the start-up as 24 bits of 15.625 µs. */
+        if (len >= 5) {
+            uint32_t steps = ((uint32_t)out[2] << 16) | ((uint32_t)out[3] << 8) | out[4];
+            d.tcxoUs = (int64_t)steps * 1000 / 64;
+        }
         break;
 
     case CMD_SET_CAD_PARAMS:
@@ -908,7 +1158,12 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
          * says CAD, which is what the medium delivers energy to. */
         setMode(d, "CAD", ST_RX);
         double tSym = (double)((uint32_t)1 << d.sf) / (double)d.bwHz;
-        armOnce(c, &c->tCad, cadDoneCb, (int64_t)(d.cadSymbols * tSym * 1e6));
+        /* The window opens once the radio is ready: BUSY fallen and the
+         * reference started (`fillState`'s `readyAt`). */
+        int64_t wait = oscWaitUs(d, S()->now_us());
+        armOnce(c, &c->tCad, cadDoneCb,
+                std::max(wait, busyFor(d, op, 0)) + (int64_t)(d.cadSymbols * tSym * 1e6));
+        if (wait > 0) armOnce(c, &c->tOscReady, oscReadyCb, wait);
         publishState = true;
         break;
     }
@@ -930,6 +1185,18 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
 
     if (op == CMD_SET_STANDBY || op == CMD_SET_SLEEP || op == CMD_SET_FS || op == CMD_SET_TX)
         abandonReception(c);
+    /* A mode on a reference still starting is said to the medium when it is
+     * ready (oscReadyCb); one without the reference stops a start-up, and a
+     * frame waiting on it. */
+    if (op == CMD_SET_STANDBY || op == CMD_SET_FS || op == CMD_SET_RX || op == CMD_SET_SLEEP) {
+        int64_t wait = oscWaitUs(d, S()->now_us());
+        if (!oscillates(d.mode)) {
+            stopTimer(c->tOscReady);
+            c->pendTxValid = false;
+        } else if (wait > 0) {
+            armOnce(c, &c->tOscReady, oscReadyCb, wait);
+        }
+    }
     if (op == CMD_SET_CAD)
         dropLock(c);
     /* Any other mode ends a CAD in progress without an answer. */
@@ -937,12 +1204,25 @@ extern "C" void simradio_transfer(simradio_t* c, const uint8_t* out, size_t len,
         op == CMD_SET_TX || op == CMD_SET_RX)
         stopTimer(c->tCad);
 
+    /* BUSY for the command's time. After a change of mode or tuning, or a
+     * calibration, the radio is deaf until it falls, which the state tells
+     * the ether. */
+    const int64_t busyUs = busyFor(d, op, len >= 2 ? out[1] : 0);
+    PinCall busyPin;
+    if (busyUs > 0) {
+        d.busyUntil = S()->now_us() + busyUs;
+        publishState = publishState || op == CMD_CALIBRATE || op == CMD_CALIBRATE_IMAGE;
+        armOnce(c, &c->tBusy, busyDoneCb, busyUs);
+        busyPin = busyOf(c);
+    }
+
     if (publishState) fillState(c, snap);
     PinCall pin = dio1Of(c);
     S()->unlock();
 
     if (publishTx)    etherPublishTx(frame);
     if (publishState) etherPublishState(snap);
+    busyPin();
     pin();
 }
 
@@ -957,6 +1237,37 @@ void raise(simradio* c, uint16_t bits)
     PinCall pin = dio1Of(c);
     S()->unlock();
     pin();
+}
+
+/* The reference is ready: a frame SetTx asked for goes on the air now, and
+ * otherwise the medium is told the mode the chip has been in since its
+ * command. */
+void oscReadyCb(void* arg)
+{
+    auto* c = (simradio*)arg;
+    EtherState s;
+    EtherTxFrame frame = {};
+    bool tx = false;
+    S()->lock();
+    int64_t now = S()->now_us();
+    if (c->pendTxValid && strcmp(c->st.mode, "TX") == 0) {
+        frame = c->pendTx;
+        int64_t shift = now - frame.t0;
+        frame.t0 += shift;
+        frame.tPre += shift;
+        frame.tHdr += shift;
+        frame.tEnd += shift;
+        fillState(c, frame.state);
+        c->pendTxValid = false;
+        c->txEnd = frame.tEnd;
+        armOnce(c, &c->tTxDone, txDoneCb, frame.tEnd - now);
+        tx = true;
+    } else {
+        fillState(c, s);
+    }
+    S()->unlock();
+    if (tx) etherPublishTx(frame);
+    else    etherPublishState(s);
 }
 
 /* TX_DONE lands at the end of the frame, and the chip falls back to whatever
@@ -1034,6 +1345,16 @@ void cadDoneCb(void* arg)
     S()->unlock();
     etherPublishState(s);
     raise(c, bits);
+}
+
+/* BUSY falls when the last command's time is up. */
+void busyDoneCb(void* arg)
+{
+    auto* c = (simradio*)arg;
+    S()->lock();
+    PinCall pin = busyOf(c);
+    S()->unlock();
+    pin();
 }
 
 }  // namespace

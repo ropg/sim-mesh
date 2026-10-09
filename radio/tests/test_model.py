@@ -38,6 +38,7 @@ SET_STANDBY, SET_RX, SET_TX, SET_RF_FREQUENCY = 0x80, 0x82, 0x83, 0x86
 SET_CAD_PARAMS, SET_PACKET_TYPE, SET_MODULATION = 0x88, 0x8A, 0x8B
 SET_PACKET_PARAMS, SET_RXTX_FALLBACK, SET_CAD = 0x8C, 0x93, 0xC5
 SET_TX_PARAMS, SET_PA_CONFIG = 0x8E, 0x95
+SET_DIO3_TCXO = 0x97
 SET_DIO_IRQ_PARAMS, CLEAR_IRQ, WRITE_REGISTER, WRITE_BUFFER = 0x08, 0x02, 0x0D, 0x0E
 GET_IRQ, GET_RX_BUF_STATUS, GET_PACKET_STATUS, GET_RSSI_INST = 0x12, 0x13, 0x14, 0x15
 READ_REGISTER, READ_BUFFER, GET_STATUS = 0x1D, 0x1E, 0xC0
@@ -70,16 +71,16 @@ def toa_seconds(payload, sf=SF, bw=BW, cr=CR, pre=PRE, implicit=False, crc=True)
 PIN_CB = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
 
 
-def load_library():
+def load_library(library=LIBRARY):
     """Build the library if it is not there, then load it."""
-    if not os.path.exists(LIBRARY):
+    if not os.path.exists(library):
         cmake = shutil.which("cmake")
         if cmake is None:
-            pytest.fail("no cmake on PATH to build %s" % LIBRARY)
+            pytest.fail("no cmake on PATH to build %s" % library)
         subprocess.run([cmake, "-B", BUILD, "-S", RADIO], check=True,
                        stdout=subprocess.DEVNULL)
         subprocess.run([cmake, "--build", BUILD], check=True, stdout=subprocess.DEVNULL)
-    lib = ctypes.CDLL(LIBRARY)
+    lib = ctypes.CDLL(library)
     lib.simradio_station_open.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p]
     lib.simradio_station_open.restype = ctypes.c_int
     lib.simradio_open.argtypes = [ctypes.c_int, PIN_CB, ctypes.c_void_p]
@@ -603,6 +604,46 @@ def test_the_sync_word_register_publishes_the_word_it_encodes(chip):
     assert state["sync"] == 0x42
 
 
+def test_a_chip_states_no_side_detectors_unless_asked(chip):
+    if os.environ.get("SIM_MESH_MULTI_SF"):
+        pytest.skip("this process was told its radio is a multi-SF receiver")
+    chip.ether.clear()
+    chip.write(SET_MODULATION, 7, 0x04, 0x01, 0x00)
+    _, state = chip.ether.expect("state")
+    assert state["sf"] == 7 and "side" not in state
+
+
+def multi_sf_case(chip):
+    """Run in a child told SIM_MESH_MULTI_SF (the model reads it once per
+    process): the receiver states, as side detectors beside its main one
+    (ether_link.h's EtherState, ether.py's `detector()`), the faster SFs an
+    LR2021 hears beside its own, by that chip's rule for the SF and
+    bandwidth it is set to; the main SF itself is not repeated there."""
+    chip.ether.clear()
+    chip.write(SET_MODULATION, 7, 0x04, 0x01, 0x00)     # SF7, 125 kHz
+    _, state = chip.ether.expect("state")
+    assert state["sf"] == 7 and [s["sf"] for s in state["side"]] == [5, 6]
+    chip.write(SET_MODULATION, 10, 0x04, 0x01, 0x01)    # SF10: three below it,
+    # SF7 on the main detector (the smallest), so the SF10-12 rule is not met
+    _, state = chip.ether.expect("state")
+    assert [s["sf"] for s in state["side"]] == [7, 8, 9]
+    chip.write(SET_MODULATION, 5, 0x04, 0x01, 0x00)     # SF5 has none below it
+    _, state = chip.ether.expect("state")
+    assert state["sf"] == 5 and "side" not in state
+
+
+def test_a_multi_sf_receiver_states_the_faster_sfs_it_hears(chip):
+    if os.environ.get("SIM_MESH_MULTI_SF"):
+        multi_sf_case(chip)
+        return
+    env = dict(os.environ, SIM_MESH_MULTI_SF="1")
+    done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                           "%s::%s" % (os.path.abspath(__file__),
+                                       "test_a_multi_sf_receiver_states_the_faster_sfs_it_hears")],
+                          env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
 def test_the_random_number_register_draws_while_receiving_and_reads_still_outside(chip):
     """RadioLib seeds a firmware's generator from 0x0819 read in RX, its low
     bit each time: a chip whose register never changed gives every station
@@ -813,3 +854,62 @@ def test_a_front_end_shapes_what_goes_out_and_what_the_chip_reads(chip):
                                        "test_a_front_end_shapes_what_goes_out_and_what_the_chip_reads")],
                           env=env, capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+# ---------------------------------------------------------------------------
+# The TCXO's start-up
+# ---------------------------------------------------------------------------
+
+# A start-up long enough to measure on a host's timers (RadioLib asks for 5 ms):
+# 6400 steps of 15.625 µs.
+TCXO_STEPS, TCXO_S = 6400, 0.1
+
+
+def tcxo(chip):
+    """DIO3 drives a TCXO at 1.8 V that takes TCXO_S to start."""
+    chip.write(SET_DIO3_TCXO, 0x02, *TCXO_STEPS.to_bytes(3, "big"))
+
+
+def test_from_stdby_rc_the_carrier_waits_out_the_tcxo_start_up(chip):
+    chip.configure(length=10)
+    tcxo(chip)
+    chip.write(SET_STANDBY, 0x00)
+    chip.frame([WRITE_BUFFER, 0x00, *range(10)])
+    chip.ether.clear()
+    sent = time.monotonic()
+    chip.write(SET_TX, 0x00, 0x00, 0x00)
+    chip.ether.expect("state", mode="FS")           # neither sending nor listening yet
+    at, tx = chip.ether.expect("tx")
+    assert TCXO_S - 0.002 <= at - sent <= TCXO_S + HOST_TIMER_LATE_S
+    assert tx["t_end"] - tx["t0"] == int(toa_seconds(10) * 1e6)
+
+
+def test_stdby_xosc_keeps_the_tcxo_running(chip):
+    chip.configure(length=10)
+    tcxo(chip)
+    chip.write(SET_STANDBY, 0x01)
+    settle(TCXO_S + HOST_TIMER_LATE_S)              # started once, and kept
+    chip.frame([WRITE_BUFFER, 0x00, *range(10)])
+    chip.ether.clear()
+    sent = time.monotonic()
+    chip.write(SET_TX, 0x00, 0x00, 0x00)
+    at, _ = chip.ether.expect("tx")
+    assert at - sent < HOST_TIMER_LATE_S
+
+
+def test_a_fallback_to_rc_stops_the_tcxo_and_the_receiver_waits_for_it(chip):
+    chip.configure(length=10, dio1=TX_DONE)
+    tcxo(chip)
+    chip.write(SET_STANDBY, 0x01)
+    settle(TCXO_S + HOST_TIMER_LATE_S)
+    chip.write(SET_RXTX_FALLBACK, 0x20)              # STDBY_RC after a frame
+    chip.frame([WRITE_BUFFER, 0x00, *range(10)])
+    chip.write(SET_TX, 0x00, 0x00, 0x00)
+    chip.wait_irq(TX_DONE)
+    chip.ether.clear()
+    asked = time.monotonic()
+    chip.write(SET_RX, 0xFF, 0xFF, 0xFF)
+    chip.ether.expect("state", mode="FS")
+    at, st = chip.ether.expect("state", mode="RX")
+    assert TCXO_S - 0.002 <= at - asked <= TCXO_S + HOST_TIMER_LATE_S
+
