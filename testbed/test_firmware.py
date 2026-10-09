@@ -254,7 +254,7 @@ def test_publishing_replaces_a_zip_lists_it_last_and_the_listing_reads_back(tmp_
             got = await firmware.publish([relay], ["old-sx1262_%s_20250101000000" % ARCH],
                                          True, "o/r", "o/site", said.append)
             assert calls == [] and said[0].startswith("add     relay-sx1262")
-            assert "delete  %s" % older in said
+            assert "delete  %s (an older version)" % older in said
             await firmware.publish([relay], ["old-sx1262_%s_20250101000000" % ARCH],
                                    False, "o/r", "o/site", said.append)
             return got
@@ -277,6 +277,66 @@ def test_publishing_replaces_a_zip_lists_it_last_and_the_listing_reads_back(tmp_
     name, _ = firmware.zip_facts(zip_file(tmp_path, "relay-sx1262", "20260101000000",
                                           filename="renamed.zip"))
     assert name == relay_zip[:-4]
+
+
+def test_a_newer_version_takes_the_place_of_the_older_ones():
+    """Only older versions, in the same scheme, of a base and arch being
+    added come off: a newer one, another arch, another base and a semver
+    version stay."""
+    other = "aarch64" if ARCH == "x86_64" else "x86_64"
+
+    def facts(base, arch, version):
+        return {"base": base, "arch": arch, "version": version, "size": 1}
+
+    listed = {"relay-sx1262_%s_20250101000000" % ARCH: facts("relay-sx1262", ARCH, "20250101000000"),
+              "relay-sx1262_%s_20270101000000" % ARCH: facts("relay-sx1262", ARCH, "20270101000000"),
+              "relay-sx1262_%s_20250101000000" % other: facts("relay-sx1262", other, "20250101000000"),
+              "relay-sx1262_%s_1.0.0" % ARCH: facts("relay-sx1262", ARCH, "1.0.0"),
+              "room-sx1262_%s_20250101000000" % ARCH: facts("room-sx1262", ARCH, "20250101000000")}
+    adding = {"relay-sx1262_%s_20260101000000" % ARCH: facts("relay-sx1262", ARCH, "20260101000000")}
+    assert firmware.superseded(listed, adding) == ["relay-sx1262_%s_20250101000000" % ARCH]
+
+
+def test_publishing_takes_the_older_versions_off_with_their_zips(tmp_path, monkeypatch):
+    """A publish of a newer version deletes the older one's zip and lists only
+    the newer; with keep_older both stay listed."""
+    import asyncio
+
+    old = "relay-sx1262_%s_20250101000000" % ARCH
+    listed = {"firmware": {old: {"base": "relay-sx1262", "arch": ARCH,
+                                 "version": "20250101000000", "size": 1}}}
+    calls = []
+
+    class Hub:
+        def __init__(self, session, need_token=True):
+            pass
+
+        async def release(self, repo, tag):
+            return {"id": 1, "assets": [{"id": 1, "name": "firmware.yaml"},
+                                        {"id": 2, "name": old + ".zip"}]}
+
+        async def asset(self, repo, asset):
+            return yaml.safe_dump(listed).encode()
+
+        async def delete_asset(self, repo, asset):
+            calls.append(("delete", asset["name"]))
+
+        async def upload(self, rel, path, name):
+            calls.append(("upload", name))
+
+        async def dispatch(self, repo, event):
+            calls.append(("dispatch", event))
+
+    monkeypatch.setattr(firmware, "_GitHub", Hub)
+    relay = zip_file(tmp_path, "relay-sx1262", "20260101000000", title="Relay")
+    said = []
+    got = asyncio.run(firmware.publish([relay], (), False, "o/r", "o/site", said.append))
+    assert list(got) == ["relay-sx1262_%s_20260101000000" % ARCH]
+    assert ("delete", old + ".zip") in calls
+    assert "delete  %s (an older version)" % old in said
+    kept = asyncio.run(firmware.publish([relay], (), True, "o/r", "o/site", said.append,
+                                        keep_older=True))
+    assert sorted(kept) == [old, "relay-sx1262_%s_20260101000000" % ARCH]
 
 
 def test_a_zip_can_be_made_in_memory_for_the_page():

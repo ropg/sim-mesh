@@ -143,6 +143,25 @@ def version_key(version):
     return (int(major), int(minor), int(patch), 0 if pre else 1, pre or "")
 
 
+def superseded(entries, adding):
+    """The listed names a publish of `adding` takes the place of: the older
+    versions, in the same scheme, of each base and arch being added. The list
+    offers what is current; a project that publishes often would otherwise
+    keep every version it ever put up."""
+    older = []
+    for name, f in entries.items():
+        if name in adding:
+            continue
+        for new in adding.values():
+            kind = scheme(new["version"])
+            if (f.get("base"), f.get("arch")) == (new["base"], new["arch"]) \
+                    and kind is not None and scheme(f["version"]) == kind \
+                    and version_key(f["version"]) < version_key(new["version"]):
+                older.append(name)
+                break
+    return sorted(older)
+
+
 def latest_base(ref):
     """The base a `<base>_latest` names, or None for any other name."""
     base, sep, last = str(ref).rpartition("_")
@@ -710,7 +729,8 @@ class _GitHub:
 
 async def publish(zips, delete=(), dry_run=False, repo=PUBLISH_REPO, site=PUBLISH_SITE,
                   say=print, keep_older=False):
-    """Firmware zips put on the pre-built list, and named ones taken off it.
+    """Firmware zips put on the pre-built list, and named ones taken off it,
+    with the older versions of what is added unless `keep_older`.
 
     The list is the `firmware` release of `repo`: every zip, `firmware.yaml`
     (each zip's node.yaml facts, by name) and the `index.html` made from it.
@@ -741,21 +761,15 @@ async def publish(zips, delete=(), dry_run=False, repo=PUBLISH_REPO, site=PUBLIS
             if name not in entries:
                 raise FirmwareError("%s is not on the list" % name)
             del entries[name]
-        if not keep_older:
-            for new in adding:
-                base, arch, version = parse_name(new)
-                for old in sorted(entries):
-                    got = parse_name(old)
-                    if got and old not in adding and got[:2] == (base, arch) and \
-                            scheme(got[2]) == scheme(version) and \
-                            version_key(got[2]) < version_key(version):
-                        del entries[old]
-                        delete.append(old)
+        older = [] if keep_older else superseded(entries, adding)
+        for name in older:
+            del entries[name]
+        delete = list(delete) + older
         entries.update(adding)
         for name in sorted(adding):
             say("add     %s" % name)
         for name in delete:
-            say("delete  %s" % name)
+            say("delete  %s%s" % (name, " (an older version)" if name in older else ""))
         if dry_run:
             return entries
         if rel is None:
@@ -811,7 +825,7 @@ def main(argv=None):
     p.add_argument("--delete", nargs="+", default=[], metavar="NAME",
                    help="take these off the list")
     p.add_argument("--keep-older", action="store_true",
-                   help="leave the older versions of each zip's base and arch listed")
+                   help="keep the older versions of what is added on the list")
     p.add_argument("-n", "--dry-run", action="store_true", help="say what it would do")
     p.add_argument("--repo", default=PUBLISH_REPO, help="whose `firmware` release is the list")
     p.add_argument("--site", default=PUBLISH_SITE, help="the site told to redeploy")
