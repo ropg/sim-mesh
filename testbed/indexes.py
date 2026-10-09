@@ -71,7 +71,7 @@ same index makes for it whose name is free here.
 **Publishing** adds something installed here to an index checked out here:
 
 ```
-sim geodata publish berlin --as berlin-centre --index ../sim-mesh.github.io/examples
+sim geodata publish berlin --as berlin-centre --index ../sim-mesh.net/examples
   ─► export_zip ─► sha256, bytes, bbox, licences
   ─► GET/POST api.github.com/repos/<owner/repo>/releases(/tags/<tag>)   the index's `release:`
   ─► POST uploads.github.com/…/assets?name=berlin-centre.zip           refused if there already

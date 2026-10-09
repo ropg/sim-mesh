@@ -51,7 +51,9 @@ def test_a_fedora_install_names_the_same_things():
     for apt_name, dnf_names in {"python3-yaml": ["python3-pyyaml"],
                                 "build-essential": ["gcc", "gcc-c++", "make"],
                                 "pkg-config": ["pkgconf-pkg-config"],
-                                "libstdc++6": ["libstdc++"], "procps": ["procps-ng"]}.items():
+                                "libstdc++6": ["libstdc++"], "procps": ["procps-ng"],
+                                "ruby-dev": ["ruby-devel"], "ruby-bundler": ["rubygem-bundler"],
+                                "zlib1g-dev": ["zlib-devel"]}.items():
         assert apt_name in dockerfile_apt() and set(dnf_names) <= dnf, apt_name
     for same in ("ca-certificates", "curl", "git", "python3", "python3-aiohttp", "python3-pytest",
                  "cmake"):

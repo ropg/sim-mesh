@@ -506,7 +506,7 @@ sim nodeset offered | add NAME… | list | delete [-f] NAME…
 checked out, its entry written for you:
 
 ```
-sim geodata publish berlin --as berlin-centre --index ../sim-mesh.github.io/examples
+sim geodata publish berlin --as berlin-centre --index ../sim-mesh.net/examples
   ─► the pack exported as a zip ─► its sha256, size, extent and licences
   ─► uploaded to the GitHub release the index names (`release: owner/repo:tag`),
      made when the repository has none by that tag
@@ -2159,7 +2159,7 @@ sim firmware publish --dry-run ZIP…         # say what it would do
 ```
 sim ── GitHub's REST API, the token of the gh logged in here ──► sim-mesh/sim-mesh, release `firmware`
         the zips, then firmware.yaml and index.html               (each zip's node.yaml facts)
-sim ── repository_dispatch firmware-published ──► sim-mesh/sim-mesh.github.io, which redeploys
+sim ── repository_dispatch firmware-published ──► sim-mesh/sim-mesh.net, which redeploys
 ```
 
 It runs where every `sim` verb does, in sim-mesh's image, so it needs
@@ -2856,6 +2856,11 @@ the same port, 8800, live-reload included: each edit is in the browser at
 once. The front's own Python is read when it starts, so a change to it still
 wants a restart. In a container the server looks for edits itself, since
 edits made outside it arrive as no file events.
+
+With the site, sim-mesh.net, checked out beside sim-mesh, `sim dev` also
+serves it from Jekyll at `http://localhost:4000/`, through the gem GitHub
+Pages builds it with, each edit reloaded in the browser as it is saved. Its
+gems go into `~/.cache/sim-mesh/site-gems`, the first time it starts.
 
 ## Tests
 

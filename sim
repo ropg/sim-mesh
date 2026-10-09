@@ -9,7 +9,10 @@
 #                                      served live from its sources, on the same
 #                                      port, each edit in the browser at once; the
 #                                      front's own Python is read when it starts,
-#                                      so a change to it wants a restart
+#                                      so a change to it wants a restart; with the
+#                                      site checked out beside sim-mesh
+#                                      (../sim-mesh.net), Jekyll serves it live
+#                                      on port 4000
 #     sim new [NAME] (--geodata G --nodeset N | --snapshot S)
 #             [--time max|<k>x|real] [--stagger N] [--build B] [--pairwise]
 #                                      start a simulation (and the front, when none runs);
@@ -122,6 +125,9 @@ if [ -n "${SIM_MESH_FRONT:-}" ]; then
 fi
 URL="http://localhost:$PORT/"
 DEV_PORT=9000                       # `sim dev`: the page's development server, inside only
+SITE=$(cd "$ROOT/.." && pwd)/sim-mesh.net   # `sim dev`: the site, served when checked out
+SITE_PORT=4000                      # `sim dev`: Jekyll's preview of the site
+SITE_RELOAD_PORT=35729              # `sim dev`: its live-reload socket
 PLANNER=$ROOT/planner
 FRONT_CONTAINER=sim-mesh-front
 
@@ -252,7 +258,8 @@ in_container() {
             [ -t 0 ] && [ -t 1 ] && args+=(-t)
             # Edits on a Mac or Windows reach a container as no file events:
             # `sim dev`'s server looks for them itself.
-            [ "$mode" != dev ] || args+=(-e CHOKIDAR_USEPOLLING=1)
+            [ "$mode" != dev ] || args+=(-e CHOKIDAR_USEPOLLING=1
+                -p "$SITE_PORT:$SITE_PORT/tcp" -p "$SITE_RELOAD_PORT:$SITE_RELOAD_PORT/tcp")
             say "the page: $URL"
             open_when_up "$URL"
         fi
@@ -491,8 +498,9 @@ cmd_front() {
 }
 
 # cmd_dev: the front with the page from its development server (`quasar dev`,
-# on DEV_PORT inside), which it passes through on its own port; Ctrl-C stops
-# both.
+# on DEV_PORT inside), which it passes through on its own port, and the site,
+# when checked out beside sim-mesh, from Jekyll on SITE_PORT; Ctrl-C stops
+# them all.
 cmd_dev() {
     local py ui="$ROOT/testbed/ui"
     py=$(pick_python)
@@ -504,18 +512,36 @@ cmd_dev() {
     [ -d "$ui/node_modules" ] || (cd "$ui" && npm install --no-fund --no-audit)
     (cd "$ui" && exec npx quasar dev --hostname 127.0.0.1 --port "$DEV_PORT") &
     local page=$!
+    local site=
+    if [ ! -f "$SITE/_config.yml" ]; then
+        say "no site at $SITE: only the page is served"
+    elif ! command -v bundle >/dev/null; then
+        say "the site needs Ruby and bundler: only the page is served"
+    else
+        # Its gems in the home, not the checkout: built for this system, and
+        # kept between runs. A UTF-8 locale, or Ruby reads the sources as
+        # US-ASCII and Sass refuses the theme's stylesheet.
+        local polling=()
+        [ -z "${SIM_MESH_IN_CONTAINER:-}" ] || polling=(--force_polling)
+        (cd "$SITE" && export BUNDLE_PATH="$HOME/.cache/sim-mesh/site-gems" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            && bundle install --quiet \
+            && exec bundle exec jekyll serve --host 0.0.0.0 --port "$SITE_PORT" \
+                    --livereload --livereload-port "$SITE_RELOAD_PORT" "${polling[@]}") &
+        site=$!
+        say "the site, live from its sources: http://localhost:$SITE_PORT/"
+    fi
     say "the page, live from its sources: $URL"
     [ -n "${SIM_MESH_IN_CONTAINER:-}" ] || open_when_up "$URL"
     "$py" "$ROOT/testbed/front.py" --bind "0.0.0.0:$PORT" \
         --page-dev "http://127.0.0.1:$DEV_PORT" "$@" &
     local front=$!
-    trap 'kill -TERM "$front" "$page" 2>/dev/null || true' INT TERM
+    trap 'kill -TERM "$front" "$page" $site 2>/dev/null || true' INT TERM
     trap 'sweep_group' EXIT
     local status=0
     while kill -0 "$front" 2>/dev/null; do
         wait "$front" && status=0 || status=$?
     done
-    kill -TERM "$page" 2>/dev/null || true
+    kill -TERM "$page" $site 2>/dev/null || true
     return "$status"
 }
 
@@ -596,9 +622,10 @@ run_script() {
 
 APT_PACKAGES=(ca-certificates curl gnupg git python3 python3-aiohttp python3-yaml
               python3-pytest python3-venv build-essential cmake pkg-config
-              libstdc++6 procps)
+              libstdc++6 procps ruby-dev ruby-bundler zlib1g-dev)
 DNF_PACKAGES=(ca-certificates curl git python3 python3-aiohttp python3-pyyaml python3-pytest
-              gcc gcc-c++ make cmake pkgconf-pkg-config libstdc++ procps-ng)
+              gcc gcc-c++ make cmake pkgconf-pkg-config libstdc++ procps-ng
+              ruby-devel rubygem-bundler zlib-devel)
 NODE_MAJOR=22                       # NodeSource's, as the image's
 NODE_FEDORA=24                      # Fedora's own, beside its default
 
