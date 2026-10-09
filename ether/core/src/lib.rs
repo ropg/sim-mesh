@@ -13,8 +13,8 @@
 //! the medium (`state` and `tx`, held for the barrier and handed over in
 //! station order), the events on the ether's clock, what the stations printed,
 //! a station's first words (`hello`), its channels (`wrote`, `read`), its host
-//! door (`floor`), and pacing. `Ether` in ether.py is the reference; each
-//! method here names the one it does the work of.
+//! door (`floor`), and pacing. This is the only conductor: the one in
+//! ether.py's `Ether` is retired.
 
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
@@ -390,7 +390,7 @@ struct State {
 }
 
 impl State {
-    /// Ether.mark
+    /// A station's idle flag, and with it the count of stations that owe one.
     fn mark(&mut self, sid: i64, idle: bool) {
         if let Some(st) = self.stations.get_mut(&sid) {
             if st.idle != idle {
@@ -400,12 +400,14 @@ impl State {
         }
     }
 
-    /// Ether.busy
+    /// Whether T must stay where it is: a station started and not heard from
+    /// yet, one that owes an idle, a channel holding T, or a hold under way.
     fn busy(&self) -> bool {
         !self.expected.is_empty() || self.busy_count > 0 || self.unread > 0 || self.holds > 0
     }
 
-    /// Ether.next_instant
+    /// The next instant anything needs: the earliest event on Python's heap or
+    /// a station's `until`, never before T; None when nothing waits.
     fn next_instant(&self) -> Option<i64> {
         let mut best = self.due;
         for st in self.stations.values() {
@@ -443,7 +445,8 @@ impl State {
         })
     }
 
-    /// Ether.send, up to the datagram: the station owes an idle for `seq`.
+    /// A message's number and T, up to the datagram: the station owes an idle
+    /// for `seq`.
     fn grant(&mut self, sid: i64, t: Option<i64>) -> Option<(i64, i64)> {
         let now = self.t;
         let st = self.stations.get_mut(&sid)?;
@@ -457,7 +460,7 @@ impl State {
     }
 }
 
-/// What a step of the barrier found to do next (Ether.kick's branches).
+/// What a step of the barrier found to do next (`advance`'s branches).
 enum Step {
     Stop,
     Flush(Vec<Held>),
@@ -520,7 +523,7 @@ impl Core {
         }
     }
 
-    /// Ether.send for a `run`, the message the barrier itself sends.
+    /// A `run` to a station due at T, the message the barrier itself sends.
     fn send_run(&self, sid: i64) {
         let sent = {
             let mut s = self.s.borrow_mut();
@@ -541,7 +544,7 @@ impl Core {
         }
     }
 
-    /// Ether.datagram_received: an idle, a state and a tx are the conductor's;
+    /// A datagram from a station: an idle, a state and a tx are the conductor's;
     /// anything else goes to Python as it came.
     fn datagram(&self, py: Python<'_>, data: &[u8], addr: SocketAddr) -> PyResult<()> {
         let parsed: Option<Value> = serde_json::from_slice(data).ok();
@@ -574,7 +577,9 @@ impl Core {
             .map(|_| ())
     }
 
-    /// Ether.recv_idle
+    /// A station's idle for message `seq`, wanting T again at `until`; it may
+    /// let T move. An idle for an older message is the ordinary race once,
+    /// and a lost message if it comes again: that one is sent again.
     fn recv_idle_inner(&self, py: Python<'_>, sid: i64, seq: Option<i64>, until: Option<i64>) -> PyResult<()> {
         let Some(seq) = seq else { return Ok(()) };
         let mut resend = None;
@@ -643,7 +648,8 @@ impl Core {
         self.kick_inner(py)
     }
 
-    /// Ether.resend
+    /// What station `sid` was sent after message `answered`, sent again; at
+    /// most once per resend gap.
     fn resend(&self, py: Python<'_>, sid: i64, answered: i64) -> PyResult<()> {
         let (missed, addr, said) = {
             let mut s = self.s.borrow_mut();
@@ -681,7 +687,8 @@ impl Core {
         Ok(())
     }
 
-    /// Ether.kick
+    /// The barrier moved as far as it goes now (`advance`), never from inside
+    /// itself, and then the outboxes sent.
     fn kick_inner(&self, py: Python<'_>) -> PyResult<()> {
         {
             let mut s = self.s.borrow_mut();
@@ -778,7 +785,8 @@ impl Core {
         }
     }
 
-    /// Ether.step_to
+    /// T moved to `t`: the events due on Python's heap are run, and each idle
+    /// station due by `t` is sent its `run`. A T that stands is logged.
     fn step_to(&self, py: Python<'_>, t: i64) -> PyResult<()> {
         let (said, due) = {
             let mut s = self.s.borrow_mut();
@@ -1112,7 +1120,7 @@ impl Core {
         Ok(())
     }
 
-    /// Ether.forget, the conductor's half: True if there was one.
+    /// A station gone, the conductor's half: True if there was one.
     fn forget(&self, sid: i64) -> bool {
         let mut s = self.s.borrow_mut();
         match s.stations.remove(&sid) {
@@ -1189,7 +1197,7 @@ impl Core {
 
     // ---- sending ------------------------------------------------------
 
-    /// Ether.send, up to the datagram: the station's next number and the T
+    /// A message for station `sid`, up to the datagram: its next number and the T
     /// the message carries (`t`, else T), or None for a station not here.
     #[pyo3(signature = (sid, t=None))]
     fn grant(&self, sid: i64, t: Option<i64>) -> Option<(i64, i64)> {
@@ -1200,7 +1208,7 @@ impl Core {
         s.grant(sid, t)
     }
 
-    /// Ether.send, the datagram `grant` numbered: kept for a resend, and sent.
+    /// The datagram `grant` numbered: kept for a resend, and sent.
     fn post(&self, sid: i64, seq: i64, data: &[u8], run: bool) -> PyResult<()> {
         let addr = {
             let mut s = self.s.borrow_mut();
