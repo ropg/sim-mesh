@@ -17,8 +17,6 @@
 #   - gcc, g++, make and cmake (the radio libraries and the time shim)
 #   - cargo via rustup, with the wasm32 target (the planner, the ether's
 #     conductor)
-#   - Ruby and bundler (`sim dev`'s Jekyll server for the site, sim-mesh.net,
-#     when it is checked out beside sim-mesh; its gems go in the home volume)
 #   - the station runtime the contract promises: libc, libstdc++
 # By its full name: podman will not guess a registry for a short one without a
 # terminal to ask on, and Docker reads it the same.
@@ -32,7 +30,6 @@ RUN set -eux; \
         ca-certificates curl gnupg git \
         python3 python3-aiohttp python3-yaml python3-pytest \
         build-essential cmake pkg-config \
-        ruby ruby-dev ruby-bundler zlib1g-dev \
         libstdc++6 \
         procps; \
     mkdir -p /etc/apt/keyrings; \
@@ -56,8 +53,7 @@ RUN set -eux; \
     chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
 
 # The home `sim` mounts a named volume on, for npm's and cargo's caches
-# between runs, and the site's gems; any uid may write it.
+# between runs; any uid may write it.
 RUN mkdir -p /home/sim-mesh && chmod 1777 /home/sim-mesh
-ENV BUNDLE_PATH=/home/sim-mesh/bundle
 
-EXPOSE 8800/tcp 8800/udp 4000/tcp 35729/tcp
+EXPOSE 8800/tcp 8800/udp
