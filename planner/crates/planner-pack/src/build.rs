@@ -567,8 +567,15 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
     if !params.lod2.is_empty() || params.cityjson.is_some() || params.osm_buildings {
         steps.begin("buildings");
         let mut acc = BuiltAccum::new(nx * ny);
-        // The ground LoD2 covers: each tile read, by its name, or for a file
-        // named otherwise the extent of its buildings.
+        // The ground LoD2 covers, in each tile's own zone: each tile read,
+        // by its name, or for a file named otherwise the extent of its
+        // buildings. Kept in its own zone, not reprojected into the pack's,
+        // because a straight tile edge turns some 5° across zones and its
+        // reprojected AABB reaches well past it (`lod2_tile_covers`).
+        let mut lod2_covered: Vec<(u8, [f64; 4])> = Vec::new();
+        // The ground CityJSON covers, in the pack's grid: each file's
+        // buildings' extent (CityJSON is parsed straight into the pack's
+        // system; `lod2_tile_covers`'s zone problem does not apply).
         let mut covered: Vec<[f64; 4]> = Vec::new();
         let mut sidecar = if sidecar_started {
             Some(std::io::BufWriter::new(std::fs::File::create(
@@ -615,17 +622,16 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                     .collect();
                 for (path, mut buildings) in chunk.iter().zip(parsed?) {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    let mut tile = crate::lod2::tile_extent(name);
+                    lod2_covered.extend(
+                        crate::lod2::tile_extent(name)
+                            .or_else(|| buildings.iter().map(crate::lod2::extent).reduce(union))
+                            .map(|t| (zone, t)),
+                    );
                     if zones.projects(zone) {
                         buildings.retain_mut(|b| reproject_building(b, from_zone));
-                        tile = tile.and_then(|t| reproject_extent(t, from_zone));
                     }
-                    let mut reach = tile;
                     for b in &buildings {
                         let e = crate::lod2::extent(b);
-                        if tile.is_none() {
-                            reach = Some(reach.map_or(e, |r| union(r, e)));
-                        }
                         if !meets(e, grid_extent) {
                             continue;
                         }
@@ -633,7 +639,6 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
                         acc.add(b, &cell_of);
                         n_lod2 += 1;
                     }
-                    covered.extend(reach);
                 }
                 parsed_files += chunk.len() as u64;
                 steps.part("buildings", parsed_files, files.len() as u64);
@@ -710,7 +715,11 @@ pub fn build(params: &BuildParams) -> Result<PackManifest, PackError> {
             s.flush()?;
         }
         let before = osm_buildings.len();
-        osm_buildings.retain(|b| !lod2_covers(&covered, b));
+        // Each LoD2 tile is tested in its own zone (`lod2_tile_covers`); only
+        // CityJSON's ground, already in the pack's, uses `lod2_covers` as is.
+        osm_buildings.retain(|b| {
+            !lod2_tile_covers(&lod2_covered, &zones, (b.e, b.n)) && !lod2_covers(&covered, (b.e, b.n))
+        });
         if before > osm_buildings.len() {
             eprintln!(
                 "osm buildings: {} of {before} left out, on ground LoD2 covers",
@@ -1344,6 +1353,15 @@ impl ZoneSet {
         Some((pt.0, pt.1))
     }
 
+    /// A point of the pack's zone in `zone`, the reverse of `into_pack`;
+    /// `None` where it fails.
+    fn into_zone(&self, zone: u8, x: f64, y: f64) -> Option<(f64, f64)> {
+        let Some((_, src, _)) = self.other(zone) else { return Some((x, y)) };
+        let mut pt = (x, y, 0.0);
+        proj4rs::transform::transform(&self.utm, src, &mut pt).ok()?;
+        Some((pt.0, pt.1))
+    }
+
     /// The pack's grid in `zone`, for choosing tiles by the corner in their
     /// names.
     fn grid_in(&self, zone: u8) -> [f64; 4] {
@@ -1402,11 +1420,22 @@ fn reproject_building(
     true
 }
 
-/// Whether a building stands on ground LoD2 covers: its centroid inside one
-/// of the covered extents (half-open, so a centroid on a shared tile edge
-/// belongs to one tile).
-fn lod2_covers(covered: &[[f64; 4]], b: &crate::lod2::Lod2Building) -> bool {
-    covered.iter().any(|t| t[0] <= b.e && b.e < t[2] && t[1] <= b.n && b.n < t[3])
+/// Whether a point stands on ground LoD2 covers: inside one of the covered
+/// extents (half-open, so a point on a shared tile edge belongs to one
+/// tile).
+fn lod2_covers(covered: &[[f64; 4]], (x, y): (f64, f64)) -> bool {
+    covered.iter().any(|t| t[0] <= x && x < t[2] && t[1] <= y && y < t[3])
+}
+
+/// Whether a point of the pack's grid stands on ground a LoD2 tile covers,
+/// each tile tested in the zone its name is in. Reprojected into the pack
+/// instead, a tile's straight edge turns some 5° across zones and its AABB
+/// reaches tens of metres past it — wide enough to lose an OpenStreetMap
+/// building that stands beside the tile, not on it.
+fn lod2_tile_covers(covered: &[(u8, [f64; 4])], zones: &ZoneSet, (x, y): (f64, f64)) -> bool {
+    covered.iter().any(|(zone, t)| {
+        zones.into_zone(*zone, x, y).is_some_and(|p| lod2_covers(std::slice::from_ref(t), p))
+    })
 }
 
 /// Building heights summed over 1 m samples per pack cell, plus the built
@@ -1629,26 +1658,45 @@ mod tests {
     /// belongs to one of them only.
     #[test]
     fn lod2_tiles_decide_where_openstreetmap_buildings_stay() {
-        let at = |e: f64, n: f64| crate::lod2::Lod2Building {
-            id: "w1".into(),
-            e,
-            n,
-            ground_z: 0.0,
-            area_m2: 100.0,
-            height_m: 9.0,
-            source: planner_buildings::HeightSource::Default,
-            rings: Vec::new(),
-        };
+        let at = |e: f64, n: f64| (e, n);
         let covered = [
             crate::lod2::tile_extent("LoD2_33_390_5820_1_BE.xml").unwrap(),
             crate::lod2::tile_extent("LoD2_33_391_5820_1_BE.xml").unwrap(),
         ];
-        assert!(lod2_covers(&covered, &at(390_500.0, 5_820_500.0)));
-        assert!(lod2_covers(&covered, &at(391_000.0, 5_820_000.0)));
-        assert!(!lod2_covers(&covered, &at(392_000.0, 5_820_500.0)));
-        assert!(!lod2_covers(&covered, &at(390_500.0, 5_821_000.0)));
-        assert!(!lod2_covers(&[], &at(390_500.0, 5_820_500.0)));
+        assert!(lod2_covers(&covered, at(390_500.0, 5_820_500.0)));
+        assert!(lod2_covers(&covered, at(391_000.0, 5_820_000.0)));
+        assert!(!lod2_covers(&covered, at(392_000.0, 5_820_500.0)));
+        assert!(!lod2_covers(&covered, at(390_500.0, 5_821_000.0)));
+        assert!(!lod2_covers(&[], at(390_500.0, 5_820_500.0)));
         assert_eq!(union([0.0, 1.0, 2.0, 3.0], [-1.0, 2.0, 1.0, 5.0]), [-1.0, 1.0, 2.0, 5.0]);
+    }
+
+    /// An OpenStreetMap building 20 m past a zone-33 LoD2 tile's corner, in
+    /// a zone-32 pack, stays: it is tested in the tile's own zone. The
+    /// tile's extent reprojected into the pack instead — turned some 5° and
+    /// widened by it, as `a_zone_33_building_is_projected_into_a_zone_32_pack`
+    /// measures for a building's ring — would have covered that point too
+    /// and lost it, as it did before a tile's own zone decided it.
+    #[test]
+    fn a_lod2_tile_covers_its_own_ground_and_no_more() {
+        let (u33, u32_) = (utm_proj(33).unwrap(), utm_proj(32).unwrap());
+        let in_32 = |x: f64, y: f64| {
+            let mut pt = (x, y, 0.0);
+            proj4rs::transform::transform(&u33, &u32_, &mut pt).unwrap();
+            (pt.0, pt.1)
+        };
+        let grid = [658_000.0, 5_944_000.0, 660_000.0, 5_946_000.0];
+        let zones = ZoneSet::new(32, std::iter::once(33u8), grid).unwrap();
+        let tile = crate::lod2::tile_extent("LoD2_33_262_5948_1_MV.gml").unwrap();
+        let covered = [(33u8, tile)];
+        let (past, inside) = (in_32(263_020.0, 5_948_990.0), in_32(262_980.0, 5_948_990.0));
+        assert!(!lod2_tile_covers(&covered, &zones, past));
+        assert!(lod2_tile_covers(&covered, &zones, inside));
+        // The bug: a tile's extent reprojected into the pack and tested
+        // directly (as the pre-zones-based code did) overcovers across the
+        // rotation and wrongly marks `past` as LoD2's too.
+        let projected = reproject_extent(tile, |x, y| zones.into_pack(33, x, y)).unwrap();
+        assert!(lod2_covers(&[projected], past));
     }
 
     /// A zone-33 tile in a zone-32 pack (Schwerin, 11.41° E): the building
